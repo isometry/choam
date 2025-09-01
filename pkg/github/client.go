@@ -48,6 +48,11 @@ func (c *Client) IsAuthenticated() bool {
 	return os.Getenv("GITHUB_TOKEN") != ""
 }
 
+// GetHTTPClient returns the underlying HTTP client for making authenticated requests
+func (c *Client) GetHTTPClient() *http.Client {
+	return c.client.Client()
+}
+
 // NewWithToken creates a new GitHub client with a specific token
 func NewWithToken(token string) *Client {
 	if token == "" {

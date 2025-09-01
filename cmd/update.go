@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"strconv"
 	"strings"
 
 	"github.com/aquasecurity/table"
@@ -110,11 +109,25 @@ func outputUpdateTable(results []*updater.ApplyResult) error {
 		maxPkgLen = 60
 	}
 
+	// Calculate max updates width
+	maxUpdatesLen := len("UPDATES") // Start with header length
+	for _, result := range results {
+		for _, update := range result.UpdatesApplied {
+			if len(update) > maxUpdatesLen {
+				maxUpdatesLen = len(update)
+			}
+		}
+	}
+	// Cap at reasonable maximum for updates
+	if maxUpdatesLen > 50 {
+		maxUpdatesLen = 50
+	}
+
 	// Create and configure table
 	t := table.New(os.Stdout)
 	t.SetRowLines(false)
 	t.SetBorders(false)
-	t.SetHeaders("PACKAGE", "OLD VERSION", "NEW VERSION", "OLD EPOCH", "NEW EPOCH", "UPDATES", "STATUS")
+	t.SetHeaders("PACKAGE", "OLD VERSION", "NEW VERSION", "UPDATES", "STATUS")
 
 	// Track statistics
 	totalFiles := len(results)
@@ -134,23 +147,22 @@ func outputUpdateTable(results []*updater.ApplyResult) error {
 			successfulUpdates++
 		}
 
-		// Format updates applied
+		// Format updates applied as multiline for table display
 		updatesApplied := "none"
 		if len(result.UpdatesApplied) > 0 {
-			if len(result.UpdatesApplied) <= 3 {
-				updatesApplied = strings.Join(result.UpdatesApplied, ", ")
-			} else {
-				updatesApplied = fmt.Sprintf("%d fields", len(result.UpdatesApplied))
+			// Truncate each line individually for multiline display
+			var truncatedUpdates []string
+			for _, update := range result.UpdatesApplied {
+				truncatedUpdates = append(truncatedUpdates, truncate(update, maxUpdatesLen))
 			}
+			updatesApplied = strings.Join(truncatedUpdates, "\n")
 		}
 
 		t.AddRow(
 			truncate(result.PackageName, maxPkgLen),
 			truncate(result.OldVersion, 15),
 			truncate(result.NewVersion, 15),
-			strconv.FormatInt(result.OldEpoch, 10),
-			strconv.FormatInt(result.NewEpoch, 10),
-			truncate(updatesApplied, 20),
+			updatesApplied, // Already truncated per line above
 			status,
 		)
 	}

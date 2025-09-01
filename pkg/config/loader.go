@@ -9,6 +9,7 @@ import (
 
 	"chainguard.dev/melange/pkg/config"
 	"github.com/goccy/go-yaml"
+	"github.com/goccy/go-yaml/ast"
 	"github.com/goccy/go-yaml/parser"
 )
 
@@ -228,4 +229,82 @@ func (l *Loader) GetPackageInfo(yamlContent []byte) (name, version string, epoch
 	}
 
 	return name, version, epoch, nil
+}
+
+// GetGoBumpDeps extracts the deps field from a go/bump pipeline
+func (l *Loader) GetGoBumpDeps(yamlContent []byte, pipelineIndex int) ([]string, error) {
+	withFields, err := l.GetPipelineWithField(yamlContent, pipelineIndex)
+	if err != nil {
+		return nil, fmt.Errorf("getting pipeline with fields: %w", err)
+	}
+	
+	deps, ok := withFields["deps"]
+	if !ok {
+		return []string{}, nil // No deps field
+	}
+	
+	// Split deps by newlines and filter empty lines
+	lines := strings.Split(deps, "\n")
+	var result []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			result = append(result, line)
+		}
+	}
+	
+	return result, nil
+}
+
+// UpdateGoBumpDeps updates the deps field in a go/bump pipeline
+func (l *Loader) UpdateGoBumpDeps(yamlContent []byte, pipelineIndex int, newDeps []string) ([]byte, error) {
+	// Join deps with newlines
+	depsString := strings.Join(newDeps, "\n")
+	
+	// Update the deps field
+	path := fmt.Sprintf("$.pipeline[%d].with.deps", pipelineIndex)
+	return l.UpdateField(yamlContent, path, depsString)
+}
+
+// RemovePipelineStep removes a single pipeline step by index while preserving formatting
+func (l *Loader) RemovePipelineStep(yamlContent []byte, pipelineIndex int) ([]byte, error) {
+	// Parse YAML to AST with comments preserved
+	file, err := parser.ParseBytes(yamlContent, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parsing YAML: %w", err)
+	}
+
+	// Get the pipeline array using path
+	yamlPath, err := yaml.PathString("$.pipeline")
+	if err != nil {
+		return nil, fmt.Errorf("creating pipeline path: %w", err)
+	}
+
+	node, err := yamlPath.FilterFile(file)
+	if err != nil {
+		return yamlContent, nil // Pipeline not found, return unchanged
+	}
+
+	// Check if it's a sequence node (array)
+	seqNode, ok := node.(*ast.SequenceNode)
+	if !ok {
+		return yamlContent, nil // Not a sequence, return unchanged
+	}
+
+	// Check if index is valid
+	if pipelineIndex < 0 || pipelineIndex >= len(seqNode.Values) {
+		return yamlContent, nil // Invalid index, return unchanged
+	}
+
+	// Remove the pipeline step by creating new slice without the item at pipelineIndex
+	newValues := make([]ast.Node, 0, len(seqNode.Values)-1)
+	for i, value := range seqNode.Values {
+		if i != pipelineIndex {
+			newValues = append(newValues, value)
+		}
+	}
+	seqNode.Values = newValues
+
+	// Return the AST string representation with formatting preserved
+	return []byte(file.String()), nil
 }

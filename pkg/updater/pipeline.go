@@ -84,6 +84,16 @@ func (pu *PipelineUpdater) UpdatePipelines(ctx context.Context, cfg *config.Conf
 		}
 	}
 
+	// Find and update go/bump pipelines
+	goBumpUpdater := NewGoBumpUpdater(pu.githubClient.GetHTTPClient())
+	updatedContent, goBumpUpdates, err := goBumpUpdater.UpdateGoBumpPipelines(ctx, result.Content, cfg, updateResult)
+	if err != nil {
+		result.Errors = append(result.Errors, fmt.Sprintf("go/bump: %v", err))
+	} else {
+		result.Content = updatedContent
+		result.UpdatesApplied = append(result.UpdatesApplied, goBumpUpdates...)
+	}
+
 	return result, nil
 }
 
