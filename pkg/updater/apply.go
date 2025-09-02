@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	melangeConfig "github.com/isometry/choam/pkg/config"
 )
@@ -29,6 +30,7 @@ type ApplyOptions struct {
 	DryRun        bool   // Don't actually modify files
 	Force         bool   // Apply update even if no version change
 	SharedUpdates bool   // Apply shared dependency updates
+	SecurityScan  bool   // Enable vulnerability scanning and security updates
 	BackupSuffix  string // Suffix for backup files (default: ".bak")
 	TempDir       string // Directory for temporary files
 }
@@ -39,6 +41,7 @@ func DefaultApplyOptions() *ApplyOptions {
 		DryRun:        false,
 		Force:         false,
 		SharedUpdates: true,
+		SecurityScan:  false,
 		BackupSuffix:  ".bak",
 		TempDir:       os.TempDir(),
 	}
@@ -86,8 +89,8 @@ func (u *Updater) ApplyUpdate(ctx context.Context, filePath string, opts *ApplyO
 		return result, nil
 	}
 
-	// Skip if no updates unless forced
-	if !updateResult.HasUpdate && !opts.Force {
+	// Skip if no updates unless forced or security scan enabled
+	if !updateResult.HasUpdate && !opts.Force && !opts.SecurityScan {
 		// No error - this is a normal state when no updates are available
 		return result, nil
 	}
@@ -120,8 +123,8 @@ func (u *Updater) ApplyUpdate(ctx context.Context, filePath string, opts *ApplyO
 	}
 
 	// Apply pipeline updates
-	pipelineUpdater := NewPipelineUpdater(u.githubClient, u.gitClient)
-	pipelineUpdates, err := pipelineUpdater.UpdatePipelines(ctx, cfg, updatedContent, updateResult)
+	pipelineUpdater := NewPipelineUpdater(u.githubClient, u.gitClient, u.httpClient)
+	pipelineUpdates, err := pipelineUpdater.UpdatePipelines(ctx, cfg, updatedContent, updateResult, opts.SecurityScan)
 	if err != nil {
 		result.Error = err.Error()
 		return result, fmt.Errorf("updating pipelines: %w", err)
@@ -130,6 +133,30 @@ func (u *Updater) ApplyUpdate(ctx context.Context, filePath string, opts *ApplyO
 	if len(pipelineUpdates.UpdatesApplied) > 0 {
 		updatedContent = pipelineUpdates.Content
 		result.UpdatesApplied = append(result.UpdatesApplied, pipelineUpdates.UpdatesApplied...)
+	}
+
+	// Check if security vulnerabilities were found and fixed without version update - need to bump epoch
+	if !updateResult.HasUpdate && opts.SecurityScan {
+		hasActualDepsChanges := false
+		for _, update := range result.UpdatesApplied {
+			// Look for actual pipeline deps changes, not just scan messages
+			if strings.Contains(update, "pipeline[") && strings.Contains(update, "with.deps") && 
+			   !strings.Contains(update, "skipped") {
+				hasActualDepsChanges = true
+				break
+			}
+		}
+
+		if hasActualDepsChanges && result.NewEpoch == result.OldEpoch {
+			// Bump epoch for security fixes without version change
+			updatedContent, err = loader.IncrementEpoch(updatedContent)
+			if err != nil {
+				result.Error = err.Error()
+				return result, fmt.Errorf("incrementing epoch for security fixes: %w", err)
+			}
+			result.NewEpoch = result.OldEpoch + 1
+			result.UpdatesApplied = append(result.UpdatesApplied, "package.epoch (security fixes)")
+		}
 	}
 
 	// Validate updated configuration

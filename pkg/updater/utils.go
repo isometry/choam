@@ -1,6 +1,7 @@
 package updater
 
 import (
+	"fmt"
 	"os"
 	"path"
 	"path/filepath"
@@ -87,16 +88,79 @@ func stripSuffixWithGlob(version, pattern string) string {
 }
 
 // isMelangeConfig performs a quick check to see if a file is a melange config
+// Optimized to read only the first part of the file for efficiency
 func isMelangeConfig(filePath string) bool {
-	content, err := os.ReadFile(filePath)
+	file, err := os.Open(filePath)
 	if err != nil {
 		return false
 	}
+	defer file.Close()
 
-	contentStr := string(content)
-	// Look for melange-specific fields
-	return strings.Contains(contentStr, "package:") &&
-		(strings.Contains(contentStr, "pipeline:") || strings.Contains(contentStr, "update:"))
+	// Read only the first 1KB to check for melange markers
+	buffer := make([]byte, 1024)
+	n, err := file.Read(buffer)
+	if err != nil && n == 0 {
+		return false
+	}
+
+	contentStr := string(buffer[:n])
+	// Look for melange-specific fields in the beginning of the file
+	hasPackage := strings.Contains(contentStr, "package:")
+	hasMarker := strings.Contains(contentStr, "pipeline:") || strings.Contains(contentStr, "update:")
+
+	return hasPackage && hasMarker
+}
+
+// substituteVariables performs template variable substitution in strings
+// Supports common melange template variables like ${{package.version}}
+func substituteVariables(template, version string) string {
+	substitutions := map[string]string{
+		"${{package.version}}":      version,
+		"${package.version}":        version,
+		"${{package.full-version}}": version,
+		"${package.full-version}":   version,
+	}
+
+	result := template
+	for variable, value := range substitutions {
+		result = strings.ReplaceAll(result, variable, value)
+	}
+
+	return result
+}
+
+// ErrorAccumulator helps collect and manage multiple errors
+type ErrorAccumulator struct {
+	errors []string
+}
+
+// NewErrorAccumulator creates a new error accumulator
+func NewErrorAccumulator() *ErrorAccumulator {
+	return &ErrorAccumulator{
+		errors: make([]string, 0),
+	}
+}
+
+// Add adds an error message to the accumulator
+func (ea *ErrorAccumulator) Add(format string, args ...any) {
+	ea.errors = append(ea.errors, fmt.Sprintf(format, args...))
+}
+
+// AddError adds an error to the accumulator
+func (ea *ErrorAccumulator) AddError(err error, context string) {
+	if err != nil {
+		ea.errors = append(ea.errors, fmt.Sprintf("%s: %v", context, err))
+	}
+}
+
+// GetErrors returns all accumulated errors
+func (ea *ErrorAccumulator) GetErrors() []string {
+	return ea.errors
+}
+
+// HasErrors returns true if there are accumulated errors
+func (ea *ErrorAccumulator) HasErrors() bool {
+	return len(ea.errors) > 0
 }
 
 // findMelangeFiles finds all YAML files in a directory that appear to be melange configs

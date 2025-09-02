@@ -29,6 +29,7 @@ Path can be a single file or a directory containing .yaml files.`,
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be updated without making changes")
 	cmd.Flags().BoolVar(&force, "force", false, "Force update even if no version change (increment epoch)")
 	cmd.Flags().BoolVar(&updateShared, "shared", true, "Update shared dependencies")
+	cmd.Flags().BoolVar(&securityScan, "security-scan", false, "Scan for security vulnerabilities and apply fixes")
 	cmd.Flags().StringVarP(&outputFormat, "format", "f", "table", "Output format: table, json")
 	cmd.Flags().StringVar(&backupSuffix, "backup-suffix", ".bak", "Suffix for backup files")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
@@ -59,6 +60,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		DryRun:        dryRun,
 		Force:         force,
 		SharedUpdates: updateShared,
+		SecurityScan:  securityScan,
 		BackupSuffix:  backupSuffix,
 		TempDir:       os.TempDir(),
 	}

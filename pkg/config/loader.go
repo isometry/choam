@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 
 	"chainguard.dev/melange/pkg/config"
@@ -237,22 +238,24 @@ func (l *Loader) GetGoBumpDeps(yamlContent []byte, pipelineIndex int) ([]string,
 	if err != nil {
 		return nil, fmt.Errorf("getting pipeline with fields: %w", err)
 	}
-	
+
 	deps, ok := withFields["deps"]
 	if !ok {
 		return []string{}, nil // No deps field
 	}
+
+	// Split deps by any whitespace (spaces, tabs, newlines)
+	whitespaceRegex := regexp.MustCompile(`\s+`)
+	parts := whitespaceRegex.Split(deps, -1)
 	
-	// Split deps by newlines and filter empty lines
-	lines := strings.Split(deps, "\n")
 	var result []string
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line != "" {
-			result = append(result, line)
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			result = append(result, part)
 		}
 	}
-	
+
 	return result, nil
 }
 
@@ -260,7 +263,7 @@ func (l *Loader) GetGoBumpDeps(yamlContent []byte, pipelineIndex int) ([]string,
 func (l *Loader) UpdateGoBumpDeps(yamlContent []byte, pipelineIndex int, newDeps []string) ([]byte, error) {
 	// Join deps with newlines
 	depsString := strings.Join(newDeps, "\n")
-	
+
 	// Update the deps field
 	path := fmt.Sprintf("$.pipeline[%d].with.deps", pipelineIndex)
 	return l.UpdateField(yamlContent, path, depsString)
@@ -303,6 +306,69 @@ func (l *Loader) RemovePipelineStep(yamlContent []byte, pipelineIndex int) ([]by
 			newValues = append(newValues, value)
 		}
 	}
+	seqNode.Values = newValues
+
+	// Return the AST string representation with formatting preserved
+	return []byte(file.String()), nil
+}
+
+// InsertPipelineStep inserts a new pipeline step at the specified index
+func (l *Loader) InsertPipelineStep(yamlContent []byte, pipelineIndex int, pipelineStep map[string]any) ([]byte, error) {
+	// Parse YAML to AST with comments preserved
+	file, err := parser.ParseBytes(yamlContent, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parsing YAML: %w", err)
+	}
+
+	// Get the pipeline array using path
+	yamlPath, err := yaml.PathString("$.pipeline")
+	if err != nil {
+		return nil, fmt.Errorf("creating pipeline path: %w", err)
+	}
+
+	node, err := yamlPath.FilterFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline not found: %w", err)
+	}
+
+	// Check if it's a sequence node (array)
+	seqNode, ok := node.(*ast.SequenceNode)
+	if !ok {
+		return nil, fmt.Errorf("pipeline is not a sequence")
+	}
+
+	// Convert the pipeline step to YAML node
+	stepYAML, err := yaml.Marshal(pipelineStep)
+	if err != nil {
+		return nil, fmt.Errorf("marshaling pipeline step: %w", err)
+	}
+
+	stepNode, err := parser.ParseBytes(stepYAML, 0)
+	if err != nil {
+		return nil, fmt.Errorf("parsing pipeline step: %w", err)
+	}
+
+	// Extract the document node contents
+	var stepASTNode ast.Node
+	if len(stepNode.Docs) > 0 {
+		stepASTNode = stepNode.Docs[0].Body
+	} else {
+		return nil, fmt.Errorf("invalid pipeline step structure")
+	}
+
+	// Insert the new step at the specified index
+	if pipelineIndex < 0 {
+		pipelineIndex = 0
+	}
+	if pipelineIndex > len(seqNode.Values) {
+		pipelineIndex = len(seqNode.Values)
+	}
+
+	// Create new slice with the inserted item
+	newValues := make([]ast.Node, 0, len(seqNode.Values)+1)
+	newValues = append(newValues, seqNode.Values[:pipelineIndex]...)
+	newValues = append(newValues, stepASTNode)
+	newValues = append(newValues, seqNode.Values[pipelineIndex:]...)
 	seqNode.Values = newValues
 
 	// Return the AST string representation with formatting preserved

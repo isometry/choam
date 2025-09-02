@@ -1,8 +1,10 @@
 package updater
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"chainguard.dev/melange/pkg/config"
@@ -22,20 +24,22 @@ type PipelineUpdateResult struct {
 type PipelineUpdater struct {
 	githubClient   *github.Client
 	gitClient      *git.Client
+	httpClient     *http.Client
 	checksumHelper *ChecksumHelper
 }
 
 // NewPipelineUpdater creates a new pipeline updater
-func NewPipelineUpdater(githubClient *github.Client, gitClient *git.Client) *PipelineUpdater {
+func NewPipelineUpdater(githubClient *github.Client, gitClient *git.Client, httpClient *http.Client) *PipelineUpdater {
 	return &PipelineUpdater{
 		githubClient:   githubClient,
 		gitClient:      gitClient,
-		checksumHelper: NewChecksumHelper(),
+		httpClient:     httpClient,
+		checksumHelper: NewChecksumHelperWithClient(httpClient),
 	}
 }
 
 // UpdatePipelines updates all relevant pipelines in the configuration
-func (pu *PipelineUpdater) UpdatePipelines(ctx context.Context, cfg *config.Configuration, yamlContent []byte, updateResult *UpdateResult) (*PipelineUpdateResult, error) {
+func (pu *PipelineUpdater) UpdatePipelines(ctx context.Context, cfg *config.Configuration, yamlContent []byte, updateResult *UpdateResult, securityScan bool) (*PipelineUpdateResult, error) {
 	loader := melangeConfig.NewLoader()
 	result := &PipelineUpdateResult{
 		Content:        yamlContent,
@@ -43,8 +47,8 @@ func (pu *PipelineUpdater) UpdatePipelines(ctx context.Context, cfg *config.Conf
 		Errors:         make([]string, 0),
 	}
 
-	// Only update pipelines if version actually changed
-	if !updateResult.HasUpdate {
+	// Only update pipelines if version actually changed or security scan is enabled
+	if !updateResult.HasUpdate && !securityScan {
 		return result, nil
 	}
 
@@ -60,7 +64,7 @@ func (pu *PipelineUpdater) UpdatePipelines(ctx context.Context, cfg *config.Conf
 			result.Errors = append(result.Errors, fmt.Sprintf("git-checkout[%d]: %v", index, err))
 			continue
 		}
-		if updated != nil {
+		if !bytes.Equal(updated, result.Content) {
 			result.Content = updated
 			result.UpdatesApplied = append(result.UpdatesApplied, fmt.Sprintf("pipeline[%d].with.expected-commit", index))
 		}
@@ -78,15 +82,15 @@ func (pu *PipelineUpdater) UpdatePipelines(ctx context.Context, cfg *config.Conf
 			result.Errors = append(result.Errors, fmt.Sprintf("fetch[%d]: %v", index, err))
 			continue
 		}
-		if updated != nil {
+		if !bytes.Equal(updated, result.Content) {
 			result.Content = updated
 			result.UpdatesApplied = append(result.UpdatesApplied, fmt.Sprintf("pipeline[%d].with.expected-sha256", index))
 		}
 	}
 
 	// Find and update go/bump pipelines
-	goBumpUpdater := NewGoBumpUpdater(pu.githubClient.GetHTTPClient())
-	updatedContent, goBumpUpdates, err := goBumpUpdater.UpdateGoBumpPipelines(ctx, result.Content, cfg, updateResult)
+	goBumpUpdater := NewGoBumpUpdater(pu.httpClient)
+	updatedContent, goBumpUpdates, err := goBumpUpdater.UpdateGoBumpPipelines(ctx, result.Content, cfg, updateResult, securityScan)
 	if err != nil {
 		result.Errors = append(result.Errors, fmt.Sprintf("go/bump: %v", err))
 	} else {
@@ -108,7 +112,8 @@ func (pu *PipelineUpdater) updateGitCheckoutPipeline(ctx context.Context, yamlCo
 	}
 
 	// Check if this pipeline has expected-commit (if not, skip)
-	if _, hasExpectedCommit := withFields["expected-commit"]; !hasExpectedCommit {
+	currentCommit, hasExpectedCommit := withFields["expected-commit"]
+	if !hasExpectedCommit {
 		return yamlContent, nil // No expected-commit to update
 	}
 
@@ -122,6 +127,11 @@ func (pu *PipelineUpdater) updateGitCheckoutPipeline(ctx context.Context, yamlCo
 	commitSHA, err := pu.getCommitForTag(ctx, repoURL, tag, updateResult)
 	if err != nil {
 		return nil, fmt.Errorf("getting commit for tag %s: %w", tag, err)
+	}
+
+	// Only update if commit actually changed
+	if currentCommit == commitSHA {
+		return yamlContent, nil // No change needed
 	}
 
 	// Update the expected-commit field
@@ -157,7 +167,7 @@ func (pu *PipelineUpdater) updateFetchPipeline(ctx context.Context, yamlContent 
 	}
 
 	// Calculate new URI with updated version
-	newURI := pu.substituteVersionInURI(uri, cfg.Package.Version, updateResult.LatestVersion)
+	newURI := substituteVariables(uri, updateResult.LatestVersion)
 	if newURI == uri {
 		return yamlContent, nil // No change in URI
 	}
@@ -196,7 +206,7 @@ func (pu *PipelineUpdater) extractGitInfo(withFields map[string]string, cfg *con
 	// Try to get tag from with fields and substitute version
 	if tagTemplate, ok := withFields["tag"]; ok {
 		// Substitute version in tag (e.g., "v${{package.version}}" -> "v1.2.3")
-		tag = pu.substituteVersionInTemplate(tagTemplate, updateResult.LatestVersion)
+		tag = substituteVariables(tagTemplate, updateResult.LatestVersion)
 	}
 
 	// If no repository in pipeline, try to get from update config
@@ -252,38 +262,4 @@ func (pu *PipelineUpdater) uriContainsVersionVariable(uri string) bool {
 	}
 
 	return false
-}
-
-// substituteVersionInURI substitutes version variables in a URI
-func (pu *PipelineUpdater) substituteVersionInURI(uri, oldVersion, newVersion string) string {
-	versionSubstitutions := map[string]string{
-		"${{package.version}}":      newVersion,
-		"${package.version}":        newVersion,
-		"${{package.full-version}}": newVersion,
-		"${package.full-version}":   newVersion,
-	}
-
-	result := uri
-	for variable, value := range versionSubstitutions {
-		result = strings.ReplaceAll(result, variable, value)
-	}
-
-	return result
-}
-
-// substituteVersionInTemplate substitutes version in a template string
-func (pu *PipelineUpdater) substituteVersionInTemplate(template, version string) string {
-	substitutions := map[string]string{
-		"${{package.version}}":      version,
-		"${package.version}":        version,
-		"${{package.full-version}}": version,
-		"${package.full-version}":   version,
-	}
-
-	result := template
-	for variable, value := range substitutions {
-		result = strings.ReplaceAll(result, variable, value)
-	}
-
-	return result
 }

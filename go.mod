@@ -9,7 +9,9 @@ require (
 	github.com/go-git/go-git/v5 v5.16.2
 	github.com/goccy/go-yaml v1.18.0
 	github.com/google/go-github/v74 v74.0.0
+	github.com/google/osv-scanner v1.9.2
 	github.com/spf13/cobra v1.10.0
+	golang.org/x/mod v0.27.0
 	golang.org/x/oauth2 v0.30.0
 )
 
@@ -22,6 +24,7 @@ require (
 	cloud.google.com/go/compute/metadata v0.8.0 // indirect
 	dario.cat/mergo v1.0.2 // indirect
 	filippo.io/edwards25519 v1.1.0 // indirect
+	github.com/BurntSushi/toml v1.4.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/ProtonMail/go-crypto v1.3.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
@@ -87,7 +90,7 @@ require (
 	go.opentelemetry.io/otel/trace v1.38.0 // indirect
 	go.step.sm/crypto v0.70.0 // indirect
 	golang.org/x/crypto v0.41.0 // indirect
-	golang.org/x/mod v0.27.0 // indirect
+	golang.org/x/exp v0.0.0-20250620022241-b7579e27df2b // indirect
 	golang.org/x/net v0.43.0 // indirect
 	golang.org/x/sync v0.16.0 // indirect
 	golang.org/x/sys v0.35.0 // indirect

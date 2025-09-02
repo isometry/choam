@@ -3,7 +3,9 @@ package updater
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"os"
+	"time"
 
 	"chainguard.dev/melange/pkg/config"
 	"github.com/isometry/choam/pkg/anitya"
@@ -29,16 +31,22 @@ type Updater struct {
 	githubClient *githubClient.Client
 	gitClient    *git.Client
 	filter       *VersionFilter
+	httpClient   *http.Client
 	verbose      bool
 }
 
 // New creates a new updater
 func New() *Updater {
+	httpClient := &http.Client{
+		Timeout: 60 * time.Second, // Standard timeout for all HTTP operations
+	}
+
 	return &Updater{
 		anityaClient: anitya.New(),
 		githubClient: githubClient.New(),
 		gitClient:    git.New(),
 		filter:       NewVersionFilter(),
+		httpClient:   httpClient,
 		verbose:      false,
 	}
 }

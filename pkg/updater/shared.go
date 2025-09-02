@@ -94,110 +94,61 @@ func (su *SharedUpdater) dependsOn(yamlContent []byte, packageName string) (bool
 	lines := strings.Split(string(yamlContent), "\n")
 
 	// Check various ways a package might depend on another:
-
-	// 1. Runtime dependencies
-	if su.checkInSection(lines, "runtime:", packageName) {
-		return true, nil
-	}
-
-	// 2. Build dependencies
-	if su.checkInSection(lines, "dependencies:", packageName) {
-		return true, nil
-	}
-
-	// 3. Pipeline references (like go/bump with specific module)
-	if su.checkInPipelines(lines, packageName) {
-		return true, nil
-	}
-
-	// 4. Environment or variable references
-	if su.checkInVariables(lines, packageName) {
-		return true, nil
-	}
-
-	return false, nil
+	return su.checkAllDependencies(lines, packageName), nil
 }
 
-// checkInSection checks if a package is referenced in a specific YAML section
-// Uses pre-split lines to avoid repeated string operations
-func (su *SharedUpdater) checkInSection(lines []string, sectionName, packageName string) bool {
-	inSection := false
-	sectionIndent := 0
-
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-
-		// Check if we're entering the target section
-		if strings.HasPrefix(trimmed, sectionName) {
-			inSection = true
-			sectionIndent = len(line) - len(strings.TrimLeft(line, " \t"))
-			continue
-		}
-
-		if inSection {
-			currentIndent := len(line) - len(strings.TrimLeft(line, " \t"))
-
-			// If we're at the same or less indentation level and it's not empty/comment, we've left the section
-			if trimmed != "" && !strings.HasPrefix(trimmed, "#") && currentIndent <= sectionIndent {
-				inSection = false
-				continue
-			}
-
-			// Check for package references in this section
-			if strings.Contains(trimmed, packageName) {
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-// checkInPipelines checks if a package is referenced in pipeline configurations
-// Uses pre-split lines to avoid repeated string operations
-func (su *SharedUpdater) checkInPipelines(lines []string, packageName string) bool {
+// checkAllDependencies checks all possible dependency types in one pass through the lines
+func (su *SharedUpdater) checkAllDependencies(lines []string, packageName string) bool {
+	inRuntime := false
+	inDependencies := false
 	inPipeline := false
+	inVariables := false
+
+	runtimeIndent := 0
+	dependenciesIndent := 0
 	pipelineIndent := 0
+	variablesIndent := 0
 
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-
-		// Check if we're entering pipeline section
-		if strings.HasPrefix(trimmed, "pipeline:") {
-			inPipeline = true
-			pipelineIndent = len(line) - len(strings.TrimLeft(line, " \t"))
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
 
-		if inPipeline {
-			currentIndent := len(line) - len(strings.TrimLeft(line, " \t"))
+		currentIndent := len(line) - len(strings.TrimLeft(line, " \t"))
 
-			// If we're at the same or less indentation and not empty/comment, check if we left pipelines
-			if trimmed != "" && !strings.HasPrefix(trimmed, "#") && currentIndent <= pipelineIndent {
-				// This might be the start of a new top-level section
-				if !strings.HasPrefix(trimmed, "-") && strings.Contains(trimmed, ":") {
-					inPipeline = false
-					continue
-				}
-			}
-
-			// Check for package references in pipeline steps
-			if strings.Contains(trimmed, packageName) {
-				return true
-			}
+		// Check section starts
+		switch {
+		case strings.HasPrefix(trimmed, "runtime:"):
+			inRuntime = true
+			runtimeIndent = currentIndent
+		case strings.HasPrefix(trimmed, "dependencies:"):
+			inDependencies = true
+			dependenciesIndent = currentIndent
+		case strings.HasPrefix(trimmed, "pipeline:"):
+			inPipeline = true
+			pipelineIndent = currentIndent
+		case strings.HasPrefix(trimmed, "vars:") || strings.HasPrefix(trimmed, "environment:"):
+			inVariables = true
+			variablesIndent = currentIndent
 		}
-	}
 
-	return false
-}
+		// Reset section flags if we've left the section
+		if inRuntime && currentIndent <= runtimeIndent && !strings.HasPrefix(trimmed, "runtime:") && strings.Contains(trimmed, ":") {
+			inRuntime = false
+		}
+		if inDependencies && currentIndent <= dependenciesIndent && !strings.HasPrefix(trimmed, "dependencies:") && strings.Contains(trimmed, ":") {
+			inDependencies = false
+		}
+		if inPipeline && currentIndent <= pipelineIndent && !strings.HasPrefix(trimmed, "-") && strings.Contains(trimmed, ":") && !strings.HasPrefix(trimmed, "pipeline:") {
+			inPipeline = false
+		}
+		if inVariables && currentIndent <= variablesIndent && strings.Contains(trimmed, ":") && !strings.HasPrefix(trimmed, "vars:") && !strings.HasPrefix(trimmed, "environment:") {
+			inVariables = false
+		}
 
-// checkInVariables checks if a package is referenced in variables or environment sections
-// Uses pre-split lines to avoid repeated string operations
-func (su *SharedUpdater) checkInVariables(lines []string, packageName string) bool {
-	variableSections := []string{"vars:", "environment:"}
-
-	for _, section := range variableSections {
-		if su.checkInSection(lines, section, packageName) {
+		// Check for package name in active sections
+		if (inRuntime || inDependencies || inPipeline || inVariables) && strings.Contains(trimmed, packageName) {
 			return true
 		}
 	}
