@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	melangeConfig "github.com/isometry/choam/pkg/config"
 )
@@ -31,7 +30,7 @@ type ApplyOptions struct {
 	Force         bool   // Apply update even if no version change
 	SharedUpdates bool   // Apply shared dependency updates
 	SecurityScan  bool   // Enable vulnerability scanning and security updates
-	BackupSuffix  string // Suffix for backup files (default: ".bak")
+	BackupSuffix  string // Suffix for backup files (empty = no backup)
 	TempDir       string // Directory for temporary files
 }
 
@@ -42,7 +41,7 @@ func DefaultApplyOptions() *ApplyOptions {
 		Force:         false,
 		SharedUpdates: true,
 		SecurityScan:  false,
-		BackupSuffix:  ".bak",
+		BackupSuffix:  "",
 		TempDir:       os.TempDir(),
 	}
 }
@@ -95,74 +94,58 @@ func (u *Updater) ApplyUpdate(ctx context.Context, filePath string, opts *ApplyO
 		return result, nil
 	}
 
-	// Prepare for update
-	updatedContent := originalContent
+	// Create update context to track all changes
+	updateContext := NewUpdateContext(originalContent, cfg.Package.Version, int64(cfg.Package.Epoch))
 	result.NewVersion = updateResult.LatestVersion
 
 	// Apply version update if version changed or forced
 	if updateResult.HasUpdate || opts.Force {
 		if updateResult.HasUpdate {
 			// Version changed - update and reset epoch
-			updatedContent, err = loader.UpdatePackageVersion(updatedContent, updateResult.LatestVersion)
+			updateContext.CurrentContent, err = loader.UpdatePackageVersion(updateContext.CurrentContent, updateResult.LatestVersion)
 			if err != nil {
 				result.Error = err.Error()
 				return result, fmt.Errorf("updating package version: %w", err)
 			}
-			result.NewEpoch = 0
-			result.UpdatesApplied = append(result.UpdatesApplied, "package.version", "package.epoch")
+			updateContext.SetVersionUpdate(updateResult.LatestVersion)
 		} else if opts.Force {
 			// Force update - increment epoch only
-			updatedContent, err = loader.IncrementEpoch(updatedContent)
+			updateContext.CurrentContent, err = loader.IncrementEpoch(updateContext.CurrentContent)
 			if err != nil {
 				result.Error = err.Error()
 				return result, fmt.Errorf("incrementing epoch: %w", err)
 			}
-			result.NewEpoch = result.OldEpoch + 1
-			result.UpdatesApplied = append(result.UpdatesApplied, "package.epoch")
+			updateContext.SetEpochBump("forced")
 		}
 	}
 
 	// Apply pipeline updates
 	pipelineUpdater := NewPipelineUpdater(u.githubClient, u.gitClient, u.httpClient)
-	pipelineUpdates, err := pipelineUpdater.UpdatePipelines(ctx, cfg, updatedContent, updateResult, opts.SecurityScan)
+	err = pipelineUpdater.UpdatePipelines(ctx, cfg, updateContext, updateResult, opts.SecurityScan)
 	if err != nil {
 		result.Error = err.Error()
 		return result, fmt.Errorf("updating pipelines: %w", err)
 	}
 
-	if len(pipelineUpdates.UpdatesApplied) > 0 {
-		updatedContent = pipelineUpdates.Content
-		result.UpdatesApplied = append(result.UpdatesApplied, pipelineUpdates.UpdatesApplied...)
+	// Check if epoch bump is needed for security fixes without version change
+	if updateContext.NeedsEpochBump() {
+		updateContext.CurrentContent, err = loader.IncrementEpoch(updateContext.CurrentContent)
+		if err != nil {
+			result.Error = err.Error()
+			return result, fmt.Errorf("incrementing epoch for security fixes: %w", err)
+		}
+		updateContext.SetEpochBump("security fixes")
 	}
 
-	// Check if security vulnerabilities were found and fixed without version update - need to bump epoch
-	if !updateResult.HasUpdate && opts.SecurityScan {
-		hasActualDepsChanges := false
-		for _, update := range result.UpdatesApplied {
-			// Look for actual pipeline deps changes, not just scan messages
-			if strings.Contains(update, "pipeline[") && strings.Contains(update, "with.deps") && 
-			   !strings.Contains(update, "skipped") {
-				hasActualDepsChanges = true
-				break
-			}
-		}
-
-		if hasActualDepsChanges && result.NewEpoch == result.OldEpoch {
-			// Bump epoch for security fixes without version change
-			updatedContent, err = loader.IncrementEpoch(updatedContent)
-			if err != nil {
-				result.Error = err.Error()
-				return result, fmt.Errorf("incrementing epoch for security fixes: %w", err)
-			}
-			result.NewEpoch = result.OldEpoch + 1
-			result.UpdatesApplied = append(result.UpdatesApplied, "package.epoch (security fixes)")
-		}
-	}
+	// Populate result from update context
+	result.NewVersion = updateContext.NewVersion
+	result.NewEpoch = updateContext.NewEpoch
+	result.UpdatesApplied = append(result.UpdatesApplied, updateContext.UpdateMessages...)
 
 	// Validate updated configuration
 	if !opts.DryRun {
 		tempFile := filepath.Join(opts.TempDir, fmt.Sprintf("melange-validate-%s.yaml", result.PackageName))
-		if err := loader.ValidateUpdatedConfig(updatedContent, tempFile); err != nil {
+		if err := loader.ValidateUpdatedConfig(updateContext.CurrentContent, tempFile); err != nil {
 			result.Error = err.Error()
 			return result, fmt.Errorf("validation failed: %w", err)
 		}
@@ -182,12 +165,15 @@ func (u *Updater) ApplyUpdate(ctx context.Context, filePath string, opts *ApplyO
 
 	// Save changes if not dry run
 	if !opts.DryRun {
-		backupPath := filePath + opts.BackupSuffix
-		if err := loader.SaveWithBackup(filePath, updatedContent); err != nil {
+		if err := loader.Save(filePath, updateContext.CurrentContent, opts.BackupSuffix); err != nil {
 			result.Error = err.Error()
 			return result, fmt.Errorf("saving updated file: %w", err)
 		}
-		result.BackupCreated = backupPath
+		// Only set BackupCreated if we actually have a backup suffix and content changed
+		if opts.BackupSuffix != "" {
+			// The Save method only creates backup if content actually changed
+			result.BackupCreated = filePath + opts.BackupSuffix
+		}
 	}
 
 	return result, nil

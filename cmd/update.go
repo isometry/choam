@@ -31,7 +31,7 @@ Path can be a single file or a directory containing .yaml files.`,
 	cmd.Flags().BoolVar(&updateShared, "shared", true, "Update shared dependencies")
 	cmd.Flags().BoolVar(&securityScan, "security-scan", false, "Scan for security vulnerabilities and apply fixes")
 	cmd.Flags().StringVarP(&outputFormat, "format", "f", "table", "Output format: table, json")
-	cmd.Flags().StringVar(&backupSuffix, "backup-suffix", ".bak", "Suffix for backup files")
+	cmd.Flags().StringVar(&backupSuffix, "backup-suffix", "", "Suffix for backup files (empty = no backup)")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
 
 	return cmd

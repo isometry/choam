@@ -213,6 +213,22 @@ func (c *Client) GetCommitForTag(ctx context.Context, owner, repo, tag string) (
 		return "", fmt.Errorf("tag reference object or SHA is nil")
 	}
 
+	// Check if this is an annotated tag
+	if ref.Object.Type != nil && *ref.Object.Type == "tag" {
+		// This is an annotated tag - we need to dereference it to get the commit SHA
+		tagObj, _, err := c.client.Git.GetTag(ctx, owner, repo, *ref.Object.SHA)
+		if err != nil {
+			return "", fmt.Errorf("getting tag object: %w", err)
+		}
+
+		if tagObj.Object == nil || tagObj.Object.SHA == nil {
+			return "", fmt.Errorf("tag object or target SHA is nil")
+		}
+
+		return *tagObj.Object.SHA, nil
+	}
+
+	// This is a lightweight tag pointing directly to a commit
 	return *ref.Object.SHA, nil
 }
 

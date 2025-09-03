@@ -1,6 +1,7 @@
 package config
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -159,10 +160,31 @@ func (l *Loader) GetPipelineWithField(yamlContent []byte, pipelineIndex int) (ma
 
 // SaveWithBackup saves the updated YAML content to file with backup
 func (l *Loader) SaveWithBackup(path string, content []byte) error {
-	// Create backup
-	backupPath := path + ".bak"
-	if err := l.copyFile(path, backupPath); err != nil {
-		return fmt.Errorf("creating backup %s: %w", backupPath, err)
+	return l.Save(path, content, ".bak")
+}
+
+// Save saves the updated YAML content to file, optionally creating a backup
+// backupSuffix: suffix for backup files (empty = no backup)
+// Returns error if save failed, nil if no changes needed or save successful
+func (l *Loader) Save(path string, content []byte, backupSuffix string) error {
+	// Read the current content to compare
+	currentContent, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading current file %s: %w", path, err)
+	}
+
+	// Check if content has actually changed
+	if bytes.Equal(currentContent, content) {
+		// No changes needed
+		return nil
+	}
+
+	// Create backup if suffix is provided
+	if backupSuffix != "" {
+		backupPath := path + backupSuffix
+		if err := l.copyFile(path, backupPath); err != nil {
+			return fmt.Errorf("creating backup %s: %w", backupPath, err)
+		}
 	}
 
 	// Write updated content
@@ -247,7 +269,7 @@ func (l *Loader) GetGoBumpDeps(yamlContent []byte, pipelineIndex int) ([]string,
 	// Split deps by any whitespace (spaces, tabs, newlines)
 	whitespaceRegex := regexp.MustCompile(`\s+`)
 	parts := whitespaceRegex.Split(deps, -1)
-	
+
 	var result []string
 	for _, part := range parts {
 		part = strings.TrimSpace(part)
@@ -261,12 +283,17 @@ func (l *Loader) GetGoBumpDeps(yamlContent []byte, pipelineIndex int) ([]string,
 
 // UpdateGoBumpDeps updates the deps field in a go/bump pipeline
 func (l *Loader) UpdateGoBumpDeps(yamlContent []byte, pipelineIndex int, newDeps []string) ([]byte, error) {
-	// Join deps with newlines
-	depsString := strings.Join(newDeps, "\n")
+	if len(newDeps) == 0 {
+		// Empty deps - remove the entire go/bump pipeline step
+		return l.RemovePipelineStep(yamlContent, pipelineIndex)
+	} else {
+		// Use block scalar format with |- for any deps (even single dep)
+		path := fmt.Sprintf("$.pipeline[%d].with.deps", pipelineIndex)
+		depsString := strings.Join(newDeps, "\n")
 
-	// Update the deps field
-	path := fmt.Sprintf("$.pipeline[%d].with.deps", pipelineIndex)
-	return l.UpdateField(yamlContent, path, depsString)
+		// Use the block scalar update function
+		return l.UpdateFieldWithBlockScalar(yamlContent, path, depsString)
+	}
 }
 
 // RemovePipelineStep removes a single pipeline step by index while preserving formatting

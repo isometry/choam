@@ -49,73 +49,68 @@ type SecurityUpdateResult struct {
 }
 
 // UpdateGoBumpPipelines processes all go/bump pipelines and optimizes them
-func (gbu *GoBumpUpdater) UpdateGoBumpPipelines(ctx context.Context, yamlContent []byte, cfg *config.Configuration, updateResult *UpdateResult, securityScan bool) ([]byte, []string, error) {
+func (gbu *GoBumpUpdater) UpdateGoBumpPipelines(ctx context.Context, updateContext *UpdateContext, cfg *config.Configuration, updateResult *UpdateResult, securityScan bool) error {
 	// Skip if no update and no security scan requested
 	if !updateResult.HasUpdate && !securityScan {
-		return yamlContent, nil, nil
+		return nil
 	}
 
 	loader := melangeConfig.NewLoader()
-	currentContent := yamlContent
 
 	// Get repository info needed for processing
-	repoURL, tag, err := gbu.extractRepositoryInfo(yamlContent, cfg, updateResult.LatestVersion)
+	repoURL, tag, err := gbu.extractRepositoryInfo(updateContext.CurrentContent, cfg, updateResult.LatestVersion)
 	if err != nil {
-		return yamlContent, nil, fmt.Errorf("extracting repository info: %w", err)
+		return fmt.Errorf("extracting repository info: %w", err)
 	}
 
 	// Process go/bump pipelines
-	currentContent, updatesApplied, err := gbu.processGoBumpPipelines(ctx, loader, currentContent, repoURL, tag)
+	err = gbu.processGoBumpPipelines(ctx, loader, updateContext, repoURL, tag)
 	if err != nil {
-		return yamlContent, updatesApplied, err
+		return err
 	}
 
 	// Handle security scanning
 	if securityScan {
-		securityUpdates, err := gbu.processSecurityScanning(ctx, currentContent, repoURL, tag, updatesApplied)
+		err = gbu.processSecurityScanning(ctx, updateContext, repoURL, tag)
 		if err != nil {
-			updatesApplied = append(updatesApplied, fmt.Sprintf("security scan failed: %v", err))
-		} else {
-			currentContent = securityUpdates.Content
-			updatesApplied = append(updatesApplied, securityUpdates.UpdatesApplied...)
+			updateContext.UpdateMessages = append(updateContext.UpdateMessages, fmt.Sprintf("security scan failed: %v", err))
 		}
 	}
 
-	return currentContent, updatesApplied, nil
+	return nil
 }
 
 // processGoBumpPipelines handles the main go/bump pipeline processing logic
-func (gbu *GoBumpUpdater) processGoBumpPipelines(ctx context.Context, loader *melangeConfig.Loader, yamlContent []byte, repoURL, tag string) ([]byte, []string, error) {
-	var updatesApplied []string
-	currentContent := yamlContent
-
+func (gbu *GoBumpUpdater) processGoBumpPipelines(ctx context.Context, loader *melangeConfig.Loader, updateContext *UpdateContext, repoURL, tag string) error {
 	// Find all go/bump pipelines
-	goBumpIndices, err := loader.FindPipelinesByUse(yamlContent, "go/bump")
+	goBumpIndices, err := loader.FindPipelinesByUse(updateContext.CurrentContent, "go/bump")
 	if err != nil {
-		return currentContent, nil, fmt.Errorf("finding go/bump pipelines: %w", err)
+		return fmt.Errorf("finding go/bump pipelines: %w", err)
 	}
 
 	if repoURL == "" {
 		// No repository info available, report that go/bump analysis was skipped
-		return currentContent, gbu.reportSkippedPipelines(goBumpIndices), nil
+		skippedMessages := gbu.reportSkippedPipelines(goBumpIndices)
+		updateContext.UpdateMessages = append(updateContext.UpdateMessages, skippedMessages...)
+		return nil
 	}
 
 	// Process go/bump pipelines in reverse order to handle index changes
 	for i := len(goBumpIndices) - 1; i >= 0; i-- {
 		index := goBumpIndices[i]
-		update, newContent, err := gbu.processSingleGoBumpPipeline(ctx, loader, currentContent, index, repoURL, tag)
+		update, newContent, err := gbu.processSingleGoBumpPipeline(ctx, loader, updateContext.CurrentContent, index, repoURL, tag)
 
 		if err != nil {
-			return currentContent, updatesApplied, err
+			return err
 		}
 
-		currentContent = newContent
+		updateContext.CurrentContent = newContent
 		if update != "" {
-			updatesApplied = append(updatesApplied, update)
+			updateContext.AddGoBumpUpdate(update)
 		}
 	}
 
-	return currentContent, updatesApplied, nil
+	return nil
 }
 
 // reportSkippedPipelines creates update messages for skipped pipelines
@@ -203,20 +198,26 @@ func (gbu *GoBumpUpdater) updatePipelineDeps(loader *melangeConfig.Loader, yamlC
 }
 
 // processSecurityScanning handles security scanning and updates
-func (gbu *GoBumpUpdater) processSecurityScanning(ctx context.Context, yamlContent []byte, repoURL, tag string, existingUpdates []string) (*SecurityUpdateResult, error) {
+func (gbu *GoBumpUpdater) processSecurityScanning(ctx context.Context, updateContext *UpdateContext, repoURL, tag string) error {
 	if repoURL == "" {
-		return &SecurityUpdateResult{
-			Content:        yamlContent,
-			UpdatesApplied: []string{"security scan skipped - no git-checkout found"},
-		}, nil
+		updateContext.UpdateMessages = append(updateContext.UpdateMessages, "security scan skipped - no git-checkout found")
+		return nil
+	}
+
+	loader := melangeConfig.NewLoader()
+	
+	// Check if this is actually a Go project (has go/build pipeline)
+	goBuildIndices, _ := loader.FindPipelinesByUse(updateContext.CurrentContent, "go/build")
+	if len(goBuildIndices) == 0 {
+		updateContext.UpdateMessages = append(updateContext.UpdateMessages, "security scan skipped - not a Go project (no go/build pipeline)")
+		return nil
 	}
 
 	// Check if there are actually go/bump pipelines in the YAML
-	loader := melangeConfig.NewLoader()
-	goBumpIndices, _ := loader.FindPipelinesByUse(yamlContent, "go/bump")
+	goBumpIndices, _ := loader.FindPipelinesByUse(updateContext.CurrentContent, "go/bump")
 	needToInsert := len(goBumpIndices) == 0
 
-	return gbu.handleSecurityScanning(ctx, yamlContent, repoURL, tag, needToInsert)
+	return gbu.handleSecurityScanning(ctx, updateContext, repoURL, tag, needToInsert)
 }
 
 // extractRepositoryInfo extracts repository URL and tag from git-checkout pipeline
@@ -402,53 +403,45 @@ func (gbu *GoBumpUpdater) analyzeBumps(deps []string, requirements map[string]st
 }
 
 // handleSecurityScanning performs security scanning and applies security updates
-func (gbu *GoBumpUpdater) handleSecurityScanning(ctx context.Context, yamlContent []byte, repoURL, tag string, needToInsertGoBump bool) (*SecurityUpdateResult, error) {
-	result := &SecurityUpdateResult{
-		Content:        yamlContent,
-		UpdatesApplied: make([]string, 0),
-	}
-
+func (gbu *GoBumpUpdater) handleSecurityScanning(ctx context.Context, updateContext *UpdateContext, repoURL, tag string, needToInsertGoBump bool) error {
 	// Fetch go.mod content
 	goModContent, err := gbu.fetchGoMod(ctx, repoURL, tag, "go.mod")
 	if err != nil {
-		return result, fmt.Errorf("fetching go.mod for security scan: %w", err)
+		return fmt.Errorf("fetching go.mod for security scan: %w", err)
 	}
 
 	// Perform vulnerability scan
 	scanResult, err := gbu.vulnerabilityScanner.ScanGoMod(ctx, goModContent)
 	if err != nil {
-		return result, fmt.Errorf("scanning go.mod for vulnerabilities: %w", err)
+		return fmt.Errorf("scanning go.mod for vulnerabilities: %w", err)
 	}
 
 	if scanResult.Error != "" {
-		return result, fmt.Errorf("security scan error: %s", scanResult.Error)
+		return fmt.Errorf("security scan error: %s", scanResult.Error)
 	}
 
 	// Check if we found any security bumps
 	if !scanResult.HasSecurityBumps() {
-		result.UpdatesApplied = append(result.UpdatesApplied, "security scan completed - no vulnerabilities found")
-		return result, nil
+		updateContext.UpdateMessages = append(updateContext.UpdateMessages, "security scan completed - no vulnerabilities found")
+		return nil
 	}
 
 	loader := melangeConfig.NewLoader()
-	currentContent := yamlContent
 
-	// Prepare vulnerability summary for later use (only add if we make changes)
+	// Set security fixes information in the update context
 	criticalCount := scanResult.GetCriticalCount()
 	highCount := scanResult.GetHighCount()
 	totalVulns := len(scanResult.Vulnerabilities)
 
-	vulnSummary := fmt.Sprintf("security scan found %d vulnerabilities", totalVulns)
-	if criticalCount > 0 || highCount > 0 {
-		vulnSummary += fmt.Sprintf(" (%d critical, %d high)", criticalCount, highCount)
-	}
+	// This call will mark security fixes and set the vulnerability counts
+	updateContext.SetSecurityFixes(len(scanResult.SecurityBumps), totalVulns, criticalCount, highCount)
 
 	// If we need to insert a go/bump pipeline, do it now
 	if needToInsertGoBump {
 		// Find the position to insert go/bump step (after git-checkout)
-		gitCheckoutIndices, err := loader.FindPipelinesByUse(currentContent, "git-checkout")
+		gitCheckoutIndices, err := loader.FindPipelinesByUse(updateContext.CurrentContent, "git-checkout")
 		if err != nil {
-			return result, fmt.Errorf("finding git-checkout pipeline for insertion: %w", err)
+			return fmt.Errorf("finding git-checkout pipeline for insertion: %w", err)
 		}
 
 		insertPosition := 0
@@ -456,29 +449,26 @@ func (gbu *GoBumpUpdater) handleSecurityScanning(ctx context.Context, yamlConten
 			insertPosition = gitCheckoutIndices[0] + 1
 		}
 
-		// Create go/bump pipeline step
-		goBumpStep := map[string]any{
-			"uses": "go/bump",
-			"with": map[string]any{
-				"deps": strings.Join(scanResult.SecurityBumps, "\n"),
-			},
-		}
+		// Process security bumps through mergeDeps to deduplicate and normalize
+		processedDeps := gbu.mergeDeps([]string{}, scanResult.SecurityBumps)
 
-		// Insert the pipeline step
-		currentContent, err = loader.InsertPipelineStep(currentContent, insertPosition, goBumpStep)
+		// Insert the go/bump pipeline step with processed deps
+		updateContext.CurrentContent, err = loader.InsertGoBumpPipelineStep(updateContext.CurrentContent, insertPosition, processedDeps)
 
 		if err != nil {
-			return result, fmt.Errorf("inserting go/bump pipeline step: %w", err)
+			return fmt.Errorf("inserting go/bump pipeline step: %w", err)
 		}
 
-		// Report vulnerabilities and insertion (we're making changes)
-		result.UpdatesApplied = append(result.UpdatesApplied, vulnSummary)
-		result.UpdatesApplied = append(result.UpdatesApplied, fmt.Sprintf("inserted pipeline[%d] (go/bump with %d security fixes)", insertPosition, len(scanResult.SecurityBumps)))
+		// Add insertion message
+		updateContext.AddGoBumpUpdate(fmt.Sprintf("inserted pipeline[%d] (go/bump with %d security fixes)", insertPosition, len(processedDeps)))
+		
+		// Mark that security fixes were actually applied
+		updateContext.MarkSecurityFixesApplied()
 	} else {
 		// Add security bumps to existing go/bump pipeline(s)
-		goBumpIndices, err := loader.FindPipelinesByUse(currentContent, "go/bump")
+		goBumpIndices, err := loader.FindPipelinesByUse(updateContext.CurrentContent, "go/bump")
 		if err != nil {
-			return result, fmt.Errorf("finding go/bump pipelines for security updates: %w", err)
+			return fmt.Errorf("finding go/bump pipelines for security updates: %w", err)
 		}
 
 		if len(goBumpIndices) > 0 {
@@ -486,9 +476,9 @@ func (gbu *GoBumpUpdater) handleSecurityScanning(ctx context.Context, yamlConten
 			index := goBumpIndices[0]
 
 			// Get existing deps
-			existingDeps, err := loader.GetGoBumpDeps(currentContent, index)
+			existingDeps, err := loader.GetGoBumpDeps(updateContext.CurrentContent, index)
 			if err != nil {
-				return result, fmt.Errorf("getting existing go/bump deps: %w", err)
+				return fmt.Errorf("getting existing go/bump deps: %w", err)
 			}
 
 			// Merge security bumps with existing deps (avoid duplicates)
@@ -496,60 +486,81 @@ func (gbu *GoBumpUpdater) handleSecurityScanning(ctx context.Context, yamlConten
 
 			// Check if deps actually changed by comparing normalized content
 			depsChanged := gbu.haveDepsChanged(existingDeps, mergedDeps)
-			
+
 			if !depsChanged {
 				// No actual changes needed
-				return result, nil
+				return nil
 			}
 
 			// Update the pipeline with merged deps
-			currentContent, err = loader.UpdateGoBumpDeps(currentContent, index, mergedDeps)
+			updateContext.CurrentContent, err = loader.UpdateGoBumpDeps(updateContext.CurrentContent, index, mergedDeps)
 			if err != nil {
-				return result, fmt.Errorf("updating go/bump deps with security fixes: %w", err)
+				return fmt.Errorf("updating go/bump deps with security fixes: %w", err)
 			}
 
-			// Report vulnerabilities and changes (we're making changes)
-			result.UpdatesApplied = append(result.UpdatesApplied, vulnSummary)
+			// Add update message
 			addedCount := len(mergedDeps) - len(existingDeps)
 			if addedCount > 0 {
-				result.UpdatesApplied = append(result.UpdatesApplied, fmt.Sprintf("pipeline[%d].with.deps (added %d security fixes)", index, addedCount))
+				updateContext.AddGoBumpUpdate(fmt.Sprintf("pipeline[%d].with.deps (added %d security fixes)", index, addedCount))
 			} else {
-				result.UpdatesApplied = append(result.UpdatesApplied, fmt.Sprintf("pipeline[%d].with.deps (updated security fixes)", index))
+				updateContext.AddGoBumpUpdate(fmt.Sprintf("pipeline[%d].with.deps (updated security fixes)", index))
 			}
+			
+			// Mark that security fixes were actually applied
+			updateContext.MarkSecurityFixesApplied()
 		}
 	}
 
-	result.Content = currentContent
-	return result, nil
+	return nil
 }
 
-// mergeDeps merges security bumps with existing deps, avoiding duplicates
+// mergeDeps merges security bumps with existing deps, avoiding duplicates and keeping highest version per module
 func (gbu *GoBumpUpdater) mergeDeps(existingDeps, securityBumps []string) []string {
-	// Use a map to deduplicate after normalization
-	depSet := make(map[string]bool)
-	
-	// Process all deps, normalizing them first
+	// Use a map to track highest version for each module
+	moduleVersions := make(map[string]string) // module path -> highest version
+
+	// Process all deps, keeping the highest version for each module
 	allDeps := append(existingDeps, securityBumps...)
 	for _, dep := range allDeps {
 		dep = strings.TrimSpace(dep)
 		if dep == "" {
 			continue
 		}
-		
-		// Normalize by removing +incompatible suffix (prefer version without suffix)
+
+		// Normalize by removing +incompatible suffix first
 		normalizedDep := strings.TrimSuffix(dep, "+incompatible")
-		depSet[normalizedDep] = true
+		
+		// Parse module@version
+		parts := strings.Split(normalizedDep, "@")
+		if len(parts) != 2 {
+			// Invalid format, skip
+			continue
+		}
+		
+		modulePath := parts[0]
+		version := parts[1]
+		
+		// Check if we already have a version for this module
+		if existingVersion, exists := moduleVersions[modulePath]; exists {
+			// Compare versions and keep the highest
+			if semver.Compare(version, existingVersion) > 0 {
+				moduleVersions[modulePath] = version
+			}
+		} else {
+			// First time seeing this module
+			moduleVersions[modulePath] = version
+		}
 	}
-	
-	// Convert set back to slice
-	mergedDeps := make([]string, 0, len(depSet))
-	for dep := range depSet {
-		mergedDeps = append(mergedDeps, dep)
+
+	// Convert map back to slice in module@version format
+	mergedDeps := make([]string, 0, len(moduleVersions))
+	for modulePath, version := range moduleVersions {
+		mergedDeps = append(mergedDeps, fmt.Sprintf("%s@%s", modulePath, version))
 	}
-	
+
 	// Sort for stability and consistency
 	slices.Sort(mergedDeps)
-	
+
 	return mergedDeps
 }
 
@@ -564,7 +575,7 @@ func (gbu *GoBumpUpdater) haveDepsChanged(existing, merged []string) bool {
 			existingNormalized[normalizedDep] = true
 		}
 	}
-	
+
 	mergedNormalized := make(map[string]bool)
 	for _, dep := range merged {
 		dep = strings.TrimSpace(dep)
@@ -573,17 +584,17 @@ func (gbu *GoBumpUpdater) haveDepsChanged(existing, merged []string) bool {
 			mergedNormalized[normalizedDep] = true
 		}
 	}
-	
+
 	// Compare the normalized sets
 	if len(existingNormalized) != len(mergedNormalized) {
 		return true
 	}
-	
+
 	for dep := range existingNormalized {
 		if !mergedNormalized[dep] {
 			return true
 		}
 	}
-	
+
 	return false
 }

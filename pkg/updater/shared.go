@@ -80,7 +80,7 @@ func (su *SharedUpdater) updateDependentPackage(filePath, updatedPackageName str
 
 	// Save the updated file if not in dry run mode
 	if !opts.DryRun {
-		if err := loader.SaveWithBackup(filePath, updatedContent); err != nil {
+		if err := loader.Save(filePath, updatedContent, opts.BackupSuffix); err != nil {
 			return false, fmt.Errorf("saving updated file: %w", err)
 		}
 	}

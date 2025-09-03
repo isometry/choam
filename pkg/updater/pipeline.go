@@ -39,66 +39,55 @@ func NewPipelineUpdater(githubClient *github.Client, gitClient *git.Client, http
 }
 
 // UpdatePipelines updates all relevant pipelines in the configuration
-func (pu *PipelineUpdater) UpdatePipelines(ctx context.Context, cfg *config.Configuration, yamlContent []byte, updateResult *UpdateResult, securityScan bool) (*PipelineUpdateResult, error) {
+func (pu *PipelineUpdater) UpdatePipelines(ctx context.Context, cfg *config.Configuration, updateContext *UpdateContext, updateResult *UpdateResult, securityScan bool) error {
 	loader := melangeConfig.NewLoader()
-	result := &PipelineUpdateResult{
-		Content:        yamlContent,
-		UpdatesApplied: make([]string, 0),
-		Errors:         make([]string, 0),
-	}
 
-	// Only update pipelines if version actually changed or security scan is enabled
-	if !updateResult.HasUpdate && !securityScan {
-		return result, nil
-	}
-
-	// Find and update git-checkout pipelines
-	gitCheckoutIndices, err := loader.FindPipelinesByUse(yamlContent, "git-checkout")
-	if err != nil {
-		return result, fmt.Errorf("finding git-checkout pipelines: %w", err)
-	}
-
-	for _, index := range gitCheckoutIndices {
-		updated, err := pu.updateGitCheckoutPipeline(ctx, result.Content, index, cfg, updateResult)
+	// Handle version-dependent pipeline updates (git-checkout, fetch)
+	// These only update when the version actually changes
+	if updateResult.HasUpdate {
+		// Find and update git-checkout pipelines
+		gitCheckoutIndices, err := loader.FindPipelinesByUse(updateContext.CurrentContent, "git-checkout")
 		if err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("git-checkout[%d]: %v", index, err))
-			continue
+			return fmt.Errorf("finding git-checkout pipelines: %w", err)
 		}
-		if !bytes.Equal(updated, result.Content) {
-			result.Content = updated
-			result.UpdatesApplied = append(result.UpdatesApplied, fmt.Sprintf("pipeline[%d].with.expected-commit", index))
+
+		for _, index := range gitCheckoutIndices {
+			updated, err := pu.updateGitCheckoutPipeline(ctx, updateContext.CurrentContent, index, cfg, updateResult)
+			if err != nil {
+				return fmt.Errorf("updating git-checkout[%d]: %w", index, err)
+			}
+			if !bytes.Equal(updated, updateContext.CurrentContent) {
+				updateContext.CurrentContent = updated
+				updateContext.AddGitCheckoutUpdate(index)
+			}
 		}
-	}
 
-	// Find and update fetch pipelines
-	fetchIndices, err := loader.FindPipelinesByUse(yamlContent, "fetch")
-	if err != nil {
-		return result, fmt.Errorf("finding fetch pipelines: %w", err)
-	}
-
-	for _, index := range fetchIndices {
-		updated, err := pu.updateFetchPipeline(ctx, result.Content, index, cfg, updateResult)
+		// Find and update fetch pipelines
+		fetchIndices, err := loader.FindPipelinesByUse(updateContext.CurrentContent, "fetch")
 		if err != nil {
-			result.Errors = append(result.Errors, fmt.Sprintf("fetch[%d]: %v", index, err))
-			continue
+			return fmt.Errorf("finding fetch pipelines: %w", err)
 		}
-		if !bytes.Equal(updated, result.Content) {
-			result.Content = updated
-			result.UpdatesApplied = append(result.UpdatesApplied, fmt.Sprintf("pipeline[%d].with.expected-sha256", index))
+
+		for _, index := range fetchIndices {
+			updated, err := pu.updateFetchPipeline(ctx, updateContext.CurrentContent, index, cfg, updateResult)
+			if err != nil {
+				return fmt.Errorf("updating fetch[%d]: %w", index, err)
+			}
+			if !bytes.Equal(updated, updateContext.CurrentContent) {
+				updateContext.CurrentContent = updated
+				updateContext.AddFetchUpdate(index)
+			}
 		}
 	}
 
 	// Find and update go/bump pipelines
 	goBumpUpdater := NewGoBumpUpdater(pu.httpClient)
-	updatedContent, goBumpUpdates, err := goBumpUpdater.UpdateGoBumpPipelines(ctx, result.Content, cfg, updateResult, securityScan)
+	err := goBumpUpdater.UpdateGoBumpPipelines(ctx, updateContext, cfg, updateResult, securityScan)
 	if err != nil {
-		result.Errors = append(result.Errors, fmt.Sprintf("go/bump: %v", err))
-	} else {
-		result.Content = updatedContent
-		result.UpdatesApplied = append(result.UpdatesApplied, goBumpUpdates...)
+		return fmt.Errorf("updating go/bump pipelines: %w", err)
 	}
 
-	return result, nil
+	return nil
 }
 
 // updateGitCheckoutPipeline updates a git-checkout pipeline with new expected-commit
