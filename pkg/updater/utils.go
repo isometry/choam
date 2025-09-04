@@ -1,7 +1,7 @@
 package updater
 
 import (
-	"fmt"
+	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
@@ -94,7 +94,13 @@ func isMelangeConfig(filePath string) bool {
 	if err != nil {
 		return false
 	}
-	defer file.Close()
+	defer func() {
+		if err := file.Close(); err != nil {
+			// Log the error but don't fail the function
+			// since this is just a cleanup operation
+			slog.Debug("Failed to close file", "error", err, "file", filePath)
+		}
+	}()
 
 	// Read only the first 1KB to check for melange markers
 	buffer := make([]byte, 1024)
@@ -127,40 +133,6 @@ func substituteVariables(template, version string) string {
 	}
 
 	return result
-}
-
-// ErrorAccumulator helps collect and manage multiple errors
-type ErrorAccumulator struct {
-	errors []string
-}
-
-// NewErrorAccumulator creates a new error accumulator
-func NewErrorAccumulator() *ErrorAccumulator {
-	return &ErrorAccumulator{
-		errors: make([]string, 0),
-	}
-}
-
-// Add adds an error message to the accumulator
-func (ea *ErrorAccumulator) Add(format string, args ...any) {
-	ea.errors = append(ea.errors, fmt.Sprintf(format, args...))
-}
-
-// AddError adds an error to the accumulator
-func (ea *ErrorAccumulator) AddError(err error, context string) {
-	if err != nil {
-		ea.errors = append(ea.errors, fmt.Sprintf("%s: %v", context, err))
-	}
-}
-
-// GetErrors returns all accumulated errors
-func (ea *ErrorAccumulator) GetErrors() []string {
-	return ea.errors
-}
-
-// HasErrors returns true if there are accumulated errors
-func (ea *ErrorAccumulator) HasErrors() bool {
-	return len(ea.errors) > 0
 }
 
 // findMelangeFiles finds all YAML files in a directory that appear to be melange configs

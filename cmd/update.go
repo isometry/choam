@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/aquasecurity/table"
@@ -29,7 +30,6 @@ Path can be a single file or a directory containing .yaml files.`,
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be updated without making changes")
 	cmd.Flags().BoolVar(&force, "force", false, "Force update even if no version change (increment epoch)")
 	cmd.Flags().BoolVar(&updateShared, "shared", true, "Update shared dependencies")
-	cmd.Flags().BoolVar(&securityScan, "security-scan", false, "Scan for security vulnerabilities and apply fixes")
 	cmd.Flags().StringVarP(&outputFormat, "format", "f", "table", "Output format: table, json")
 	cmd.Flags().StringVar(&backupSuffix, "backup-suffix", "", "Suffix for backup files (empty = no backup)")
 	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
@@ -55,12 +55,11 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		fmt.Fprintf(os.Stderr, "Found %d melange files to update\n", len(files))
 	}
 
-	// Configure update options
-	opts := &updater.ApplyOptions{
+	// Configure processor options (note: no more SecurityScan - always enabled)
+	opts := updater.ProcessorOptions{
 		DryRun:        dryRun,
 		Force:         force,
 		SharedUpdates: updateShared,
-		SecurityScan:  securityScan,
 		BackupSuffix:  backupSuffix,
 		TempDir:       os.TempDir(),
 	}
@@ -69,12 +68,50 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		fmt.Println("Dry run mode - no files will be modified")
 	}
 
-	// Create updater and apply updates
-	u := updater.New()
-	u.SetVerbose(verbose)
-	results, err := u.ApplyUpdates(ctx, files, opts)
+	// Create orchestrator
+	orchestrator := updater.NewOrchestrator()
+	orchestrator.SetVerbose(verbose)
+
+	// Process all files for updates
+	processors, err := orchestrator.ProcessMultipleApplies(ctx, files, opts)
 	if err != nil {
 		return fmt.Errorf("applying updates: %w", err)
+	}
+
+	// Convert processors to results for output
+	results := make([]*updater.ApplyResult, 0, len(processors))
+	for _, proc := range processors {
+		errorMsg := ""
+		if len(proc.Errors) > 0 {
+			errorMsg = strings.Join(proc.Errors, "; ")
+		}
+
+		result := &updater.ApplyResult{
+			PackageName:    proc.PackageName,
+			FilePath:       proc.FilePath,
+			OldVersion:     proc.CurrentVersion,
+			NewVersion:     proc.CurrentVersion, // Default to current
+			OldEpoch:       proc.OldEpoch,
+			NewEpoch:       proc.NewEpoch,
+			UpdatesApplied: proc.Messages,
+			SharedUpdates:  make([]string, 0), // TODO: Implement if needed
+			IsManual:       proc.IsManual,
+			Error:          errorMsg,
+		}
+
+		// If version changed, update new version
+		if proc.VersionChanged {
+			result.NewVersion = proc.LatestVersion
+		}
+
+		// Add backup path if configured
+		if backupSuffix != "" {
+			ext := filepath.Ext(proc.FilePath)
+			base := strings.TrimSuffix(proc.FilePath, ext)
+			result.BackupCreated = base + backupSuffix + ext
+		}
+
+		results = append(results, result)
 	}
 
 	// Output results

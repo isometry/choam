@@ -21,7 +21,6 @@ var (
 	// Update-specific flags
 	updateShared bool
 	backupSuffix string
-	securityScan bool
 )
 
 // NewRootCmd creates the root command

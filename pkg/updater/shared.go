@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	melange "chainguard.dev/melange/pkg/config"
 	melangeConfig "github.com/isometry/choam/pkg/config"
 )
 
@@ -19,7 +20,7 @@ func NewSharedUpdater() *SharedUpdater {
 }
 
 // UpdateSharedDependencies updates packages that depend on the updated package
-func (su *SharedUpdater) UpdateSharedDependencies(ctx context.Context, updatedFilePath, updatedPackageName string, opts *ApplyOptions) ([]string, error) {
+func (su *SharedUpdater) UpdateSharedDependencies(ctx context.Context, updatedFilePath, updatedPackageName string, opts *ProcessorOptions) ([]string, error) {
 	var results []string
 
 	// Get directory containing the updated package
@@ -53,7 +54,7 @@ func (su *SharedUpdater) UpdateSharedDependencies(ctx context.Context, updatedFi
 }
 
 // updateDependentPackage checks if a package depends on the updated package and updates it
-func (su *SharedUpdater) updateDependentPackage(filePath, updatedPackageName string, opts *ApplyOptions) (bool, error) {
+func (su *SharedUpdater) updateDependentPackage(filePath, updatedPackageName string, opts *ProcessorOptions) (bool, error) {
 	loader := melangeConfig.NewLoader()
 
 	// Load the file to check for dependencies
@@ -220,4 +221,65 @@ func (su *SharedUpdater) GetSharedDependencies(dirPath string) (map[string][]str
 	}
 
 	return dependencies, nil
+}
+
+// Common helper functions
+
+// newMelangeLoader creates a new melange configuration loader
+// This centralizes the loader creation pattern used throughout the package
+func newMelangeLoader() *melangeConfig.Loader {
+	return melangeConfig.NewLoader()
+}
+
+// extractRepositoryFromYAML extracts repository URL and tag from git-checkout pipeline in YAML content
+// This consolidates repository extraction logic used across multiple components
+func extractRepositoryFromYAML(yamlContent []byte, cfg *melange.Configuration, newVersion string) (string, string, error) {
+	loader := newMelangeLoader()
+
+	// Find git-checkout pipelines
+	gitCheckoutIndices, err := loader.FindPipelinesByUse(yamlContent, "git-checkout")
+	if err != nil {
+		return "", "", fmt.Errorf("finding git-checkout pipelines: %w", err)
+	}
+
+	if len(gitCheckoutIndices) == 0 {
+		// Fallback to config-based extraction when no YAML pipeline processing is available
+		repoURL, err := extractRepositoryFromConfig(cfg)
+		if err != nil {
+			return "", "", err
+		}
+		return repoURL, newVersion, nil
+	}
+
+	// Use the first git-checkout pipeline
+	withFields, err := loader.GetPipelineWithField(yamlContent, gitCheckoutIndices[0])
+	if err != nil {
+		return "", "", fmt.Errorf("getting pipeline with fields: %w", err)
+	}
+
+	repoURL, hasRepo := withFields["repository"]
+	if !hasRepo {
+		return "", "", fmt.Errorf("no repository found in git-checkout pipeline")
+	}
+
+	// Extract tag, substituting version if needed
+	tag := newVersion // default
+	if tagTemplate, hasTag := withFields["tag"]; hasTag {
+		tag = substituteVariables(tagTemplate, newVersion)
+	}
+
+	return repoURL, tag, nil
+}
+
+// extractRepositoryFromConfig extracts repository URL from melange configuration.
+// This is a fallback method for configurations without YAML pipeline processing.
+func extractRepositoryFromConfig(cfg *melange.Configuration) (string, error) {
+	for _, pipeline := range cfg.Pipeline {
+		if pipeline.Uses == "git-checkout" && pipeline.With != nil {
+			if repoURL, exists := pipeline.With["repository"]; exists {
+				return repoURL, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("no git-checkout pipeline step with repository found")
 }

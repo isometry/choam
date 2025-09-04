@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/aquasecurity/table"
 	"github.com/isometry/choam/pkg/updater"
@@ -54,22 +55,37 @@ func runCheck(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Create updater and load configurations
-	u := updater.New()
-	u.SetVerbose(verbose)
-	configs, err := u.LoadConfigurations(files)
+	// Create orchestrator
+	orchestrator := updater.NewOrchestrator()
+	orchestrator.SetVerbose(verbose)
+
+	// Process all files for checking
+	processors, err := orchestrator.ProcessMultipleChecks(ctx, files)
 	if err != nil {
-		return fmt.Errorf("loading configurations: %w", err)
+		return fmt.Errorf("checking updates: %w", err)
 	}
 
 	if verbose {
-		fmt.Fprintf(os.Stderr, "Loaded %d configurations\n", len(configs))
+		fmt.Fprintf(os.Stderr, "Processed %d files\n", len(processors))
 	}
 
-	// Check for updates
-	results, err := u.CheckUpdates(ctx, configs)
-	if err != nil {
-		return fmt.Errorf("checking updates: %w", err)
+	// Convert processors to results for output
+	results := make([]*updater.UpdateResult, 0, len(processors))
+	for _, proc := range processors {
+		errorMsg := ""
+		if len(proc.Errors) > 0 {
+			errorMsg = strings.Join(proc.Errors, "; ")
+		}
+
+		results = append(results, &updater.UpdateResult{
+			PackageName:    proc.PackageName,
+			CurrentVersion: proc.CurrentVersion,
+			LatestVersion:  proc.LatestVersion,
+			HasUpdate:      proc.UpdateAvailable,
+			UpdateSource:   proc.UpdateSource,
+			IsManual:       proc.IsManual,
+			Error:          errorMsg,
+		})
 	}
 
 	// Output results

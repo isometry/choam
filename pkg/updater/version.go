@@ -2,7 +2,6 @@ package updater
 
 import (
 	"fmt"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -12,17 +11,11 @@ import (
 
 // VersionComparator handles version comparison logic
 type VersionComparator struct {
-	verbose bool
 }
 
 // NewVersionComparator creates a new version comparator
 func NewVersionComparator() *VersionComparator {
-	return &VersionComparator{verbose: false}
-}
-
-// SetVerbose sets the verbose flag for debugging output
-func (vc *VersionComparator) SetVerbose(verbose bool) {
-	vc.verbose = verbose
+	return &VersionComparator{}
 }
 
 // isMultiPartNumeric checks if a version consists only of numbers and dots
@@ -131,18 +124,10 @@ func (vc *VersionComparator) ApplyTransform(version, match, replace string) (str
 
 // MatchesIgnorePattern checks if a version matches any of the ignore patterns
 func (vc *VersionComparator) MatchesIgnorePattern(version string, patterns []string) (bool, error) {
-	return vc.matchesIgnorePatternVerbose(version, patterns, vc.verbose)
-}
-
-// matchesIgnorePatternVerbose checks if a version matches any of the ignore patterns with optional verbose output
-func (vc *VersionComparator) matchesIgnorePatternVerbose(version string, patterns []string, verbose bool) (bool, error) {
 	for _, pattern := range patterns {
 		matched, err := regexp.MatchString(pattern, version)
 		if err != nil {
-			return false, fmt.Errorf("matching pattern %s: %w", pattern, err)
-		}
-		if verbose {
-			fmt.Fprintf(os.Stderr, "[DEBUG]     Pattern %q vs %q: %v\n", pattern, version, matched)
+			return false, fmt.Errorf("invalid regex pattern '%s': %w", pattern, err)
 		}
 		if matched {
 			return true, nil
