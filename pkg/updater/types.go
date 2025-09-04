@@ -22,6 +22,7 @@ type ApplyResult struct {
 	UpdatesApplied []string `json:"updates_applied"`
 	SharedUpdates  []string `json:"shared_updates,omitempty"`
 	BackupCreated  string   `json:"backup_created,omitempty"`
+	FileWasWritten bool     `json:"file_was_written"`
 	IsManual       bool     `json:"is_manual"`
 	Error          string   `json:"error,omitempty"`
 }

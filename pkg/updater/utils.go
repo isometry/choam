@@ -1,11 +1,16 @@
 package updater
 
 import (
+	"fmt"
 	"log/slog"
 	"os"
 	"path"
 	"path/filepath"
+	"regexp"
 	"strings"
+
+	melange "chainguard.dev/melange/pkg/config"
+	"chainguard.dev/melange/pkg/cond"
 )
 
 var yamlExtensions = []string{".yaml", ".yml"}
@@ -117,21 +122,77 @@ func isMelangeConfig(filePath string) bool {
 	return hasPackage && hasMarker
 }
 
-// substituteVariables performs template variable substitution in strings
-// Supports common melange template variables like ${{package.version}}
+// createVariableLookup creates a VariableLookupFunction that handles melange variable substitution
+// Supports standard variables, config vars, and var-transforms
+func createVariableLookup(cfg *melange.Configuration, version string) cond.VariableLookupFunction {
+	return func(key string) (string, error) {
+		// Handle standard melange variables
+		switch key {
+		case "package.version":
+			return version, nil
+		case "package.full-version":
+			return version, nil
+		case "package.name":
+			if cfg != nil {
+				return cfg.Package.Name, nil
+			}
+			return "", fmt.Errorf("package name not available")
+		case "package.epoch":
+			if cfg != nil {
+				return fmt.Sprintf("%d", cfg.Package.Epoch), nil
+			}
+			return "0", nil
+		}
+
+		// Handle vars.* variables from config
+		if cfg != nil && strings.HasPrefix(key, "vars.") {
+			varName := strings.TrimPrefix(key, "vars.")
+			
+			// First check direct vars
+			if value, ok := cfg.Vars[varName]; ok {
+				return value, nil
+			}
+
+			// Then check var-transforms
+			for _, transform := range cfg.VarTransforms {
+				if transform.To == varName {
+					// Recursively resolve the 'from' variable first
+					fromValue, err := cond.Subst(transform.From, createVariableLookup(cfg, version))
+					if err != nil {
+						return "", fmt.Errorf("resolving transform source %q: %w", transform.From, err)
+					}
+
+					// Apply the regex transformation
+					re, err := regexp.Compile(transform.Match)
+					if err != nil {
+						return "", fmt.Errorf("compiling transform regex %q: %w", transform.Match, err)
+					}
+
+					return re.ReplaceAllString(fromValue, transform.Replace), nil
+				}
+			}
+		}
+
+		return "", fmt.Errorf("variable %q not defined", key)
+	}
+}
+
+// substituteVariables performs template variable substitution using melange's cond.Subst
+// This replaces our custom implementation with melange's battle-tested logic
 func substituteVariables(template, version string) string {
-	substitutions := map[string]string{
-		"${{package.version}}":      version,
-		"${package.version}":        version,
-		"${{package.full-version}}": version,
-		"${package.full-version}":   version,
-	}
+	return substituteVariablesWithConfig(template, version, nil)
+}
 
-	result := template
-	for variable, value := range substitutions {
-		result = strings.ReplaceAll(result, variable, value)
+// substituteVariablesWithConfig performs template variable substitution with full melange config support
+func substituteVariablesWithConfig(template, version string, cfg *melange.Configuration) string {
+	lookupFn := createVariableLookup(cfg, version)
+	result, err := cond.Subst(template, lookupFn)
+	if err != nil {
+		// Fallback to original template if substitution fails
+		// This maintains backward compatibility
+		slog.Debug("Variable substitution failed", "template", template, "error", err)
+		return template
 	}
-
 	return result
 }
 

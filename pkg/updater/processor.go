@@ -85,8 +85,12 @@ type PackageProcessor struct {
 	Messages             []string `json:"messages"`
 	Errors               []string `json:"errors,omitempty"`
 	VulnerabilitiesFound int      `json:"vulnerabilities_found"`
+	VulnerabilitiesFixed int      `json:"vulnerabilities_fixed"`
 	CriticalVulns        int      `json:"critical_vulnerabilities"`
 	HighVulns            int      `json:"high_vulnerabilities"`
+	CriticalFixed        int      `json:"critical_fixed"`
+	HighFixed            int      `json:"high_fixed"`
+	FileWasWritten       bool     `json:"file_was_written"`
 
 	// Processing options
 	Options ProcessorOptions `json:"options"`
@@ -135,11 +139,11 @@ func (p *PackageProcessor) SetUpdateResult(hasUpdate bool, latestVersion, source
 	p.IsManual = isManual
 }
 
-// SetVersionUpdate marks that the version was updated and resets epoch
+// SetVersionUpdate marks that the version was updated (epoch handling moved to EpochApplier)
 func (p *PackageProcessor) SetVersionUpdate(newVersion string) {
 	p.VersionChanged = true
 	p.LatestVersion = newVersion
-	p.NewEpoch = 0 // Reset epoch when version changes
+	// Epoch handling is now centralized in EpochApplier
 
 	p.AddMessage(fmt.Sprintf("version updated: %s -> %s", p.CurrentVersion, newVersion))
 	p.Logger.Info("Version updated", "old_version", p.CurrentVersion, "new_version", newVersion)
@@ -209,24 +213,39 @@ func (p *PackageProcessor) AddBumpAction(action BumpAction) {
 	p.Logger.Debug("Go bump action added", "action", action.Action, "reason", action.Reason)
 }
 
-// SetVulnerabilityInfo updates vulnerability scan results
+// SetVulnerabilityInfo updates vulnerability scan results (found, not necessarily fixed)
 func (p *PackageProcessor) SetVulnerabilityInfo(vulnCount, criticalCount, highCount int) {
 	p.VulnerabilitiesFound = vulnCount
 	p.CriticalVulns = criticalCount
 	p.HighVulns = highCount
 
-	// Add vulnerability summary message
-	if criticalCount > 0 || highCount > 0 {
-		p.AddMessage(fmt.Sprintf("security scan found %d vulnerabilities (%d critical, %d high)",
-			vulnCount, criticalCount, highCount))
-	} else {
-		p.AddMessage(fmt.Sprintf("security scan found %d vulnerabilities", vulnCount))
-	}
-
+	// Don't add messages here - only add messages when vulnerabilities are actually fixed
 	p.Logger.Info("Vulnerability scan completed",
 		"total_vulnerabilities", vulnCount,
 		"critical", criticalCount,
 		"high", highCount)
+}
+
+// SetVulnerabilityFixes updates vulnerability fix results (actually fixed)
+func (p *PackageProcessor) SetVulnerabilityFixes(fixedCount, criticalFixed, highFixed int) {
+	p.VulnerabilitiesFixed = fixedCount
+	p.CriticalFixed = criticalFixed
+	p.HighFixed = highFixed
+
+	// Only add messages when vulnerabilities are actually fixed
+	if fixedCount > 0 {
+		if criticalFixed > 0 || highFixed > 0 {
+			p.AddMessage(fmt.Sprintf("security fixes applied: %d vulnerabilities fixed (%d critical, %d high)",
+				fixedCount, criticalFixed, highFixed))
+		} else {
+			p.AddMessage(fmt.Sprintf("security fixes applied: %d vulnerabilities fixed", fixedCount))
+		}
+	}
+
+	p.Logger.Info("Vulnerability fixes applied",
+		"vulnerabilities_fixed", fixedCount,
+		"critical_fixed", criticalFixed,
+		"high_fixed", highFixed)
 }
 
 // AddMessage adds a human-readable message about changes
@@ -244,6 +263,11 @@ func (p *PackageProcessor) AddError(err error) {
 // HasChanges returns true if any changes were made to the package
 func (p *PackageProcessor) HasChanges() bool {
 	return p.VersionChanged || p.EpochChanged || len(p.PipelineChanges) > 0 || len(p.SecurityFixes) > 0
+}
+
+// HasFileChanges returns true if actual file modifications were made
+func (p *PackageProcessor) HasFileChanges() bool {
+	return p.FileWasWritten
 }
 
 // NeedsEpochBump returns true if epoch should be bumped (changes without version change)

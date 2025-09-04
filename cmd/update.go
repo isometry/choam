@@ -86,6 +86,16 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 			errorMsg = strings.Join(proc.Errors, "; ")
 		}
 
+		// Only include fixes in updates, not discovery messages
+		updatesApplied := make([]string, 0)
+		for _, msg := range proc.Messages {
+			// Only include messages that indicate actual changes, not discoveries
+			if strings.Contains(msg, "updated") || strings.Contains(msg, "bumped") || 
+			   strings.Contains(msg, "applied") || strings.Contains(msg, "fixed") {
+				updatesApplied = append(updatesApplied, msg)
+			}
+		}
+		
 		result := &updater.ApplyResult{
 			PackageName:    proc.PackageName,
 			FilePath:       proc.FilePath,
@@ -93,8 +103,9 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 			NewVersion:     proc.CurrentVersion, // Default to current
 			OldEpoch:       proc.OldEpoch,
 			NewEpoch:       proc.NewEpoch,
-			UpdatesApplied: proc.Messages,
+			UpdatesApplied: updatesApplied,
 			SharedUpdates:  make([]string, 0), // TODO: Implement if needed
+			FileWasWritten: proc.HasFileChanges(),
 			IsManual:       proc.IsManual,
 			Error:          errorMsg,
 		}
@@ -181,9 +192,11 @@ func outputUpdateTable(results []*updater.ApplyResult) error {
 			errors++
 		} else if result.IsManual {
 			status = "MANUAL"
-		} else if len(result.UpdatesApplied) > 0 {
+		} else if result.FileWasWritten {
 			status = "OK"
 			successfulUpdates++
+		} else if len(result.UpdatesApplied) > 0 {
+			status = "NO UPDATE"
 		}
 
 		// Format updates applied as multiline for table display

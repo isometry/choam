@@ -155,10 +155,7 @@ func (o *UpdateOrchestrator) ProcessPackageApply(ctx context.Context, filePath s
 		stageLogger.Debug("Apply stage completed", "has_changes", processor.HasChanges())
 	}
 
-	// Handle epoch bump if needed
-	if processor.NeedsEpochBump() {
-		processor.SetEpochBump("security fixes without version change")
-	}
+	// Epoch bump handling is now done by EpochApplier stage
 
 	processor.Logger.Info("Package apply completed",
 		"has_changes", processor.HasChanges(),

@@ -2,7 +2,7 @@
 
 # Build the binary
 build:
-	go build -o choam cmd/choam/main.go
+	go build -o choam ./main.go
 
 # Run tests
 test:
@@ -32,11 +32,7 @@ lint:
 
 # Install the binary
 install:
-	go install cmd/choam/main.go
-
-# Run example checks
-example:
-	./choam check --dry-run examples/
+	go install
 
 # Help
 help:
@@ -49,5 +45,4 @@ help:
 	@echo "  fmt           Format code"
 	@echo "  lint          Lint code (requires golangci-lint)"
 	@echo "  install       Install the binary"
-	@echo "  example       Run example with dry-run"
 	@echo "  help          Show this help message"

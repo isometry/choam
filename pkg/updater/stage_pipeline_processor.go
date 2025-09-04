@@ -193,8 +193,21 @@ func (pp *PipelineProcessor) updateFetchPipeline(ctx context.Context, processor 
 		return nil
 	}
 
-	// Calculate new URI with updated version
-	newURI := substituteVariables(uri, processor.LatestVersion)
+	// Calculate new URI with updated version using renderer
+	var newURI string
+	renderer, rendererErr := melangeConfig.NewRenderer(processor.Config)
+	if rendererErr != nil {
+		// Fallback to existing method
+		newURI = substituteVariablesWithConfig(uri, processor.LatestVersion, processor.Config)
+	} else {
+		renderedURI, renderErr := renderer.RenderString(uri)
+		if renderErr != nil {
+			// Fallback to existing method
+			newURI = substituteVariablesWithConfig(uri, processor.LatestVersion, processor.Config)
+		} else {
+			newURI = renderedURI
+		}
+	}
 	if newURI == uri {
 		logger.Debug("URI unchanged after substitution - skipping")
 		return nil
@@ -263,9 +276,31 @@ func (pp *PipelineProcessor) extractGitInfo(withFields map[string]string, proces
 		repoURL = repo
 	}
 
-	// Try to get tag from with fields and substitute version
+	// Try to get tag from with fields and substitute version using renderer
 	if tagTemplate, ok := withFields["tag"]; ok {
-		tag = substituteVariables(tagTemplate, processor.LatestVersion)
+		// Use cloned config with updated version if processor has version change
+		configForRendering := processor.Config
+		if processor.VersionChanged && processor.LatestVersion != processor.Config.Package.Version {
+			configForRendering = cloneConfigWithVersion(processor.Config, processor.LatestVersion)
+			if configForRendering == nil {
+				// Fallback to original config if cloning failed
+				configForRendering = processor.Config
+			}
+		}
+		
+		renderer, rendererErr := melangeConfig.NewRenderer(configForRendering)
+		if rendererErr != nil {
+			// Fallback to existing method
+			tag = substituteVariablesWithConfig(tagTemplate, processor.LatestVersion, processor.Config)
+		} else {
+			renderedTag, renderErr := renderer.RenderString(tagTemplate)
+			if renderErr != nil {
+				// Fallback to existing method
+				tag = substituteVariablesWithConfig(tagTemplate, processor.LatestVersion, processor.Config)
+			} else {
+				tag = renderedTag
+			}
+		}
 	}
 
 	// If no repository in pipeline, try to get from update config

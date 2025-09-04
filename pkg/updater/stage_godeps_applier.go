@@ -185,20 +185,39 @@ func (gda *GoDepsApplier) removeGoBumpPipeline(processor *PackageProcessor, acti
 // recordSecurityFixes records security fixes in the processor for reporting
 func (gda *GoDepsApplier) recordSecurityFixes(processor *PackageProcessor, action BumpAction, logger *slog.Logger) {
 	if len(processor.SecurityBumps) > 0 {
+		// Count vulnerabilities actually fixed by this action
+		// This should be the number of dependencies that had vulnerabilities and are being bumped
+		vulnerabilitiesFixed := len(processor.SecurityBumps)
+		criticalFixed := 0
+		highFixed := 0
+		
+		// For now, assume proportional distribution of severity for fixed vulnerabilities
+		// In a more sophisticated implementation, we'd track severity per dependency
+		totalVulns := processor.VulnerabilitiesFound
+		if totalVulns > 0 {
+			criticalFixed = (processor.CriticalVulns * vulnerabilitiesFixed) / totalVulns
+			highFixed = (processor.HighVulns * vulnerabilitiesFixed) / totalVulns
+		}
+		
+		// Record the actual fixes being applied
+		processor.SetVulnerabilityFixes(vulnerabilitiesFixed, criticalFixed, highFixed)
+		
 		// Create a consolidated security fix record
 		fix := SecurityFix{
 			Module:        "go.mod dependencies",
-			Vulnerability: fmt.Sprintf("%d vulnerabilities", processor.VulnerabilitiesFound),
+			Vulnerability: fmt.Sprintf("%d vulnerabilities", vulnerabilitiesFixed),
 			OldVersion:    "various",
 			NewVersion:    "updated",
-			Severity:      gda.determineSeverity(processor.CriticalVulns, processor.HighVulns),
+			Severity:      gda.determineSeverity(criticalFixed, highFixed),
 		}
 		processor.AddSecurityFix(fix)
 
 		logger.Info("Security fixes recorded",
-			"vulnerabilities", processor.VulnerabilitiesFound,
-			"critical", processor.CriticalVulns,
-			"high", processor.HighVulns)
+			"action_index", action.PipelineIdx,
+			"action", action.Action,
+			"vulnerabilities", vulnerabilitiesFixed,
+			"critical", criticalFixed,
+			"high", highFixed)
 	}
 }
 

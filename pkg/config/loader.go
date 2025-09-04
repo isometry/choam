@@ -68,7 +68,7 @@ func (l *Loader) UpdateIntField(yamlContent []byte, path string, newValue int64)
 	return l.UpdateField(yamlContent, path, fmt.Sprintf("%d", newValue))
 }
 
-// UpdatePackageVersion updates the package version and resets epoch to 0
+// UpdatePackageVersion updates the package version (epoch handling moved to EpochApplier)
 func (l *Loader) UpdatePackageVersion(yamlContent []byte, newVersion string) ([]byte, error) {
 	// Update version
 	updated, err := l.UpdateField(yamlContent, "$.package.version", newVersion)
@@ -76,12 +76,7 @@ func (l *Loader) UpdatePackageVersion(yamlContent []byte, newVersion string) ([]
 		return nil, fmt.Errorf("updating package version: %w", err)
 	}
 
-	// Reset epoch to 0
-	updated, err = l.UpdateIntField(updated, "$.package.epoch", 0)
-	if err != nil {
-		return nil, fmt.Errorf("resetting package epoch: %w", err)
-	}
-
+	// Epoch handling is now centralized in EpochApplier
 	return updated, nil
 }
 
@@ -103,6 +98,11 @@ func (l *Loader) IncrementEpoch(yamlContent []byte) ([]byte, error) {
 	}
 
 	return l.UpdateIntField(yamlContent, "$.package.epoch", currentEpoch+1)
+}
+
+// SetEpoch sets the epoch field to a specific value
+func (l *Loader) SetEpoch(yamlContent []byte, newEpoch int64) ([]byte, error) {
+	return l.UpdateIntField(yamlContent, "$.package.epoch", newEpoch)
 }
 
 // UpdatePipelineField updates a field within a specific pipeline

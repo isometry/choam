@@ -52,14 +52,34 @@ func (gdc *GoDepsChecker) Check(ctx context.Context, processor *PackageProcessor
 		return nil
 	}
 
-	// Check for modpath in go/build pipelines
+	// Check for modroot and modpath in go/build pipelines
 	modPath := "go.mod"
 	if len(goBuildIndices) > 0 {
 		withFields, err := loader.GetPipelineWithField(processor.CurrentYAML, goBuildIndices[0])
 		if err == nil {
+			var basePath string
+			
+			// Check for modroot first (base directory for the module)
+			if modroot, ok := withFields["modroot"]; ok && modroot != "" {
+				basePath = modroot
+				logger.Debug("Using modroot from go/build pipeline", "modroot", modroot)
+			}
+			
+			// Check for modpath (subdirectory within modroot containing go.mod)
 			if customModPath, ok := withFields["modpath"]; ok && customModPath != "" {
-				modPath = customModPath + "/go.mod"
-				logger.Debug("Using custom modpath", "modpath", customModPath)
+				if basePath != "" {
+					// Combine modroot and modpath
+					modPath = basePath + "/" + customModPath + "/go.mod"
+					logger.Debug("Using combined modroot and modpath", "modroot", basePath, "modpath", customModPath, "final_path", modPath)
+				} else {
+					// Just modpath
+					modPath = customModPath + "/go.mod"
+					logger.Debug("Using custom modpath", "modpath", customModPath)
+				}
+			} else if basePath != "" {
+				// Just modroot
+				modPath = basePath + "/go.mod"
+				logger.Debug("Using modroot only", "modroot", basePath)
 			}
 		}
 	}

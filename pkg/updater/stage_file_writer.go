@@ -66,6 +66,9 @@ func (fw *FileWriter) Apply(ctx context.Context, processor *PackageProcessor) er
 	// Log success with details
 	logger.Info("File updated successfully")
 
+	// Mark that file was actually written
+	processor.FileWasWritten = true
+
 	// Add final message about file write
 	if processor.Options.BackupSuffix != "" {
 		processor.AddMessage(fmt.Sprintf("file updated with backup: %s%s", processor.FilePath, processor.Options.BackupSuffix))

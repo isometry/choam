@@ -87,6 +87,7 @@ func DefaultStageRegistry() *StageRegistry {
 	registry.RegisterApplyStage(&VersionApplier{})
 	registry.RegisterApplyStage(&PipelineProcessor{})
 	registry.RegisterApplyStage(&GoDepsApplier{})
+	registry.RegisterApplyStage(&EpochApplier{})
 
 	// FileWriter must be the final stage to ensure all modifications are complete
 	registry.RegisterApplyStage(&FileWriter{})
