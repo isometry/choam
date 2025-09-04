@@ -51,10 +51,10 @@ func (ea *EpochApplier) Apply(ctx context.Context, processor *PackageProcessor) 
 	// Handle config changes without version change: increment epoch
 	if processor.RequiresEpochBump {
 		newEpoch := processor.OldEpoch + 1
-		
+
 		if processor.Options.DryRun {
 			logger.Info("Dry run - would increment epoch for config changes")
-			processor.AddMessage(fmt.Sprintf("would increment epoch: %d -> %d (config changes without version change)", 
+			processor.AddMessage(fmt.Sprintf("would increment epoch: %d -> %d (config changes without version change)",
 				processor.OldEpoch, newEpoch))
 			processor.NewEpoch = newEpoch
 			processor.EpochChanged = true

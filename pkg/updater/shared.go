@@ -274,7 +274,7 @@ func extractRepositoryFromYAML(yamlContent []byte, cfg *melange.Configuration, n
 				configForRendering = cfg
 			}
 		}
-		
+
 		// Create a renderer with the appropriate configuration
 		renderer, err := melangeConfig.NewRenderer(configForRendering)
 		if err != nil {
@@ -313,7 +313,7 @@ func cloneConfigWithVersion(cfg *melange.Configuration, newVersion string) *mela
 	if cfg == nil {
 		return nil
 	}
-	
+
 	// Create a new configuration with the same structure
 	cloned := &melange.Configuration{
 		Package:       cfg.Package,       // This will be modified below
@@ -328,7 +328,7 @@ func cloneConfigWithVersion(cfg *melange.Configuration, newVersion string) *mela
 		Options:       cfg.Options,       // Shallow copy is fine for options
 		Test:          cfg.Test,          // Shallow copy is fine for test config
 	}
-	
+
 	// Deep copy and update the package information
 	cloned.Package = melange.Package{
 		Name:         cfg.Package.Name,
@@ -343,6 +343,6 @@ func cloneConfigWithVersion(cfg *melange.Configuration, newVersion string) *mela
 		Scriptlets:   cfg.Package.Scriptlets,
 		Checks:       cfg.Package.Checks,
 	}
-	
+
 	return cloned
 }

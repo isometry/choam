@@ -35,8 +35,8 @@ func (va *VersionApplier) Apply(ctx context.Context, processor *PackageProcessor
 	// Skip if there's no actual version change (even with --force)
 	// This prevents panic when --force is used without an available update
 	if processor.LatestVersion == "" || processor.LatestVersion == processor.CurrentVersion {
-		logger.Debug("No version change to apply", 
-			"current", processor.CurrentVersion, 
+		logger.Debug("No version change to apply",
+			"current", processor.CurrentVersion,
 			"latest", processor.LatestVersion)
 		return nil
 	}

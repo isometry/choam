@@ -9,8 +9,8 @@ import (
 	"regexp"
 	"strings"
 
-	melange "chainguard.dev/melange/pkg/config"
 	"chainguard.dev/melange/pkg/cond"
+	melange "chainguard.dev/melange/pkg/config"
 )
 
 var yamlExtensions = []string{".yaml", ".yml"}
@@ -147,7 +147,7 @@ func createVariableLookup(cfg *melange.Configuration, version string) cond.Varia
 		// Handle vars.* variables from config
 		if cfg != nil && strings.HasPrefix(key, "vars.") {
 			varName := strings.TrimPrefix(key, "vars.")
-			
+
 			// First check direct vars
 			if value, ok := cfg.Vars[varName]; ok {
 				return value, nil

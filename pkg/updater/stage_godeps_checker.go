@@ -58,13 +58,13 @@ func (gdc *GoDepsChecker) Check(ctx context.Context, processor *PackageProcessor
 		withFields, err := loader.GetPipelineWithField(processor.CurrentYAML, goBuildIndices[0])
 		if err == nil {
 			var basePath string
-			
+
 			// Check for modroot first (base directory for the module)
 			if modroot, ok := withFields["modroot"]; ok && modroot != "" {
 				basePath = modroot
 				logger.Debug("Using modroot from go/build pipeline", "modroot", modroot)
 			}
-			
+
 			// Check for modpath (subdirectory within modroot containing go.mod)
 			if customModPath, ok := withFields["modpath"]; ok && customModPath != "" {
 				if basePath != "" {
@@ -86,13 +86,12 @@ func (gdc *GoDepsChecker) Check(ctx context.Context, processor *PackageProcessor
 
 	logger.Info("Starting Go dependency analysis", "repo_url", repoURL, "tag", tag, "modpath", modPath)
 
-	// Get service clients and shared cache
+	// Get service clients
 	orchestrator := NewOrchestrator()
 	_, _, _, httpClient := orchestrator.GetServiceClients()
-	cache := orchestrator.GetVulnerabilityCache()
 
 	// Create go/bump updater for dependency analysis
-	goBumpUpdater := NewGoBumpUpdaterWithCache(httpClient, cache)
+	goBumpUpdater := NewGoBumpUpdater(httpClient)
 
 	// Perform the analysis
 	if err := gdc.performAnalysis(ctx, processor, repoURL, tag, modPath, goBumpUpdater, httpClient, logger); err != nil {
@@ -120,9 +119,8 @@ func (gdc *GoDepsChecker) performAnalysis(ctx context.Context, processor *Packag
 		return fmt.Errorf("parsing go.mod: %w", err)
 	}
 
-	// Perform vulnerability scan
-	vulnerabilityScanner := scan.NewVulnerabilityScanner(httpClient)
-	scanResult, err := vulnerabilityScanner.ScanGoMod(ctx, goModContent)
+	// Perform vulnerability scan using the scanner from GoBumpUpdater (which has cache)
+	scanResult, err := goBumpUpdater.vulnerabilityScanner.ScanGoMod(ctx, goModContent)
 	if err != nil {
 		return fmt.Errorf("scanning go.mod for vulnerabilities: %w", err)
 	}

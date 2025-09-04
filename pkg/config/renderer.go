@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"strconv"
 
-	melange "chainguard.dev/melange/pkg/config"
 	"chainguard.dev/melange/pkg/cond"
+	melange "chainguard.dev/melange/pkg/config"
 )
 
 // Renderer provides variable rendering for melange configurations

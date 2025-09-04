@@ -66,7 +66,7 @@ func (gda *GoDepsApplier) Apply(ctx context.Context, processor *PackageProcessor
 			break
 		}
 	}
-	
+
 	if hasActualChanges && len(processor.SecurityBumps) > 0 {
 		processor.MarkSecurityFixesApplied()
 		logger.Debug("Security fixes applied - epoch bump will be required")
@@ -190,7 +190,7 @@ func (gda *GoDepsApplier) recordSecurityFixes(processor *PackageProcessor, actio
 		vulnerabilitiesFixed := len(processor.SecurityBumps)
 		criticalFixed := 0
 		highFixed := 0
-		
+
 		// For now, assume proportional distribution of severity for fixed vulnerabilities
 		// In a more sophisticated implementation, we'd track severity per dependency
 		totalVulns := processor.VulnerabilitiesFound
@@ -198,10 +198,10 @@ func (gda *GoDepsApplier) recordSecurityFixes(processor *PackageProcessor, actio
 			criticalFixed = (processor.CriticalVulns * vulnerabilitiesFixed) / totalVulns
 			highFixed = (processor.HighVulns * vulnerabilitiesFixed) / totalVulns
 		}
-		
+
 		// Record the actual fixes being applied
 		processor.SetVulnerabilityFixes(vulnerabilitiesFixed, criticalFixed, highFixed)
-		
+
 		// Create a consolidated security fix record
 		fix := SecurityFix{
 			Module:        "go.mod dependencies",

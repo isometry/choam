@@ -11,7 +11,6 @@ import (
 	"github.com/isometry/choam/pkg/anitya"
 	"github.com/isometry/choam/pkg/git"
 	githubClient "github.com/isometry/choam/pkg/github"
-	"github.com/isometry/choam/pkg/scan"
 )
 
 // UpdateOrchestrator manages the package update pipeline using a stage-based architecture
@@ -31,9 +30,6 @@ type UpdateOrchestrator struct {
 	// Stage registry for extensible pipeline
 	stageRegistry *StageRegistry
 
-	// Shared cache for vulnerability scans to avoid duplicate API calls
-	vulnerabilityCache *scan.VulnerabilityCache
-
 	// Configuration
 	verbose bool
 }
@@ -45,15 +41,14 @@ func NewOrchestrator() *UpdateOrchestrator {
 	}
 
 	return &UpdateOrchestrator{
-		anityaClient:       anitya.New(),
-		githubClient:       githubClient.New(),
-		gitClient:          git.New(),
-		httpClient:         httpClient,
-		versionFilter:      NewVersionFilter(),
-		versionComparator:  NewVersionComparator(),
-		stageRegistry:      DefaultStageRegistry(),
-		vulnerabilityCache: scan.NewVulnerabilityCache(),
-		verbose:            false,
+		anityaClient:      anitya.New(),
+		githubClient:      githubClient.New(),
+		gitClient:         git.New(),
+		httpClient:        httpClient,
+		versionFilter:     NewVersionFilter(),
+		versionComparator: NewVersionComparator(),
+		stageRegistry:     DefaultStageRegistry(),
+		verbose:           false,
 	}
 }
 
@@ -219,11 +214,6 @@ func (o *UpdateOrchestrator) GetServiceClients() (anitya *anitya.Client, github 
 // GetVersionComponents returns the version filtering and comparison components
 func (o *UpdateOrchestrator) GetVersionComponents() (*VersionFilter, *VersionComparator) {
 	return o.versionFilter, o.versionComparator
-}
-
-// GetVulnerabilityCache returns the shared vulnerability cache
-func (o *UpdateOrchestrator) GetVulnerabilityCache() *scan.VulnerabilityCache {
-	return o.vulnerabilityCache
 }
 
 // RegisterCheckStage adds a custom check stage to the pipeline

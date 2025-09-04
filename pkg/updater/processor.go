@@ -28,10 +28,10 @@ type SecurityFix struct {
 
 // BumpAction represents a planned action for go/bump pipelines
 type BumpAction struct {
-	Action       string   `json:"action"`        // "insert", "update", "remove"
-	PipelineIdx  int      `json:"pipeline_idx"`  // pipeline index for update/remove
-	Dependencies []string `json:"dependencies"`  // dependencies to insert/update with
-	Reason       string   `json:"reason"`        // human-readable reason
+	Action       string   `json:"action"`       // "insert", "update", "remove"
+	PipelineIdx  int      `json:"pipeline_idx"` // pipeline index for update/remove
+	Dependencies []string `json:"dependencies"` // dependencies to insert/update with
+	Reason       string   `json:"reason"`       // human-readable reason
 }
 
 // ProcessorOptions contains configuration for package processing

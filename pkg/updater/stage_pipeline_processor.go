@@ -287,7 +287,7 @@ func (pp *PipelineProcessor) extractGitInfo(withFields map[string]string, proces
 				configForRendering = processor.Config
 			}
 		}
-		
+
 		renderer, rendererErr := melangeConfig.NewRenderer(configForRendering)
 		if rendererErr != nil {
 			// Fallback to existing method

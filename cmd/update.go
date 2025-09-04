@@ -90,12 +90,12 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		updatesApplied := make([]string, 0)
 		for _, msg := range proc.Messages {
 			// Only include messages that indicate actual changes, not discoveries
-			if strings.Contains(msg, "updated") || strings.Contains(msg, "bumped") || 
-			   strings.Contains(msg, "applied") || strings.Contains(msg, "fixed") {
+			if strings.Contains(msg, "updated") || strings.Contains(msg, "bumped") ||
+				strings.Contains(msg, "applied") || strings.Contains(msg, "fixed") {
 				updatesApplied = append(updatesApplied, msg)
 			}
 		}
-		
+
 		result := &updater.ApplyResult{
 			PackageName:    proc.PackageName,
 			FilePath:       proc.FilePath,

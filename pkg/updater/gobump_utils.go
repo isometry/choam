@@ -34,17 +34,6 @@ func NewGoBumpUpdater(httpClient *http.Client) *GoBumpUpdater {
 	}
 }
 
-// NewGoBumpUpdaterWithCache creates a new go/bump utility helper with vulnerability cache
-func NewGoBumpUpdaterWithCache(httpClient *http.Client, cache *scan.VulnerabilityCache) *GoBumpUpdater {
-	if httpClient == nil {
-		httpClient = &http.Client{}
-	}
-	return &GoBumpUpdater{
-		httpClient:           httpClient,
-		vulnerabilityScanner: scan.NewVulnerabilityScannerWithCache(httpClient, cache),
-	}
-}
-
 // BumpAnalysis represents the analysis result for a single bump
 type BumpAnalysis struct {
 	Module       string
@@ -180,10 +169,10 @@ func (gbu *GoBumpUpdater) buildRawURL(repoURL, tag, filepath string) (string, er
 	return "", fmt.Errorf("unsupported repository URL format: %s", repoURL)
 }
 
-// GoModInfo contains parsed go.mod information including requirements and replacements  
+// GoModInfo contains parsed go.mod information including requirements and replacements
 type GoModInfo struct {
-	Requirements map[string]string            // module -> version
-	Replacements map[string]*modfile.Replace  // module -> replacement
+	Requirements map[string]string           // module -> version
+	Replacements map[string]*modfile.Replace // module -> replacement
 }
 
 // parseGoMod parses go.mod content and extracts module requirements and replacements
@@ -216,10 +205,10 @@ func (gbu *GoBumpUpdater) parseGoMod(content []byte) (*GoModInfo, error) {
 // analyzeBumps analyzes each bump and determines whether to keep or remove it
 func (gbu *GoBumpUpdater) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]BumpAnalysis, []string) {
 	var analysis []BumpAnalysis
-	
+
 	// First, deduplicate and keep only the latest version per module
 	latestVersions := make(map[string]string)
-	
+
 	for _, dep := range deps {
 		dep = strings.TrimSpace(dep)
 		if dep == "" {
@@ -238,7 +227,7 @@ func (gbu *GoBumpUpdater) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]B
 
 		module := parts[0]
 		bumpVersion := parts[1]
-		
+
 		// Keep only the latest version for each module
 		if existing, exists := latestVersions[module]; exists {
 			if existing == "" {
@@ -256,7 +245,7 @@ func (gbu *GoBumpUpdater) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]B
 
 	// Now analyze the deduplicated dependencies
 	var filteredDeps []string
-	
+
 	for module, bumpVersion := range latestVersions {
 		if bumpVersion == "" {
 			// Malformed dep, keep it as is
@@ -287,7 +276,7 @@ func (gbu *GoBumpUpdater) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]B
 
 		// Check for replace directives that affect this module
 		effectiveVersion := gbu.getEffectiveVersion(module, goModVersion, goModInfo.Replacements)
-		
+
 		// Compare versions using semantic versioning
 		comparison := semver.Compare(bumpVersion, effectiveVersion)
 
@@ -342,7 +331,7 @@ func (gbu *GoBumpUpdater) getEffectiveVersion(module, originalVersion string, re
 			return replace.New.Version
 		}
 	}
-	
+
 	// Check for module-level replacement (all versions)
 	if replace, ok := replacements[module]; ok {
 		if gbu.isLocalPath(replace.New.Path) {
@@ -353,7 +342,7 @@ func (gbu *GoBumpUpdater) getEffectiveVersion(module, originalVersion string, re
 			return replace.New.Version
 		}
 	}
-	
+
 	// No replacement, use original version
 	return originalVersion
 }

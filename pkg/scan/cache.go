@@ -6,6 +6,19 @@ import (
 	"github.com/google/osv-scanner/pkg/models"
 )
 
+// Global vulnerability cache instance shared across the entire application
+var globalVulnerabilityCache *VulnerabilityCache
+
+// Initialize the global cache once
+func init() {
+	globalVulnerabilityCache = NewVulnerabilityCache()
+}
+
+// GetGlobalCache returns the shared global vulnerability cache
+func GetGlobalCache() *VulnerabilityCache {
+	return globalVulnerabilityCache
+}
+
 // VulnerabilityCache provides a thread-safe cache for vulnerability scan results
 // to avoid redundant API calls for the same package@version combinations within a single run
 type VulnerabilityCache struct {
