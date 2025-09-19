@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/isometry/choam/pkg/scan"
+	"github.com/isometry/choam/pkg/utils"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
 )
@@ -70,7 +71,7 @@ func (gbu *GoBumpUpdater) fetchGoMod(ctx context.Context, repoURL, tag, goModPat
 			return content, nil
 		}
 		// Return the original error if API also fails
-		return nil, fmt.Errorf("failed to fetch from both raw URL (%v) and GitHub API (%v)", err, apiErr)
+		return nil, fmt.Errorf("failed to fetch from both raw URL (%w) and GitHub API (%v)", err, apiErr)
 	}
 
 	return nil, err
@@ -153,6 +154,33 @@ func (gbu *GoBumpUpdater) fetchFromGitHubAPI(ctx context.Context, repoURL, tag, 
 	return content, nil
 }
 
+// fetchGoSum fetches go.sum content from a git repository
+// Uses GitHub API for private repos, falls back to raw.githubusercontent.com for public repos
+func (gbu *GoBumpUpdater) fetchGoSum(ctx context.Context, repoURL, tag, goSumPath string) ([]byte, error) {
+	// First try raw URL (works for public repos)
+	rawURL, err := gbu.buildRawURL(repoURL, tag, goSumPath)
+	if err != nil {
+		return nil, fmt.Errorf("building raw URL: %w", err)
+	}
+
+	content, err := gbu.fetchFromRawURL(ctx, rawURL)
+	if err == nil {
+		return content, nil
+	}
+
+	// If raw URL fails with 404, try GitHub API (for private repos)
+	if strings.Contains(err.Error(), "HTTP error 404") {
+		content, apiErr := gbu.fetchFromGitHubAPI(ctx, repoURL, tag, goSumPath)
+		if apiErr == nil {
+			return content, nil
+		}
+		// Return the original error if API also fails
+		return nil, fmt.Errorf("failed to fetch from both raw URL (%w) and GitHub API (%v)", err, apiErr)
+	}
+
+	return nil, err
+}
+
 // buildRawURL converts a GitHub repository URL to a raw content URL
 func (gbu *GoBumpUpdater) buildRawURL(repoURL, tag, filepath string) (string, error) {
 	// Handle GitHub URLs - convert to raw.githubusercontent.com format
@@ -171,8 +199,9 @@ func (gbu *GoBumpUpdater) buildRawURL(repoURL, tag, filepath string) (string, er
 
 // GoModInfo contains parsed go.mod information including requirements and replacements
 type GoModInfo struct {
-	Requirements map[string]string           // module -> version
-	Replacements map[string]*modfile.Replace // module -> replacement
+	Requirements    map[string]string           // module -> version (direct dependencies)
+	AllRequirements map[string]string           // module -> version (all dependencies including indirect)
+	Replacements    map[string]*modfile.Replace // module -> replacement
 }
 
 // parseGoMod parses go.mod content and extracts module requirements and replacements
@@ -183,8 +212,10 @@ func (gbu *GoBumpUpdater) parseGoMod(content []byte) (*GoModInfo, error) {
 	}
 
 	requirements := make(map[string]string)
+	allRequirements := make(map[string]string)
 	for _, req := range modFile.Require {
 		requirements[req.Mod.Path] = req.Mod.Version
+		allRequirements[req.Mod.Path] = req.Mod.Version
 	}
 
 	replacements := make(map[string]*modfile.Replace)
@@ -197,9 +228,92 @@ func (gbu *GoBumpUpdater) parseGoMod(content []byte) (*GoModInfo, error) {
 	}
 
 	return &GoModInfo{
-		Requirements: requirements,
-		Replacements: replacements,
+		Requirements:    requirements,
+		AllRequirements: allRequirements,
+		Replacements:    replacements,
 	}, nil
+}
+
+// parseGoSum parses go.sum content and extracts all module versions
+// This is used to get indirect dependencies that aren't listed in go.mod (Go < 1.17)
+func (gbu *GoBumpUpdater) parseGoSum(content []byte) (map[string]string, error) {
+	allDeps := make(map[string]string)
+	lines := strings.Split(string(content), "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// go.sum format: module version hash
+		parts := strings.Fields(line)
+		if len(parts) < 2 {
+			continue
+		}
+
+		module := parts[0]
+		version := parts[1]
+
+		// Skip /go.mod entries, we only want the actual module versions
+		if strings.HasSuffix(version, "/go.mod") {
+			continue
+		}
+
+		// Keep the latest version for each module (go.sum may have multiple versions)
+		if existing, ok := allDeps[module]; !ok || semver.Compare(version, existing) > 0 {
+			allDeps[module] = version
+		}
+	}
+
+	return allDeps, nil
+}
+
+// parseGoModWithSum parses both go.mod and go.sum to get complete dependency information
+func (gbu *GoBumpUpdater) parseGoModWithSum(goModContent, goSumContent []byte) (*GoModInfo, error) {
+	// First parse go.mod for direct dependencies and replacements
+	goModInfo, err := gbu.parseGoMod(goModContent)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parse go.sum to get all dependencies (direct + indirect)
+	if goSumContent != nil {
+		allDeps, err := gbu.parseGoSum(goSumContent)
+		if err != nil {
+			return nil, fmt.Errorf("parsing go.sum: %w", err)
+		}
+
+		// Update AllRequirements with complete dependency list
+		for module, version := range allDeps {
+			goModInfo.AllRequirements[module] = version
+		}
+	}
+
+	return goModInfo, nil
+}
+
+// createVulnScanInput creates a vulnerability scanner input from GoModInfo
+// This provides a unified list of dependencies for vulnerability scanning
+func (gbu *GoBumpUpdater) createVulnScanInput(goModInfo *GoModInfo) string {
+	var lines []string
+
+	// Create a mock go.mod content with all dependencies for vulnerability scanning
+	lines = append(lines, "module temp")
+	lines = append(lines, "")
+	lines = append(lines, "require (")
+
+	for module, version := range goModInfo.AllRequirements {
+		// Skip standard library modules
+		if strings.HasPrefix(module, "std") {
+			continue
+		}
+		lines = append(lines, fmt.Sprintf("\t%s %s", module, version))
+	}
+
+	lines = append(lines, ")")
+
+	return strings.Join(lines, "\n")
 }
 
 // analyzeBumps analyzes each bump and determines whether to keep or remove it
@@ -260,16 +374,16 @@ func (gbu *GoBumpUpdater) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]B
 			continue
 		}
 
-		// Check if this module exists in go.mod requirements
-		goModVersion, exists := goModInfo.Requirements[module]
+		// Check if this module exists in go.mod requirements (including indirect)
+		goModVersion, exists := goModInfo.AllRequirements[module]
 		if !exists {
-			// Module not found in go.mod - remove it
+			// Module not found in go.mod/go.sum - remove it
 			analysis = append(analysis, BumpAnalysis{
 				Module:       module,
 				BumpVersion:  bumpVersion,
 				GoModVersion: "(missing)",
 				Action:       "remove-missing",
-				Reason:       "module not found in go.mod",
+				Reason:       "module not found in go.mod/go.sum",
 			})
 			continue
 		}
@@ -323,7 +437,7 @@ func (gbu *GoBumpUpdater) getEffectiveVersion(module, originalVersion string, re
 	// Check for exact version replacement first (module@version)
 	exactKey := module + "@" + originalVersion
 	if replace, ok := replacements[exactKey]; ok {
-		if gbu.isLocalPath(replace.New.Path) {
+		if utils.IsLocalPath(replace.New.Path) {
 			// Local replacement - treat as effectively very new version
 			return "v999.999.999" // This ensures bumps are considered downgrades
 		}
@@ -334,7 +448,7 @@ func (gbu *GoBumpUpdater) getEffectiveVersion(module, originalVersion string, re
 
 	// Check for module-level replacement (all versions)
 	if replace, ok := replacements[module]; ok {
-		if gbu.isLocalPath(replace.New.Path) {
+		if utils.IsLocalPath(replace.New.Path) {
 			// Local replacement - treat as effectively very new version
 			return "v999.999.999" // This ensures bumps are considered downgrades
 		}
@@ -345,14 +459,6 @@ func (gbu *GoBumpUpdater) getEffectiveVersion(module, originalVersion string, re
 
 	// No replacement, use original version
 	return originalVersion
-}
-
-// isLocalPath determines if a path is a local filesystem path
-func (gbu *GoBumpUpdater) isLocalPath(path string) bool {
-	return path == "" ||
-		strings.HasPrefix(path, ".") ||
-		strings.HasPrefix(path, "/") ||
-		strings.Contains(path, "\\") // Windows paths
 }
 
 // haveDepsChanged compares two dependency lists to determine if they're different

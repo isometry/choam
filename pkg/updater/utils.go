@@ -60,7 +60,12 @@ func stripVersionAffix(version, pattern string, isPrefix bool) string {
 
 // stripPrefixWithGlob removes a prefix that matches a glob pattern
 func stripPrefixWithGlob(version, pattern string) string {
-	// Try progressively longer prefixes until we find a match
+	// For simple cases without wildcards, use faster string operations
+	if !strings.Contains(pattern, "*") && !strings.Contains(pattern, "?") {
+		return strings.TrimPrefix(version, pattern)
+	}
+
+	// For patterns with wildcards, find the shortest match by trying progressively longer prefixes
 	for i := 1; i <= len(version); i++ {
 		prefix := version[:i]
 		matched, err := path.Match(pattern, prefix)
@@ -77,7 +82,12 @@ func stripPrefixWithGlob(version, pattern string) string {
 
 // stripSuffixWithGlob removes a suffix that matches a glob pattern
 func stripSuffixWithGlob(version, pattern string) string {
-	// Try progressively longer suffixes until we find a match
+	// For simple cases without wildcards, use faster string operations
+	if !strings.Contains(pattern, "*") && !strings.Contains(pattern, "?") {
+		return strings.TrimSuffix(version, pattern)
+	}
+
+	// For patterns with wildcards, find the shortest match by trying progressively longer suffixes
 	for i := 1; i <= len(version); i++ {
 		suffix := version[len(version)-i:]
 		matched, err := path.Match(pattern, suffix)
@@ -126,55 +136,69 @@ func isMelangeConfig(filePath string) bool {
 // Supports standard variables, config vars, and var-transforms
 func createVariableLookup(cfg *melange.Configuration, version string) cond.VariableLookupFunction {
 	return func(key string) (string, error) {
-		// Handle standard melange variables
-		switch key {
-		case "package.version":
-			return version, nil
-		case "package.full-version":
-			return version, nil
-		case "package.name":
-			if cfg != nil {
-				return cfg.Package.Name, nil
-			}
-			return "", fmt.Errorf("package name not available")
-		case "package.epoch":
-			if cfg != nil {
-				return fmt.Sprintf("%d", cfg.Package.Epoch), nil
-			}
-			return "0", nil
+		// Handle standard melange variables first (most common case)
+		if value, ok := resolveStandardVariable(key, cfg, version); ok {
+			return value, nil
 		}
 
 		// Handle vars.* variables from config
 		if cfg != nil && strings.HasPrefix(key, "vars.") {
-			varName := strings.TrimPrefix(key, "vars.")
-
-			// First check direct vars
-			if value, ok := cfg.Vars[varName]; ok {
-				return value, nil
-			}
-
-			// Then check var-transforms
-			for _, transform := range cfg.VarTransforms {
-				if transform.To == varName {
-					// Recursively resolve the 'from' variable first
-					fromValue, err := cond.Subst(transform.From, createVariableLookup(cfg, version))
-					if err != nil {
-						return "", fmt.Errorf("resolving transform source %q: %w", transform.From, err)
-					}
-
-					// Apply the regex transformation
-					re, err := regexp.Compile(transform.Match)
-					if err != nil {
-						return "", fmt.Errorf("compiling transform regex %q: %w", transform.Match, err)
-					}
-
-					return re.ReplaceAllString(fromValue, transform.Replace), nil
-				}
-			}
+			return resolveVarsVariable(key, cfg, version)
 		}
 
 		return "", fmt.Errorf("variable %q not defined", key)
 	}
+}
+
+// resolveStandardVariable handles built-in melange variables
+func resolveStandardVariable(key string, cfg *melange.Configuration, version string) (string, bool) {
+	switch key {
+	case "package.version", "package.full-version":
+		return version, true
+	case "package.name":
+		if cfg != nil {
+			return cfg.Package.Name, true
+		}
+		return "", false
+	case "package.epoch":
+		if cfg != nil {
+			return fmt.Sprintf("%d", cfg.Package.Epoch), true
+		}
+		return "0", true
+	}
+	return "", false
+}
+
+// resolveVarsVariable handles vars.* variables including transforms
+func resolveVarsVariable(key string, cfg *melange.Configuration, version string) (string, error) {
+	varName := strings.TrimPrefix(key, "vars.")
+
+	// Check direct vars first (most common case)
+	if value, ok := cfg.Vars[varName]; ok {
+		return value, nil
+	}
+
+	// Check var-transforms
+	for _, transform := range cfg.VarTransforms {
+		if transform.To != varName {
+			continue
+		}
+
+		// Found matching transform - apply it
+		fromValue, err := cond.Subst(transform.From, createVariableLookup(cfg, version))
+		if err != nil {
+			return "", fmt.Errorf("resolving transform source %q: %w", transform.From, err)
+		}
+
+		re, err := regexp.Compile(transform.Match)
+		if err != nil {
+			return "", fmt.Errorf("compiling transform regex %q: %w", transform.Match, err)
+		}
+
+		return re.ReplaceAllString(fromValue, transform.Replace), nil
+	}
+
+	return "", fmt.Errorf("variable %q not defined", key)
 }
 
 // substituteVariables performs template variable substitution using melange's cond.Subst

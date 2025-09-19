@@ -86,10 +86,6 @@ type PackageProcessor struct {
 	Errors               []string `json:"errors,omitempty"`
 	VulnerabilitiesFound int      `json:"vulnerabilities_found"`
 	VulnerabilitiesFixed int      `json:"vulnerabilities_fixed"`
-	CriticalVulns        int      `json:"critical_vulnerabilities"`
-	HighVulns            int      `json:"high_vulnerabilities"`
-	CriticalFixed        int      `json:"critical_fixed"`
-	HighFixed            int      `json:"high_fixed"`
 	FileWasWritten       bool     `json:"file_was_written"`
 
 	// Processing options
@@ -216,8 +212,6 @@ func (p *PackageProcessor) AddBumpAction(action BumpAction) {
 // SetVulnerabilityInfo updates vulnerability scan results (found, not necessarily fixed)
 func (p *PackageProcessor) SetVulnerabilityInfo(vulnCount, criticalCount, highCount int) {
 	p.VulnerabilitiesFound = vulnCount
-	p.CriticalVulns = criticalCount
-	p.HighVulns = highCount
 
 	// Don't add messages here - only add messages when vulnerabilities are actually fixed
 	p.Logger.Info("Vulnerability scan completed",
@@ -229,8 +223,6 @@ func (p *PackageProcessor) SetVulnerabilityInfo(vulnCount, criticalCount, highCo
 // SetVulnerabilityFixes updates vulnerability fix results (actually fixed)
 func (p *PackageProcessor) SetVulnerabilityFixes(fixedCount, criticalFixed, highFixed int) {
 	p.VulnerabilitiesFixed = fixedCount
-	p.CriticalFixed = criticalFixed
-	p.HighFixed = highFixed
 
 	// Only add messages when vulnerabilities are actually fixed
 	if fixedCount > 0 {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/isometry/choam/pkg/scan"
 )
@@ -114,20 +115,38 @@ func (gdc *GoDepsChecker) performAnalysis(ctx context.Context, processor *Packag
 		return fmt.Errorf("fetching go.mod: %w", err)
 	}
 
-	goModInfo, err := goBumpUpdater.parseGoMod(goModContent)
+	// Fetch go.sum for complete dependency list (including indirect dependencies)
+	goSumPath := strings.Replace(modPath, "go.mod", "go.sum", 1)
+	goSumContent, err := goBumpUpdater.fetchGoSum(ctx, repoURL, tag, goSumPath)
 	if err != nil {
-		return fmt.Errorf("parsing go.mod: %w", err)
+		// go.sum might not exist for all projects, continue with warning
+		logger.Warn("Could not fetch go.sum, will only scan direct dependencies", "error", err)
+		goSumContent = nil
 	}
 
-	// Perform vulnerability scan using the scanner from GoBumpUpdater (which has cache)
-	scanResult, err := goBumpUpdater.vulnerabilityScanner.ScanGoMod(ctx, goModContent)
+	// Parse both go.mod and go.sum to get complete dependency information
+	goModInfo, err := goBumpUpdater.parseGoModWithSum(goModContent, goSumContent)
 	if err != nil {
-		return fmt.Errorf("scanning go.mod for vulnerabilities: %w", err)
+		return fmt.Errorf("parsing go.mod/go.sum: %w", err)
+	}
+
+	// Create vulnerability scanner input with all dependencies (direct + indirect)
+	vulnScanInput := goBumpUpdater.createVulnScanInput(goModInfo)
+
+	// Perform vulnerability scan with complete dependency list
+	scanResult, err := goBumpUpdater.vulnerabilityScanner.ScanGoMod(ctx, []byte(vulnScanInput))
+	if err != nil {
+		return fmt.Errorf("scanning dependencies for vulnerabilities: %w", err)
 	}
 
 	if scanResult.Error != "" {
 		return fmt.Errorf("security scan error: %s", scanResult.Error)
 	}
+
+	logger.Info("Vulnerability scan completed",
+		"direct_deps", len(goModInfo.Requirements),
+		"total_deps", len(goModInfo.AllRequirements),
+		"vulnerabilities_found", len(scanResult.Vulnerabilities))
 
 	// Set vulnerability information
 	criticalCount := scanResult.GetCriticalCount()

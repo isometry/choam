@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"time"
 )
 
@@ -72,14 +71,12 @@ func (ch *ChecksumHelper) CalculateSHA256FromURL(ctx context.Context, url string
 
 // CalculateSHA256FromFile calculates SHA256 hash of a local file
 func (ch *ChecksumHelper) CalculateSHA256FromFile(filePath string) (string, error) {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return "", fmt.Errorf("opening file %s: %w", filePath, err)
-	}
-	defer func() { _ = file.Close() }()
-
 	hasher := sha256.New()
-	if _, err := io.Copy(hasher, file); err != nil {
+	err := withFileReader(filePath, func(reader io.Reader) error {
+		_, err := io.Copy(hasher, reader)
+		return err
+	})
+	if err != nil {
 		return "", fmt.Errorf("reading file %s: %w", filePath, err)
 	}
 
