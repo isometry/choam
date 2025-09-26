@@ -36,6 +36,7 @@ and release-monitoring.org.`,
 
 	cmd.AddCommand(NewCheckCmd())
 	cmd.AddCommand(NewUpdateCmd())
+	cmd.AddCommand(NewGoBumpCmd())
 
 	return cmd
 }

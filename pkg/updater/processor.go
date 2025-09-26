@@ -17,22 +17,6 @@ type PipelineChange struct {
 	Description string `json:"description"` // human-readable description
 }
 
-// SecurityFix represents a security vulnerability fix applied
-type SecurityFix struct {
-	Module        string `json:"module"`        // Go module affected
-	Vulnerability string `json:"vulnerability"` // CVE or vulnerability ID
-	OldVersion    string `json:"old_version"`   // version before fix
-	NewVersion    string `json:"new_version"`   // version after fix
-	Severity      string `json:"severity"`      // critical, high, medium, low
-}
-
-// BumpAction represents a planned action for go/bump pipelines
-type BumpAction struct {
-	Action       string   `json:"action"`       // "insert", "update", "remove"
-	PipelineIdx  int      `json:"pipeline_idx"` // pipeline index for update/remove
-	Dependencies []string `json:"dependencies"` // dependencies to insert/update with
-	Reason       string   `json:"reason"`       // human-readable reason
-}
 
 // ProcessorOptions contains configuration for package processing
 type ProcessorOptions struct {
@@ -67,26 +51,16 @@ type PackageProcessor struct {
 	IsManual        bool   `json:"is_manual"`
 
 	// Apply phase state
-	VersionChanged    bool             `json:"version_changed"`
-	EpochChanged      bool             `json:"epoch_changed"`
-	OldEpoch          int64            `json:"old_epoch"`
-	NewEpoch          int64            `json:"new_epoch"`
-	PipelineChanges   []PipelineChange `json:"pipeline_changes"`
-	SecurityFixes     []SecurityFix    `json:"security_fixes"`
-	RequiresEpochBump bool             `json:"requires_epoch_bump"`
-
-	// Go dependency analysis results
-	GoDepsAnalyzed    bool              `json:"go_deps_analyzed"`
-	GoModRequirements map[string]string `json:"go_mod_requirements,omitempty"`
-	SecurityBumps     []string          `json:"security_bumps,omitempty"`
-	GoBumpActions     []BumpAction      `json:"go_bump_actions,omitempty"`
+	VersionChanged  bool             `json:"version_changed"`
+	EpochChanged    bool             `json:"epoch_changed"`
+	OldEpoch        int64            `json:"old_epoch"`
+	NewEpoch        int64            `json:"new_epoch"`
+	PipelineChanges []PipelineChange `json:"pipeline_changes"`
 
 	// Accumulated state and messages
-	Messages             []string `json:"messages"`
-	Errors               []string `json:"errors,omitempty"`
-	VulnerabilitiesFound int      `json:"vulnerabilities_found"`
-	VulnerabilitiesFixed int      `json:"vulnerabilities_fixed"`
-	FileWasWritten       bool     `json:"file_was_written"`
+	Messages       []string `json:"messages"`
+	Errors         []string `json:"errors,omitempty"`
+	FileWasWritten bool     `json:"file_was_written"`
 
 	// Processing options
 	Options ProcessorOptions `json:"options"`
@@ -101,19 +75,15 @@ func NewPackageProcessor(filePath, packageName, currentVersion string, currentEp
 	)
 
 	return &PackageProcessor{
-		FilePath:          filePath,
-		PackageName:       packageName,
-		Logger:            logger,
-		CurrentVersion:    currentVersion,
-		OldEpoch:          currentEpoch,
-		NewEpoch:          currentEpoch,
-		GoModRequirements: make(map[string]string),
-		SecurityBumps:     make([]string, 0),
-		GoBumpActions:     make([]BumpAction, 0),
-		Messages:          make([]string, 0),
-		Errors:            make([]string, 0),
-		PipelineChanges:   make([]PipelineChange, 0),
-		SecurityFixes:     make([]SecurityFix, 0),
+		FilePath:        filePath,
+		PackageName:     packageName,
+		Logger:          logger,
+		CurrentVersion:  currentVersion,
+		OldEpoch:        currentEpoch,
+		NewEpoch:        currentEpoch,
+		Messages:        make([]string, 0),
+		Errors:          make([]string, 0),
+		PipelineChanges: make([]PipelineChange, 0),
 	}
 }
 
@@ -145,20 +115,6 @@ func (p *PackageProcessor) SetVersionUpdate(newVersion string) {
 	p.Logger.Info("Version updated", "old_version", p.CurrentVersion, "new_version", newVersion)
 }
 
-// SetEpochBump marks that the epoch was bumped
-func (p *PackageProcessor) SetEpochBump(reason string) {
-	p.EpochChanged = true
-	p.NewEpoch++
-
-	p.AddMessage(fmt.Sprintf("epoch bumped: %d -> %d (%s)", p.OldEpoch, p.NewEpoch, reason))
-	p.Logger.Info("Epoch bumped", "old_epoch", p.OldEpoch, "new_epoch", p.NewEpoch, "reason", reason)
-}
-
-// MarkSecurityFixesApplied marks that security fixes were applied
-func (p *PackageProcessor) MarkSecurityFixesApplied() {
-	p.RequiresEpochBump = true
-	p.Logger.Debug("Security fixes applied - epoch bump will be required")
-}
 
 // AddPipelineChange records a pipeline modification
 func (p *PackageProcessor) AddPipelineChange(change PipelineChange) {
@@ -172,73 +128,6 @@ func (p *PackageProcessor) AddPipelineChange(change PipelineChange) {
 		"description", change.Description)
 }
 
-// AddSecurityFix records a security vulnerability fix
-func (p *PackageProcessor) AddSecurityFix(fix SecurityFix) {
-	p.SecurityFixes = append(p.SecurityFixes, fix)
-	p.AddMessage(fmt.Sprintf("security fix: %s %s -> %s (%s)", fix.Module, fix.OldVersion, fix.NewVersion, fix.Vulnerability))
-
-	p.Logger.Info("Security fix applied",
-		"module", fix.Module,
-		"vulnerability", fix.Vulnerability,
-		"old_version", fix.OldVersion,
-		"new_version", fix.NewVersion,
-		"severity", fix.Severity)
-}
-
-// SetGoDepsAnalysis sets the Go dependency analysis results
-func (p *PackageProcessor) SetGoDepsAnalysis(requirements map[string]string, securityBumps []string, actions []BumpAction) {
-	p.GoDepsAnalyzed = true
-	p.GoModRequirements = requirements
-	p.SecurityBumps = securityBumps
-	p.GoBumpActions = actions
-
-	p.Logger.Debug("Go deps analysis set",
-		"go_mod_deps", len(requirements),
-		"security_bumps", len(securityBumps),
-		"actions", len(actions))
-}
-
-// HasGoDepsActions returns true if there are go/bump actions to apply
-func (p *PackageProcessor) HasGoDepsActions() bool {
-	return len(p.GoBumpActions) > 0
-}
-
-// AddBumpAction adds a go/bump action to be applied
-func (p *PackageProcessor) AddBumpAction(action BumpAction) {
-	p.GoBumpActions = append(p.GoBumpActions, action)
-	p.Logger.Debug("Go bump action added", "action", action.Action, "reason", action.Reason)
-}
-
-// SetVulnerabilityInfo updates vulnerability scan results (found, not necessarily fixed)
-func (p *PackageProcessor) SetVulnerabilityInfo(vulnCount, criticalCount, highCount int) {
-	p.VulnerabilitiesFound = vulnCount
-
-	// Don't add messages here - only add messages when vulnerabilities are actually fixed
-	p.Logger.Info("Vulnerability scan completed",
-		"total_vulnerabilities", vulnCount,
-		"critical", criticalCount,
-		"high", highCount)
-}
-
-// SetVulnerabilityFixes updates vulnerability fix results (actually fixed)
-func (p *PackageProcessor) SetVulnerabilityFixes(fixedCount, criticalFixed, highFixed int) {
-	p.VulnerabilitiesFixed = fixedCount
-
-	// Only add messages when vulnerabilities are actually fixed
-	if fixedCount > 0 {
-		if criticalFixed > 0 || highFixed > 0 {
-			p.AddMessage(fmt.Sprintf("security fixes applied: %d vulnerabilities fixed (%d critical, %d high)",
-				fixedCount, criticalFixed, highFixed))
-		} else {
-			p.AddMessage(fmt.Sprintf("security fixes applied: %d vulnerabilities fixed", fixedCount))
-		}
-	}
-
-	p.Logger.Info("Vulnerability fixes applied",
-		"vulnerabilities_fixed", fixedCount,
-		"critical_fixed", criticalFixed,
-		"high_fixed", highFixed)
-}
 
 // AddMessage adds a human-readable message about changes
 func (p *PackageProcessor) AddMessage(message string) {
@@ -254,7 +143,7 @@ func (p *PackageProcessor) AddError(err error) {
 
 // HasChanges returns true if any changes were made to the package
 func (p *PackageProcessor) HasChanges() bool {
-	return p.VersionChanged || p.EpochChanged || len(p.PipelineChanges) > 0 || len(p.SecurityFixes) > 0
+	return p.VersionChanged || p.EpochChanged || len(p.PipelineChanges) > 0
 }
 
 // HasFileChanges returns true if actual file modifications were made
@@ -262,10 +151,6 @@ func (p *PackageProcessor) HasFileChanges() bool {
 	return p.FileWasWritten
 }
 
-// NeedsEpochBump returns true if epoch should be bumped (changes without version change)
-func (p *PackageProcessor) NeedsEpochBump() bool {
-	return p.RequiresEpochBump && !p.VersionChanged && !p.EpochChanged
-}
 
 // HasErrors returns true if any errors were recorded
 func (p *PackageProcessor) HasErrors() bool {

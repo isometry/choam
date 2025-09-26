@@ -5,9 +5,8 @@ import (
 	"fmt"
 )
 
-// EpochApplier implements ApplyStage to apply epoch bumps when needed
-// This stage handles epoch increments for cases where go/bump dependencies
-// change but package version does not change.
+// EpochApplier implements ApplyStage to reset epoch when package version changes
+// In the simplified update flow, epoch is always reset to 0 when version changes
 type EpochApplier struct{}
 
 func (ea *EpochApplier) Name() string {
@@ -15,16 +14,17 @@ func (ea *EpochApplier) Name() string {
 }
 
 func (ea *EpochApplier) Description() string {
-	return "Apply epoch bump for dependency updates without version changes"
+	return "Reset epoch to 0 when package version changes"
 }
 
-// Apply handles all epoch changes: reset to 0 for version changes, increment for config changes
+// Apply resets epoch to 0 when version changes
 func (ea *EpochApplier) Apply(ctx context.Context, processor *PackageProcessor) error {
 	logger := processor.WithStage(ea.Name())
-	loader := newMelangeLoader()
 
-	// Handle version changes: reset epoch to 0
+	// Only handle version changes: reset epoch to 0
 	if processor.VersionChanged {
+		loader := newMelangeLoader()
+
 		if processor.Options.DryRun {
 			logger.Info("Dry run - would reset epoch to 0 due to version change")
 			processor.AddMessage(fmt.Sprintf("would reset epoch: %d -> 0 (version changed)", processor.OldEpoch))
@@ -48,35 +48,7 @@ func (ea *EpochApplier) Apply(ctx context.Context, processor *PackageProcessor) 
 		return nil
 	}
 
-	// Handle config changes without version change: increment epoch
-	if processor.RequiresEpochBump {
-		newEpoch := processor.OldEpoch + 1
-
-		if processor.Options.DryRun {
-			logger.Info("Dry run - would increment epoch for config changes")
-			processor.AddMessage(fmt.Sprintf("would increment epoch: %d -> %d (config changes without version change)",
-				processor.OldEpoch, newEpoch))
-			processor.NewEpoch = newEpoch
-			processor.EpochChanged = true
-			return nil
-		}
-
-		logger.Info("Incrementing epoch for config changes", "old_epoch", processor.OldEpoch, "new_epoch", newEpoch)
-		updatedContent, err := loader.SetEpoch(processor.CurrentYAML, newEpoch)
-		if err != nil {
-			return fmt.Errorf("incrementing epoch: %w", err)
-		}
-
-		// Update processor state
-		processor.CurrentYAML = updatedContent
-		processor.NewEpoch = newEpoch
-		processor.EpochChanged = true
-		processor.AddMessage(fmt.Sprintf("epoch bumped: %d -> %d (config changes without version change)", processor.OldEpoch, newEpoch))
-		logger.Info("Epoch incremented", "old_epoch", processor.OldEpoch, "new_epoch", newEpoch)
-		return nil
-	}
-
-	// No epoch changes needed
-	logger.Debug("No epoch changes needed")
+	// No epoch changes needed (version unchanged)
+	logger.Debug("No version change - no epoch reset needed")
 	return nil
 }

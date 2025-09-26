@@ -122,10 +122,9 @@ func (o *UpdateOrchestrator) ProcessPackageApply(ctx context.Context, filePath s
 	// Set processing options
 	processor.Options = options
 
-	// Skip apply if no update available, no go/bump actions, and not forced
-	// Note: Security scanning now always runs as part of go/bump processing
-	if !processor.UpdateAvailable && !processor.HasGoDepsActions() && !options.Force {
-		processor.Logger.Info("No updates or go/bump actions available, skipping apply phase")
+	// Skip apply if no update available and not forced
+	if !processor.UpdateAvailable && !options.Force {
+		processor.Logger.Info("No updates available, skipping apply phase")
 		return processor, nil
 	}
 
@@ -156,8 +155,7 @@ func (o *UpdateOrchestrator) ProcessPackageApply(ctx context.Context, filePath s
 		"has_changes", processor.HasChanges(),
 		"version_changed", processor.VersionChanged,
 		"epoch_changed", processor.EpochChanged,
-		"pipeline_changes", len(processor.PipelineChanges),
-		"security_fixes", len(processor.SecurityFixes))
+		"pipeline_changes", len(processor.PipelineChanges))
 
 	return processor, nil
 }
