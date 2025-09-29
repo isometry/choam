@@ -8,7 +8,7 @@ import (
 	"strings"
 
 	"github.com/aquasecurity/table"
-	"github.com/isometry/choam/pkg/updater"
+	"github.com/isometry/choam/internal/updater"
 	"github.com/spf13/cobra"
 )
 
@@ -24,13 +24,15 @@ Path can be a single file or a directory containing .yaml files.`,
 
 	cmd.Flags().StringVarP(&outputFormat, "format", "f", "table", "Output format: table, json")
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be checked without making API calls")
-	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
 
 	return cmd
 }
 
 func runCheck(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
+
+	// Initialize logging based on verbosity flag
+	InitLogger(verbosity)
 
 	// Collect all melange files from the provided paths
 	files, err := collectMelangeFiles(args)
@@ -43,7 +45,7 @@ func runCheck(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	if verbose {
+	if verbosity > 0 {
 		fmt.Fprintf(os.Stderr, "Found %d melange files to check\n", len(files))
 	}
 
@@ -57,7 +59,6 @@ func runCheck(cmd *cobra.Command, args []string) error {
 
 	// Create orchestrator
 	orchestrator := updater.NewOrchestrator()
-	orchestrator.SetVerbose(verbose)
 
 	// Process all files for checking
 	processors, err := orchestrator.ProcessMultipleChecks(ctx, files)
@@ -65,7 +66,7 @@ func runCheck(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("checking updates: %w", err)
 	}
 
-	if verbose {
+	if verbosity > 0 {
 		fmt.Fprintf(os.Stderr, "Processed %d files\n", len(processors))
 	}
 
@@ -73,14 +74,19 @@ func runCheck(cmd *cobra.Command, args []string) error {
 	results := make([]*updater.UpdateResult, 0, len(processors))
 	for _, proc := range processors {
 		errorMsg := ""
-		if len(proc.Errors) > 0 {
-			errorMsg = strings.Join(proc.Errors, "; ")
+		errors := proc.GetErrors()
+		if len(errors) > 0 {
+			errorStrs := make([]string, len(errors))
+			for i, err := range errors {
+				errorStrs[i] = err.Error()
+			}
+			errorMsg = strings.Join(errorStrs, "; ")
 		}
 
 		results = append(results, &updater.UpdateResult{
-			PackageName:    proc.PackageName,
-			CurrentVersion: proc.CurrentVersion,
-			LatestVersion:  proc.LatestVersion,
+			PackageName:    proc.GetPackageName(),
+			CurrentVersion: proc.GetCurrentVersion(),
+			LatestVersion:  proc.GetLatestVersion(),
 			HasUpdate:      proc.UpdateAvailable,
 			UpdateSource:   proc.UpdateSource,
 			IsManual:       proc.IsManual,
@@ -156,7 +162,7 @@ func outputTable(results []*updater.UpdateResult) error {
 	t.Render()
 
 	// Print verbose error details after the table
-	if verbose {
+	if verbosity > 0 {
 		for _, result := range results {
 			if result.Error != "" {
 				fmt.Printf("\nError for %s: %s\n", result.PackageName, result.Error)

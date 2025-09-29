@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/aquasecurity/table"
-	"github.com/isometry/choam/pkg/updater"
+	"github.com/isometry/choam/internal/updater"
 	"github.com/spf13/cobra"
 )
 
@@ -32,13 +32,15 @@ Path can be a single file or a directory containing .yaml files.`,
 	cmd.Flags().BoolVar(&updateShared, "shared", true, "Update shared dependencies")
 	cmd.Flags().StringVarP(&outputFormat, "format", "f", "table", "Output format: table, json")
 	cmd.Flags().StringVar(&backupSuffix, "backup-suffix", "", "Suffix for backup files (empty = no backup)")
-	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
 
 	return cmd
 }
 
 func runUpdate(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
+
+	// Initialize logging based on verbosity flag
+	InitLogger(verbosity)
 
 	// Collect all melange files from the provided paths
 	files, err := collectMelangeFiles(args)
@@ -51,7 +53,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	if verbose {
+	if verbosity > 0 {
 		fmt.Fprintf(os.Stderr, "Found %d melange files to update\n", len(files))
 	}
 
@@ -70,25 +72,30 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 
 	// Create orchestrator
 	orchestrator := updater.NewOrchestrator()
-	orchestrator.SetVerbose(verbose)
 
 	// Process all files for updates
 	processors, err := orchestrator.ProcessMultipleApplies(ctx, files, opts)
 	if err != nil {
-		return fmt.Errorf("applying updates: %w", err)
+		return fmt.Errorf("processing updates: %w", err)
 	}
 
 	// Convert processors to results for output
 	results := make([]*updater.ApplyResult, 0, len(processors))
 	for _, proc := range processors {
 		errorMsg := ""
-		if len(proc.Errors) > 0 {
-			errorMsg = strings.Join(proc.Errors, "; ")
+		errors := proc.GetErrors()
+		if len(errors) > 0 {
+			errorStrs := make([]string, len(errors))
+			for i, err := range errors {
+				errorStrs[i] = err.Error()
+			}
+			errorMsg = strings.Join(errorStrs, "; ")
 		}
 
 		// Only include fixes in updates, not discovery messages
 		updatesApplied := make([]string, 0)
-		for _, msg := range proc.Messages {
+		messages := proc.GetMessages()
+		for _, msg := range messages {
 			// Only include messages that indicate actual changes, not discoveries
 			if strings.Contains(msg, "updated") || strings.Contains(msg, "bumped") ||
 				strings.Contains(msg, "applied") || strings.Contains(msg, "fixed") {
@@ -97,12 +104,12 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		}
 
 		result := &updater.ApplyResult{
-			PackageName:    proc.PackageName,
-			FilePath:       proc.FilePath,
-			OldVersion:     proc.CurrentVersion,
-			NewVersion:     proc.CurrentVersion, // Default to current
-			OldEpoch:       proc.OldEpoch,
-			NewEpoch:       proc.NewEpoch,
+			PackageName:    proc.GetPackageName(),
+			FilePath:       proc.GetFilePath(),
+			OldVersion:     proc.GetCurrentVersion(),
+			NewVersion:     proc.GetCurrentVersion(), // Default to current
+			OldEpoch:       proc.GetCurrentEpoch(),
+			NewEpoch:       proc.GetNewEpoch(),
 			UpdatesApplied: updatesApplied,
 			SharedUpdates:  make([]string, 0), // TODO: Implement if needed
 			FileWasWritten: proc.HasFileChanges(),
@@ -111,14 +118,14 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		}
 
 		// If version changed, update new version
-		if proc.VersionChanged {
-			result.NewVersion = proc.LatestVersion
+		if proc.IsVersionChanged() {
+			result.NewVersion = proc.GetLatestVersion()
 		}
 
 		// Add backup path if configured
 		if backupSuffix != "" {
-			ext := filepath.Ext(proc.FilePath)
-			base := strings.TrimSuffix(proc.FilePath, ext)
+			ext := filepath.Ext(proc.GetFilePath())
+			base := strings.TrimSuffix(proc.GetFilePath(), ext)
 			result.BackupCreated = base + backupSuffix + ext
 		}
 
@@ -223,7 +230,7 @@ func outputUpdateTable(results []*updater.ApplyResult) error {
 	t.Render()
 
 	// Show verbose details after the table
-	if verbose {
+	if verbosity > 0 {
 		for _, result := range results {
 			if len(result.SharedUpdates) > 0 {
 				fmt.Printf("\nShared updates for %s:\n", result.PackageName)

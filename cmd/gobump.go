@@ -9,9 +9,8 @@ import (
 	"strings"
 
 	"github.com/aquasecurity/table"
-	"github.com/isometry/choam/pkg/gobump"
+	"github.com/isometry/choam/internal/gobump"
 	"github.com/spf13/cobra"
-	melange "chainguard.dev/melange/pkg/config"
 )
 
 func NewGoBumpCmd() *cobra.Command {
@@ -31,13 +30,15 @@ Path can be a single file or a directory containing .yaml files.`,
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be changed without making changes")
 	cmd.Flags().StringVarP(&outputFormat, "format", "f", "table", "Output format: table, json")
 	cmd.Flags().StringVar(&backupSuffix, "backup-suffix", "", "Suffix for backup files (empty = no backup)")
-	cmd.Flags().BoolVarP(&verbose, "verbose", "v", false, "Verbose output")
 
 	return cmd
 }
 
 func runGoBump(cmd *cobra.Command, args []string) error {
 	ctx := context.Background()
+
+	// Initialize logging based on verbosity flag
+	InitLogger(verbosity)
 
 	// Collect all melange files from the provided paths
 	files, err := collectMelangeFiles(args)
@@ -50,7 +51,7 @@ func runGoBump(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	if verbose {
+	if verbosity > 0 {
 		fmt.Fprintf(os.Stderr, "Found %d melange files to check for Go vulnerabilities\n", len(files))
 	}
 
@@ -68,15 +69,14 @@ func runGoBump(cmd *cobra.Command, args []string) error {
 	// Create HTTP client and components
 	httpClient := &http.Client{}
 	analyzer := gobump.NewAnalyzer(httpClient)
-	checker := gobump.NewChecker(analyzer)
-	applier := gobump.NewApplier(analyzer)
 
-	// Process all files
+	// Process all files using shared processor architecture
 	results := make([]*gobump.GoBumpResult, 0, len(files))
 	for _, file := range files {
-		result, err := processGoBumpFile(ctx, file, opts, checker, applier)
+		result, err := gobump.ProcessFile(ctx, file, opts, analyzer)
+
 		if err != nil {
-			if verbose {
+			if verbosity > 0 {
 				fmt.Fprintf(os.Stderr, "Error processing %s: %v\n", file, err)
 			}
 			// Create error result
@@ -91,66 +91,6 @@ func runGoBump(cmd *cobra.Command, args []string) error {
 
 	// Output results
 	return outputGoBumpResults(results, outputFormat)
-}
-
-func processGoBumpFile(ctx context.Context, filePath string, opts gobump.ProcessorOptions, checker *gobump.Checker, applier *gobump.Applier) (*gobump.GoBumpResult, error) {
-	// Read and parse melange file
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("reading file %s: %w", filePath, err)
-	}
-
-	// Parse melange configuration
-	cfg, err := melange.ParseConfiguration(ctx, filePath)
-	if err != nil {
-		return nil, fmt.Errorf("parsing melange configuration: %w", err)
-	}
-
-	// Create processor
-	processor := gobump.NewProcessor(filePath, cfg.Package.Name, cfg.Package.Version, int64(cfg.Package.Epoch))
-	processor.Config = cfg
-	processor.OriginalYAML = content
-	processor.CurrentYAML = content
-	processor.SetOptions(opts)
-
-	// Check for vulnerabilities
-	analysis, err := checker.CheckVulnerabilities(ctx, processor)
-	if err != nil {
-		processor.AddError(err)
-		return processor.ToResult(), fmt.Errorf("checking vulnerabilities: %w", err)
-	}
-
-	processor.VulnerabilityAnalysis = analysis
-
-	// If no vulnerabilities found, we're done
-	if analysis.VulnerabilitiesFound == 0 {
-		processor.AddMessage("No vulnerabilities found")
-		return processor.ToResult(), nil
-	}
-
-	// Apply go/bump changes
-	if err := applier.ApplyGoBumpChanges(ctx, processor, analysis); err != nil {
-		processor.AddError(err)
-		return processor.ToResult(), fmt.Errorf("applying go/bump changes: %w", err)
-	}
-
-	// Apply epoch bump if needed
-	if processor.EpochChanged {
-		if err := processor.ApplyEpochBump(); err != nil {
-			processor.AddError(err)
-			return processor.ToResult(), fmt.Errorf("applying epoch bump: %w", err)
-		}
-	}
-
-	// Write file if changes were made
-	if processor.HasFileChanges() {
-		if err := processor.WriteFile(); err != nil {
-			processor.AddError(err)
-			return processor.ToResult(), fmt.Errorf("writing file: %w", err)
-		}
-	}
-
-	return processor.ToResult(), nil
 }
 
 func outputGoBumpResults(results []*gobump.GoBumpResult, format string) error {
@@ -241,7 +181,7 @@ func outputGoBumpTable(results []*gobump.GoBumpResult) error {
 	t.Render()
 
 	// Show verbose details after the table
-	if verbose {
+	if verbosity > 0 {
 		for _, result := range results {
 			if len(result.Messages) > 0 {
 				fmt.Printf("\nMessages for %s:\n", result.PackageName)
@@ -279,10 +219,7 @@ func extractPackageNameFromPath(filePath string) string {
 	if len(parts) > 0 {
 		filename := parts[len(parts)-1]
 		// Remove .yaml extension if present
-		if strings.HasSuffix(filename, ".yaml") {
-			filename = filename[:len(filename)-5]
-		}
-		return filename
+		return strings.TrimSuffix(filename, ".yaml")
 	}
 	return "unknown"
 }

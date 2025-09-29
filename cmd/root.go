@@ -15,7 +15,7 @@ var (
 	// Common flags shared across commands
 	outputFormat string
 	dryRun       bool
-	verbose      bool
+	verbosity    int
 	force        bool
 
 	// Update-specific flags
@@ -33,6 +33,9 @@ respecting the update configuration schema and integrating with GitHub, Git,
 and release-monitoring.org.`,
 		SilenceUsage: true,
 	}
+
+	// Global flags available to all subcommands
+	cmd.PersistentFlags().CountVarP(&verbosity, "verbose", "v", "Increase verbosity: -v (info), -vv (debug)")
 
 	cmd.AddCommand(NewCheckCmd())
 	cmd.AddCommand(NewUpdateCmd())
