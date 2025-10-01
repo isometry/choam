@@ -1,0 +1,41 @@
+package:
+  name: complex-package
+  version: "2.5.1"
+  epoch: 12
+  description: Complex package with multiple pipelines and update config
+
+vars:
+  golang-version: "1.21"
+
+environment:
+  contents:
+    packages:
+      - go=${{vars.golang-version}}
+      - build-base
+      - ca-certificates
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/complex
+      tag: v${{package.version}}
+      expected-commit: deadbeef123456
+
+  - uses: go/build
+    with:
+      packages: .
+      output: complex-app
+      ldflags: -s -w
+
+  - runs: |
+      mkdir -p ${{targets.destdir}}/usr/bin
+      cp complex-app ${{targets.destdir}}/usr/bin/
+
+update:
+  enabled: true
+  github:
+    identifier: example/complex
+    strip-prefix: v
+    tag-filter: v
+  schedule:
+    period: daily

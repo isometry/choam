@@ -87,8 +87,8 @@ func (vc *VersionChecker) Check(ctx context.Context, p processor.Processor) erro
 			"source", source,
 			"manual", cfg.Update.Manual)
 	} else {
-		up.AddMessage("package is up to date")
-		logger.Debug("Package is up to date")
+		up.AddMessage("package is up-to-date")
+		logger.Debug("Package is up-to-date")
 	}
 
 	return nil

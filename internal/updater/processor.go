@@ -109,7 +109,7 @@ func (p *UpdaterProcessor) Summary() string {
 	}
 
 	if !p.UpdateAvailable {
-		return p.GetPackageName() + ": up to date"
+		return p.GetPackageName() + ": up-to-date"
 	}
 
 	if p.IsManual {

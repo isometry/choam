@@ -1,0 +1,28 @@
+package:
+  name: go-test-package
+  version: "1.2.3"
+  epoch: 5
+  description: Go package with vulnerabilities
+
+environment:
+  contents:
+    packages:
+      - go
+      - build-base
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/test
+      tag: v${{package.version}}
+      expected-commit: abc123def456
+
+  - uses: go/build
+    with:
+      packages: ./cmd/test
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/crypto@v0.10.0
+        github.com/gin-gonic/gin@v1.9.0

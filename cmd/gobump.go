@@ -146,11 +146,20 @@ func outputGoBumpTable(results []*gobump.GoBumpResult) error {
 			filesWithVulns++
 			totalVulnsFound += result.VulnerabilitiesFound
 			if result.VulnerabilitiesFixed > 0 {
+				// Actual changes were made and applied
 				status = "FIXED"
 				filesFixed++
 				totalVulnsFixed += result.VulnerabilitiesFixed
+			} else if result.EpochChanged {
+				// Epoch changed but no security fixes counted (shouldn't happen but handle it)
+				status = "FIXED"
+				filesFixed++
+			} else if result.FileWasWritten {
+				// File was written but no fixes counted (rare edge case)
+				status = "UPDATED"
 			} else {
-				status = "FOUND"
+				// Vulnerabilities found but no changes needed (pipeline already correct)
+				status = "UP-TO-DATE"
 			}
 		}
 

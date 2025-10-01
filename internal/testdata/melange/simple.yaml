@@ -1,0 +1,16 @@
+package:
+  name: test-package
+  version: "1.0.0"
+  epoch: 0
+  description: Simple test package
+
+environment:
+  contents:
+    packages:
+      - build-base
+
+pipeline:
+  - uses: fetch
+    with:
+      uri: https://example.com/test-package-1.0.0.tar.gz
+      expected-sha256: abc123

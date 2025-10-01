@@ -56,7 +56,12 @@ func (p *GoBumpProcessor) HasActualChanges() bool {
 // ToResult converts the processor state to a GoBumpResult
 func (p *GoBumpProcessor) ToResult() *GoBumpResult {
 	vulnerabilitiesFound := 0
-	vulnerabilitiesFixed := len(p.SecurityFixes)
+	vulnerabilitiesFixed := 0
+
+	// Only count fixes when actual changes were made to the file
+	if p.HasActualChanges() {
+		vulnerabilitiesFixed = len(p.SecurityFixes)
+	}
 
 	if p.VulnerabilityAnalysis != nil {
 		vulnerabilitiesFound = p.VulnerabilityAnalysis.VulnerabilitiesFound
