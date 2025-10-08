@@ -15,8 +15,9 @@ import (
 
 func NewGoBumpCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Use:   "gobump [path...]",
-		Short: "Fix Go module vulnerabilities using go/bump pipelines",
+		Hidden: true, // until stable
+		Use:    "gobump [path...]",
+		Short:  "Fix Go module vulnerabilities using go/bump pipelines",
 		Long: `Fix Go module vulnerabilities by adding or updating go/bump pipeline steps.
 This command checks for vulnerabilities in the current version of Go modules
 and applies security fixes by updating go/bump pipelines. The package epoch
