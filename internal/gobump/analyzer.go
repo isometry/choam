@@ -216,8 +216,70 @@ func (a *Analyzer) AnalyzeBumps(deps []string, goModInfo *GoModInfo) ([]BumpAnal
 		}
 	}
 
-	// Sort the filtered deps lexicographically for stability
-	slices.Sort(filteredDeps)
+	// Smart ordering: group by dependency type, then sort alphabetically within groups
+	// This helps prevent later bumps from downgrading earlier ones via transitive deps
+	indirectDeps := make([]string, 0)
+	directDeps := make([]string, 0)
+	newDeps := make([]string, 0)
+
+	slog.Debug("classifying dependencies for smart ordering",
+		"total_deps", len(filteredDeps))
+
+	for _, dep := range filteredDeps {
+		// Extract module name (before @version)
+		parts := strings.Split(dep, "@")
+		if len(parts) != 2 {
+			// Malformed, put in new deps
+			newDeps = append(newDeps, dep)
+			slog.Debug("malformed dep - classifying as new",
+				"dep", dep)
+			continue
+		}
+		module := parts[0]
+
+		// Classify based on presence in go.mod
+		if _, isRequired := goModInfo.Requirements[module]; isRequired {
+			// Direct dependency (explicitly in project's go.mod)
+			directDeps = append(directDeps, dep)
+			slog.Debug("classified as direct dependency",
+				"module", module,
+				"reason", "found in Requirements")
+		} else if _, isTransitive := goModInfo.AllRequirements[module]; isTransitive {
+			// Indirect dependency (transitive, not directly required)
+			indirectDeps = append(indirectDeps, dep)
+			slog.Debug("classified as indirect dependency",
+				"module", module,
+				"reason", "found in AllRequirements but not Requirements")
+		} else {
+			// New dependency (not currently in go.mod at all)
+			newDeps = append(newDeps, dep)
+			slog.Debug("classified as new dependency",
+				"module", module,
+				"reason", "not found in go.mod")
+		}
+	}
+
+	// Sort each group alphabetically for stability and reproducibility
+	slices.Sort(indirectDeps)
+	slices.Sort(directDeps)
+	slices.Sort(newDeps)
+
+	slog.Debug("dependency groups sorted alphabetically",
+		"indirect_count", len(indirectDeps),
+		"direct_count", len(directDeps),
+		"new_count", len(newDeps))
+
+	// Combine in order: indirect → direct → new
+	// Rationale: indirect deps are "leaves", direct deps are "roots" that depend on them
+	// Applying indirect first establishes baseline before direct deps potentially override
+	filteredDeps = make([]string, 0, len(indirectDeps)+len(directDeps)+len(newDeps))
+	filteredDeps = append(filteredDeps, indirectDeps...)
+	filteredDeps = append(filteredDeps, directDeps...)
+	filteredDeps = append(filteredDeps, newDeps...)
+
+	slog.Debug("smart ordering applied",
+		"order", "indirect→direct→new",
+		"final_list", filteredDeps)
 
 	// Count actions for summary
 	kept, removedMissing, removedNoop, removedDowngrade := 0, 0, 0, 0

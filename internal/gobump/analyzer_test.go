@@ -630,17 +630,24 @@ func TestNewAnalyzer(t *testing.T) {
 }
 
 func TestAnalyzer_AnalyzeBumps_SortingStability(t *testing.T) {
-	// Test that filtered deps are lexicographically sorted
+	// Test that filtered deps are sorted alphabetically within each group (indirect/direct/new)
 	deps := []string{
-		"github.com/z-package/zoo@v1.0.0",
-		"github.com/a-package/alpha@v1.0.0",
-		"github.com/m-package/middle@v1.0.0",
+		"github.com/z-package/zoo@v1.0.0",       // indirect
+		"github.com/a-package/alpha@v1.0.0",     // direct
+		"github.com/m-package/middle@v1.0.0",    // indirect
+		"github.com/new-package/newpkg@v1.0.0",  // indirect (in AllRequirements but not Requirements)
 	}
 	goModInfo := &GoModInfo{
+		Requirements: map[string]string{
+			// Only alpha is direct
+			"github.com/a-package/alpha": "v0.9.0",
+		},
 		AllRequirements: map[string]string{
-			"github.com/z-package/zoo":     "v0.9.0",
-			"github.com/a-package/alpha":   "v0.9.0",
-			"github.com/m-package/middle":  "v0.9.0",
+			// Alpha is direct, others are indirect
+			"github.com/a-package/alpha":    "v0.9.0",
+			"github.com/z-package/zoo":      "v0.9.0",
+			"github.com/m-package/middle":   "v0.9.0",
+			"github.com/new-package/newpkg": "v0.9.0",
 		},
 		Replacements: map[string]*modfile.Replace{},
 	}
@@ -648,20 +655,153 @@ func TestAnalyzer_AnalyzeBumps_SortingStability(t *testing.T) {
 	analyzer := NewAnalyzer(http.DefaultClient)
 	_, filteredDeps := analyzer.AnalyzeBumps(deps, goModInfo)
 
+	// Expected order: indirect (alphabetical) → direct (alphabetical)
 	expected := []string{
-		"github.com/a-package/alpha@v1.0.0",
+		// Indirect first (alphabetically sorted)
 		"github.com/m-package/middle@v1.0.0",
+		"github.com/new-package/newpkg@v1.0.0",
 		"github.com/z-package/zoo@v1.0.0",
+		// Direct second
+		"github.com/a-package/alpha@v1.0.0",
 	}
 
 	if len(filteredDeps) != len(expected) {
-		t.Fatalf("got %d deps, want %d", len(filteredDeps), len(expected))
+		t.Fatalf("got %d deps, want %d\nGot: %v\nWant: %v", len(filteredDeps), len(expected), filteredDeps, expected)
 	}
 
 	for i, dep := range filteredDeps {
 		if dep != expected[i] {
 			t.Errorf("filteredDeps[%d] = %q, want %q", i, dep, expected[i])
 		}
+	}
+}
+
+func TestAnalyzer_AnalyzeBumps_DependencyOrdering(t *testing.T) {
+	tests := []struct {
+		name        string
+		deps        []string
+		goModInfo   *GoModInfo
+		wantOrdered []string // Expected order after smart sorting
+	}{
+		{
+			name: "indirect before direct",
+			deps: []string{
+				"github.com/direct/package@v1.5.0",
+				"github.com/indirect/package@v1.2.0",
+			},
+			goModInfo: &GoModInfo{
+				Requirements: map[string]string{
+					"github.com/direct/package": "v1.0.0",
+				},
+				AllRequirements: map[string]string{
+					"github.com/direct/package":   "v1.0.0",
+					"github.com/indirect/package": "v1.0.0",
+				},
+				Replacements: map[string]*modfile.Replace{},
+			},
+			wantOrdered: []string{
+				"github.com/indirect/package@v1.2.0", // indirect first
+				"github.com/direct/package@v1.5.0",   // direct second
+			},
+		},
+		{
+			name: "all indirect - alphabetical",
+			deps: []string{
+				"github.com/z/pkg@v1.0.0",
+				"github.com/a/pkg@v1.0.0",
+				"github.com/m/pkg@v1.0.0",
+			},
+			goModInfo: &GoModInfo{
+				Requirements: map[string]string{},
+				AllRequirements: map[string]string{
+					"github.com/z/pkg": "v0.9.0",
+					"github.com/a/pkg": "v0.9.0",
+					"github.com/m/pkg": "v0.9.0",
+				},
+				Replacements: map[string]*modfile.Replace{},
+			},
+			wantOrdered: []string{
+				"github.com/a/pkg@v1.0.0",
+				"github.com/m/pkg@v1.0.0",
+				"github.com/z/pkg@v1.0.0",
+			},
+		},
+		{
+			name: "all direct - alphabetical",
+			deps: []string{
+				"github.com/z/pkg@v1.0.0",
+				"github.com/a/pkg@v1.0.0",
+				"github.com/m/pkg@v1.0.0",
+			},
+			goModInfo: &GoModInfo{
+				Requirements: map[string]string{
+					"github.com/z/pkg": "v0.9.0",
+					"github.com/a/pkg": "v0.9.0",
+					"github.com/m/pkg": "v0.9.0",
+				},
+				AllRequirements: map[string]string{
+					"github.com/z/pkg": "v0.9.0",
+					"github.com/a/pkg": "v0.9.0",
+					"github.com/m/pkg": "v0.9.0",
+				},
+				Replacements: map[string]*modfile.Replace{},
+			},
+			wantOrdered: []string{
+				"github.com/a/pkg@v1.0.0",
+				"github.com/m/pkg@v1.0.0",
+				"github.com/z/pkg@v1.0.0",
+			},
+		},
+		{
+			name: "mixed types - correct grouping",
+			deps: []string{
+				"github.com/new/pkg@v1.0.0",        // indirect
+				"github.com/direct-z/pkg@v1.0.0",   // direct
+				"github.com/indirect-a/pkg@v1.0.0", // indirect
+				"github.com/direct-a/pkg@v1.0.0",   // direct
+				"github.com/indirect-z/pkg@v1.0.0", // indirect
+			},
+			goModInfo: &GoModInfo{
+				Requirements: map[string]string{
+					"github.com/direct-z/pkg": "v0.9.0",
+					"github.com/direct-a/pkg": "v0.9.0",
+				},
+				AllRequirements: map[string]string{
+					"github.com/direct-z/pkg":   "v0.9.0",
+					"github.com/direct-a/pkg":   "v0.9.0",
+					"github.com/indirect-a/pkg": "v0.9.0",
+					"github.com/indirect-z/pkg": "v0.9.0",
+					"github.com/new/pkg":        "v0.9.0",
+				},
+				Replacements: map[string]*modfile.Replace{},
+			},
+			wantOrdered: []string{
+				// Indirect first (alphabetical)
+				"github.com/indirect-a/pkg@v1.0.0",
+				"github.com/indirect-z/pkg@v1.0.0",
+				"github.com/new/pkg@v1.0.0",
+				// Direct second (alphabetical)
+				"github.com/direct-a/pkg@v1.0.0",
+				"github.com/direct-z/pkg@v1.0.0",
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			analyzer := NewAnalyzer(http.DefaultClient)
+			_, filteredDeps := analyzer.AnalyzeBumps(tt.deps, tt.goModInfo)
+
+			if len(filteredDeps) != len(tt.wantOrdered) {
+				t.Fatalf("got %d deps, want %d\nGot: %v\nWant: %v", len(filteredDeps), len(tt.wantOrdered), filteredDeps, tt.wantOrdered)
+			}
+
+			for i, dep := range filteredDeps {
+				if dep != tt.wantOrdered[i] {
+					t.Errorf("filteredDeps[%d] = %q, want %q", i, dep, tt.wantOrdered[i])
+				}
+			}
+		})
 	}
 }
 
