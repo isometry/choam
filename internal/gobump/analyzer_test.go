@@ -134,20 +134,20 @@ func TestAnalyzer_AnalyzeBumps(t *testing.T) {
 			name: "complex scenario - multiple modules, mixed outcomes",
 			deps: []string{
 				"github.com/gin-gonic/gin@v1.9.1",
-				"github.com/gin-gonic/gin@v1.9.0",      // duplicate, older
-				"github.com/stretchr/testify@v1.9.0",   // keep (newer)
-				"github.com/sirupsen/logrus@v1.9.3",    // remove (no-op)
-				"github.com/pkg/errors@v0.9.0",         // remove (downgrade)
-				"github.com/unknown/module@v1.0.0",     // remove (missing)
-				"github.com/spf13/cobra@v1.8.0",        // keep (newer)
+				"github.com/gin-gonic/gin@v1.9.0",    // duplicate, older
+				"github.com/stretchr/testify@v1.9.0", // keep (newer)
+				"github.com/sirupsen/logrus@v1.9.3",  // remove (no-op)
+				"github.com/pkg/errors@v0.9.0",       // remove (downgrade)
+				"github.com/unknown/module@v1.0.0",   // remove (missing)
+				"github.com/spf13/cobra@v1.8.0",      // keep (newer)
 			},
 			goModInfo: &GoModInfo{
 				AllRequirements: map[string]string{
-					"github.com/gin-gonic/gin":     "v1.8.0",
-					"github.com/stretchr/testify":  "v1.8.4",
-					"github.com/sirupsen/logrus":   "v1.9.3",
-					"github.com/pkg/errors":        "v0.9.1",
-					"github.com/spf13/cobra":       "v1.7.0",
+					"github.com/gin-gonic/gin":    "v1.8.0",
+					"github.com/stretchr/testify": "v1.8.4",
+					"github.com/sirupsen/logrus":  "v1.9.3",
+					"github.com/pkg/errors":       "v0.9.1",
+					"github.com/spf13/cobra":      "v1.7.0",
 				},
 				Replacements: map[string]*modfile.Replace{},
 			},
@@ -632,10 +632,10 @@ func TestNewAnalyzer(t *testing.T) {
 func TestAnalyzer_AnalyzeBumps_SortingStability(t *testing.T) {
 	// Test that filtered deps are sorted alphabetically within each group (indirect/direct/new)
 	deps := []string{
-		"github.com/z-package/zoo@v1.0.0",       // indirect
-		"github.com/a-package/alpha@v1.0.0",     // direct
-		"github.com/m-package/middle@v1.0.0",    // indirect
-		"github.com/new-package/newpkg@v1.0.0",  // indirect (in AllRequirements but not Requirements)
+		"github.com/z-package/zoo@v1.0.0",      // indirect
+		"github.com/a-package/alpha@v1.0.0",    // direct
+		"github.com/m-package/middle@v1.0.0",   // indirect
+		"github.com/new-package/newpkg@v1.0.0", // indirect (in AllRequirements but not Requirements)
 	}
 	goModInfo := &GoModInfo{
 		Requirements: map[string]string{
@@ -873,12 +873,12 @@ func TestAnalyzer_AnalyzeBumps_PreReleaseVersions(t *testing.T) {
 
 func TestAnalyzer_NormalizeModulePath(t *testing.T) {
 	tests := []struct {
-		name            string
-		module          string
-		version         string
-		goModInfo       *GoModInfo
-		wantNormalized  string
-		wantFound       bool
+		name           string
+		module         string
+		version        string
+		goModInfo      *GoModInfo
+		wantNormalized string
+		wantFound      bool
 	}{
 		{
 			name:    "v1 module - no suffix needed",

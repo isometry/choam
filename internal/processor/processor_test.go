@@ -360,10 +360,10 @@ func TestBaseProcessor_ChangeTracking(t *testing.T) {
 // TestBaseProcessor_HasFileChanges tests file change detection
 func TestBaseProcessor_HasFileChanges(t *testing.T) {
 	tests := []struct {
-		name             string
-		originalYAML     []byte
-		currentYAML      []byte
-		wantFileChanges  bool
+		name            string
+		originalYAML    []byte
+		currentYAML     []byte
+		wantFileChanges bool
 	}{
 		{
 			name:            "no file changes - both nil",
@@ -627,17 +627,6 @@ func TestBaseProcessor_Context_Overwrite(t *testing.T) {
 
 	proc.SetContext(key, secondValue)
 	assert.Equal(t, secondValue, proc.GetContext(key))
-}
-
-// TestBaseProcessor_WithStage tests stage logger creation
-func TestBaseProcessor_WithStage(t *testing.T) {
-	proc := NewBaseProcessor("/test.yaml", "test-pkg", "1.0.0", 0)
-
-	stageName := "validation"
-	stageLogger := proc.WithStage(stageName)
-
-	require.NotNil(t, stageLogger)
-	assert.NotEqual(t, proc.Logger, stageLogger)
 }
 
 // TestBaseProcessor_IntegrationScenario tests realistic usage scenario

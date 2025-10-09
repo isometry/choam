@@ -69,67 +69,6 @@ func TestParseRepository(t *testing.T) {
 	}
 }
 
-func TestClient_FilterTags(t *testing.T) {
-	client := New()
-
-	tags := []*github.RepositoryTag{
-		{Name: github.Ptr("v1.0.0")},
-		{Name: github.Ptr("v1.1.0")},
-		{Name: github.Ptr("go1.22.0")},
-		{Name: github.Ptr("go1.22.1")},
-		{Name: github.Ptr("v2.0.0-beta")},
-	}
-
-	tests := []struct {
-		name     string
-		tags     []*github.RepositoryTag
-		pattern  string
-		expected []string
-	}{
-		{
-			name:     "filter go versions",
-			tags:     tags,
-			pattern:  "go1.22",
-			expected: []string{"go1.22.0", "go1.22.1"},
-		},
-		{
-			name:     "filter v versions",
-			tags:     tags,
-			pattern:  "v1",
-			expected: []string{"v1.0.0", "v1.1.0"},
-		},
-		{
-			name:     "no pattern",
-			tags:     tags,
-			pattern:  "",
-			expected: []string{"v1.0.0", "v1.1.0", "go1.22.0", "go1.22.1", "v2.0.0-beta"},
-		},
-		{
-			name:     "no matches",
-			tags:     tags,
-			pattern:  "nonexistent",
-			expected: []string{},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := client.FilterTags(tt.tags, tt.pattern)
-
-			if len(result) != len(tt.expected) {
-				t.Errorf("FilterTags() returned %d items, want %d", len(result), len(tt.expected))
-				return
-			}
-
-			for i, tag := range result {
-				if tag.Name != nil && *tag.Name != tt.expected[i] {
-					t.Errorf("FilterTags()[%d].Name = %s, want %s", i, *tag.Name, tt.expected[i])
-				}
-			}
-		})
-	}
-}
-
 func TestClient_FilterTagsWithPrefix(t *testing.T) {
 	client := New()
 

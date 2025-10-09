@@ -11,20 +11,8 @@ import (
 
 	"chainguard.dev/melange/pkg/cond"
 	melange "chainguard.dev/melange/pkg/config"
+	"github.com/isometry/choam/internal/utils"
 )
-
-var yamlExtensions = []string{".yaml", ".yml"}
-
-// isYAMLFile checks if a filename has a YAML extension
-func isYAMLFile(filename string) bool {
-	lowerName := strings.ToLower(filename)
-	for _, ext := range yamlExtensions {
-		if strings.HasSuffix(lowerName, ext) {
-			return true
-		}
-	}
-	return false
-}
 
 // stripVersionAffix removes a prefix or suffix from a version string using proper glob patterns.
 // Uses Go's standard path.Match for correct glob pattern matching.
@@ -235,7 +223,7 @@ func findMelangeFiles(dirPath string) ([]string, error) {
 		}
 
 		name := entry.Name()
-		if isYAMLFile(name) {
+		if utils.IsYAMLFile(name) {
 			fullPath := filepath.Join(dirPath, name)
 
 			// Quick check if it looks like a melange config

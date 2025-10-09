@@ -35,41 +35,6 @@ func New() *Client {
 	}
 }
 
-// NewWithClient creates a new GitHub client with a custom GitHub client
-func NewWithClient(client *github.Client) *Client {
-	return &Client{
-		client: client,
-	}
-}
-
-// IsAuthenticated checks if the client is using authentication
-func (c *Client) IsAuthenticated() bool {
-	// Check if GITHUB_TOKEN environment variable is set
-	return os.Getenv("GITHUB_TOKEN") != ""
-}
-
-// GetHTTPClient returns the underlying HTTP client for making authenticated requests
-func (c *Client) GetHTTPClient() *http.Client {
-	return c.client.Client()
-}
-
-// NewWithToken creates a new GitHub client with a specific token
-func NewWithToken(token string) *Client {
-	if token == "" {
-		return New()
-	}
-
-	ctx := context.Background()
-	ts := oauth2.StaticTokenSource(
-		&oauth2.Token{AccessToken: token},
-	)
-	httpClient := oauth2.NewClient(ctx, ts)
-
-	return &Client{
-		client: github.NewClient(httpClient),
-	}
-}
-
 // paginateAll is a generic helper for paginating through GitHub API responses
 type paginateFunc[T any] func(ctx context.Context, opts *github.ListOptions) ([]T, *github.Response, error)
 
@@ -129,22 +94,6 @@ func (c *Client) GetTags(ctx context.Context, owner, repo string) ([]*github.Rep
 	})
 }
 
-// FilterTags filters tags based on a pattern
-func (c *Client) FilterTags(tags []*github.RepositoryTag, pattern string) []*github.RepositoryTag {
-	if pattern == "" {
-		return tags
-	}
-
-	var filtered []*github.RepositoryTag
-	for _, tag := range tags {
-		if tag.Name != nil && strings.Contains(*tag.Name, pattern) {
-			filtered = append(filtered, tag)
-		}
-	}
-
-	return filtered
-}
-
 // FilterTagsWithPrefix filters tags that start with a specific prefix
 func (c *Client) FilterTagsWithPrefix(tags []*github.RepositoryTag, prefix string) []*github.RepositoryTag {
 	if prefix == "" {
@@ -172,33 +121,6 @@ func ParseRepository(identifier string) (*Repository, error) {
 		Owner: parts[0],
 		Name:  parts[1],
 	}, nil
-}
-
-// GetLatestTagVersion returns the latest tag that matches the filter
-func (c *Client) GetLatestTagVersion(ctx context.Context, owner, repo, tagFilter string) (string, error) {
-	tags, err := c.GetTags(ctx, owner, repo)
-	if err != nil {
-		return "", fmt.Errorf("getting tags: %w", err)
-	}
-
-	if len(tags) == 0 {
-		return "", fmt.Errorf("no tags found for %s/%s", owner, repo)
-	}
-
-	// Apply filter if specified
-	if tagFilter != "" {
-		tags = c.FilterTags(tags, tagFilter)
-		if len(tags) == 0 {
-			return "", fmt.Errorf("no tags matching filter '%s' found for %s/%s", tagFilter, owner, repo)
-		}
-	}
-
-	// Return the first (most recent) tag
-	if tags[0].Name == nil {
-		return "", fmt.Errorf("tag name is nil")
-	}
-
-	return *tags[0].Name, nil
 }
 
 // GetCommitForTag gets the commit SHA for a specific tag

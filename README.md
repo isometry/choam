@@ -1,14 +1,15 @@
 # CHOAM
 
-An idiomatic Go CLI tool for detecting available updates in melange build specification files. CHOAM respects the standard `update:` schema and integrates with GitHub, Git repositories, and release-monitoring.org to check for package updates.
+A Go CLI tool for managing melange build specifications and securing software supply chains. CHOAM detects updates, applies changes, and scans for vulnerabilities in Go dependencies.
 
 ## Features
 
-- 🔍 **Multi-source Update Detection**: Supports GitHub releases/tags, Git repositories, and release-monitoring.org
-- 📋 **Respects Update Configuration**: Honors all `update:` schema fields including filters, transforms, and exclusions
-- 🚀 **Simple & Fast**: Lightweight implementation with no external dependencies for basic operations
-- 📊 **Multiple Output Formats**: Table and JSON output formats for integration with other tools
-- 🛡️ **Robust Filtering**: Version filtering, regex patterns, pre-release handling, and version transformations
+- 🔍 **Update Detection**: Multi-source monitoring (GitHub releases/tags, Git repositories, release-monitoring.org)
+- ⚡ **Automated Updates**: Apply version updates with epoch management and SHA256 verification
+- 🛡️ **Vulnerability Scanning**: OSV database integration for Go module security analysis (in-development)
+- 📊 **Multiple Output Formats**: Table and JSON output for CI/CD integration
+- 🏗️ **Comment-Preserving YAML**: Maintains formatting, comments, and structure
+- 🔧 **Processor Architecture**: Extensible pipeline stages with change tracking and rollback
 
 ## Installation
 
@@ -16,58 +17,108 @@ An idiomatic Go CLI tool for detecting available updates in melange build specif
 
 ```bash
 git clone https://github.com/isometry/choam
-cd spice
-go build -o spice cmd/spice/main.go
+cd choam
+make build
 ```
 
 ### Using Go Install
 
 ```bash
-go install github.com/isometry/choam/cmd/spice@latest
+go install github.com/isometry/choam@latest
+```
+
+### Using Make
+
+```bash
+make deps      # Install dependencies
+make build     # Build binary
+make install   # Install to $GOPATH/bin
 ```
 
 ## Usage
 
-### Basic Usage
+CHOAM provides three main commands:
 
-Check a single melange file:
+### 1. Check for Updates
+
+Detect available updates without making changes:
+
 ```bash
-spice check py3-authlib.yaml
+# Check single file
+choam check py3-authlib.yaml
+
+# Check directory
+choam check ./packages/
+
+# JSON output for automation
+choam check --format json ./packages/
+
+# Verbose output
+choam check -vv ./packages/
 ```
 
-Check multiple files:
+#### Flags
+
+- `--format, -f`: Output format (table, json)
+- `--dry-run`: Show what would be checked without API calls
+- `--verbose, -v`: Increase verbosity (-v info, -vv debug)
+
+### 2. Apply Updates
+
+Update package versions, epochs, and checksums:
+
 ```bash
-spice check go.yaml py3-authlib.yaml
+# Update files with available updates
+choam update ./packages/
+
+# Dry run to preview changes
+choam update --dry-run ./packages/
+
+# Create backups
+choam update --backup-suffix .bak ./packages/
+
+# Force update (increment epoch even without version change)
+choam update --force package.yaml
 ```
 
-Check a directory:
+#### Flags
+
+- `--format, -f`: Output format (table, json)
+- `--dry-run`: Show what would be changed without writing
+- `--backup-suffix`: Create backup files (e.g., `.bak`)
+- `--force`: Force update and increment epoch
+- `--shared`: Update shared dependencies (default: true)
+- `--verbose, -v`: Increase verbosity
+
+### 3. Bump Vulnerable Go Dependencies
+
+⚠️ **Note:** This feature is in-development and not yet stable.
+
+Scan and fix Go module vulnerabilities using go/bump pipelines:
+
 ```bash
-spice check ./packages/
+# Scan for vulnerabilities
+choam gobump ./packages/
+
+# Dry run to preview fixes
+choam gobump --dry-run ./packages/
+
+# Create backups before fixing
+choam gobump --backup-suffix .bak ./packages/
 ```
 
-### Output Formats
+#### Flags
 
-Table output (default):
-```bash
-spice check py3-authlib.yaml
-```
-
-JSON output for integration:
-```bash
-spice check --format json py3-authlib.yaml
-```
-
-### Options
-
-- `--format, -f`: Output format (`table` or `json`)
-- `--dry-run`: Show what would be checked without making API calls
-- `--verbose, -v`: Verbose output with additional details
+- `--format, -f`: Output format (table, json)
+- `--dry-run`: Show what would be changed without writing
+- `--backup-suffix`: Create backup files
+- `--verbose, -v`: Increase verbosity
 
 ## Configuration
 
-CHOAM reads standard melange `update:` configurations from your melange.yaml files:
+CHOAM reads standard melange `update:` configurations:
 
-### GitHub Monitor (Recommended)
+### GitHub Monitor
 
 ```yaml
 package:
@@ -80,9 +131,10 @@ update:
   github:
     identifier: lepture/authlib
     strip-prefix: v
+    use-tag: false  # Use releases (default) or tags
 ```
 
-Note: if `GITHUB_TOKEN` is set, it will be used for authentication.
+Set `GITHUB_TOKEN` environment variable for authentication and higher rate limits.
 
 ### Release Monitor (release-monitoring.org)
 
@@ -97,106 +149,107 @@ update:
     identifier: 242117
 ```
 
-Note: if `ANITYA_TOKEN` is set, it will be used for authentication.
+Optionally set `ANITYA_TOKEN` environment variable for authentication.
 
-## Update Sources
+### Git Monitor
 
-### 1. GitHub Monitor
-
-Monitors GitHub releases or tags:
-
-- **identifier**: Repository in format `owner/repo`
-- **use-tag**: Use Git tags instead of releases
-- **tag-filter**: Filter tags containing this string
-- **tag-filter-prefix**: Filter tags starting with this prefix
-
-### 2. Release Monitor (Anitya)
-
-Monitors packages via release-monitoring.org:
-
-- **identifier**: Anitya project ID (integer)
-- **strip-prefix/strip-suffix**: Clean up version strings
-
-### 3. Git Monitor
-
-Monitors Git repositories directly:
-
-- Requires repository URL configuration
-- Supports tag filtering similar to GitHub
-
-## Examples
-
-### Example Output
-
+```yaml
+update:
+  enabled: true
+  git:
+    url: https://github.com/example/repo
+    strip-prefix: v
 ```
-PACKAGE                        CURRENT         LATEST          UPDATE     SOURCE               STATUS
-amazon-corretto-11             11.0.28.6.1     11.0.28.6.1     NO         github-tags          MANUAL
-py3-authlib                    1.5.2           1.6.3           YES        github-releases      OK
-example-package                1.0.0           1.0.0           NO         anitya               OK
-```
-
-### Example JSON Output
-
-```json
-[
-  {
-    "package_name": "py3-authlib",
-    "current_version": "1.5.2",
-    "latest_version": "1.6.3",
-    "has_update": true,
-    "update_source": "github-releases"
-  }
-]
-```
-
-## Architecture
-
-```
-spice/
-├── pkg/
-│   ├── anitya/          # Release-monitoring.org client
-│   ├── github/          # GitHub API client
-│   ├── git/             # Git repository client
-│   └── updater/         # Core update detection logic
-└── cmd/
-    └── choam/           # CLI interface
-```
-
-### Key Components
-
-- **pkg/anitya**: Simple HTTP client for release-monitoring.org API
-- **pkg/github**: GitHub API client for releases and tags
-- **pkg/git**: Git client using command-line git for repository monitoring
-- **pkg/updater**: Core logic that coordinates all clients and applies update rules
 
 ## Development
 
-### Running Tests
+### Building & Testing
 
 ```bash
-go test ./...
+# Development workflow
+make deps              # Install dependencies
+make build             # Build binary
+make test              # Run all tests
+make lint              # Lint code
+
+# Testing variants
+make test-short        # Skip slow tests
+make test-race         # Run with race detector
+make test-coverage     # Generate coverage report
+make test-package PKG=internal/scan  # Test specific package
+
+# Code quality
+make fmt               # Format code
+make clean             # Remove artifacts
 ```
 
-### Building
+### Project Structure
 
-```bash
-go build -o spice cmd/spice/main.go
 ```
+cmd/              CLI commands (check, update, gobump)
+internal/
+  processor/      Processing pipeline architecture
+  updater/        Update detection and application
+  gobump/         Go module vulnerability scanning
+  scan/           OSV vulnerability scanner
+  github/         GitHub API client
+  git/            Git operations client
+  anitya/         Release monitoring client
+  config/         YAML configuration handling
+```
+
+## Example Output
+
+### Check Command
+
+```
+PACKAGE         CURRENT    LATEST     UPDATE    SOURCE            STATUS
+py3-authlib     1.5.2      1.6.3      YES       github-releases   OK
+go              1.21.0     1.21.5     YES       github-tags       OK
+example         1.0.0      1.0.0      NO        anitya            OK
+```
+
+### Update Command
+
+```
+PACKAGE         CURRENT    LATEST     UPDATED    EPOCH    STATUS
+py3-authlib     1.5.2      1.6.3      YES        0→1      OK
+go              1.21.0     1.21.5     YES        0→1      OK
+```
+
+### GoBump Command
+
+```
+PACKAGE              MODULE                    CURRENT    FIXED      VULNS    EPOCH    STATUS
+go-package           github.com/example/vuln   v1.2.0     v1.2.3     2        5→6      FIXED
+safe-package         github.com/example/safe   v2.0.0     v2.0.0     0        3        OK
+```
+
+## Environment Variables
+
+- `GITHUB_TOKEN`: GitHub personal access token for API authentication
+- `ANITYA_TOKEN`: Release monitoring API token
+- `LOG_LEVEL`: Log level override (debug, info, warn, error)
+
+## Requirements
+
+- Go 1.24.6 or later
+- Optional: `golangci-lint` for linting
 
 ## Contributing
 
 1. Fork the repository
 2. Create a feature branch
-3. Add tests for new functionality
-4. Ensure all tests pass
+3. Write tests for new functionality
+4. Run `make lint && make test` before committing
 5. Submit a pull request
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Related Projects
 
 - [Melange](https://github.com/chainguard-dev/melange) - APK package builder
 - [Wolfi](https://github.com/wolfi-dev) - Container-optimized Linux distribution
 - [Chainguard](https://www.chainguard.dev/) - Supply chain security platform
+
+## License
+
+MIT License - see LICENSE file for details

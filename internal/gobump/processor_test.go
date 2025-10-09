@@ -273,20 +273,20 @@ func TestGoBumpProcessor_HasActualChanges(t *testing.T) {
 
 func TestGoBumpProcessor_ToResult(t *testing.T) {
 	tests := []struct {
-		name                 string
-		setupProc            func(*GoBumpProcessor)
-		wantVulnsFound       int
-		wantVulnsFixed       int
-		wantSecurityFixes    int
-		wantActionsApplied   int
-		wantOldEpoch         int64
-		wantNewEpoch         int64
-		wantEpochChanged     bool
-		wantFileWasWritten   bool
-		wantMessages         int
-		wantError            string
-		validatePackageName  string
-		validateFilePath     string
+		name                string
+		setupProc           func(*GoBumpProcessor)
+		wantVulnsFound      int
+		wantVulnsFixed      int
+		wantSecurityFixes   int
+		wantActionsApplied  int
+		wantOldEpoch        int64
+		wantNewEpoch        int64
+		wantEpochChanged    bool
+		wantFileWasWritten  bool
+		wantMessages        int
+		wantError           string
+		validatePackageName string
+		validateFilePath    string
 	}{
 		{
 			name: "no vulnerabilities - clean state",
@@ -495,9 +495,9 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 
 func TestGoBumpProcessor_Integration(t *testing.T) {
 	tests := []struct {
-		name             string
-		scenario         func(*GoBumpProcessor)
-		validateResult   func(*testing.T, *GoBumpResult)
+		name           string
+		scenario       func(*GoBumpProcessor)
+		validateResult func(*testing.T, *GoBumpResult)
 	}{
 		{
 			name: "complete vulnerability fix workflow",

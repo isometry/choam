@@ -72,11 +72,11 @@ func (m *mockApplyStage) Apply(ctx context.Context, p Processor) error {
 
 type mockValidatingStage struct {
 	BaseStage
-	shouldRun     bool
-	validateErr   error
-	executeErr    error
+	shouldRun      bool
+	validateErr    error
+	executeErr     error
 	validateCalled bool
-	executeCalled bool
+	executeCalled  bool
 }
 
 func (m *mockValidatingStage) ShouldRun(ctx context.Context, p Processor) (bool, error) {

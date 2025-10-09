@@ -308,7 +308,7 @@ func TestUpdaterProcessor_GetNewEpoch(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			proc := NewUpdaterProcessor("/test/path.yaml", "test-pkg", "1.0.0", tt.oldEpoch)
-			proc.BaseProcessor.NewEpoch = tt.newEpoch
+			proc.NewEpoch = tt.newEpoch
 
 			assert.Equal(t, tt.newEpoch, proc.GetNewEpoch())
 		})
@@ -439,7 +439,7 @@ func TestUpdaterProcessor_HasChanges(t *testing.T) {
 		{
 			name: "epoch changed",
 			setup: func(p *UpdaterProcessor) {
-				p.BaseProcessor.EpochChanged = true
+				p.EpochChanged = true
 			},
 			expectChanges: true,
 		},
@@ -456,7 +456,7 @@ func TestUpdaterProcessor_HasChanges(t *testing.T) {
 			name: "all changes",
 			setup: func(p *UpdaterProcessor) {
 				p.VersionChanged = true
-				p.BaseProcessor.EpochChanged = true
+				p.EpochChanged = true
 				p.PipelineChanges = []PipelineChange{
 					{Type: "update", Description: "test"},
 				}
@@ -676,7 +676,7 @@ func TestUpdaterProcessor_Integration(t *testing.T) {
 		proc.SetVersionUpdate("1.0.0", "1.1.0")
 
 		// Apply epoch update
-		proc.BaseProcessor.SetEpochUpdate(5, 6)
+		proc.SetEpochUpdate(5, 6)
 
 		// Verify both changes tracked
 		assert.True(t, proc.IsVersionChanged())
@@ -731,7 +731,7 @@ func TestUpdaterProcessor_ProcessorInterfaceCompliance(t *testing.T) {
 		assert.Equal(t, int64(0), proc.GetNewEpoch())
 		assert.False(t, proc.IsEpochChanged())
 
-		proc.BaseProcessor.SetEpochUpdate(0, 1)
+		proc.SetEpochUpdate(0, 1)
 		assert.True(t, proc.IsEpochChanged())
 		assert.Equal(t, int64(1), proc.GetNewEpoch())
 	})

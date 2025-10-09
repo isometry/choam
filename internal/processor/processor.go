@@ -201,8 +201,3 @@ func (bp *BaseProcessor) AddMessage(message string) {
 func (bp *BaseProcessor) AddError(err error) {
 	bp.Errors = append(bp.Errors, err)
 }
-
-// WithStage creates a logger with stage context
-func (bp *BaseProcessor) WithStage(stageName string) *slog.Logger {
-	return bp.Logger.With("stage", stageName)
-}

@@ -4,12 +4,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
+	"github.com/isometry/choam/internal/utils"
 	"github.com/spf13/cobra"
 )
-
-var yamlExtensions = []string{".yaml", ".yml"}
 
 var (
 	// Common flags shared across commands
@@ -44,17 +42,6 @@ and release-monitoring.org.`,
 	return cmd
 }
 
-// isYAMLFile checks if a filename has a YAML extension
-func isYAMLFile(filename string) bool {
-	lowerName := strings.ToLower(filename)
-	for _, ext := range yamlExtensions {
-		if strings.HasSuffix(lowerName, ext) {
-			return true
-		}
-	}
-	return false
-}
-
 // collectMelangeFiles collects all YAML files from the provided paths
 func collectMelangeFiles(paths []string) ([]string, error) {
 	var files []string
@@ -74,7 +61,7 @@ func collectMelangeFiles(paths []string) ([]string, error) {
 			files = append(files, dirFiles...)
 		} else {
 			// Single file
-			if isYAMLFile(path) {
+			if utils.IsYAMLFile(path) {
 				files = append(files, path)
 			}
 		}
@@ -98,7 +85,7 @@ func collectFromDirectory(dir string) ([]string, error) {
 		}
 
 		name := entry.Name()
-		if isYAMLFile(name) {
+		if utils.IsYAMLFile(name) {
 			fullPath := filepath.Join(dir, name)
 			files = append(files, fullPath)
 		}

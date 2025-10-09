@@ -231,69 +231,6 @@ func newMelangeLoader() *melangeConfig.Loader {
 	return melangeConfig.NewLoader()
 }
 
-// extractRepositoryFromYAML extracts repository URL and tag from git-checkout pipeline in YAML content
-// This consolidates repository extraction logic used across multiple components
-func extractRepositoryFromYAML(yamlContent []byte, cfg *melange.Configuration, newVersion string) (string, string, error) {
-	loader := newMelangeLoader()
-
-	// Find git-checkout pipelines
-	gitCheckoutIndices, err := loader.FindPipelinesByUse(yamlContent, "git-checkout")
-	if err != nil {
-		return "", "", fmt.Errorf("finding git-checkout pipelines: %w", err)
-	}
-
-	if len(gitCheckoutIndices) == 0 {
-		// Fallback to config-based extraction when no YAML pipeline processing is available
-		repoURL, err := extractRepositoryFromConfig(cfg)
-		if err != nil {
-			return "", "", err
-		}
-		return repoURL, newVersion, nil
-	}
-
-	// Use the first git-checkout pipeline
-	withFields, err := loader.GetPipelineWithField(yamlContent, gitCheckoutIndices[0])
-	if err != nil {
-		return "", "", fmt.Errorf("getting pipeline with fields: %w", err)
-	}
-
-	repoURL, hasRepo := withFields["repository"]
-	if !hasRepo {
-		return "", "", fmt.Errorf("no repository found in git-checkout pipeline")
-	}
-
-	// Extract tag, substituting version if needed using the renderer
-	tag := newVersion // default
-	if tagTemplate, hasTag := withFields["tag"]; hasTag {
-		// Use cloned config with updated version if different from current version
-		configForRendering := cfg
-		if newVersion != cfg.Package.Version {
-			configForRendering = cloneConfigWithVersion(cfg, newVersion)
-			if configForRendering == nil {
-				// Fallback to original config if cloning failed
-				configForRendering = cfg
-			}
-		}
-
-		// Create a renderer with the appropriate configuration
-		renderer, err := melangeConfig.NewRenderer(configForRendering)
-		if err != nil {
-			// Fallback to the existing method if renderer fails
-			tag = substituteVariablesWithConfig(tagTemplate, newVersion, cfg)
-		} else {
-			renderedTag, err := renderer.RenderString(tagTemplate)
-			if err != nil {
-				// Fallback to the existing method if rendering fails
-				tag = substituteVariablesWithConfig(tagTemplate, newVersion, cfg)
-			} else {
-				tag = renderedTag
-			}
-		}
-	}
-
-	return repoURL, tag, nil
-}
-
 // extractRepositoryFromConfig extracts repository URL from melange configuration.
 // This is a fallback method for configurations without YAML pipeline processing.
 func extractRepositoryFromConfig(cfg *melange.Configuration) (string, error) {
@@ -305,44 +242,4 @@ func extractRepositoryFromConfig(cfg *melange.Configuration) (string, error) {
 		}
 	}
 	return "", fmt.Errorf("no git-checkout pipeline step with repository found")
-}
-
-// cloneConfigWithVersion creates a deep copy of melange configuration with updated package version
-// This is used when we need to render templates with a different version than what's in the config
-func cloneConfigWithVersion(cfg *melange.Configuration, newVersion string) *melange.Configuration {
-	if cfg == nil {
-		return nil
-	}
-
-	// Create a new configuration with the same structure
-	cloned := &melange.Configuration{
-		Package:       cfg.Package,       // This will be modified below
-		Environment:   cfg.Environment,   // Shallow copy is fine for most fields
-		Capabilities:  cfg.Capabilities,  // Shallow copy is fine for capabilities
-		Pipeline:      cfg.Pipeline,      // Shallow copy is fine for pipelines
-		Subpackages:   cfg.Subpackages,   // Shallow copy is fine for subpackages
-		Data:          cfg.Data,          // Shallow copy is fine for data
-		Update:        cfg.Update,        // Shallow copy is fine for update config
-		Vars:          cfg.Vars,          // Shallow copy is fine for vars
-		VarTransforms: cfg.VarTransforms, // Shallow copy is fine for transforms
-		Options:       cfg.Options,       // Shallow copy is fine for options
-		Test:          cfg.Test,          // Shallow copy is fine for test config
-	}
-
-	// Deep copy and update the package information
-	cloned.Package = melange.Package{
-		Name:         cfg.Package.Name,
-		Version:      newVersion, // This is the key change
-		Epoch:        cfg.Package.Epoch,
-		Description:  cfg.Package.Description,
-		URL:          cfg.Package.URL,
-		Commit:       cfg.Package.Commit,
-		Copyright:    cfg.Package.Copyright,
-		Dependencies: cfg.Package.Dependencies,
-		Options:      cfg.Package.Options,
-		Scriptlets:   cfg.Package.Scriptlets,
-		Checks:       cfg.Package.Checks,
-	}
-
-	return cloned
 }
