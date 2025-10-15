@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -29,7 +28,8 @@ Path can be a single file or a directory containing .yaml files.`,
 }
 
 func runCheck(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
+	// Use the command context which supports cancellation (Ctrl+C)
+	ctx := cmd.Context()
 
 	// Initialize logging based on verbosity flag
 	InitLogger(verbosity)
@@ -57,8 +57,8 @@ func runCheck(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	// Create orchestrator
-	orchestrator := updater.NewOrchestrator()
+	// Create orchestrator with custom HTTP timeout
+	orchestrator := updater.NewOrchestratorWithTimeout(httpTimeout)
 
 	// Process all files for checking
 	processors, err := orchestrator.ProcessMultipleChecks(ctx, files)

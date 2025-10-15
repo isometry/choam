@@ -1,6 +1,7 @@
 package github
 
 import (
+	"net/http"
 	"testing"
 
 	"github.com/google/go-github/v74/github"
@@ -70,7 +71,7 @@ func TestParseRepository(t *testing.T) {
 }
 
 func TestClient_FilterTagsWithPrefix(t *testing.T) {
-	client := New()
+	client := New(&http.Client{})
 
 	tags := []*github.RepositoryTag{
 		{Name: github.Ptr("v1.0.0")},

@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/isometry/choam/internal/httpclient"
 )
 
 func TestClient_GetProject(t *testing.T) {
@@ -46,7 +48,7 @@ func TestClient_GetProject(t *testing.T) {
 	defer server.Close()
 
 	// Create client with custom base URL for testing
-	client := New()
+	client := New(httpclient.NewHTTPClient())
 	client.baseURL = server.URL // This will override the default URL logic
 
 	tests := []struct {
@@ -133,7 +135,7 @@ func TestClient_GetLatestVersion(t *testing.T) {
 	defer server.Close()
 
 	// Create client with custom base URL for testing
-	client := New()
+	client := New(httpclient.NewHTTPClient())
 	client.baseURL = server.URL
 
 	tests := []struct {
@@ -201,7 +203,7 @@ func TestClient_GetStableVersions(t *testing.T) {
 	defer server.Close()
 
 	// Create client with custom base URL for testing
-	client := New()
+	client := New(httpclient.NewHTTPClient())
 	client.baseURL = server.URL
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

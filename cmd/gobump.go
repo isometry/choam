@@ -1,15 +1,14 @@
 package cmd
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"os"
 	"strings"
 
 	"github.com/aquasecurity/table"
 	"github.com/isometry/choam/internal/gobump"
+	"github.com/isometry/choam/internal/httpclient"
 	"github.com/spf13/cobra"
 )
 
@@ -36,7 +35,8 @@ Path can be a single file or a directory containing .yaml files.`,
 }
 
 func runGoBump(cmd *cobra.Command, args []string) error {
-	ctx := context.Background()
+	// Use the command context which supports cancellation (Ctrl+C)
+	ctx := cmd.Context()
 
 	// Initialize logging based on verbosity flag
 	InitLogger(verbosity)
@@ -67,8 +67,8 @@ func runGoBump(cmd *cobra.Command, args []string) error {
 		fmt.Println("Dry run mode - no files will be modified")
 	}
 
-	// Create HTTP client and components
-	httpClient := &http.Client{}
+	// Create shared HTTP client with custom timeout
+	httpClient := httpclient.NewHTTPClientWithTimeout(httpTimeout)
 	analyzer := gobump.NewAnalyzer(httpClient)
 
 	// Process all files using shared processor architecture

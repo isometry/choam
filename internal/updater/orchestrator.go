@@ -12,6 +12,7 @@ import (
 	"github.com/isometry/choam/internal/anitya"
 	"github.com/isometry/choam/internal/git"
 	githubClient "github.com/isometry/choam/internal/github"
+	"github.com/isometry/choam/internal/httpclient"
 	"github.com/isometry/choam/internal/processor"
 )
 
@@ -30,15 +31,19 @@ type UpdateOrchestrator struct {
 	versionComparator *VersionComparator
 }
 
-// NewOrchestrator creates a new update orchestrator with default configuration
+// NewOrchestrator creates a new update orchestrator with default HTTP timeout
 func NewOrchestrator() *UpdateOrchestrator {
-	httpClient := &http.Client{
-		Timeout: 60 * time.Second,
-	}
+	return NewOrchestratorWithTimeout(httpclient.DefaultTimeout)
+}
+
+// NewOrchestratorWithTimeout creates a new update orchestrator with a custom HTTP timeout
+func NewOrchestratorWithTimeout(httpTimeout time.Duration) *UpdateOrchestrator {
+	// Create shared HTTP client with specified timeout
+	httpClient := httpclient.NewHTTPClientWithTimeout(httpTimeout)
 
 	return &UpdateOrchestrator{
-		anityaClient:      anitya.New(),
-		githubClient:      githubClient.New(),
+		anityaClient:      anitya.New(httpClient),
+		githubClient:      githubClient.New(httpClient),
 		gitClient:         git.New(),
 		httpClient:        httpClient,
 		versionFilter:     NewVersionFilter(),

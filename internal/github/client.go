@@ -18,15 +18,16 @@ type Client struct {
 }
 
 // New creates a new GitHub client with optional authentication
-func New() *Client {
-	var httpClient *http.Client
-
+// If httpClient is nil, a default HTTP client will be used
+// If authentication is configured via GITHUB_TOKEN, the client will be wrapped with oauth2
+func New(httpClient *http.Client) *Client {
 	// Check for GitHub token in environment for authentication
 	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
 		ctx := context.Background()
 		ts := oauth2.StaticTokenSource(
 			&oauth2.Token{AccessToken: token},
 		)
+		// Wrap the provided HTTP client (or nil) with oauth2
 		httpClient = oauth2.NewClient(ctx, ts)
 	}
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/isometry/choam/internal/utils"
 	"github.com/spf13/cobra"
@@ -15,6 +16,7 @@ var (
 	dryRun       bool
 	verbosity    int
 	force        bool
+	httpTimeout  time.Duration
 
 	// Update-specific flags
 	updateShared bool
@@ -34,6 +36,7 @@ and release-monitoring.org.`,
 
 	// Global flags available to all subcommands
 	cmd.PersistentFlags().CountVarP(&verbosity, "verbose", "v", "Increase verbosity: -v (info), -vv (debug)")
+	cmd.PersistentFlags().DurationVar(&httpTimeout, "http-timeout", 15*time.Second, "Timeout for individual HTTP requests")
 
 	cmd.AddCommand(NewCheckCmd())
 	cmd.AddCommand(NewUpdateCmd())

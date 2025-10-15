@@ -6,14 +6,11 @@ import (
 	"fmt"
 	"net/http"
 	"os"
-	"time"
 )
 
 const (
 	// DefaultBaseURL is the base URL for the release-monitoring.org API
 	DefaultBaseURL = "https://release-monitoring.org/api/v2"
-	// DefaultTimeout is the default timeout for HTTP requests
-	DefaultTimeout = 30 * time.Second
 )
 
 // Client represents a client for the release-monitoring.org API
@@ -23,19 +20,12 @@ type Client struct {
 	token      string
 }
 
-// New creates a new anitya client
-func New() *Client {
-	return &Client{
-		baseURL: DefaultBaseURL,
-		httpClient: &http.Client{
-			Timeout: DefaultTimeout,
-		},
-		token: os.Getenv("ANITYA_TOKEN"),
+// New creates a new anitya client with a custom HTTP client
+// The httpClient parameter is required and should be obtained from httpclient.NewHTTPClient()
+func New(httpClient *http.Client) *Client {
+	if httpClient == nil {
+		panic("anitya.New: httpClient cannot be nil")
 	}
-}
-
-// NewWithClient creates a new anitya client with a custom HTTP client
-func NewWithClient(httpClient *http.Client) *Client {
 	return &Client{
 		baseURL:    DefaultBaseURL,
 		httpClient: httpClient,

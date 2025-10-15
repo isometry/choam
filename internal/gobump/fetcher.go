@@ -24,9 +24,10 @@ type Fetcher struct {
 }
 
 // NewFetcher creates a new fetcher with the provided HTTP client
+// The httpClient parameter is required and should be obtained from httpclient.NewHTTPClient()
 func NewFetcher(httpClient *http.Client) *Fetcher {
 	if httpClient == nil {
-		httpClient = &http.Client{}
+		panic("gobump.NewFetcher: httpClient cannot be nil")
 	}
 	return &Fetcher{
 		httpClient: httpClient,
