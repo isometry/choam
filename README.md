@@ -13,6 +13,13 @@ A Go CLI tool for managing melange build specifications and securing software su
 
 ## Installation
 
+### Using Homebrew
+
+```bash
+# Install choam
+brew install isometry/tap/choam
+```
+
 ### From Source
 
 ```bash
@@ -30,16 +37,22 @@ go install github.com/isometry/choam@latest
 ### Using Make
 
 ```bash
-make deps      # Install dependencies
-make build     # Build binary
-make install   # Install to $GOPATH/bin
+make deps build
+make install # Install to $GOPATH/bin
 ```
 
 ## Usage
 
-CHOAM provides three main commands:
+### Global Flags
 
-### 1. Check for Updates
+All commands support these global flags:
+
+- `--verbose, -v`: Increase verbosity (-v for info, -vv for debug)
+- `--http-timeout`: Timeout for HTTP requests (default: 15s)
+
+CHOAM provides two main commands (plus experimental features):
+
+### Check for Updates
 
 Detect available updates without making changes:
 
@@ -63,7 +76,7 @@ choam check -vv ./packages/
 - `--dry-run`: Show what would be checked without API calls
 - `--verbose, -v`: Increase verbosity (-v info, -vv debug)
 
-### 2. Apply Updates
+### Apply Updates
 
 Update package versions, epochs, and checksums:
 
@@ -90,30 +103,6 @@ choam update --force package.yaml
 - `--shared`: Update shared dependencies (default: true)
 - `--verbose, -v`: Increase verbosity
 
-### 3. Bump Vulnerable Go Dependencies
-
-⚠️ **Note:** This feature is in-development and not yet stable.
-
-Scan and fix Go module vulnerabilities using go/bump pipelines:
-
-```bash
-# Scan for vulnerabilities
-choam gobump ./packages/
-
-# Dry run to preview fixes
-choam gobump --dry-run ./packages/
-
-# Create backups before fixing
-choam gobump --backup-suffix .bak ./packages/
-```
-
-#### Flags
-
-- `--format, -f`: Output format (table, json)
-- `--dry-run`: Show what would be changed without writing
-- `--backup-suffix`: Create backup files
-- `--verbose, -v`: Increase verbosity
-
 ## Configuration
 
 CHOAM reads standard melange `update:` configurations:
@@ -131,7 +120,7 @@ update:
   github:
     identifier: lepture/authlib
     strip-prefix: v
-    use-tag: false  # Use releases (default) or tags
+    use-tag: false # Use releases (default) or tags
 ```
 
 Set `GITHUB_TOKEN` environment variable for authentication and higher rate limits.
@@ -198,6 +187,46 @@ internal/
   config/         YAML configuration handling
 ```
 
+## Experimental Features
+
+⚠️ **WARNING**: The following features are experimental and hidden from standard CLI help. They may change or be removed without notice. Use at your own risk in production environments.
+
+### gobump - Vulnerability Scanning (Hidden Command)
+
+The `gobump` command scans and fixes Go module vulnerabilities using go/bump pipelines. This command is currently **hidden** (not shown in `choam --help`) and should be considered **unstable**.
+
+**Why hidden?** This feature is under active development. The API, behavior, and output format may change between releases without deprecation warnings.
+
+#### Usage
+
+```bash
+# Scan for vulnerabilities (hidden command)
+choam gobump ./packages/
+
+# Dry run to preview fixes
+choam gobump --dry-run ./packages/
+
+# Create backups before fixing
+choam gobump --backup-suffix .bak ./packages/
+```
+
+#### Flags
+
+- `--format, -f`: Output format (table, json)
+- `--dry-run`: Show what would be changed without writing
+- `--backup-suffix`: Create backup files
+- `--verbose, -v`: Increase verbosity
+
+#### Example Output
+
+```
+PACKAGE              VULNS FOUND    VULNS FIXED    OLD EPOCH    NEW EPOCH    STATUS
+go-package           2              2              5            6            FIXED
+safe-package         0              0              3            3            NO VULNS
+
+Summary: 2 files processed, 1 with vulnerabilities, 1 fixed, 0 errors (2 vulnerabilities found, 2 fixed)
+```
+
 ## Example Output
 
 ### Check Command
@@ -217,14 +246,6 @@ py3-authlib     1.5.2      1.6.3      YES        0→1      OK
 go              1.21.0     1.21.5     YES        0→1      OK
 ```
 
-### GoBump Command
-
-```
-PACKAGE              MODULE                    CURRENT    FIXED      VULNS    EPOCH    STATUS
-go-package           github.com/example/vuln   v1.2.0     v1.2.3     2        5→6      FIXED
-safe-package         github.com/example/safe   v2.0.0     v2.0.0     0        3        OK
-```
-
 ## Environment Variables
 
 - `GITHUB_TOKEN`: GitHub personal access token for API authentication
@@ -233,7 +254,7 @@ safe-package         github.com/example/safe   v2.0.0     v2.0.0     0        3 
 
 ## Requirements
 
-- Go 1.24.6 or later
+- Go 1.25.3 or later
 - Optional: `golangci-lint` for linting
 
 ## Contributing

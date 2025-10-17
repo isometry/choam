@@ -1,7 +1,6 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -9,6 +8,7 @@ import (
 	"github.com/aquasecurity/table"
 	"github.com/isometry/choam/internal/gobump"
 	"github.com/isometry/choam/internal/httpclient"
+	"github.com/isometry/choam/internal/output"
 	"github.com/spf13/cobra"
 )
 
@@ -28,7 +28,7 @@ Path can be a single file or a directory containing .yaml files.`,
 	}
 
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be changed without making changes")
-	cmd.Flags().StringVarP(&outputFormat, "format", "f", "table", "Output format: table, json")
+	cmd.Flags().StringVarP(&outputFormat, "format", "f", "table", "Output format: table, json, yaml")
 	cmd.Flags().StringVar(&backupSuffix, "backup-suffix", "", "Suffix for backup files (empty = no backup)")
 
 	return cmd
@@ -97,7 +97,9 @@ func runGoBump(cmd *cobra.Command, args []string) error {
 func outputGoBumpResults(results []*gobump.GoBumpResult, format string) error {
 	switch format {
 	case "json":
-		return outputGoBumpJSON(results)
+		return outputGoBumpStructured(results, "json")
+	case "yaml":
+		return outputGoBumpStructured(results, "yaml")
 	case "table":
 		return outputGoBumpTable(results)
 	default:
@@ -105,10 +107,43 @@ func outputGoBumpResults(results []*gobump.GoBumpResult, format string) error {
 	}
 }
 
-func outputGoBumpJSON(results []*gobump.GoBumpResult) error {
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(results)
+func outputGoBumpStructured(results []*gobump.GoBumpResult, format string) error {
+	// Build map keyed by filename
+	resultsMap := make(map[string]*gobump.GoBumpResult)
+	for _, result := range results {
+		filename := output.ExtractFilename(result.FilePath)
+		resultsMap[filename] = result
+	}
+
+	// Calculate summary statistics
+	summary := output.GoBumpSummary{
+		TotalPackages: len(results),
+	}
+	for _, r := range results {
+		if r.VulnerabilitiesFound > 0 {
+			summary.PackagesWithVulns++
+			summary.TotalVulnsFound += r.VulnerabilitiesFound
+		}
+		if r.VulnerabilitiesFixed > 0 {
+			summary.PackagesFixed++
+			summary.TotalVulnsFixed += r.VulnerabilitiesFixed
+		}
+		if r.Error != "" {
+			summary.Errors++
+		}
+	}
+
+	// Wrap in response structure
+	response := output.GoBumpResponse{
+		Results: resultsMap,
+		Summary: summary,
+	}
+
+	// Output in requested format
+	if format == "json" {
+		return output.OutputJSON(os.Stdout, response)
+	}
+	return output.OutputYAML(os.Stdout, response)
 }
 
 func outputGoBumpTable(results []*gobump.GoBumpResult) error {

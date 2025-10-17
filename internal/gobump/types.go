@@ -7,19 +7,19 @@ import (
 
 // BumpAction represents a planned action for go/bump pipelines
 type BumpAction struct {
-	Action       string   `json:"action"`       // "insert", "update", "remove"
-	PipelineIdx  int      `json:"pipeline_idx"` // pipeline index for update/remove
-	Dependencies []string `json:"dependencies"` // dependencies to insert/update with
-	Reason       string   `json:"reason"`       // human-readable reason
+	Action       string   `json:"action" yaml:"action"`             // "insert", "update", "remove"
+	PipelineIdx  int      `json:"pipeline_idx" yaml:"pipeline_idx"` // pipeline index for update/remove
+	Dependencies []string `json:"dependencies" yaml:"dependencies"` // dependencies to insert/update with
+	Reason       string   `json:"reason" yaml:"reason"`             // human-readable reason
 }
 
 // SecurityFix represents a security vulnerability fix applied
 type SecurityFix struct {
-	Module        string `json:"module"`        // Go module affected
-	Vulnerability string `json:"vulnerability"` // CVE or vulnerability ID
-	OldVersion    string `json:"old_version"`   // version before fix
-	NewVersion    string `json:"new_version"`   // version after fix
-	Severity      string `json:"severity"`      // critical, high, medium, low
+	Module        string `json:"module" yaml:"module"`               // Go module affected
+	Vulnerability string `json:"vulnerability" yaml:"vulnerability"` // CVE or vulnerability ID
+	OldVersion    string `json:"old_version" yaml:"old_version"`     // version before fix
+	NewVersion    string `json:"new_version" yaml:"new_version"`     // version after fix
+	Severity      string `json:"severity" yaml:"severity"`           // critical, high, medium, low
 }
 
 // BumpAnalysis represents the analysis result for a single bump
@@ -40,37 +40,37 @@ type GoModInfo struct {
 
 // GoBumpResult represents the result of a go bump operation
 type GoBumpResult struct {
-	PackageName          string        `json:"package_name"`
-	FilePath             string        `json:"file_path"`
-	VulnerabilitiesFound int           `json:"vulnerabilities_found"`
-	VulnerabilitiesFixed int           `json:"vulnerabilities_fixed"`
-	CriticalFixed        int           `json:"critical_fixed"`
-	HighFixed            int           `json:"high_fixed"`
-	SecurityFixes        []SecurityFix `json:"security_fixes"`
-	ActionsApplied       []BumpAction  `json:"actions_applied"`
-	OldEpoch             int64         `json:"old_epoch"`
-	NewEpoch             int64         `json:"new_epoch"`
-	EpochChanged         bool          `json:"epoch_changed"`
-	FileWasWritten       bool          `json:"file_was_written"`
-	Messages             []string      `json:"messages"`
-	Error                string        `json:"error,omitempty"`
+	PackageName          string        `json:"package_name" yaml:"package_name"`
+	FilePath             string        `json:"file_path" yaml:"file_path"`
+	VulnerabilitiesFound int           `json:"vulnerabilities_found" yaml:"vulnerabilities_found"`
+	VulnerabilitiesFixed int           `json:"vulnerabilities_fixed" yaml:"vulnerabilities_fixed"`
+	CriticalFixed        int           `json:"critical_fixed" yaml:"critical_fixed"`
+	HighFixed            int           `json:"high_fixed" yaml:"high_fixed"`
+	SecurityFixes        []SecurityFix `json:"security_fixes" yaml:"security_fixes"`
+	ActionsApplied       []BumpAction  `json:"actions_applied" yaml:"actions_applied"`
+	OldEpoch             int64         `json:"old_epoch" yaml:"old_epoch"`
+	NewEpoch             int64         `json:"new_epoch" yaml:"new_epoch"`
+	EpochChanged         bool          `json:"epoch_changed" yaml:"epoch_changed"`
+	FileWasWritten       bool          `json:"file_was_written" yaml:"file_was_written"`
+	Messages             []string      `json:"messages" yaml:"messages"`
+	Error                string        `json:"error,omitempty" yaml:"error,omitempty"`
 }
 
 // VulnerabilityAnalysis contains the results of scanning go dependencies
 type VulnerabilityAnalysis struct {
-	GoModInfo            *GoModInfo       `json:"go_mod_info"`
-	ScanResult           *scan.ScanResult `json:"scan_result"`
-	VulnerabilitiesFound int              `json:"vulnerabilities_found"`
-	CriticalCount        int              `json:"critical_count"`
-	HighCount            int              `json:"high_count"`
-	SecurityBumps        []string         `json:"security_bumps"`
-	BumpActions          []BumpAction     `json:"bump_actions"`
-	Analysis             []BumpAnalysis   `json:"analysis"`
+	GoModInfo            *GoModInfo       `json:"go_mod_info" yaml:"go_mod_info"`
+	ScanResult           *scan.ScanResult `json:"scan_result" yaml:"scan_result"`
+	VulnerabilitiesFound int              `json:"vulnerabilities_found" yaml:"vulnerabilities_found"`
+	CriticalCount        int              `json:"critical_count" yaml:"critical_count"`
+	HighCount            int              `json:"high_count" yaml:"high_count"`
+	SecurityBumps        []string         `json:"security_bumps" yaml:"security_bumps"`
+	BumpActions          []BumpAction     `json:"bump_actions" yaml:"bump_actions"`
+	Analysis             []BumpAnalysis   `json:"analysis" yaml:"analysis"`
 }
 
 // ProcessorOptions configures processor behavior
 type ProcessorOptions struct {
-	DryRun       bool   `json:"dry_run"`
-	BackupSuffix string `json:"backup_suffix"`
-	TempDir      string `json:"temp_dir"`
+	DryRun       bool   `json:"dry_run" yaml:"dry_run"`
+	BackupSuffix string `json:"backup_suffix" yaml:"backup_suffix"`
+	TempDir      string `json:"temp_dir" yaml:"temp_dir"`
 }

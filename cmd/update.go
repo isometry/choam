@@ -1,13 +1,13 @@
 package cmd
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/aquasecurity/table"
+	"github.com/isometry/choam/internal/output"
 	"github.com/isometry/choam/internal/updater"
 	"github.com/spf13/cobra"
 )
@@ -29,7 +29,7 @@ Path can be a single file or a directory containing .yaml files.`,
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be updated without making changes")
 	cmd.Flags().BoolVar(&force, "force", false, "Force update even if no version change (increment epoch)")
 	cmd.Flags().BoolVar(&updateShared, "shared", true, "Update shared dependencies")
-	cmd.Flags().StringVarP(&outputFormat, "format", "f", "table", "Output format: table, json")
+	cmd.Flags().StringVarP(&outputFormat, "format", "f", "table", "Output format: table, json, yaml")
 	cmd.Flags().StringVar(&backupSuffix, "backup-suffix", "", "Suffix for backup files (empty = no backup)")
 
 	return cmd
@@ -139,7 +139,9 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 func outputUpdateResults(results []*updater.ApplyResult, format string) error {
 	switch format {
 	case "json":
-		return outputUpdateJSON(results)
+		return outputUpdateStructured(results, "json")
+	case "yaml":
+		return outputUpdateStructured(results, "yaml")
 	case "table":
 		return outputUpdateTable(results)
 	default:
@@ -147,10 +149,41 @@ func outputUpdateResults(results []*updater.ApplyResult, format string) error {
 	}
 }
 
-func outputUpdateJSON(results []*updater.ApplyResult) error {
-	encoder := json.NewEncoder(os.Stdout)
-	encoder.SetIndent("", "  ")
-	return encoder.Encode(results)
+func outputUpdateStructured(results []*updater.ApplyResult, format string) error {
+	// Build map keyed by filename
+	resultsMap := make(map[string]*updater.ApplyResult)
+	for _, result := range results {
+		filename := output.ExtractFilename(result.FilePath)
+		resultsMap[filename] = result
+	}
+
+	// Calculate summary statistics
+	summary := output.UpdateSummary{
+		TotalPackages: len(results),
+	}
+	for _, r := range results {
+		if r.FileWasWritten {
+			summary.SuccessfulUpdates++
+		}
+		if r.Error != "" {
+			summary.Errors++
+		}
+		if r.IsManual {
+			summary.Manual++
+		}
+	}
+
+	// Wrap in response structure
+	response := output.UpdateResponse{
+		Results: resultsMap,
+		Summary: summary,
+	}
+
+	// Output in requested format
+	if format == "json" {
+		return output.OutputJSON(os.Stdout, response)
+	}
+	return output.OutputYAML(os.Stdout, response)
 }
 
 func outputUpdateTable(results []*updater.ApplyResult) error {
