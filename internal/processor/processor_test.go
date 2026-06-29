@@ -832,7 +832,7 @@ func TestBaseProcessor_LargeChangeSet(t *testing.T) {
 	proc := NewBaseProcessor("/test.yaml", "test-pkg", "1.0.0", 0)
 
 	// Add 100 changes
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		proc.AddChange(Change{
 			Type:        "test",
 			Field:       fmt.Sprintf("field-%d", i),

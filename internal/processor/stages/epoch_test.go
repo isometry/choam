@@ -24,11 +24,11 @@ func newMockProcessor(packageName, currentVersion string, currentEpoch int64, op
 	base := processor.NewBaseProcessor("test.yaml", packageName, currentVersion, currentEpoch)
 	base.Options = opts
 	base.Logger = logger
-	base.OriginalYAML = []byte(fmt.Sprintf(`package:
+	base.OriginalYAML = fmt.Appendf(nil, `package:
   name: %s
   version: "%s"
   epoch: %d
-`, packageName, currentVersion, currentEpoch))
+`, packageName, currentVersion, currentEpoch)
 	base.CurrentYAML = base.OriginalYAML
 	return &mockProcessor{
 		BaseProcessor: *base,
@@ -799,7 +799,7 @@ func TestEpochStage_ConcurrentSafety(t *testing.T) {
 
 	// Run multiple processors concurrently
 	done := make(chan bool)
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		go func(id int) {
 			proc := newMockProcessor(fmt.Sprintf("pkg-%d", id), "1.0.0", 5, processor.ProcessorOptions{
 				DryRun: true,
@@ -816,7 +816,7 @@ func TestEpochStage_ConcurrentSafety(t *testing.T) {
 	}
 
 	// Wait for all goroutines
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		<-done
 	}
 }

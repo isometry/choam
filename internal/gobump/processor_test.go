@@ -439,7 +439,7 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 						{Action: "insert"},
 					},
 				}
-				for i := 0; i < 3; i++ {
+				for range 3 {
 					proc.AddSecurityFix(SecurityFix{
 						Module:        "test/module",
 						Vulnerability: "CVE-2024-1111",

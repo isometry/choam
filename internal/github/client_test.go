@@ -74,11 +74,11 @@ func TestClient_FilterTagsWithPrefix(t *testing.T) {
 	client := New(&http.Client{})
 
 	tags := []*github.RepositoryTag{
-		{Name: github.Ptr("v1.0.0")},
-		{Name: github.Ptr("v1.1.0")},
-		{Name: github.Ptr("go1.22.0")},
-		{Name: github.Ptr("go1.22.1")},
-		{Name: github.Ptr("release-2.0.0")},
+		{Name: new("v1.0.0")},
+		{Name: new("v1.1.0")},
+		{Name: new("go1.22.0")},
+		{Name: new("go1.22.1")},
+		{Name: new("release-2.0.0")},
 	}
 
 	tests := []struct {

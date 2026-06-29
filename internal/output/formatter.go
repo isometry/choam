@@ -9,14 +9,14 @@ import (
 )
 
 // OutputJSON writes data as formatted JSON to the given writer
-func OutputJSON(w io.Writer, data interface{}) error {
+func OutputJSON(w io.Writer, data any) error {
 	encoder := json.NewEncoder(w)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(data)
 }
 
 // OutputYAML writes data as formatted YAML to the given writer
-func OutputYAML(w io.Writer, data interface{}) error {
+func OutputYAML(w io.Writer, data any) error {
 	bytes, err := yaml.Marshal(data)
 	if err != nil {
 		return err

@@ -700,7 +700,7 @@ func BenchmarkPipeline_Execute_SingleStage(b *testing.B) {
 func BenchmarkPipeline_Execute_MultipleStages(b *testing.B) {
 	pipeline := NewPipeline("benchmark-pipeline")
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		stage := &mockExecutableStage{
 			BaseStage: BaseStage{StageName: fmt.Sprintf("stage-%d", i)},
 			shouldRun: true,

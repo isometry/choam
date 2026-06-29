@@ -63,8 +63,8 @@ pipeline:
 			}
 
 			// Verify the version line specifically
-			lines := strings.Split(result, "\n")
-			for _, line := range lines {
+			lines := strings.SplitSeq(result, "\n")
+			for line := range lines {
 				if strings.Contains(line, "version:") {
 					if !strings.Contains(line, quotedVersion) {
 						t.Errorf("Version line does not contain quoted version:\n  got: %s\n  want: version: %s", line, quotedVersion)
