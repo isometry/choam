@@ -23,7 +23,14 @@ func GetGlobalCache() *VulnerabilityCache {
 // to avoid redundant API calls for the same package@version combinations within a single run
 type VulnerabilityCache struct {
 	mu      sync.RWMutex
-	entries map[string][]models.Vulnerability // Key: "package@version"
+	entries map[string][]models.Vulnerability // Key: "ecosystem|package@version"
+}
+
+// cacheKeyFor builds an ecosystem-qualified cache key, preventing collisions
+// between packages that share a name+version across different ecosystems
+// (e.g. a Go module and a crate of the same name and version).
+func cacheKeyFor(ecosystem, name, version string) string {
+	return ecosystem + "|" + name + "@" + version
 }
 
 // NewVulnerabilityCache creates a new vulnerability cache

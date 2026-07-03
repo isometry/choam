@@ -312,8 +312,8 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 				proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 					VulnerabilitiesFound: 3,
 					BumpActions: []BumpAction{
-						{Action: "update", PipelineIdx: 0, Dependencies: []string{"dep1@v1.0.0"}},
-						{Action: "insert", PipelineIdx: -1, Dependencies: []string{"dep2@v2.0.0"}},
+						{Action: "update", Modroots: []string{"."}, Dependencies: []string{"dep1@v1.0.0"}},
+						{Action: "insert", Modroots: []string{"cmd/foo"}, Dependencies: []string{"dep2@v2.0.0"}},
 					},
 				}
 				proc.AddSecurityFix(SecurityFix{
@@ -353,7 +353,7 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 				proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 					VulnerabilitiesFound: 1,
 					BumpActions: []BumpAction{
-						{Action: "update", PipelineIdx: 0},
+						{Action: "update", Modroots: []string{"."}},
 					},
 				}
 				proc.AddSecurityFix(SecurityFix{
@@ -408,8 +408,8 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 				proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 					VulnerabilitiesFound: 2,
 					BumpActions: []BumpAction{
-						{Action: "keep", PipelineIdx: 0},
-						{Action: "keep", PipelineIdx: 1},
+						{Action: "keep", Modroots: []string{"."}},
+						{Action: "keep", Modroots: []string{"cmd/foo"}},
 					},
 				}
 				// No changes to YAML, no ActualChangesApplied flag
@@ -510,13 +510,13 @@ func TestGoBumpProcessor_Integration(t *testing.T) {
 					BumpActions: []BumpAction{
 						{
 							Action:       "update",
-							PipelineIdx:  0,
+							Modroots:     []string{"."},
 							Dependencies: []string{"golang.org/x/crypto@v0.14.0"},
 							Reason:       "security fix for CVE-2023-1234",
 						},
 						{
 							Action:       "insert",
-							PipelineIdx:  -1,
+							Modroots:     []string{"cmd/foo"},
 							Dependencies: []string{"github.com/gin-gonic/gin@v1.9.1"},
 							Reason:       "security fix for GHSA-xxxx-yyyy",
 						},

@@ -1,7 +1,6 @@
-package gobump
+package golang
 
 import (
-	"net/http"
 	"testing"
 
 	"golang.org/x/mod/modfile"
@@ -176,19 +175,6 @@ func TestAnalyzer_AnalyzeBumps(t *testing.T) {
 			wantKeep: []string{"github.com/test/module@v1.5.0"},
 		},
 		{
-			name: "version comparison mixed v prefix - bump has v, gomod doesn't",
-			deps: []string{
-				"github.com/test/module@v1.5.0",
-			},
-			goModInfo: &GoModInfo{
-				AllRequirements: map[string]string{
-					"github.com/test/module": "v1.4.0",
-				},
-				Replacements: map[string]*modfile.Replace{},
-			},
-			wantKeep: []string{"github.com/test/module@v1.5.0"},
-		},
-		{
 			name: "v2+ module path normalization - OSV returns path without /v2 suffix",
 			deps: []string{
 				"github.com/cli/go-gh@v2.11.1",
@@ -237,29 +223,25 @@ func TestAnalyzer_AnalyzeBumps(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			analyzer := NewAnalyzer(http.DefaultClient)
-			analysis, filteredDeps := analyzer.AnalyzeBumps(tt.deps, tt.goModInfo)
+			a := newAnalyzer()
+			analysis, filteredDeps := a.analyzeBumps(tt.deps, tt.goModInfo)
 
-			// Verify filtered deps match expected kept deps
 			if len(filteredDeps) != len(tt.wantKeep) {
 				t.Errorf("filteredDeps count = %d, want %d", len(filteredDeps), len(tt.wantKeep))
 			}
 
-			// Build maps for easier verification
 			filteredMap := make(map[string]bool)
 			for _, dep := range filteredDeps {
 				filteredMap[dep] = true
 			}
 
-			// Verify all expected kept deps are in filtered deps
 			for _, expectedDep := range tt.wantKeep {
 				if !filteredMap[expectedDep] {
 					t.Errorf("expected dep %q not found in filtered deps", expectedDep)
 				}
 			}
 
-			// Build analysis maps
-			analysisMap := make(map[string]BumpAnalysis)
+			analysisMap := make(map[string]bumpAnalysis)
 			for _, a := range analysis {
 				key := a.Module
 				if a.BumpVersion != "" {
@@ -268,7 +250,6 @@ func TestAnalyzer_AnalyzeBumps(t *testing.T) {
 				analysisMap[key] = a
 			}
 
-			// Verify removed deps have correct actions
 			if tt.wantRemove != nil {
 				for dep, expectedAction := range tt.wantRemove {
 					if a, ok := analysisMap[dep]; ok {
@@ -276,11 +257,9 @@ func TestAnalyzer_AnalyzeBumps(t *testing.T) {
 							t.Errorf("dep %q action = %q, want %q", dep, a.Action, expectedAction)
 						}
 					}
-					// Note: We don't fail if dep not found because deduplication happens before analysis
 				}
 			}
 
-			// Verify reasons contain expected substrings
 			if tt.wantReasons != nil {
 				for dep, expectedReasonSubstr := range tt.wantReasons {
 					if a, ok := analysisMap[dep]; ok {
@@ -293,7 +272,6 @@ func TestAnalyzer_AnalyzeBumps(t *testing.T) {
 				}
 			}
 
-			// Verify kept deps have "keep" action
 			for _, keptDep := range tt.wantKeep {
 				if a, ok := analysisMap[keptDep]; ok {
 					if a.Action != "keep" {
@@ -438,8 +416,8 @@ func TestAnalyzer_GetEffectiveVersion(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			analyzer := NewAnalyzer(http.DefaultClient)
-			result := analyzer.getEffectiveVersion(tt.module, tt.originalVersion, tt.replacements)
+			a := newAnalyzer()
+			result := a.getEffectiveVersion(tt.module, tt.originalVersion, tt.replacements)
 			if result != tt.expected {
 				t.Errorf("getEffectiveVersion() = %q, want %q", result, tt.expected)
 			}
@@ -447,190 +425,7 @@ func TestAnalyzer_GetEffectiveVersion(t *testing.T) {
 	}
 }
 
-func TestAnalyzer_HaveDepsChanged(t *testing.T) {
-	tests := []struct {
-		name     string
-		existing []string
-		merged   []string
-		expected bool
-	}{
-		{
-			name: "identical lists",
-			existing: []string{
-				"github.com/gin-gonic/gin@v1.9.1",
-				"github.com/stretchr/testify@v1.9.0",
-			},
-			merged: []string{
-				"github.com/gin-gonic/gin@v1.9.1",
-				"github.com/stretchr/testify@v1.9.0",
-			},
-			expected: false,
-		},
-		{
-			name: "different order but same content",
-			existing: []string{
-				"github.com/gin-gonic/gin@v1.9.1",
-				"github.com/stretchr/testify@v1.9.0",
-			},
-			merged: []string{
-				"github.com/stretchr/testify@v1.9.0",
-				"github.com/gin-gonic/gin@v1.9.1",
-			},
-			expected: false,
-		},
-		{
-			name: "added dependency",
-			existing: []string{
-				"github.com/gin-gonic/gin@v1.9.1",
-			},
-			merged: []string{
-				"github.com/gin-gonic/gin@v1.9.1",
-				"github.com/stretchr/testify@v1.9.0",
-			},
-			expected: true,
-		},
-		{
-			name: "removed dependency",
-			existing: []string{
-				"github.com/gin-gonic/gin@v1.9.1",
-				"github.com/stretchr/testify@v1.9.0",
-			},
-			merged: []string{
-				"github.com/gin-gonic/gin@v1.9.1",
-			},
-			expected: true,
-		},
-		{
-			name: "version changed",
-			existing: []string{
-				"github.com/gin-gonic/gin@v1.9.1",
-			},
-			merged: []string{
-				"github.com/gin-gonic/gin@v1.9.2",
-			},
-			expected: true,
-		},
-		{
-			name:     "both empty",
-			existing: []string{},
-			merged:   []string{},
-			expected: false,
-		},
-		{
-			name:     "existing empty, merged has deps",
-			existing: []string{},
-			merged: []string{
-				"github.com/gin-gonic/gin@v1.9.1",
-			},
-			expected: true,
-		},
-		{
-			name: "merged empty, existing has deps",
-			existing: []string{
-				"github.com/gin-gonic/gin@v1.9.1",
-			},
-			merged:   []string{},
-			expected: true,
-		},
-		{
-			name: "whitespace and empty strings ignored",
-			existing: []string{
-				"github.com/gin-gonic/gin@v1.9.1",
-				"  ",
-				"",
-			},
-			merged: []string{
-				"",
-				"github.com/gin-gonic/gin@v1.9.1",
-				"\t",
-			},
-			expected: false,
-		},
-		{
-			name: "whitespace trimmed for comparison",
-			existing: []string{
-				"  github.com/gin-gonic/gin@v1.9.1  ",
-			},
-			merged: []string{
-				"github.com/gin-gonic/gin@v1.9.1",
-			},
-			expected: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			analyzer := NewAnalyzer(http.DefaultClient)
-			result := analyzer.HaveDepsChanged(tt.existing, tt.merged)
-			if result != tt.expected {
-				t.Errorf("HaveDepsChanged() = %t, want %t", result, tt.expected)
-			}
-		})
-	}
-}
-
-func TestAnalyzer_GetVulnerabilityScanner(t *testing.T) {
-	analyzer := NewAnalyzer(http.DefaultClient)
-	scanner := analyzer.GetVulnerabilityScanner()
-	if scanner == nil {
-		t.Error("GetVulnerabilityScanner() returned nil")
-	}
-}
-
-func TestAnalyzer_GetFetcher(t *testing.T) {
-	analyzer := NewAnalyzer(http.DefaultClient)
-	fetcher := analyzer.GetFetcher()
-	if fetcher == nil {
-		t.Error("GetFetcher() returned nil")
-	}
-}
-
-func TestAnalyzer_GetParser(t *testing.T) {
-	analyzer := NewAnalyzer(http.DefaultClient)
-	parser := analyzer.GetParser()
-	if parser == nil {
-		t.Error("GetParser() returned nil")
-	}
-}
-
-func TestNewAnalyzer(t *testing.T) {
-	t.Run("with http client", func(t *testing.T) {
-		client := &http.Client{}
-		analyzer := NewAnalyzer(client)
-		if analyzer == nil {
-			t.Fatal("NewAnalyzer() returned nil")
-		}
-		if analyzer.fetcher == nil {
-			t.Error("analyzer.fetcher is nil")
-		}
-		if analyzer.parser == nil {
-			t.Error("analyzer.parser is nil")
-		}
-		if analyzer.vulnerabilityScanner == nil {
-			t.Error("analyzer.vulnerabilityScanner is nil")
-		}
-	})
-
-	t.Run("with nil http client", func(t *testing.T) {
-		analyzer := NewAnalyzer(nil)
-		if analyzer == nil {
-			t.Fatal("NewAnalyzer() returned nil")
-		}
-		// Should still create components with default client
-		if analyzer.fetcher == nil {
-			t.Error("analyzer.fetcher is nil")
-		}
-		if analyzer.parser == nil {
-			t.Error("analyzer.parser is nil")
-		}
-		if analyzer.vulnerabilityScanner == nil {
-			t.Error("analyzer.vulnerabilityScanner is nil")
-		}
-	})
-}
-
 func TestAnalyzer_AnalyzeBumps_SortingStability(t *testing.T) {
-	// Test that filtered deps are sorted alphabetically within each group (indirect/direct/new)
 	deps := []string{
 		"github.com/z-package/zoo@v1.0.0",      // indirect
 		"github.com/a-package/alpha@v1.0.0",    // direct
@@ -639,11 +434,9 @@ func TestAnalyzer_AnalyzeBumps_SortingStability(t *testing.T) {
 	}
 	goModInfo := &GoModInfo{
 		Requirements: map[string]string{
-			// Only alpha is direct
 			"github.com/a-package/alpha": "v0.9.0",
 		},
 		AllRequirements: map[string]string{
-			// Alpha is direct, others are indirect
 			"github.com/a-package/alpha":    "v0.9.0",
 			"github.com/z-package/zoo":      "v0.9.0",
 			"github.com/m-package/middle":   "v0.9.0",
@@ -652,16 +445,13 @@ func TestAnalyzer_AnalyzeBumps_SortingStability(t *testing.T) {
 		Replacements: map[string]*modfile.Replace{},
 	}
 
-	analyzer := NewAnalyzer(http.DefaultClient)
-	_, filteredDeps := analyzer.AnalyzeBumps(deps, goModInfo)
+	a := newAnalyzer()
+	_, filteredDeps := a.analyzeBumps(deps, goModInfo)
 
-	// Expected order: indirect (alphabetical) → direct (alphabetical)
 	expected := []string{
-		// Indirect first (alphabetically sorted)
 		"github.com/m-package/middle@v1.0.0",
 		"github.com/new-package/newpkg@v1.0.0",
 		"github.com/z-package/zoo@v1.0.0",
-		// Direct second
 		"github.com/a-package/alpha@v1.0.0",
 	}
 
@@ -681,7 +471,7 @@ func TestAnalyzer_AnalyzeBumps_DependencyOrdering(t *testing.T) {
 		name        string
 		deps        []string
 		goModInfo   *GoModInfo
-		wantOrdered []string // Expected order after smart sorting
+		wantOrdered []string
 	}{
 		{
 			name: "indirect before direct",
@@ -700,8 +490,8 @@ func TestAnalyzer_AnalyzeBumps_DependencyOrdering(t *testing.T) {
 				Replacements: map[string]*modfile.Replace{},
 			},
 			wantOrdered: []string{
-				"github.com/indirect/package@v1.2.0", // indirect first
-				"github.com/direct/package@v1.5.0",   // direct second
+				"github.com/indirect/package@v1.2.0",
+				"github.com/direct/package@v1.5.0",
 			},
 		},
 		{
@@ -727,39 +517,13 @@ func TestAnalyzer_AnalyzeBumps_DependencyOrdering(t *testing.T) {
 			},
 		},
 		{
-			name: "all direct - alphabetical",
-			deps: []string{
-				"github.com/z/pkg@v1.0.0",
-				"github.com/a/pkg@v1.0.0",
-				"github.com/m/pkg@v1.0.0",
-			},
-			goModInfo: &GoModInfo{
-				Requirements: map[string]string{
-					"github.com/z/pkg": "v0.9.0",
-					"github.com/a/pkg": "v0.9.0",
-					"github.com/m/pkg": "v0.9.0",
-				},
-				AllRequirements: map[string]string{
-					"github.com/z/pkg": "v0.9.0",
-					"github.com/a/pkg": "v0.9.0",
-					"github.com/m/pkg": "v0.9.0",
-				},
-				Replacements: map[string]*modfile.Replace{},
-			},
-			wantOrdered: []string{
-				"github.com/a/pkg@v1.0.0",
-				"github.com/m/pkg@v1.0.0",
-				"github.com/z/pkg@v1.0.0",
-			},
-		},
-		{
 			name: "mixed types - correct grouping",
 			deps: []string{
-				"github.com/new/pkg@v1.0.0",        // indirect
-				"github.com/direct-z/pkg@v1.0.0",   // direct
-				"github.com/indirect-a/pkg@v1.0.0", // indirect
-				"github.com/direct-a/pkg@v1.0.0",   // direct
-				"github.com/indirect-z/pkg@v1.0.0", // indirect
+				"github.com/new/pkg@v1.0.0",
+				"github.com/direct-z/pkg@v1.0.0",
+				"github.com/indirect-a/pkg@v1.0.0",
+				"github.com/direct-a/pkg@v1.0.0",
+				"github.com/indirect-z/pkg@v1.0.0",
 			},
 			goModInfo: &GoModInfo{
 				Requirements: map[string]string{
@@ -776,11 +540,9 @@ func TestAnalyzer_AnalyzeBumps_DependencyOrdering(t *testing.T) {
 				Replacements: map[string]*modfile.Replace{},
 			},
 			wantOrdered: []string{
-				// Indirect first (alphabetical)
 				"github.com/indirect-a/pkg@v1.0.0",
 				"github.com/indirect-z/pkg@v1.0.0",
 				"github.com/new/pkg@v1.0.0",
-				// Direct second (alphabetical)
 				"github.com/direct-a/pkg@v1.0.0",
 				"github.com/direct-z/pkg@v1.0.0",
 			},
@@ -789,8 +551,8 @@ func TestAnalyzer_AnalyzeBumps_DependencyOrdering(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			analyzer := NewAnalyzer(http.DefaultClient)
-			_, filteredDeps := analyzer.AnalyzeBumps(tt.deps, tt.goModInfo)
+			a := newAnalyzer()
+			_, filteredDeps := a.analyzeBumps(tt.deps, tt.goModInfo)
 
 			if len(filteredDeps) != len(tt.wantOrdered) {
 				t.Fatalf("got %d deps, want %d\nGot: %v\nWant: %v", len(filteredDeps), len(tt.wantOrdered), filteredDeps, tt.wantOrdered)
@@ -823,7 +585,7 @@ func TestAnalyzer_AnalyzeBumps_PreReleaseVersions(t *testing.T) {
 				},
 				Replacements: map[string]*modfile.Replace{},
 			},
-			wantKeep: []string{}, // Filtered because v1→v2 is major version upgrade
+			wantKeep: []string{},
 		},
 		{
 			name: "stable version newer than pre-release - same major version",
@@ -855,8 +617,8 @@ func TestAnalyzer_AnalyzeBumps_PreReleaseVersions(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			analyzer := NewAnalyzer(http.DefaultClient)
-			_, filteredDeps := analyzer.AnalyzeBumps(tt.deps, tt.goModInfo)
+			a := newAnalyzer()
+			_, filteredDeps := a.analyzeBumps(tt.deps, tt.goModInfo)
 
 			if len(filteredDeps) != len(tt.wantKeep) {
 				t.Fatalf("got %d deps, want %d", len(filteredDeps), len(tt.wantKeep))
@@ -988,8 +750,8 @@ func TestAnalyzer_NormalizeModulePath(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			analyzer := NewAnalyzer(http.DefaultClient)
-			gotNormalized, gotFound := analyzer.normalizeModulePath(tt.module, tt.version, tt.goModInfo)
+			a := newAnalyzer()
+			gotNormalized, gotFound := a.normalizeModulePath(tt.module, tt.version, tt.goModInfo)
 
 			if gotNormalized != tt.wantNormalized {
 				t.Errorf("normalizeModulePath() normalized = %q, want %q", gotNormalized, tt.wantNormalized)

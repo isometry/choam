@@ -3,6 +3,8 @@ package git
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"sort"
@@ -389,6 +391,63 @@ func (c *Client) CloneRepository(ctx context.Context, repoURL string) (*git.Repo
 	}
 
 	return repo, nil
+}
+
+// CloneAtTag clones the repository at the given tag into destDir. It first
+// attempts a shallow single-branch clone (cheap); some servers reject shallow
+// tag fetches, in which case it falls back to a full clone of the tag ref.
+func (c *Client) CloneAtTag(ctx context.Context, repoURL, tag, destDir string) error {
+	opts := &git.CloneOptions{
+		URL:           repoURL,
+		ReferenceName: plumbing.NewTagReferenceName(tag),
+		SingleBranch:  true,
+		Depth:         1,
+		Tags:          git.NoTags,
+	}
+
+	if _, err := git.PlainCloneContext(ctx, destDir, false, opts); err != nil {
+		// Retry without shallow depth: leave destDir clean for the retry.
+		if cleanErr := removeDirContents(destDir); cleanErr != nil {
+			return fmt.Errorf("cloning %s at tag %s: %w (cleanup failed: %v)", repoURL, tag, err, cleanErr)
+		}
+		opts.Depth = 0
+		if _, retryErr := git.PlainCloneContext(ctx, destDir, false, opts); retryErr != nil {
+			return fmt.Errorf("cloning %s at tag %s: %w", repoURL, tag, retryErr)
+		}
+	}
+
+	return nil
+}
+
+// HeadCommit returns the commit SHA the checkout at dir points to.
+func (c *Client) HeadCommit(dir string) (string, error) {
+	repo, err := git.PlainOpen(dir)
+	if err != nil {
+		return "", fmt.Errorf("opening repository at %s: %w", dir, err)
+	}
+	head, err := repo.Head()
+	if err != nil {
+		return "", fmt.Errorf("resolving HEAD at %s: %w", dir, err)
+	}
+	return head.Hash().String(), nil
+}
+
+// removeDirContents empties dir without removing dir itself, so a caller
+// holding a temp dir can reuse it.
+func removeDirContents(dir string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	for _, entry := range entries {
+		if err := os.RemoveAll(filepath.Join(dir, entry.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // GetCommitFromClone gets detailed commit information by cloning the repository

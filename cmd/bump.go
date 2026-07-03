@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/aquasecurity/table"
 	"github.com/isometry/choam/internal/gobump"
@@ -12,29 +13,31 @@ import (
 	"github.com/spf13/cobra"
 )
 
-func NewGoBumpCmd() *cobra.Command {
+func NewBumpCmd() *cobra.Command {
 	cmd := &cobra.Command{
-		Hidden: true, // until stable
-		Use:    "gobump [path...]",
-		Short:  "Fix Go module vulnerabilities using go/bump pipelines",
-		Long: `Fix Go module vulnerabilities by adding or updating go/bump pipeline steps.
-This command checks for vulnerabilities in the current version of Go modules
-and applies security fixes by updating go/bump pipelines. The package epoch
-will be incremented when vulnerabilities are fixed.
+		Use:     "bump [path...]",
+		Aliases: []string{"gobump"},
+		Short:   "Fix module vulnerabilities using bump pipelines",
+		Long: `Fix module vulnerabilities by adding or updating bump pipeline steps.
+This command checks for vulnerabilities in the current version of a package's
+dependencies and applies security fixes by updating bump pipelines. The
+package epoch will be incremented when vulnerabilities are fixed.
 
 Path can be a single file or a directory containing .yaml files.`,
 		Args: cobra.MinimumNArgs(1),
-		RunE: runGoBump,
+		RunE: runBump,
 	}
 
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be changed without making changes")
 	cmd.Flags().StringVarP(&outputFormat, "format", "f", "table", "Output format: table, json, yaml")
 	cmd.Flags().StringVar(&backupSuffix, "backup-suffix", "", "Suffix for backup files (empty = no backup)")
+	cmd.Flags().BoolVar(&noValidate, "no-validate", false, "Skip bump simulation (writes deps lists without proving they resolve or cover all advisories, and skips artifact-reachability filtering; go.sum narrowing still applies); requires a go toolchain otherwise")
+	cmd.Flags().DurationVar(&simulationTimeout, "simulation-timeout", 10*time.Minute, "Per-package budget for bump simulation")
 
 	return cmd
 }
 
-func runGoBump(cmd *cobra.Command, args []string) error {
+func runBump(cmd *cobra.Command, args []string) error {
 	// Use the command context which supports cancellation (Ctrl+C)
 	ctx := cmd.Context()
 
@@ -53,14 +56,16 @@ func runGoBump(cmd *cobra.Command, args []string) error {
 	}
 
 	if verbosity > 0 {
-		fmt.Fprintf(os.Stderr, "Found %d melange files to check for Go vulnerabilities\n", len(files))
+		fmt.Fprintf(os.Stderr, "Found %d melange files to check for vulnerabilities\n", len(files))
 	}
 
 	// Configure processor options
 	opts := gobump.ProcessorOptions{
-		DryRun:       dryRun,
-		BackupSuffix: backupSuffix,
-		TempDir:      os.TempDir(),
+		DryRun:            dryRun,
+		BackupSuffix:      backupSuffix,
+		TempDir:           os.TempDir(),
+		Validate:          !noValidate,
+		SimulationTimeout: simulationTimeout,
 	}
 
 	if dryRun {
@@ -91,23 +96,23 @@ func runGoBump(cmd *cobra.Command, args []string) error {
 	}
 
 	// Output results
-	return outputGoBumpResults(results, outputFormat)
+	return outputBumpResults(results, outputFormat)
 }
 
-func outputGoBumpResults(results []*gobump.GoBumpResult, format string) error {
+func outputBumpResults(results []*gobump.GoBumpResult, format string) error {
 	switch format {
 	case "json":
-		return outputGoBumpStructured(results, "json")
+		return outputBumpStructured(results, "json")
 	case "yaml":
-		return outputGoBumpStructured(results, "yaml")
+		return outputBumpStructured(results, "yaml")
 	case "table":
-		return outputGoBumpTable(results)
+		return outputBumpTable(results)
 	default:
 		return fmt.Errorf("unsupported output format: %s", format)
 	}
 }
 
-func outputGoBumpStructured(results []*gobump.GoBumpResult, format string) error {
+func outputBumpStructured(results []*gobump.GoBumpResult, format string) error {
 	// Build map keyed by filename
 	resultsMap := make(map[string]*gobump.GoBumpResult)
 	for _, result := range results {
@@ -123,11 +128,20 @@ func outputGoBumpStructured(results []*gobump.GoBumpResult, format string) error
 		if r.VulnerabilitiesFound > 0 {
 			summary.PackagesWithVulns++
 			summary.TotalVulnsFound += r.VulnerabilitiesFound
+			if !r.Validated {
+				summary.PackagesUnvalidated++
+			}
 		}
 		if r.VulnerabilitiesFixed > 0 {
 			summary.PackagesFixed++
 			summary.TotalVulnsFixed += r.VulnerabilitiesFixed
 		}
+		if r.VulnerabilitiesResidual > 0 {
+			summary.PackagesPartial++
+			summary.TotalVulnsResidual += r.VulnerabilitiesResidual
+		}
+		summary.TotalVulnsUnreachable += r.VulnerabilitiesUnreachable
+		summary.TotalModulesBumped += r.ModulesBumped
 		if r.Error != "" {
 			summary.Errors++
 		}
@@ -146,7 +160,7 @@ func outputGoBumpStructured(results []*gobump.GoBumpResult, format string) error
 	return output.OutputYAML(os.Stdout, response)
 }
 
-func outputGoBumpTable(results []*gobump.GoBumpResult) error {
+func outputBumpTable(results []*gobump.GoBumpResult) error {
 	// Calculate max package name length
 	maxPkgLen := len("PACKAGE")
 	for _, result := range results {
@@ -162,7 +176,7 @@ func outputGoBumpTable(results []*gobump.GoBumpResult) error {
 	t := table.New(os.Stdout)
 	t.SetRowLines(false)
 	t.SetBorders(false)
-	t.SetHeaders("PACKAGE", "VULNS FOUND", "VULNS FIXED", "OLD EPOCH", "NEW EPOCH", "STATUS")
+	t.SetHeaders("PACKAGE", "FOUND", "FIXED", "RESIDUAL", "UNLINKED", "BUMPED", "OLD EPOCH", "NEW EPOCH", "STATUS")
 
 	// Track statistics
 	totalFiles := len(results)
@@ -170,6 +184,9 @@ func outputGoBumpTable(results []*gobump.GoBumpResult) error {
 	filesFixed := 0
 	totalVulnsFound := 0
 	totalVulnsFixed := 0
+	totalVulnsResidual := 0
+	totalVulnsUnreachable := 0
+	totalModulesBumped := 0
 	errors := 0
 
 	// Add rows
@@ -181,49 +198,74 @@ func outputGoBumpTable(results []*gobump.GoBumpResult) error {
 		} else if result.VulnerabilitiesFound > 0 {
 			filesWithVulns++
 			totalVulnsFound += result.VulnerabilitiesFound
-			if result.VulnerabilitiesFixed > 0 {
-				// Actual changes were made and applied
-				status = "FIXED"
+			totalVulnsFixed += result.VulnerabilitiesFixed
+			totalVulnsResidual += result.VulnerabilitiesResidual
+			totalVulnsUnreachable += result.VulnerabilitiesUnreachable
+
+			switch {
+			case result.VulnerabilitiesFixed > 0 || result.EpochChanged:
 				filesFixed++
-				totalVulnsFixed += result.VulnerabilitiesFixed
-			} else if result.EpochChanged {
-				// Epoch changed but no security fixes counted (shouldn't happen but handle it)
-				status = "FIXED"
-				filesFixed++
-			} else if result.FileWasWritten {
-				// File was written but no fixes counted (rare edge case)
+				switch {
+				case !result.Validated:
+					status = "UNVALIDATED"
+				case result.VulnerabilitiesResidual > 0:
+					status = "PARTIAL"
+				default:
+					status = "FIXED"
+				}
+			case result.FileWasWritten:
 				status = "UPDATED"
-			} else {
+			default:
 				// Vulnerabilities found but no changes needed (pipeline already correct)
 				status = "UP-TO-DATE"
+				if result.Validated && result.VulnerabilitiesResidual > 0 {
+					status = "PARTIAL"
+				}
 			}
 		}
-
-		vulnsFoundStr := "0"
-		if result.VulnerabilitiesFound > 0 {
-			vulnsFoundStr = fmt.Sprintf("%d", result.VulnerabilitiesFound)
-		}
-
-		vulnsFixedStr := "0"
-		if result.VulnerabilitiesFixed > 0 {
-			vulnsFixedStr = fmt.Sprintf("%d", result.VulnerabilitiesFixed)
-		}
-
-		oldEpochStr := fmt.Sprintf("%d", result.OldEpoch)
-		newEpochStr := fmt.Sprintf("%d", result.NewEpoch)
+		totalModulesBumped += result.ModulesBumped
 
 		t.AddRow(
 			truncate(result.PackageName, maxPkgLen),
-			vulnsFoundStr,
-			vulnsFixedStr,
-			oldEpochStr,
-			newEpochStr,
+			fmt.Sprintf("%d", result.VulnerabilitiesFound),
+			fmt.Sprintf("%d", result.VulnerabilitiesFixed),
+			fmt.Sprintf("%d", result.VulnerabilitiesResidual),
+			fmt.Sprintf("%d", result.VulnerabilitiesUnreachable),
+			fmt.Sprintf("%d", result.ModulesBumped),
+			fmt.Sprintf("%d", result.OldEpoch),
+			fmt.Sprintf("%d", result.NewEpoch),
 			status,
 		)
 	}
 
 	// Render the table
 	t.Render()
+
+	// Residuals and validation warnings are always shown - a package with
+	// residual advisories must never silently read as clean.
+	for _, result := range results {
+		if len(result.Residuals) > 0 {
+			fmt.Printf("\nResidual vulnerabilities for %s (no reachable zero-vulnerability state):\n", result.PackageName)
+			for _, residual := range result.Residuals {
+				location := residual.Module
+				if residual.ResolvedVersion != "" {
+					location += "@" + residual.ResolvedVersion
+				}
+				detail := residual.Reason
+				if residual.FixedVersion != "" {
+					detail = fmt.Sprintf("needs %s: %s", residual.FixedVersion, residual.Reason)
+				}
+				vulns := strings.Join(residual.VulnIDs, ", ")
+				if vulns == "" {
+					vulns = "-"
+				}
+				fmt.Printf("  - %s [%s] %s\n", location, vulns, detail)
+			}
+		}
+		if result.Error == "" && result.VulnerabilitiesFound > 0 && !result.Validated {
+			fmt.Printf("\nWARNING: %s deps list NOT validated - resolvability and completeness unproven\n", result.PackageName)
+		}
+	}
 
 	// Show verbose details after the table
 	if verbosity > 0 {
@@ -246,7 +288,8 @@ func outputGoBumpTable(results []*gobump.GoBumpResult) error {
 		totalFiles, filesWithVulns, filesFixed, errors)
 
 	if totalVulnsFound > 0 {
-		summary += fmt.Sprintf(" (%d vulnerabilities found, %d fixed)", totalVulnsFound, totalVulnsFixed)
+		summary += fmt.Sprintf(" (%d advisories found, %d fixed, %d residual, %d in unlinked modules; %d modules bumped)",
+			totalVulnsFound, totalVulnsFixed, totalVulnsResidual, totalVulnsUnreachable, totalModulesBumped)
 	}
 
 	fmt.Printf("\n%s\n", summary)

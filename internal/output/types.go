@@ -39,12 +39,20 @@ type GoBumpResponse struct {
 	Summary GoBumpSummary                   `json:"summary" yaml:"summary"`
 }
 
-// GoBumpSummary provides aggregate statistics for gobump command
+// GoBumpSummary provides aggregate statistics for gobump command. Vuln
+// counts are advisories; TotalModulesBumped counts changed dependency entries.
 type GoBumpSummary struct {
-	TotalPackages     int `json:"total_packages" yaml:"total_packages"`
-	PackagesWithVulns int `json:"packages_with_vulns" yaml:"packages_with_vulns"`
-	PackagesFixed     int `json:"packages_fixed" yaml:"packages_fixed"`
-	TotalVulnsFound   int `json:"total_vulns_found" yaml:"total_vulns_found"`
-	TotalVulnsFixed   int `json:"total_vulns_fixed" yaml:"total_vulns_fixed"`
-	Errors            int `json:"errors" yaml:"errors"`
+	TotalPackages       int `json:"total_packages" yaml:"total_packages"`
+	PackagesWithVulns   int `json:"packages_with_vulns" yaml:"packages_with_vulns"`
+	PackagesFixed       int `json:"packages_fixed" yaml:"packages_fixed"`
+	PackagesPartial     int `json:"packages_partial" yaml:"packages_partial"`
+	PackagesUnvalidated int `json:"packages_unvalidated" yaml:"packages_unvalidated"`
+	TotalVulnsFound     int `json:"total_vulns_found" yaml:"total_vulns_found"`
+	TotalVulnsFixed     int `json:"total_vulns_fixed" yaml:"total_vulns_fixed"`
+	TotalVulnsResidual  int `json:"total_vulns_residual" yaml:"total_vulns_residual"`
+	// TotalVulnsUnreachable counts advisories affecting only modules not
+	// linked into any build artifact (informational; not fixed, not residual).
+	TotalVulnsUnreachable int `json:"total_vulns_unreachable" yaml:"total_vulns_unreachable"`
+	TotalModulesBumped    int `json:"total_modules_bumped" yaml:"total_modules_bumped"`
+	Errors                int `json:"errors" yaml:"errors"`
 }

@@ -1,0 +1,556 @@
+package gobump
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	omnibumpgolang "github.com/chainguard-dev/omnibump/pkg/languages/golang"
+	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
+	"github.com/isometry/choam/internal/processor"
+	"github.com/isometry/choam/internal/simulate"
+	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/semver"
+)
+
+// bumpSimulator is the seam between the pipeline stage and
+// simulate.Simulator, injectable for tests.
+type bumpSimulator interface {
+	Simulate(ctx context.Context, repoURL, tag, expectedCommit string, reqs []simulate.ModrootRequest) (map[string]*simulate.ModrootResult, error)
+}
+
+// SimulationStage validates the Go bump candidate sets computed by the
+// vulnerability check before the applier writes them: it clones the source
+// the build will use, applies the candidates with the real go toolchain, and
+// OSV-rescans the resolved graph to a fixpoint (see internal/simulate). The
+// per-modroot DesiredDeps are replaced with the proven set; anything
+// unreachable is reported as a residual. When simulation cannot run at all
+// (no go binary, clone failure, --no-validate) the pre-simulation candidates
+// pass through unchanged and the result is marked unvalidated.
+type SimulationStage struct {
+	processor.BaseStage
+	Analyzer *Analyzer
+	Options  ProcessorOptions
+
+	// newSimulator constructs the simulator lazily so a missing go toolchain
+	// degrades at Apply time (with a message) instead of failing pipeline
+	// construction; tests override it.
+	newSimulator func(opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error)
+
+	// detectCoUpdates reproduces melange gobump's build-time co-update
+	// advisory (see declareCoUpdates); a func field so tests can inject a
+	// fake without live proxy.golang.org access.
+	detectCoUpdates func(ctx context.Context, packagesToUpdate map[string]string, modFile *modfile.File) map[string]omnibumpgolang.MissingDependency
+}
+
+func NewSimulationStage(analyzer *Analyzer, opts ProcessorOptions) *SimulationStage {
+	return &SimulationStage{
+		BaseStage: processor.BaseStage{
+			StageName:        "bump_simulation",
+			StageDescription: "Validate Go bump candidates against a source checkout",
+		},
+		Analyzer:        analyzer,
+		Options:         opts,
+		newSimulator:    defaultSimulator,
+		detectCoUpdates: defaultDetectCoUpdates,
+	}
+}
+
+// defaultDetectCoUpdates wraps omnibump's DetectCoUpdates - the exact
+// function melange's bump pipeline runs at build time - discarding its
+// API-compat alert map (a heuristic "verify manually" tier, not actionable
+// here).
+func defaultDetectCoUpdates(ctx context.Context, packagesToUpdate map[string]string, modFile *modfile.File) map[string]omnibumpgolang.MissingDependency {
+	missing, _ := omnibumpgolang.DetectCoUpdates(ctx, packagesToUpdate, modFile)
+	return missing
+}
+
+func defaultSimulator(opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error) {
+	simOpts := simulate.Options{Budget: opts.SimulationTimeout}.WithDefaults()
+	toolchain, err := simulate.NewToolchain(simOpts.CommandTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return simulate.NewSimulator(nil, toolchain, analyzer.vulnerabilityScanner, opts.TempDir, simOpts), nil
+}
+
+func (s *SimulationStage) ShouldRun(_ context.Context, p processor.Processor) (bool, error) {
+	gp, ok := p.(*GoBumpProcessor)
+	if !ok {
+		return false, fmt.Errorf("expected GoBumpProcessor, got %T", p)
+	}
+	if !s.Options.Validate {
+		return false, nil
+	}
+	analysis := gp.VulnerabilityAnalysis
+	if analysis == nil || analysis.RepoURL == "" || analysis.Tag == "" {
+		return false, nil
+	}
+	for _, action := range analysis.BumpActions {
+		if action.Language == "go" {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) error {
+	gp, ok := p.(*GoBumpProcessor)
+	if !ok {
+		return fmt.Errorf("expected GoBumpProcessor, got %T", p)
+	}
+	analysis := gp.VulnerabilityAnalysis
+
+	sim, err := s.newSimulator(s.Options, s.Analyzer)
+	if err != nil {
+		s.degrade(gp, err)
+		return nil
+	}
+
+	for i := range analysis.ByLanguage {
+		lang := &analysis.ByLanguage[i]
+		if lang.Language != "go" || len(lang.ByModroot) == 0 {
+			continue
+		}
+
+		goEco := ecogolang.New()
+		reqs := make([]simulate.ModrootRequest, 0, len(lang.ByModroot))
+		for _, m := range lang.ByModroot {
+			reqs = append(reqs, simulate.ModrootRequest{
+				Modroot:  m.Modroot,
+				Seeds:    seedCandidates(m),
+				Baseline: goEco.EffectiveVersions(m.Deps),
+				Packages: m.BuildPackages,
+			})
+		}
+
+		results, err := sim.Simulate(ctx, analysis.RepoURL, analysis.Tag, analysis.ExpectedCommit, reqs)
+		if err != nil {
+			s.degrade(gp, err)
+			return nil
+		}
+
+		reach := newReachabilityDiff()
+		for mi := range lang.ByModroot {
+			m := &lang.ByModroot[mi]
+			result := results[m.Modroot]
+			if result == nil {
+				// Skipped/unsimulated modroot: everything it found counts as
+				// reachable (fail open).
+				reach.observe(*m, nil, false)
+				continue
+			}
+			m.DesiredDeps = result.FinalDeps
+			m.DesiredReplaces = result.FinalReplaces
+			m.SecurityBumpModules = result.CVEBackedModules
+			m.Simulated = true
+			m.SimulationConverged = result.Converged
+			m.Residuals = result.Residuals
+			m.Dropped = result.Dropped
+			gp.AddResiduals(result.Residuals)
+			unlinkedHere := reach.observe(*m, result.Linked, true)
+
+			s.declareCoUpdates(ctx, gp, m, result)
+
+			gp.AddMessage(fmt.Sprintf(
+				"simulation: modroot %s %s in %d iteration(s): %d validated dep(s), %d replace(s), %d dropped, %d residual advisory(ies), %d advisory(ies) in unlinked modules",
+				m.Modroot, convergedWord(result.Converged), result.Iterations,
+				len(result.FinalDeps), len(result.FinalReplaces), len(result.Dropped), len(result.RemainingVulnIDs), unlinkedHere))
+			for _, dropped := range result.Dropped {
+				slog.Info("bump candidate dropped by simulation",
+					"modroot", m.Modroot, "module", dropped.Module, "version", dropped.Version, "reason", dropped.Reason)
+			}
+			for _, residual := range result.Residuals {
+				slog.Warn("residual vulnerability after simulation",
+					"modroot", m.Modroot, "module", residual.Module,
+					"resolved", residual.ResolvedVersion, "fix", residual.FixedVersion,
+					"vulns", strings.Join(residual.VulnIDs, ","), "reason", residual.Reason)
+			}
+		}
+
+		// Advisories whose modules were unlinked in EVERY modroot that saw
+		// them: informational only - no bump proposed, neither fixed nor
+		// residual (an ID linked - and therefore fixed or residual - in any
+		// other modroot counts as reachable).
+		unreachableIDs, unreachableModules := reach.finalize()
+		gp.AddUnreachableVulnIDs(unreachableIDs)
+		for _, module := range unreachableModules {
+			gp.AddMessage(fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts - no bump proposed",
+				module.name, strings.Join(module.vulnIDs, ", ")))
+			slog.Info("advisory in unlinked module - no bump proposed",
+				"module", module.name, "vulns", strings.Join(module.vulnIDs, ","))
+		}
+
+		rebuildLanguageActions(analysis, lang)
+	}
+
+	gp.Validated = true
+	return nil
+}
+
+// coUpdateBudget bounds each declareCoUpdates round - DetectCoUpdates
+// prefetches dependency go.mod files from proxy.golang.org and can be slow
+// on huge module graphs; failing open just means the build-time advisory
+// reappears.
+const coUpdateBudget = 2 * time.Minute
+
+// declareCoUpdates makes the written deps list satisfy melange gobump's
+// build-time co-update advisory. It runs omnibump's own DetectCoUpdates -
+// the exact check the build will run - with the PROVEN final deps against
+// the pristine go.mod, and appends the recommendations that are already
+// true in the validated graph as explicit, coherence-only deps entries.
+// Gates keep this a pure declaration step with zero resolution impact:
+//   - sustained: the final tidied go.mod must require the module at >= the
+//     recommended version (a pin above that is unproven and would fail
+//     gobump's post-tidy verification);
+//   - linked: an unlinked pin would be re-dropped by the NEXT run's
+//     reachability pruning, churning the YAML forever - skip those (the
+//     build-time advisory persists for them, rarely);
+//   - absent: never duplicate a coordinate already in the list.
+//
+// Appending can itself trigger new group recommendations at build time
+// (e.g. otel -> otel/trace -> otel/metric), so the check iterates to a
+// small fixpoint. Recommendations the proven graph did NOT satisfy (a
+// lagging family member MVS didn't raise, cross-major suggestions) are
+// skipped by the sustained gate - bumping those for real would need
+// another simulation round. Best-effort throughout: any failure leaves the
+// deps list unchanged. Appended entries are absent from
+// SecurityBumpModules, so accounting never credits them as security fixes.
+// The build image may run a different omnibump version than CHOAM links,
+// so silence is parity-by-same-function, not a guarantee.
+func (s *SimulationStage) declareCoUpdates(ctx context.Context, gp *GoBumpProcessor, m *ModrootAnalysis, result *simulate.ModrootResult) {
+	if len(result.FinalDeps) == 0 || len(result.Requires) == 0 {
+		return
+	}
+	modFile := ecogolang.ModFileOf(m.Deps)
+	if modFile == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, coUpdateBudget)
+	defer cancel()
+
+	const maxRounds = 3
+	for round := 0; round < maxRounds; round++ {
+		// Build-time omnibump's update list spans deps AND replaces, so the
+		// parity check must too ("old=new@version" contributes new@version).
+		packagesToUpdate := make(map[string]string, len(m.DesiredDeps)+len(m.DesiredReplaces))
+		for _, dep := range m.DesiredDeps {
+			if module, version, ok := splitCoordVersion(dep); ok {
+				packagesToUpdate[module] = version
+			}
+		}
+		for _, replace := range m.DesiredReplaces {
+			coord, version, ok := splitCoordVersion(replace)
+			if !ok {
+				continue
+			}
+			if _, newPath, found := strings.Cut(coord, "="); found {
+				packagesToUpdate[newPath] = version
+			}
+		}
+		if len(packagesToUpdate) == 0 {
+			return
+		}
+
+		missing := s.safeDetectCoUpdates(ctx, packagesToUpdate, modFile)
+
+		appended := false
+		for module, rec := range missing {
+			if _, present := packagesToUpdate[module]; present {
+				continue
+			}
+			sustainedVersion, required := result.Requires[module]
+			if !required || semver.Compare(sustainedVersion, rec.RequiredVersion) < 0 {
+				slog.Debug("co-update recommendation not satisfied by the validated graph - skipping",
+					"modroot", m.Modroot, "module", module, "recommended", rec.RequiredVersion, "reason", rec.Reason)
+				continue
+			}
+			if result.Linked != nil {
+				if _, linked := result.Linked[module]; !linked {
+					slog.Debug("co-update recommendation for unlinked module - skipping",
+						"modroot", m.Modroot, "module", module, "recommended", rec.RequiredVersion)
+					continue
+				}
+			}
+
+			entry := module + "@" + sustainedVersion
+			m.DesiredDeps = append(m.DesiredDeps, entry)
+			appended = true
+			gp.AddMessage(fmt.Sprintf("declared co-update: %s (required alongside the validated bumps; already satisfied by the proven graph)", entry))
+			slog.Info("declared co-update", "modroot", m.Modroot, "module", module,
+				"version", sustainedVersion, "reason", rec.Reason)
+		}
+
+		if !appended {
+			return
+		}
+	}
+}
+
+// safeDetectCoUpdates guards the injected detector (omnibump internals or a
+// test double) so a panic or late failure never breaks the run - worst case
+// the build-time advisory reappears.
+func (s *SimulationStage) safeDetectCoUpdates(ctx context.Context, packagesToUpdate map[string]string, modFile *modfile.File) (missing map[string]omnibumpgolang.MissingDependency) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Debug("co-update declaration panicked - skipping", "recover", r)
+			missing = nil
+		}
+	}()
+	return s.detectCoUpdates(ctx, packagesToUpdate, modFile)
+}
+
+// degrade falls back to the unvalidated pre-simulation candidate set,
+// loudly: the written deps list has not been proven to resolve or to cover
+// every advisory.
+func (s *SimulationStage) degrade(gp *GoBumpProcessor, err error) {
+	gp.Validated = false
+	slog.Warn("bump simulation unavailable - proceeding with UNVALIDATED deps", "error", err)
+	gp.AddMessage(fmt.Sprintf("WARNING: deps list NOT validated - simulation unavailable: %v", err))
+}
+
+// seedCandidates converts a modroot's post-FilterBumps desired deps and its
+// existing replace directives into simulation candidates, marking those
+// backed by an OSV advisory (with their advisory IDs) so the loop knows
+// which entries to defend. Replace seeds come first: the loop routes a deps
+// seed for an already-replace-claimed module into the replace channel.
+func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
+	bumpByModule := make(map[string]*simulateBumpInfo)
+	if m.ScanResult != nil {
+		for _, bump := range m.ScanResult.SecurityBumps {
+			bumpByModule[bump.Name] = &simulateBumpInfo{vulnIDs: bump.VulnIDs}
+		}
+	}
+	infoFor := func(module string) *simulateBumpInfo {
+		if info := bumpByModule[module]; info != nil {
+			return info
+		}
+		// OSV names v2+ modules without the /vN path suffix that
+		// FilterBumps normalizes in.
+		return bumpByModule[trimMajorSuffix(module)]
+	}
+
+	seeds := make([]simulate.Candidate, 0, len(m.DesiredDeps)+len(m.ExistingReplaces))
+
+	for _, replace := range m.ExistingReplaces {
+		coord, version, ok := splitCoordVersion(replace)
+		if !ok {
+			continue
+		}
+		oldPath, newPath, found := strings.Cut(coord, "=")
+		if !found {
+			continue // not gobump grammar; leave to the loop's residual reporting
+		}
+		candidate := simulate.Candidate{
+			Module: newPath, Version: version,
+			Replace: true, ReplaceOld: oldPath,
+		}
+		if info := infoFor(newPath); info != nil {
+			candidate.FromCVE = true
+			candidate.VulnIDs = info.vulnIDs
+		}
+		seeds = append(seeds, candidate)
+	}
+
+	for _, dep := range m.DesiredDeps {
+		module, version, ok := splitCoordVersion(dep)
+		if !ok {
+			continue
+		}
+		candidate := simulate.Candidate{Module: module, Version: version}
+		if info := infoFor(module); info != nil {
+			candidate.FromCVE = true
+			candidate.VulnIDs = info.vulnIDs
+		}
+		seeds = append(seeds, candidate)
+	}
+	return seeds
+}
+
+type simulateBumpInfo struct {
+	vulnIDs []string
+}
+
+// rebuildLanguageActions recomputes one language's bump actions from its
+// post-simulation desired deps, leaving other languages' actions untouched.
+func rebuildLanguageActions(analysis *VulnerabilityAnalysis, lang *LanguageAnalysis) {
+	kept := make([]BumpAction, 0, len(analysis.BumpActions))
+	for _, action := range analysis.BumpActions {
+		if action.Language != lang.Language {
+			kept = append(kept, action)
+		}
+	}
+	for _, m := range lang.ByModroot {
+		// Replaces-only changes (a promotion with unchanged deps) must also
+		// produce an action, or the applier never writes them.
+		if haveDepsChanged(m.ExistingDeps, m.DesiredDeps) || haveDepsChanged(m.ExistingReplaces, m.DesiredReplaces) {
+			kept = append(kept, BumpAction{
+				Action:       "needs_bump",
+				Language:     lang.Language,
+				Modroots:     []string{m.Modroot},
+				Dependencies: newlyAddedDeps(m.ExistingDeps, m.DesiredDeps),
+				Replaces:     newlyAddedDeps(m.ExistingReplaces, m.DesiredReplaces),
+				Reason:       fmt.Sprintf("validated dependency changes for modroot %s", m.Modroot),
+			})
+		}
+	}
+	analysis.BumpActions = kept
+}
+
+// reachabilityDiff accumulates, across a language's modroots, which
+// analysis-scan advisories affect only unlinked modules. The analysis scan
+// already paid for the full-graph findings (ModrootAnalysis.ScanResult);
+// diffing them once per modroot against the simulation's final linked set is
+// what lets the loop itself scan linked-only without losing the
+// "vulnerable but not linked" information.
+type reachabilityDiff struct {
+	reachableIDs   map[string]struct{}
+	unreachableIDs map[string]struct{}
+	moduleIDs      map[string]map[string]struct{} // unlinked module -> its advisory IDs
+}
+
+func newReachabilityDiff() *reachabilityDiff {
+	return &reachabilityDiff{
+		reachableIDs:   make(map[string]struct{}),
+		unreachableIDs: make(map[string]struct{}),
+		moduleIDs:      make(map[string]map[string]struct{}),
+	}
+}
+
+// observe records one modroot's analysis findings against its linked set.
+// simulated=false or a nil linked set means reachability is unknown for this
+// modroot (skipped, or the loop failed open) - every finding then counts as
+// reachable. Returns how many advisory IDs were unlinked in THIS modroot.
+func (r *reachabilityDiff) observe(m ModrootAnalysis, linked map[string]struct{}, simulated bool) int {
+	failOpen := !simulated || linked == nil
+
+	isLinked := func(module string) bool {
+		if failOpen {
+			return true
+		}
+		if _, ok := linked[module]; ok {
+			return true
+		}
+		// The analysis map's coordinates are go.mod-normalized, but no-fix
+		// vulnerability records carry OSV's own naming, which drops v2+
+		// path suffixes - tolerate the mismatch in the linked direction.
+		for candidate := range linked {
+			if trimMajorSuffix(candidate) == module {
+				return true
+			}
+		}
+		return false
+	}
+
+	record := func(module string, vulnIDs []string) {
+		if len(vulnIDs) == 0 {
+			return
+		}
+		if isLinked(module) {
+			for _, id := range vulnIDs {
+				r.reachableIDs[id] = struct{}{}
+			}
+			return
+		}
+		ids, ok := r.moduleIDs[module]
+		if !ok {
+			ids = make(map[string]struct{})
+			r.moduleIDs[module] = ids
+		}
+		for _, id := range vulnIDs {
+			r.unreachableIDs[id] = struct{}{}
+			ids[id] = struct{}{}
+		}
+	}
+
+	unlinkedBefore := len(r.unreachableIDs)
+
+	// Fixable advisories, in rendered-coordinate space (go.mod-normalized);
+	// fall back to OSV naming when the coordinate map is absent (the linked
+	// check tolerates the missing /vN suffix either way).
+	if len(m.SecurityBumpsByCoord) > 0 {
+		for coord, bump := range m.SecurityBumpsByCoord {
+			record(coord, bump.VulnIDs)
+		}
+	} else if m.ScanResult != nil {
+		for _, bump := range m.ScanResult.SecurityBumps {
+			record(bump.Name, bump.VulnIDs)
+		}
+	}
+	// No-fix advisories only exist in the raw vulnerability list.
+	if m.ScanResult != nil {
+		for _, vuln := range m.ScanResult.Vulnerabilities {
+			if vuln.FixedVersion == "" {
+				record(vuln.Module, []string{vuln.ID})
+			}
+		}
+	}
+
+	return len(r.unreachableIDs) - unlinkedBefore
+}
+
+// unreachableModule is one unlinked module and its advisory IDs, for reporting.
+type unreachableModule struct {
+	name    string
+	vulnIDs []string
+}
+
+// finalize returns the advisory IDs unlinked in every modroot that saw them,
+// plus the per-module breakdown (IDs that proved reachable anywhere are
+// subtracted from both).
+func (r *reachabilityDiff) finalize() ([]string, []unreachableModule) {
+	var ids []string
+	for id := range r.unreachableIDs {
+		if _, ok := r.reachableIDs[id]; !ok {
+			ids = append(ids, id)
+		}
+	}
+	sort.Strings(ids)
+
+	var modules []unreachableModule
+	for name, moduleIDs := range r.moduleIDs {
+		module := unreachableModule{name: name}
+		for id := range moduleIDs {
+			if _, ok := r.reachableIDs[id]; !ok {
+				module.vulnIDs = append(module.vulnIDs, id)
+			}
+		}
+		if len(module.vulnIDs) == 0 {
+			continue
+		}
+		sort.Strings(module.vulnIDs)
+		modules = append(modules, module)
+	}
+	sort.Slice(modules, func(i, j int) bool { return modules[i].name < modules[j].name })
+
+	return ids, modules
+}
+
+// trimMajorSuffix strips a trailing /vN major-version path element
+// (e.g. github.com/foo/bar/v2 -> github.com/foo/bar).
+func trimMajorSuffix(module string) string {
+	idx := strings.LastIndex(module, "/")
+	if idx < 0 {
+		return module
+	}
+	last := module[idx+1:]
+	if len(last) < 2 || last[0] != 'v' {
+		return module
+	}
+	if _, err := strconv.Atoi(last[1:]); err != nil {
+		return module
+	}
+	return module[:idx]
+}
+
+func convergedWord(converged bool) string {
+	if converged {
+		return "converged"
+	}
+	return "did NOT converge"
+}
