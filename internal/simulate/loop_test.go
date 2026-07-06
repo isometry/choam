@@ -34,10 +34,12 @@ type fakeToolchain struct {
 
 	// linked models `go list -deps` reachability: nil means "every module
 	// in the current resolved graph is linked" (keeps reachability inert
-	// for tests that don't care); linkedErr makes LinkedModules fail (the
-	// loop must then fail open).
-	linked    []string
-	linkedErr error
+	// for tests that don't care); linkedPkgs models the package-level set
+	// (nil means unknown - package gates fail open); linkedErr makes
+	// Linked fail (the loop must then fail open entirely).
+	linked     []string
+	linkedPkgs []string
+	linkedErr  error
 
 	applied  map[string]string
 	replaced map[string]ReplaceTarget // replace edits of the current apply attempt
@@ -46,11 +48,18 @@ type fakeToolchain struct {
 	editLog  []string
 }
 
-func (f *fakeToolchain) LinkedModules(ctx context.Context, dir string, _ []string) (map[string]struct{}, error) {
+func (f *fakeToolchain) Linked(ctx context.Context, dir string, _ []string) (map[string]struct{}, map[string]struct{}, error) {
 	if f.linkedErr != nil {
-		return nil, f.linkedErr
+		return nil, nil, f.linkedErr
 	}
-	set := make(map[string]struct{})
+	var packages map[string]struct{}
+	if f.linkedPkgs != nil {
+		packages = make(map[string]struct{}, len(f.linkedPkgs))
+		for _, pkg := range f.linkedPkgs {
+			packages[pkg] = struct{}{}
+		}
+	}
+	modules := make(map[string]struct{})
 	if f.linked == nil {
 		// Reachability-inert default: everything currently resolved is
 		// linked. Preserve lastCall - this query must not perturb the
@@ -59,17 +68,17 @@ func (f *fakeToolchain) LinkedModules(ctx context.Context, dir string, _ []strin
 		resolved, err := f.ListModules(ctx, dir)
 		f.lastCall = lastCall
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		for module := range resolved {
-			set[module] = struct{}{}
+			modules[module] = struct{}{}
 		}
-		return set, nil
+		return modules, packages, nil
 	}
 	for _, module := range f.linked {
-		set[module] = struct{}{}
+		modules[module] = struct{}{}
 	}
-	return set, nil
+	return modules, packages, nil
 }
 
 func (f *fakeToolchain) ModTidy(_ context.Context, _ string) error {
@@ -188,9 +197,12 @@ func (f *fakeToolchain) Requirements(_ context.Context, _ string) (map[string]st
 }
 
 // fakeAdvisory affects versions in [introduced, fixed); empty introduced
-// means "always"; empty fixed means "no released fix".
+// means "always"; empty fixed means "no released fix". imports optionally
+// models the advisory's vulnerable-package metadata
+// (scan.Vulnerability.VulnerableImports).
 type fakeAdvisory struct {
 	module, id, introduced, fixed string
+	imports                       []scan.VulnerableImport
 }
 
 type fakeScanner struct {
@@ -216,6 +228,7 @@ func (f *fakeScanner) ScanPackages(_ context.Context, pkgs []scan.Package) (*sca
 			result.Vulnerabilities = append(result.Vulnerabilities, scan.Vulnerability{
 				ID: adv.id, Module: pkg.Name, Ecosystem: "Go",
 				CurrentVersion: pkg.Version, FixedVersion: adv.fixed,
+				VulnerableImports: adv.imports,
 			})
 			if adv.fixed == "" {
 				continue
@@ -618,8 +631,14 @@ func TestRunLoop_DropsTidyPrunedModules(t *testing.T) {
 	// The glog case: nothing imports the module after the other bumps, so
 	// `go mod tidy` prunes it - and melange's gobump errors on a deps entry
 	// absent from the tidied go.mod. The entry must be dropped.
+	// glog is in the pristine graph (so pre-apply reachability keeps it -
+	// the fake treats every resolved module as linked) but go mod tidy
+	// prunes it after the apply; matching Baseline below.
 	tc := &fakeToolchain{
-		base:   map[string]string{"example.com/kept": "v1.0.0"},
+		base: map[string]string{
+			"example.com/kept":       "v1.0.0",
+			"github.com/golang/glog": "v0.0.0-20160126235308-23def4e6c14b",
+		},
 		pruned: map[string]bool{"github.com/golang/glog": true},
 	}
 	sc := &fakeScanner{}
@@ -1065,4 +1084,105 @@ func TestRunLoop_ReachableModuleStillRaised(t *testing.T) {
 	assert.Equal(t, []string{"example.com/mod@v1.3.0"}, result.FinalDeps)
 	assert.Equal(t, []string{"example.com/mod"}, result.CVEBackedModules)
 	assert.Empty(t, result.Dropped)
+}
+
+// TestRunLoop_PackageUnreachableSeedDroppedPreApply: the x/sys/windows
+// shape - the module IS linked (via another package) but the seed advisory's
+// vulnerable packages are not in the artifact's import graph. The seed must
+// be shed BEFORE the first apply (a doomed candidate must never perturb the
+// graph) with the package-level reason and NO residual.
+func TestRunLoop_PackageUnreachableSeedDroppedPreApply(t *testing.T) {
+	tc := &fakeToolchain{
+		base:       map[string]string{"golang.org/x/sys": "v0.39.0"},
+		linked:     []string{"golang.org/x/sys"},
+		linkedPkgs: []string{"golang.org/x/sys/unix"},
+	}
+	sc := &fakeScanner{}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "golang.org/x/sys", Version: "v0.44.0", FromCVE: true, VulnIDs: []string{"GO-2026-5024"}},
+		},
+		Baseline:    map[string]string{"golang.org/x/sys": "v0.39.0"},
+		VulnImports: map[string][]string{"GO-2026-5024": {"golang.org/x/sys/windows"}},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Empty(t, result.FinalDeps)
+	assert.Empty(t, result.Residuals, "a package-unreachable advisory is neither fixed nor residual")
+	assert.Empty(t, tc.getLog, "the doomed seed must never be applied")
+
+	require.Len(t, result.Dropped, 1)
+	assert.Contains(t, result.Dropped[0].Reason, "vulnerable package(s) not linked into build artifacts")
+}
+
+// TestRunLoop_PackageUnreachableRescanFindingNotRaised: a rescan finding
+// whose own OSV metadata places the vulnerable code in an unlinked package
+// must be neither raised nor a residual.
+func TestRunLoop_PackageUnreachableRescanFindingNotRaised(t *testing.T) {
+	tc := &fakeToolchain{
+		base:       map[string]string{"golang.org/x/sys": "v0.39.0"},
+		linked:     []string{"golang.org/x/sys"},
+		linkedPkgs: []string{"golang.org/x/sys/unix"},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "golang.org/x/sys", id: "GO-2026-5024", fixed: "v0.44.0",
+			imports: []scan.VulnerableImport{{Path: "golang.org/x/sys/windows", GOOS: []string{"windows"}}}},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{Modroot: "."}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Equal(t, 1, result.Iterations, "nothing raised - single iteration")
+	assert.Empty(t, result.FinalDeps)
+	assert.Empty(t, result.Residuals)
+	assert.Empty(t, result.Dropped)
+}
+
+// TestRunLoop_PackageReachableFindingStillRaised: regression guard - a
+// finding whose vulnerable package IS linked behaves exactly as before.
+func TestRunLoop_PackageReachableFindingStillRaised(t *testing.T) {
+	tc := &fakeToolchain{
+		base:       map[string]string{"golang.org/x/sys": "v0.39.0"},
+		linked:     []string{"golang.org/x/sys"},
+		linkedPkgs: []string{"golang.org/x/sys/unix"},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "golang.org/x/sys", id: "GO-UNIX-1", fixed: "v0.44.0",
+			imports: []scan.VulnerableImport{{Path: "golang.org/x/sys/unix"}}},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot:  ".",
+		Baseline: map[string]string{"golang.org/x/sys": "v0.39.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Equal(t, []string{"golang.org/x/sys@v0.44.0"}, result.FinalDeps)
+}
+
+// TestRunLoop_PackageGateFailsOpen: without package metadata (no
+// VulnImports, no linkedPkgs) behavior is identical to module-level only.
+func TestRunLoop_PackageGateFailsOpen(t *testing.T) {
+	tc := &fakeToolchain{
+		base:   map[string]string{"golang.org/x/sys": "v0.39.0"},
+		linked: []string{"golang.org/x/sys"},
+		// linkedPkgs nil: package graph unknown - gates must fail open.
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "golang.org/x/sys", id: "GO-2026-5024", fixed: "v0.44.0",
+			imports: []scan.VulnerableImport{{Path: "golang.org/x/sys/windows"}}},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot:  ".",
+		Baseline: map[string]string{"golang.org/x/sys": "v0.39.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"golang.org/x/sys@v0.44.0"}, result.FinalDeps, "unknown package graph must not filter")
 }

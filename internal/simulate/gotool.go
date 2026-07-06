@@ -137,10 +137,13 @@ func (t *GoToolchain) ListModules(ctx context.Context, dir string) (map[string]s
 	return resolved, nil
 }
 
-// LinkedModules returns the module paths providing packages in the
-// transitive non-test import graph of the given build patterns - exactly the
-// modules the linker records in the binary's buildinfo (what APK scanners
-// read). Deliberate choices:
+// Linked returns the modules AND packages in the transitive non-test import
+// graph of the given build patterns - exactly what the linker records in the
+// binary's buildinfo (what APK scanners read), plus the package-level detail
+// needed to check an advisory's vulnerable import paths (a module can be
+// linked via one package while the vulnerable package is not - e.g.
+// x/sys/unix linked, x/sys/windows not). Both sets come from ONE go list
+// walk. Deliberate choices:
 //   - Test-only imports are excluded BY DESIGN (no -test flag): they never
 //     ship in the artifact, which is precisely the narrowing this exists for.
 //   - No -e flag: a package-load error fails the whole call so the caller
@@ -151,25 +154,29 @@ func (t *GoToolchain) ListModules(ctx context.Context, dir string) (map[string]s
 //   - GOOS=linux for build-target parity (melange targets linux; GOOS is the
 //     axis that flips import sets via _linux.go files). GOARCH stays host,
 //     and melange's build tags (netgo, osusergo, user tags) are not
-//     replicated - a module-level over-approximation, acceptable.
-func (t *GoToolchain) LinkedModules(ctx context.Context, dir string, patterns []string) (map[string]struct{}, error) {
+//     replicated - an over-approximation, acceptable.
+func (t *GoToolchain) Linked(ctx context.Context, dir string, patterns []string) (modules, packages map[string]struct{}, err error) {
 	if len(patterns) == 0 {
 		patterns = []string{"./..."}
 	}
-	const tmpl = `{{if and .Module (not .Standard)}}{{if .Module.Replace}}{{.Module.Replace.Path}}{{else}}{{.Module.Path}}{{end}}{{end}}`
+	const tmpl = `{{if and .Module (not .Standard)}}{{.ImportPath}} {{if .Module.Replace}}{{.Module.Replace.Path}}{{else}}{{.Module.Path}}{{end}}{{end}}`
 	args := append([]string{"list", "-deps", "-f", tmpl}, patterns...)
 	output, err := t.runEnv(ctx, dir, []string{"GOOS=linux"}, args...)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	linked := make(map[string]struct{})
+	modules = make(map[string]struct{})
+	packages = make(map[string]struct{})
 	for line := range strings.SplitSeq(string(output), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			linked[line] = struct{}{}
+		pkg, module, found := strings.Cut(strings.TrimSpace(line), " ")
+		if !found {
+			continue
 		}
+		packages[pkg] = struct{}{}
+		modules[module] = struct{}{}
 	}
-	return linked, nil
+	return modules, packages, nil
 }
 
 // Replace applies a replace directive with gobump parity: dropreplace first

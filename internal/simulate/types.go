@@ -36,12 +36,13 @@ type Toolchain interface {
 	// Replaces returns dir's go.mod replace directives keyed by Old.Path; a
 	// local filesystem target is reported with Version == "".
 	Replaces(ctx context.Context, dir string) (map[string]ReplaceTarget, error)
-	// LinkedModules returns the module paths providing packages in the
+	// Linked returns the module paths AND package import paths in the
 	// transitive non-test import graph of the given build patterns (empty
 	// means ./...) - the modules the linker records in the binary's
-	// buildinfo, i.e. what actually ships. Errors make reachability
-	// filtering fail OPEN (treat everything as linked).
-	LinkedModules(ctx context.Context, dir string, patterns []string) (map[string]struct{}, error)
+	// buildinfo, i.e. what actually ships, plus the package-level detail
+	// for checking advisories' vulnerable import paths. Errors make
+	// reachability filtering fail OPEN (treat everything as linked).
+	Linked(ctx context.Context, dir string, patterns []string) (modules, packages map[string]struct{}, err error)
 }
 
 // ReplaceTarget is the right-hand side of a go.mod replace directive.
@@ -125,10 +126,15 @@ type ModrootResult struct {
 	Resolved map[string]string `json:"-" yaml:"-"`
 
 	// Linked is the artifact-linked module set of the final clean state
-	// (see Toolchain.LinkedModules); nil when reachability was unavailable
-	// and the loop failed open (everything treated as linked). Callers use
-	// it to tell which analysis-time findings never affected the artifact.
+	// (see Toolchain.Linked); nil when reachability was unavailable and
+	// the loop failed open (everything treated as linked). Callers use it
+	// to tell which analysis-time findings never affected the artifact.
 	Linked map[string]struct{} `json:"-" yaml:"-"`
+
+	// LinkedPackages is the package-level companion of Linked: the import
+	// paths in the artifact's non-test import graph, for checking an
+	// advisory's vulnerable import paths (nil when unavailable - fail open).
+	LinkedPackages map[string]struct{} `json:"-" yaml:"-"`
 
 	// Requires are the final tidied go.mod require entries (module ->
 	// version) - the sustainability contract melange's gobump verifies
@@ -165,6 +171,12 @@ type ModrootRequest struct {
 	// import graphs define artifact reachability; empty falls back to ./...
 	// (over-approximate, never narrower than the artifact).
 	Packages []string
+	// VulnImports maps each seed advisory ID to the import paths its
+	// vulnerable code lives in (from the analysis scan's OSV metadata; see
+	// scan.Vulnerability.VulnerableImports). Seed candidates whose
+	// advisories all live in unlinked packages are dropped before the
+	// first apply. Absent/empty entries fail open.
+	VulnImports map[string][]string
 }
 
 // Options tunes the simulation.

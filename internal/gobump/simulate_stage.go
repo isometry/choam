@@ -12,6 +12,7 @@ import (
 	omnibumpgolang "github.com/chainguard-dev/omnibump/pkg/languages/golang"
 	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
 	"github.com/isometry/choam/internal/processor"
+	"github.com/isometry/choam/internal/scan"
 	"github.com/isometry/choam/internal/simulate"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
@@ -121,10 +122,11 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 		reqs := make([]simulate.ModrootRequest, 0, len(lang.ByModroot))
 		for _, m := range lang.ByModroot {
 			reqs = append(reqs, simulate.ModrootRequest{
-				Modroot:  m.Modroot,
-				Seeds:    seedCandidates(m),
-				Baseline: goEco.EffectiveVersions(m.Deps),
-				Packages: m.BuildPackages,
+				Modroot:     m.Modroot,
+				Seeds:       seedCandidates(m),
+				Baseline:    goEco.EffectiveVersions(m.Deps),
+				Packages:    m.BuildPackages,
+				VulnImports: vulnImportPaths(m.ScanResult),
 			})
 		}
 
@@ -141,7 +143,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			if result == nil {
 				// Skipped/unsimulated modroot: everything it found counts as
 				// reachable (fail open).
-				reach.observe(*m, nil, false)
+				reach.observe(*m, nil, nil, false)
 				continue
 			}
 			m.DesiredDeps = result.FinalDeps
@@ -152,7 +154,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			m.Residuals = result.Residuals
 			m.Dropped = result.Dropped
 			gp.AddResiduals(result.Residuals)
-			unlinkedHere := reach.observe(*m, result.Linked, true)
+			unlinkedHere := reach.observe(*m, result.Linked, result.LinkedPackages, true)
 
 			s.declareCoUpdates(ctx, gp, m, result)
 
@@ -179,10 +181,14 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 		unreachableIDs, unreachableModules := reach.finalize()
 		gp.AddUnreachableVulnIDs(unreachableIDs)
 		for _, module := range unreachableModules {
-			gp.AddMessage(fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts - no bump proposed",
-				module.name, strings.Join(module.vulnIDs, ", ")))
-			slog.Info("advisory in unlinked module - no bump proposed",
-				"module", module.name, "vulns", strings.Join(module.vulnIDs, ","))
+			detail := ""
+			if module.moduleLinked {
+				detail = " (module is linked; the vulnerable packages are not)"
+			}
+			gp.AddMessage(fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts%s - no bump proposed",
+				module.name, strings.Join(module.vulnIDs, ", "), detail))
+			slog.Info("advisory in unlinked code - no bump proposed",
+				"module", module.name, "module_linked", module.moduleLinked, "vulns", strings.Join(module.vulnIDs, ","))
 		}
 
 		rebuildLanguageActions(analysis, lang)
@@ -411,36 +417,66 @@ func rebuildLanguageActions(analysis *VulnerabilityAnalysis, lang *LanguageAnaly
 type reachabilityDiff struct {
 	reachableIDs   map[string]struct{}
 	unreachableIDs map[string]struct{}
-	moduleIDs      map[string]map[string]struct{} // unlinked module -> its advisory IDs
+	moduleIDs      map[string]*unreachableModule // unlinked module -> its advisory IDs
 }
 
 func newReachabilityDiff() *reachabilityDiff {
 	return &reachabilityDiff{
 		reachableIDs:   make(map[string]struct{}),
 		unreachableIDs: make(map[string]struct{}),
-		moduleIDs:      make(map[string]map[string]struct{}),
+		moduleIDs:      make(map[string]*unreachableModule),
 	}
 }
 
-// observe records one modroot's analysis findings against its linked set.
-// simulated=false or a nil linked set means reachability is unknown for this
-// modroot (skipped, or the loop failed open) - every finding then counts as
-// reachable. Returns how many advisory IDs were unlinked in THIS modroot.
-func (r *reachabilityDiff) observe(m ModrootAnalysis, linked map[string]struct{}, simulated bool) int {
-	failOpen := !simulated || linked == nil
+// observe records one modroot's analysis findings against its linked module
+// and package sets. simulated=false or a nil set means the corresponding
+// granularity is unknown for this modroot (skipped, or the loop failed open)
+// - findings then count as reachable at that granularity. A finding is
+// unreachable when its module is unlinked, OR when the module IS linked but
+// the advisory's vulnerable packages (OSV ecosystem_specific.imports) are
+// all outside the artifact's import graph (e.g. x/sys/windows in a module
+// linked via x/sys/unix). Returns how many advisory IDs were unlinked in
+// THIS modroot.
+func (r *reachabilityDiff) observe(m ModrootAnalysis, linkedModules, linkedPackages map[string]struct{}, simulated bool) int {
+	if !simulated {
+		linkedModules, linkedPackages = nil, nil
+	}
 
-	isLinked := func(module string) bool {
-		if failOpen {
+	moduleLinked := func(module string) bool {
+		if linkedModules == nil {
 			return true
 		}
-		if _, ok := linked[module]; ok {
+		if _, ok := linkedModules[module]; ok {
 			return true
 		}
 		// The analysis map's coordinates are go.mod-normalized, but no-fix
 		// vulnerability records carry OSV's own naming, which drops v2+
 		// path suffixes - tolerate the mismatch in the linked direction.
-		for candidate := range linked {
+		for candidate := range linkedModules {
 			if trimMajorSuffix(candidate) == module {
+				return true
+			}
+		}
+		return false
+	}
+
+	// Per-advisory vulnerable import paths, from the analysis scan.
+	importsByID := make(map[string][]scan.VulnerableImport)
+	if m.ScanResult != nil {
+		for _, vuln := range m.ScanResult.Vulnerabilities {
+			importsByID[vuln.ID] = vuln.VulnerableImports
+		}
+	}
+	packagesLinked := func(vulnID string) bool {
+		imports := importsByID[vulnID]
+		if linkedPackages == nil || len(imports) == 0 {
+			return true // unknown either way - fail open
+		}
+		for _, imp := range imports {
+			if imp.Path == "" {
+				return true
+			}
+			if _, ok := linkedPackages[imp.Path]; ok {
 				return true
 			}
 		}
@@ -451,20 +487,20 @@ func (r *reachabilityDiff) observe(m ModrootAnalysis, linked map[string]struct{}
 		if len(vulnIDs) == 0 {
 			return
 		}
-		if isLinked(module) {
-			for _, id := range vulnIDs {
-				r.reachableIDs[id] = struct{}{}
-			}
-			return
-		}
-		ids, ok := r.moduleIDs[module]
-		if !ok {
-			ids = make(map[string]struct{})
-			r.moduleIDs[module] = ids
-		}
+		modLinked := moduleLinked(module)
 		for _, id := range vulnIDs {
+			if modLinked && packagesLinked(id) {
+				r.reachableIDs[id] = struct{}{}
+				continue
+			}
+			entry, ok := r.moduleIDs[module]
+			if !ok {
+				entry = &unreachableModule{name: module, moduleLinked: modLinked, idSet: make(map[string]struct{})}
+				r.moduleIDs[module] = entry
+			}
+			entry.moduleLinked = entry.moduleLinked || modLinked
+			entry.idSet[id] = struct{}{}
 			r.unreachableIDs[id] = struct{}{}
-			ids[id] = struct{}{}
 		}
 	}
 
@@ -494,10 +530,14 @@ func (r *reachabilityDiff) observe(m ModrootAnalysis, linked map[string]struct{}
 	return len(r.unreachableIDs) - unlinkedBefore
 }
 
-// unreachableModule is one unlinked module and its advisory IDs, for reporting.
+// unreachableModule is one unlinked module and its advisory IDs, for
+// reporting. moduleLinked distinguishes the package-only case (the module IS
+// in the artifact but the vulnerable packages are not).
 type unreachableModule struct {
-	name    string
-	vulnIDs []string
+	name         string
+	vulnIDs      []string
+	moduleLinked bool
+	idSet        map[string]struct{}
 }
 
 // finalize returns the advisory IDs unlinked in every modroot that saw them,
@@ -513,9 +553,9 @@ func (r *reachabilityDiff) finalize() ([]string, []unreachableModule) {
 	sort.Strings(ids)
 
 	var modules []unreachableModule
-	for name, moduleIDs := range r.moduleIDs {
-		module := unreachableModule{name: name}
-		for id := range moduleIDs {
+	for name, entry := range r.moduleIDs {
+		module := unreachableModule{name: name, moduleLinked: entry.moduleLinked}
+		for id := range entry.idSet {
 			if _, ok := r.reachableIDs[id]; !ok {
 				module.vulnIDs = append(module.vulnIDs, id)
 			}
@@ -529,6 +569,27 @@ func (r *reachabilityDiff) finalize() ([]string, []unreachableModule) {
 	sort.Slice(modules, func(i, j int) bool { return modules[i].name < modules[j].name })
 
 	return ids, modules
+}
+
+// vulnImportPaths projects a modroot's analysis findings onto advisory ID ->
+// vulnerable import paths, for threading into the simulation (seed advisories
+// were scanned before the checkout exists).
+func vulnImportPaths(scanResult *scan.ScanResult) map[string][]string {
+	if scanResult == nil {
+		return nil
+	}
+	paths := make(map[string][]string)
+	for _, vuln := range scanResult.Vulnerabilities {
+		for _, imp := range vuln.VulnerableImports {
+			if imp.Path != "" {
+				paths[vuln.ID] = append(paths[vuln.ID], imp.Path)
+			}
+		}
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	return paths
 }
 
 // trimMajorSuffix strips a trailing /vN major-version path element

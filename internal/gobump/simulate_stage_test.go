@@ -573,3 +573,71 @@ func TestSimulationStage_CoUpdateFixpoint(t *testing.T) {
 		"go.opentelemetry.io/otel/metric@v1.41.0",
 	}, m.DesiredDeps)
 }
+
+// TestSimulationStage_PackageUnreachableClassifiedAsInfo: the x/sys/windows
+// shape end-to-end at the stage level - the module is linked but the
+// advisory's vulnerable packages are not; the advisory must land in the
+// unreachable info bucket (neither fixed nor residual) with the
+// package-level wording.
+func TestSimulationStage_PackageUnreachableClassifiedAsInfo(t *testing.T) {
+	scanResult := &scan.ScanResult{
+		Vulnerabilities: []scan.Vulnerability{{
+			ID: "GO-2026-5024", Module: "golang.org/x/sys", Ecosystem: "Go",
+			CurrentVersion: "v0.39.0", FixedVersion: "v0.44.0",
+			VulnerableImports: []scan.VulnerableImport{{Path: "golang.org/x/sys/windows", GOOS: []string{"windows"}}},
+		}},
+		SecurityBumps: []scan.SecurityBump{
+			{Name: "golang.org/x/sys", Ecosystem: "Go", CurrentVersion: "v0.39.0", FixedVersion: "v0.44.0", VulnIDs: []string{"GO-2026-5024"}},
+		},
+	}
+
+	gp := NewGoBumpProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
+	gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{
+		RepoURL: "https://github.com/example/repo", Tag: "v1.0.0",
+		ByLanguage: []LanguageAnalysis{{
+			Language: "go",
+			ByModroot: []ModrootAnalysis{{
+				Modroot:              ".",
+				DesiredDeps:          []string{"golang.org/x/sys@v0.44.0"},
+				ScanResult:           scanResult,
+				SecurityBumpsByCoord: map[string]scan.SecurityBump{"golang.org/x/sys": scanResult.SecurityBumps[0]},
+			}},
+		}},
+		VulnerabilitiesFound: 1,
+		BumpActions:          []BumpAction{{Action: "needs_bump", Language: "go", Modroots: []string{"."}}},
+	}
+
+	fake := &fakeBumpSimulator{
+		results: map[string]*simulate.ModrootResult{
+			".": {
+				Modroot: ".", Converged: true, Iterations: 1,
+				// The loop dropped the seed pre-apply (package unreachable).
+				Dropped: []simulate.DroppedCandidate{
+					{Module: "golang.org/x/sys", Version: "v0.44.0", Reason: "vulnerable package(s) not linked into build artifacts"},
+				},
+				Linked:         map[string]struct{}{"golang.org/x/sys": {}},
+				LinkedPackages: map[string]struct{}{"golang.org/x/sys/unix": {}},
+			},
+		},
+	}
+	stage := newStageWithFake(fake)
+
+	require.NoError(t, stage.Apply(t.Context(), gp))
+
+	assert.Equal(t, []string{"GO-2026-5024"}, gp.UnreachableVulnIDs)
+	assert.Empty(t, gp.Residuals)
+
+	var messaged bool
+	for _, msg := range gp.GetMessages() {
+		if strings.Contains(msg, "golang.org/x/sys") &&
+			strings.Contains(msg, "module is linked; the vulnerable packages are not") {
+			messaged = true
+		}
+	}
+	assert.True(t, messaged, "expected the package-level info wording, got %v", gp.GetMessages())
+
+	// Accounting: found=1, residual=0, unreachable=1 -> fixed=0.
+	result := gp.ToResult()
+	assert.Equal(t, 1, result.VulnerabilitiesUnreachable)
+	assert.Equal(t, 0, result.VulnerabilitiesFixed)
+}

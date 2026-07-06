@@ -51,12 +51,13 @@ type loop struct {
 
 	// Artifact reachability: buildPatterns are the go/build package patterns
 	// (default ./...) whose non-test import graph decides what actually
-	// ships; linked is the module set from the last LinkedModules query, nil
-	// when unknown (query failed) - reachability then fails OPEN and no
-	// filtering happens.
-	buildPatterns []string
-	linked        map[string]struct{}
-	linkedWarned  bool
+	// ships; linked/linkedPackages are the module and package sets from the
+	// last Toolchain.Linked query, nil when unknown (query failed) -
+	// reachability then fails OPEN and no filtering happens.
+	buildPatterns  []string
+	linked         map[string]struct{}
+	linkedPackages map[string]struct{}
+	linkedWarned   bool
 }
 
 // raise is a rescan finding that requires moving a module further forward.
@@ -101,6 +102,13 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	for _, seed := range req.Seeds {
 		l.seedCandidate(seed)
 	}
+
+	// Pristine reachability: shed unreachable seeds BEFORE the first apply.
+	// A doomed candidate must never get to perturb the module graph - an
+	// unlinked-but-unappliable fix would otherwise destabilize a fragile
+	// graph and surface as a bogus "fix breaks module graph" residual.
+	l.refreshLinked(ctx)
+	l.dropUnreachable()
 
 	result := &ModrootResult{Modroot: req.Modroot}
 
@@ -172,10 +180,18 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 
 	result.Resolved = resolved
 	result.Linked = l.linked
+	result.LinkedPackages = l.linkedPackages
 	result.Requires = l.requirements
 	result.FinalDeps, result.FinalReplaces, result.CVEBackedModules = l.finalOutputs(resolved)
 	result.Dropped = l.dropped
 	result.Residuals = append(append([]Residual{}, l.persistentResiduals...), l.scanResiduals...)
+	for i := range result.Residuals {
+		// Apply-time residuals are recorded before any clean resolve exists;
+		// backfill the module's final graph version for honest reporting.
+		if result.Residuals[i].ResolvedVersion == "" {
+			result.Residuals[i].ResolvedVersion = resolved[result.Residuals[i].Module]
+		}
+	}
 	sort.Slice(result.Residuals, func(i, j int) bool { return result.Residuals[i].Module < result.Residuals[j].Module })
 	result.RemainingVulnIDs = remainingVulnIDs(result.Residuals)
 
@@ -633,23 +649,24 @@ func (l *loop) dropLatestRaise(err error) bool {
 // (once per module) - replaces survive tidy unconditionally and gobump
 // verifies them against the Replace entries, not Require. Returns true when
 // anything changed (the apply must then be redone).
-// refreshLinked recomputes the artifact-linked module set for the current
-// go.mod state. Recomputed every sustain pass rather than once: membership
-// can drift as versions move (a raised module can import new modules - the
-// genproto-split family is exactly this shape). Failure fails OPEN: linked
-// becomes nil and no reachability filtering happens (warned once per loop).
+// refreshLinked recomputes the artifact-linked module and package sets for
+// the current go.mod state. Recomputed every sustain pass rather than once:
+// membership can drift as versions move (a raised module can import new
+// modules - the genproto-split family is exactly this shape). Failure fails
+// OPEN: both sets become nil and no reachability filtering happens (warned
+// once per loop).
 func (l *loop) refreshLinked(ctx context.Context) {
-	linked, err := l.tc.LinkedModules(ctx, l.dir, l.buildPatterns)
+	linked, linkedPackages, err := l.tc.Linked(ctx, l.dir, l.buildPatterns)
 	if err != nil {
 		if !l.linkedWarned {
 			slog.Warn("artifact reachability unavailable - not filtering",
 				"modroot", l.req.Modroot, "packages", strings.Join(l.buildPatterns, " "), "error", err)
 			l.linkedWarned = true
 		}
-		l.linked = nil
+		l.linked, l.linkedPackages = nil, nil
 		return
 	}
-	l.linked = linked
+	l.linked, l.linkedPackages = linked, linkedPackages
 }
 
 // isLinked reports whether module is linked into a build artifact; unknown
@@ -682,30 +699,84 @@ func (l *loop) scanTargets(resolved map[string]string) []scan.Package {
 
 // dropUnreachable sheds every active candidate - seeds included, which is
 // what prunes already-declared YAML deps - whose module is not linked into
-// any build artifact. An unlinked module's replace directive is equally
-// inert in the artifact, so replace seeds are shed too (the one exception to
-// "seed replaces are user intent, never shed"). Unlike every other CVE-backed
-// drop, NO residual is recorded: the advisory affects nothing that ships, so
-// the fix is neither applied nor outstanding (the orchestrator reports such
-// advisories separately, as info). Returns true when anything was shed.
+// any build artifact, or (for CVE-backed candidates with known advisory
+// import metadata) whose advisories' vulnerable packages are all outside
+// the artifact's import graph even though the module is linked (e.g.
+// x/sys/windows in a module linked via x/sys/unix). An unlinked module's
+// replace directive is equally inert in the artifact, so replace seeds are
+// shed too (the one exception to "seed replaces are user intent, never
+// shed"). Unlike every other CVE-backed drop, NO residual is recorded: the
+// advisory affects nothing that ships, so the fix is neither applied nor
+// outstanding (the orchestrator reports such advisories separately, as
+// info). Returns true when anything was shed.
 func (l *loop) dropUnreachable() bool {
 	if l.linked == nil {
 		return false
 	}
 	changed := false
 	for _, c := range l.activeCandidates() {
-		if l.isLinked(c.Module) {
+		var reason string
+		switch {
+		case !l.isLinked(c.Module):
+			reason = fmt.Sprintf("module not linked into build artifacts (packages: %s)", strings.Join(l.buildPatterns, " "))
+		case c.FromCVE && !l.seedVulnPackagesLinked(c.VulnIDs):
+			reason = "vulnerable package(s) not linked into build artifacts"
+		default:
 			continue
 		}
 		c.dropped = true
 		l.dropped = append(l.dropped, DroppedCandidate{
 			Module:  c.Module,
 			Version: c.Version,
-			Reason:  fmt.Sprintf("module not linked into build artifacts (packages: %s)", strings.Join(l.buildPatterns, " ")),
+			Reason:  reason,
 		})
 		changed = true
 	}
 	return changed
+}
+
+// seedVulnPackagesLinked reports whether any of the given seed advisories'
+// vulnerable packages (threaded in via ModrootRequest.VulnImports) is in the
+// artifact's import graph. Fail open everywhere data is missing: unknown
+// package graph, no IDs, an ID without import metadata, or a pathless entry
+// all count as linked.
+func (l *loop) seedVulnPackagesLinked(vulnIDs []string) bool {
+	if l.linkedPackages == nil || len(vulnIDs) == 0 {
+		return true
+	}
+	for _, id := range vulnIDs {
+		paths, known := l.req.VulnImports[id]
+		if !known || len(paths) == 0 {
+			return true
+		}
+		for _, path := range paths {
+			if path == "" {
+				return true
+			}
+			if _, linked := l.linkedPackages[path]; linked {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// vulnApplies reports whether a rescan finding's vulnerable packages (from
+// its own OSV metadata) intersect the artifact's import graph. Fail open
+// when either side is unknown.
+func (l *loop) vulnApplies(v scan.Vulnerability) bool {
+	if l.linkedPackages == nil || len(v.VulnerableImports) == 0 {
+		return true
+	}
+	for _, imp := range v.VulnerableImports {
+		if imp.Path == "" {
+			return true
+		}
+		if _, linked := l.linkedPackages[imp.Path]; linked {
+			return true
+		}
+	}
+	return false
 }
 
 func (l *loop) dropUnsustained() bool {
@@ -860,9 +931,28 @@ func (l *loop) processScan(scanResult *scan.ScanResult, resolved map[string]stri
 // residuals (no released fix, or the fix requires a major-version import
 // path change that go/bump cannot express).
 func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]string) ([]raise, []Residual) {
+	// Package-level applicability: a finding whose vulnerable packages are
+	// all outside the artifact's import graph is neither raised nor a
+	// residual (the orchestrator reports it as info from the analysis scan).
+	applies := make(map[string]bool, len(scanResult.Vulnerabilities))
+	for _, vuln := range scanResult.Vulnerabilities {
+		applies[vuln.ID] = l.vulnApplies(vuln)
+	}
+	anyApplies := func(vulnIDs []string) bool {
+		if len(vulnIDs) == 0 {
+			return true // no per-vuln data - fail open
+		}
+		for _, id := range vulnIDs {
+			if applicable, known := applies[id]; !known || applicable {
+				return true
+			}
+		}
+		return false
+	}
+
 	noFixByModule := make(map[string]*Residual)
 	for _, vuln := range scanResult.Vulnerabilities {
-		if vuln.FixedVersion != "" {
+		if vuln.FixedVersion != "" || !applies[vuln.ID] {
 			continue
 		}
 		if existing, ok := noFixByModule[vuln.Module]; ok {
@@ -884,6 +974,9 @@ func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]str
 	}
 
 	for _, bump := range scanResult.SecurityBumps {
+		if !anyApplies(bump.VulnIDs) {
+			continue
+		}
 		resolvedVersion := resolved[bump.Name]
 		if resolvedVersion != "" && semver.Compare(bump.FixedVersion, resolvedVersion) <= 0 {
 			continue
@@ -972,11 +1065,11 @@ func (l *loop) confirmMinimalSet(ctx context.Context, resolved map[string]string
 	// would compare linked-filtered accepted residuals against an unfiltered
 	// candidate scan, see "new" unlinked advisories, and spuriously reject
 	// the minimal set. Restore the converged set's view on any rejection.
-	convergedLinked := l.linked
+	convergedLinked, convergedPackages := l.linked, l.linkedPackages
 	adopted := false
 	defer func() {
 		if !adopted {
-			l.linked = convergedLinked
+			l.linked, l.linkedPackages = convergedLinked, convergedPackages
 		}
 	}()
 	l.refreshLinked(ctx)

@@ -133,10 +133,17 @@ func TestGoToolchain_LinkedModules(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	linked, err := toolchain.LinkedModules(t.Context(), dir, nil) // nil -> ./...
+	linked, linkedPackages, err := toolchain.Linked(t.Context(), dir, nil) // nil -> ./...
 	require.NoError(t, err)
 
 	assert.Contains(t, linked, "golang.org/x/text", "main-linked module must be reachable")
 	assert.NotContains(t, linked, "github.com/google/go-cmp",
 		"test-only module must be excluded (buildinfo parity)")
+
+	// Package granularity: the imported subpackage is linked; a subpackage
+	// of the same module that nothing imports is not.
+	assert.Contains(t, linkedPackages, "golang.org/x/text/language",
+		"imported package must be in the linked package set")
+	assert.NotContains(t, linkedPackages, "golang.org/x/text/number",
+		"never-imported subpackage of a linked module must be absent")
 }
