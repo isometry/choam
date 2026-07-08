@@ -33,6 +33,7 @@ Path can be a single file or a directory containing .yaml files.`,
 	cmd.Flags().StringVar(&backupSuffix, "backup-suffix", "", "Suffix for backup files (empty = no backup)")
 	cmd.Flags().BoolVar(&noValidate, "no-validate", false, "Skip bump simulation (writes deps lists without proving they resolve or cover all advisories, and skips artifact-reachability filtering; go.sum narrowing still applies); requires a go toolchain otherwise")
 	cmd.Flags().DurationVar(&simulationTimeout, "simulation-timeout", 10*time.Minute, "Per-package budget for bump simulation")
+	cmd.Flags().BoolVar(&noStdlib, "no-stdlib", false, "Skip the Go stdlib staleness check (no epoch bump for toolchain-fixed vulnerabilities). The check is also skipped automatically for files with uncommitted changes.")
 
 	return cmd
 }
@@ -60,14 +61,7 @@ func runBump(cmd *cobra.Command, args []string) error {
 	}
 
 	// Configure processor options
-	opts := gobump.ProcessorOptions{
-		DryRun:            dryRun,
-		BackupSuffix:      backupSuffix,
-		TempDir:           os.TempDir(),
-		Validate:          !noValidate,
-		SimulationTimeout: simulationTimeout,
-		StdlibCheck:       true, // on by default; CLI opt-out arrives with --no-stdlib
-	}
+	opts := buildBumpProcessorOptions()
 
 	if dryRun {
 		fmt.Println("Dry run mode - no files will be modified")
@@ -98,6 +92,21 @@ func runBump(cmd *cobra.Command, args []string) error {
 
 	// Output results
 	return outputBumpResults(results, outputFormat)
+}
+
+// buildBumpProcessorOptions maps the bump command's flag-backed package
+// variables onto gobump.ProcessorOptions. Factored out of runBump so the
+// flag-to-option wiring (e.g. --no-stdlib -> StdlibCheck) is directly
+// testable without driving the full command.
+func buildBumpProcessorOptions() gobump.ProcessorOptions {
+	return gobump.ProcessorOptions{
+		DryRun:            dryRun,
+		BackupSuffix:      backupSuffix,
+		TempDir:           os.TempDir(),
+		Validate:          !noValidate,
+		SimulationTimeout: simulationTimeout,
+		StdlibCheck:       !noStdlib,
+	}
 }
 
 func outputBumpResults(results []*gobump.GoBumpResult, format string) error {
@@ -146,6 +155,10 @@ func outputBumpStructured(results []*gobump.GoBumpResult, format string) error {
 		if r.Error != "" {
 			summary.Errors++
 		}
+		if distinct := output.DistinctStdlibVulnIDs(r.StdlibBumps); len(distinct) > 0 {
+			summary.PackagesStdlibStale++
+			summary.TotalStdlibVulns += len(distinct)
+		}
 	}
 
 	// Wrap in response structure
@@ -177,12 +190,13 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 	t := table.New(os.Stdout)
 	t.SetRowLines(false)
 	t.SetBorders(false)
-	t.SetHeaders("PACKAGE", "FOUND", "FIXED", "RESIDUAL", "UNLINKED", "BUMPED", "OLD EPOCH", "NEW EPOCH", "STATUS")
+	t.SetHeaders("PACKAGE", "FOUND", "FIXED", "RESIDUAL", "UNLINKED", "BUMPED", "STDLIB", "OLD EPOCH", "NEW EPOCH", "STATUS")
 
 	// Track statistics
 	totalFiles := len(results)
 	filesWithVulns := 0
 	filesFixed := 0
+	filesStdlibStale := 0
 	totalVulnsFound := 0
 	totalVulnsFixed := 0
 	totalVulnsResidual := 0
@@ -192,9 +206,12 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 
 	// Add rows
 	for _, result := range results {
-		status := "NO VULNS"
+		stdlibVulns := len(output.DistinctStdlibVulnIDs(result.StdlibBumps))
+		if stdlibVulns > 0 {
+			filesStdlibStale++
+		}
+
 		if result.Error != "" {
-			status = "ERROR"
 			errors++
 		} else if result.VulnerabilitiesFound > 0 {
 			filesWithVulns++
@@ -202,26 +219,8 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 			totalVulnsFixed += result.VulnerabilitiesFixed
 			totalVulnsResidual += result.VulnerabilitiesResidual
 			totalVulnsUnreachable += result.VulnerabilitiesUnreachable
-
-			switch {
-			case result.VulnerabilitiesFixed > 0 || result.EpochChanged:
+			if result.VulnerabilitiesFixed > 0 || result.EpochChanged {
 				filesFixed++
-				switch {
-				case !result.Validated:
-					status = "UNVALIDATED"
-				case result.VulnerabilitiesResidual > 0:
-					status = "PARTIAL"
-				default:
-					status = "FIXED"
-				}
-			case result.FileWasWritten:
-				status = "UPDATED"
-			default:
-				// Vulnerabilities found but no changes needed (pipeline already correct)
-				status = "UP-TO-DATE"
-				if result.Validated && result.VulnerabilitiesResidual > 0 {
-					status = "PARTIAL"
-				}
 			}
 		}
 		totalModulesBumped += result.ModulesBumped
@@ -233,9 +232,10 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 			fmt.Sprintf("%d", result.VulnerabilitiesResidual),
 			fmt.Sprintf("%d", result.VulnerabilitiesUnreachable),
 			fmt.Sprintf("%d", result.ModulesBumped),
+			stdlibColumnValue(stdlibVulns, result.StdlibChecked),
 			fmt.Sprintf("%d", result.OldEpoch),
 			fmt.Sprintf("%d", result.NewEpoch),
-			status,
+			bumpRowStatus(result, stdlibVulns),
 		)
 	}
 
@@ -293,6 +293,10 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 			totalVulnsFound, totalVulnsFixed, totalVulnsResidual, totalVulnsUnreachable, totalModulesBumped)
 	}
 
+	if filesStdlibStale > 0 {
+		summary += fmt.Sprintf("; %d stdlib-stale", filesStdlibStale)
+	}
+
 	fmt.Printf("\n%s\n", summary)
 
 	if dryRun {
@@ -300,6 +304,55 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 	}
 
 	return nil
+}
+
+// bumpRowStatus computes the table STATUS cell for one result, mirroring the
+// found/fixed/residual precedence used for dependency vulnerabilities and
+// adding a distinct status for files whose only change is a stdlib-driven
+// epoch bump: zero dependency vulnerabilities found, but the stdlib
+// staleness check proposed one or more fixes and the epoch moved. Files with
+// both dependency fixes and stdlib bumps keep their existing dependency-
+// driven status - the STDLIB column carries that information instead.
+func bumpRowStatus(result *gobump.GoBumpResult, stdlibVulns int) string {
+	switch {
+	case result.Error != "":
+		return "ERROR"
+	case result.VulnerabilitiesFound > 0:
+		switch {
+		case result.VulnerabilitiesFixed > 0 || result.EpochChanged:
+			switch {
+			case !result.Validated:
+				return "UNVALIDATED"
+			case result.VulnerabilitiesResidual > 0:
+				return "PARTIAL"
+			default:
+				return "FIXED"
+			}
+		case result.FileWasWritten:
+			return "UPDATED"
+		default:
+			// Vulnerabilities found but no changes needed (pipeline already correct)
+			if result.Validated && result.VulnerabilitiesResidual > 0 {
+				return "PARTIAL"
+			}
+			return "UP-TO-DATE"
+		}
+	case stdlibVulns > 0 && result.EpochChanged:
+		return "STDLIB-REBUILD"
+	default:
+		return "NO VULNS"
+	}
+}
+
+// stdlibColumnValue renders the table STDLIB column: the count of distinct
+// linked fixable stdlib vulnerability IDs (deduped across go-package pin
+// constraints - see output.DistinctStdlibVulnIDs), or "-" when the check
+// didn't run or found nothing to fix.
+func stdlibColumnValue(stdlibVulns int, checked bool) string {
+	if !checked || stdlibVulns == 0 {
+		return "-"
+	}
+	return fmt.Sprintf("%d", stdlibVulns)
 }
 
 func extractPackageNameFromPath(filePath string) string {

@@ -25,6 +25,7 @@ var (
 	// Bump-specific flags
 	noValidate        bool
 	simulationTimeout time.Duration
+	noStdlib          bool
 )
 
 // NewRootCmd creates the root command

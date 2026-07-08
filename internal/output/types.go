@@ -55,4 +55,13 @@ type GoBumpSummary struct {
 	TotalVulnsUnreachable int `json:"total_vulns_unreachable" yaml:"total_vulns_unreachable"`
 	TotalModulesBumped    int `json:"total_modules_bumped" yaml:"total_modules_bumped"`
 	Errors                int `json:"errors" yaml:"errors"`
+
+	// PackagesStdlibStale counts files with at least one distinct fixable
+	// stdlib vulnerability ID (see DistinctStdlibVulnIDs); TotalStdlibVulns
+	// sums those per-file distinct counts across all files. Deliberately
+	// separate from the dependency-vulnerability counters above: a stdlib
+	// staleness fix is a toolchain rebuild, not a dependency bump, and a file
+	// can carry stdlib fixes with zero dependency vulnerabilities found.
+	PackagesStdlibStale int `json:"packages_stdlib_stale" yaml:"packages_stdlib_stale"`
+	TotalStdlibVulns    int `json:"total_stdlib_vulns" yaml:"total_stdlib_vulns"`
 }
