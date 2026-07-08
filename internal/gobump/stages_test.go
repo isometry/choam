@@ -7,6 +7,8 @@ import (
 
 	melange "chainguard.dev/melange/pkg/config"
 	"github.com/isometry/choam/internal/config"
+	"github.com/isometry/choam/internal/ecosystem"
+	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
 	"github.com/isometry/choam/internal/scan"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -809,6 +811,421 @@ func TestReconcileBumpSteps_PreservesBlankLineConvention(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 3, bumpSteps)
+}
+
+func TestExistingGoVersionsForModroots(t *testing.T) {
+	steps := []config.BumpStep{
+		{Index: 1, Action: "go/bump", Modroots: []string{".", "cmd/a"}, GoVersion: "1.24"},
+		{Index: 2, Action: "bump", Modroots: []string{"."}, GoVersion: "1.26"},
+		{Index: 3, Action: "bump", Language: "rust", Modroots: []string{"."}, GoVersion: "1.99"},        // non-go step ignored
+		{Index: 4, Action: "bump", Modroots: []string{"cmd/b"}, GoVersion: "${{vars.go}}"},              // unorderable value ignored
+		{Index: 5, Action: "bump", Language: "go", Modroots: []string{"cmd/b"}, GoVersion: ""},          // no value
+		{Index: 6, Action: "bump", Language: "go", Modroots: []string{"test/e2e"}, GoVersion: "1.25.2"}, // patch-level value kept as-is
+	}
+
+	got := existingGoVersionsForModroots([]string{".", "cmd/a", "cmd/b", "test/e2e"}, steps)
+	assert.Equal(t, "1.26", got["."], "max across covering go steps")
+	assert.Equal(t, "1.24", got["cmd/a"])
+	assert.Equal(t, "", got["cmd/b"])
+	assert.Equal(t, "1.25.2", got["test/e2e"])
+}
+
+func TestEffectiveGoVersionHelpers(t *testing.T) {
+	assert.Equal(t, "1.26", effectiveGoVersion(ModrootAnalysis{ExistingGoVersion: "1.26", RequiredGoVersion: "1.25"}), "existing wins when higher - never lowered")
+	assert.Equal(t, "1.27", effectiveGoVersion(ModrootAnalysis{ExistingGoVersion: "1.26", RequiredGoVersion: "1.27"}))
+	assert.Equal(t, "", effectiveGoVersion(ModrootAnalysis{}))
+
+	assert.True(t, allRootsShareGoVersion([]ModrootAnalysis{
+		{Modroot: "a", RequiredGoVersion: "1.26"},
+		{Modroot: "b", ExistingGoVersion: "1.26"},
+	}))
+	assert.False(t, allRootsShareGoVersion([]ModrootAnalysis{
+		{Modroot: "a", RequiredGoVersion: "1.26"},
+		{Modroot: "b"},
+	}))
+}
+
+// TestCoalesceModroots_SplitsByGoVersion: identical desired deps with
+// divergent effective go-versions must land in separate groups; empty
+// go-versions group together as before.
+func TestCoalesceModroots_SplitsByGoVersion(t *testing.T) {
+	byModroot := []ModrootAnalysis{
+		{Modroot: "cmd/a", DesiredDeps: []string{"a@v1"}, RequiredGoVersion: "1.26"},
+		{Modroot: "cmd/b", DesiredDeps: []string{"a@v1"}},
+		{Modroot: "cmd/c", DesiredDeps: []string{"a@v1"}, ExistingGoVersion: "1.26"},
+	}
+
+	groups := coalesceModroots(byModroot)
+	require.Len(t, groups, 2)
+	assert.Equal(t, []string{"cmd/a", "cmd/c"}, groups[0].Modroots)
+	assert.Equal(t, "1.26", groups[0].GoVersion)
+	assert.Equal(t, []string{"cmd/b"}, groups[1].Modroots)
+	assert.Equal(t, "", groups[1].GoVersion)
+}
+
+// TestReconcileBumpSteps_FastPathEmitsGoVersion: the fast path upserts
+// go-version into the existing step when the analysis demands a raise, and
+// re-running the applier on the already-updated YAML is byte-stable.
+func TestReconcileBumpSteps_FastPathEmitsGoVersion(t *testing.T) {
+	gp := newTestProcessor(t, singleGoBumpYAML)
+	loader := config.NewLoader()
+	applier := NewGoBumpApplier(nil)
+
+	analysis := &VulnerabilityAnalysis{
+		ByLanguage: []LanguageAnalysis{{
+			Language: "go",
+			ByModroot: []ModrootAnalysis{
+				{
+					Modroot:             ".",
+					ExistingDeps:        []string{"golang.org/x/net@v0.55.0"},
+					DesiredDeps:         []string{"golang.org/x/net@v0.56.0"},
+					RequiredGoVersion:   "1.26",
+					SecurityBumpModules: []string{"golang.org/x/net"},
+				},
+			},
+		}},
+		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"."}}},
+	}
+
+	require.NoError(t, applier.reconcileBumpSteps(gp, analysis, loader))
+
+	firstPass := string(gp.GetCurrentYAML())
+	assert.Contains(t, firstPass, `go-version: "1.26"`)
+
+	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, "go/bump", steps[0].Action, "fast path preserves the step")
+	assert.Equal(t, "1.26", steps[0].GoVersion)
+
+	// Second run, as a real re-run would see it: existing deps/go-version now
+	// come from the updated YAML, the analysis still computes the same
+	// requirement. Must be a byte-for-byte no-op.
+	secondAnalysis := &VulnerabilityAnalysis{
+		ByLanguage: []LanguageAnalysis{{
+			Language: "go",
+			ByModroot: []ModrootAnalysis{
+				{
+					Modroot:             ".",
+					ExistingDeps:        []string{"golang.org/x/net@v0.56.0"},
+					DesiredDeps:         []string{"golang.org/x/net@v0.56.0"},
+					ExistingGoVersion:   existingGoVersionsForModroots([]string{"."}, steps)["."],
+					RequiredGoVersion:   "1.26",
+					SecurityBumpModules: []string{"golang.org/x/net"},
+				},
+			},
+		}},
+		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"."}}},
+	}
+	require.NoError(t, applier.reconcileBumpSteps(gp, secondAnalysis, loader))
+	assert.Equal(t, firstPass, string(gp.GetCurrentYAML()), "double-running the applier must be byte-stable")
+}
+
+// TestReconcileBumpSteps_NeverLowersGoVersion: an existing step's go-version
+// above the computed requirement is kept, byte-for-byte.
+func TestReconcileBumpSteps_NeverLowersGoVersion(t *testing.T) {
+	const pinnedGoVersionYAML = `package:
+  name: example
+  version: "1.0.0"
+  epoch: 0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.55.0
+      go-version: "1.26"
+`
+	gp := newTestProcessor(t, pinnedGoVersionYAML)
+	loader := config.NewLoader()
+	applier := NewGoBumpApplier(nil)
+
+	analysis := &VulnerabilityAnalysis{
+		ByLanguage: []LanguageAnalysis{{
+			Language: "go",
+			ByModroot: []ModrootAnalysis{
+				{
+					Modroot:           ".",
+					ExistingDeps:      []string{"golang.org/x/net@v0.55.0"},
+					DesiredDeps:       []string{"golang.org/x/net@v0.56.0"},
+					ExistingGoVersion: "1.26",
+					RequiredGoVersion: "1.25", // computed LOWER than the existing value
+				},
+			},
+		}},
+		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"."}}},
+	}
+
+	require.NoError(t, applier.reconcileBumpSteps(gp, analysis, loader))
+
+	content := string(gp.GetCurrentYAML())
+	assert.Contains(t, content, `go-version: "1.26"`)
+	assert.NotContains(t, content, "1.25")
+
+	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, "1.26", steps[0].GoVersion)
+}
+
+// TestReconcileBumpSteps_TemplatedGoVersionWarnedNotRewritten: a step whose
+// go-version is a template expression is never overwritten - the analysis
+// requirement is surfaced as a message instead.
+func TestReconcileBumpSteps_TemplatedGoVersionWarnedNotRewritten(t *testing.T) {
+	const templatedGoVersionYAML = `package:
+  name: example
+  version: "1.0.0"
+  epoch: 0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.55.0
+      go-version: ${{vars.go-version}}
+`
+	gp := newTestProcessor(t, templatedGoVersionYAML)
+	loader := config.NewLoader()
+	applier := NewGoBumpApplier(nil)
+
+	analysis := &VulnerabilityAnalysis{
+		ByLanguage: []LanguageAnalysis{{
+			Language: "go",
+			ByModroot: []ModrootAnalysis{
+				{
+					Modroot:           ".",
+					ExistingDeps:      []string{"golang.org/x/net@v0.55.0"},
+					DesiredDeps:       []string{"golang.org/x/net@v0.56.0"},
+					RequiredGoVersion: "1.26",
+				},
+			},
+		}},
+		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"."}}},
+	}
+
+	require.NoError(t, applier.reconcileBumpSteps(gp, analysis, loader))
+
+	content := string(gp.GetCurrentYAML())
+	assert.Contains(t, content, "go-version: ${{vars.go-version}}", "templated value must survive untouched")
+	assert.NotContains(t, content, `go-version: "1.26"`)
+
+	var warned bool
+	for _, msg := range gp.GetMessages() {
+		if strings.Contains(msg, "not a plain version") {
+			warned = true
+		}
+	}
+	assert.True(t, warned, "expected a templated-go-version warning, got %v", gp.GetMessages())
+}
+
+// TestReconcileBumpSteps_GeneralPathTemplatedGoVersionWarned: when the
+// general (strip + re-insert) path rebuilds bump steps, an existing step
+// carrying a templated/unorderable go-version must not be silently dropped -
+// it can't be re-emitted (InsertBumpPipelineStep rejects non plain-version
+// characters), but the rebuild must warn loudly about it.
+func TestReconcileBumpSteps_GeneralPathTemplatedGoVersionWarned(t *testing.T) {
+	const templatedGeneralPathYAML = `package:
+  name: example
+  version: "1.0.0"
+  epoch: 0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.55.0
+      modroot: |-
+        cmd/a
+      go-version: ${{vars.go-ver}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.55.0
+      modroot: |-
+        cmd/b
+`
+	gp := newTestProcessor(t, templatedGeneralPathYAML)
+	loader := config.NewLoader()
+	applier := NewGoBumpApplier(nil)
+
+	// Two existing go bump steps force the general (rebuild) path even
+	// though both roots end up wanting identical deps and no go-version.
+	analysis := &VulnerabilityAnalysis{
+		ByLanguage: []LanguageAnalysis{{
+			Language: "go",
+			ByModroot: []ModrootAnalysis{
+				{Modroot: "cmd/a", DesiredDeps: []string{"golang.org/x/net@v0.56.0"}},
+				{Modroot: "cmd/b", DesiredDeps: []string{"golang.org/x/net@v0.56.0"}},
+			},
+		}},
+		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"cmd/a", "cmd/b"}}},
+	}
+
+	require.NoError(t, applier.reconcileBumpSteps(gp, analysis, loader))
+
+	content := string(gp.GetCurrentYAML())
+	assert.NotContains(t, content, "go-version", "the templated go-version cannot be re-emitted through the rebuild")
+
+	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
+	require.NoError(t, err)
+	for _, step := range steps {
+		assert.Equal(t, "", step.GoVersion)
+	}
+
+	var warned bool
+	for _, msg := range gp.GetMessages() {
+		if strings.Contains(msg, "not a plain version") && strings.Contains(msg, "${{vars.go-ver}}") && strings.Contains(msg, "could not be preserved") {
+			warned = true
+		}
+	}
+	assert.True(t, warned, "expected a templated-go-version-dropped warning, got %v", gp.GetMessages())
+}
+
+// TestReconcileBumpSteps_GeneralPathSplitsByGoVersion: two roots wanting the
+// same deps but different effective go-versions must end up in separate
+// steps, each with its own (or no) go-version.
+func TestReconcileBumpSteps_GeneralPathSplitsByGoVersion(t *testing.T) {
+	gp := newTestProcessor(t, noBumpStepYAML)
+	loader := config.NewLoader()
+	applier := NewGoBumpApplier(nil)
+
+	analysis := &VulnerabilityAnalysis{
+		ByLanguage: []LanguageAnalysis{{
+			Language: "go",
+			ByModroot: []ModrootAnalysis{
+				{Modroot: "cmd/a", DesiredDeps: []string{"golang.org/x/net@v0.56.0"}, RequiredGoVersion: "1.26"},
+				{Modroot: "cmd/b", DesiredDeps: []string{"golang.org/x/net@v0.56.0"}},
+			},
+		}},
+		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"cmd/a", "cmd/b"}}},
+	}
+
+	require.NoError(t, applier.reconcileBumpSteps(gp, analysis, loader))
+
+	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
+	require.NoError(t, err)
+	require.Len(t, steps, 2)
+
+	byRoot := make(map[string]config.BumpStep)
+	for _, step := range steps {
+		for _, root := range step.Modroots {
+			byRoot[root] = step
+		}
+	}
+	assert.Equal(t, "1.26", byRoot["cmd/a"].GoVersion)
+	assert.Equal(t, "", byRoot["cmd/b"].GoVersion)
+	assert.Contains(t, string(gp.GetCurrentYAML()), `go-version: "1.26"`)
+
+	// Second run, as a re-run would see it: the split steps now exist, and
+	// cmd/a's ExistingGoVersion comes from its own step. The general path
+	// removes and re-inserts identical steps - must be byte-stable.
+	firstPass := string(gp.GetCurrentYAML())
+	secondAnalysis := &VulnerabilityAnalysis{
+		ByLanguage: []LanguageAnalysis{{
+			Language: "go",
+			ByModroot: []ModrootAnalysis{
+				{
+					Modroot:           "cmd/a",
+					ExistingDeps:      []string{"golang.org/x/net@v0.56.0"},
+					DesiredDeps:       []string{"golang.org/x/net@v0.56.0"},
+					ExistingGoVersion: existingGoVersionsForModroots([]string{"cmd/a"}, steps)["cmd/a"],
+					RequiredGoVersion: "1.26",
+				},
+				{
+					Modroot:      "cmd/b",
+					ExistingDeps: []string{"golang.org/x/net@v0.56.0"},
+					DesiredDeps:  []string{"golang.org/x/net@v0.56.0"},
+				},
+			},
+		}},
+		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"cmd/a", "cmd/b"}}},
+	}
+	require.NoError(t, applier.reconcileBumpSteps(gp, secondAnalysis, loader))
+	assert.Equal(t, firstPass, string(gp.GetCurrentYAML()), "re-running the general path must be byte-stable")
+}
+
+// TestApplyGoBumpChanges_GoVersionAndPinWiring: the full apply-phase wiring
+// in one pass - a simulated modroot with a required Go raise updates its bump
+// step's deps, upserts go-version, and raises the file's too-old go-package
+// pin, all in the same applyGoBumpChanges call.
+func TestApplyGoBumpChanges_GoVersionAndPinWiring(t *testing.T) {
+	const wiringYAML = `package:
+  name: example
+  version: "1.0.0"
+  epoch: 0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  - uses: go/build
+    with:
+      go-package: go-1.22
+      packages: ./cmd/app
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.55.0
+`
+	gp := newTestProcessor(t, wiringYAML)
+	gp.Config = &melange.Configuration{}
+	applier := NewGoBumpApplier(nil)
+
+	deps, err := golangDeps(t, "module example.com/app\n\ngo 1.22\n")
+	require.NoError(t, err)
+
+	analysis := &VulnerabilityAnalysis{
+		ByLanguage: []LanguageAnalysis{{
+			Language: "go",
+			ByModroot: []ModrootAnalysis{
+				{
+					Modroot:             ".",
+					Deps:                deps,
+					ExistingDeps:        []string{"golang.org/x/net@v0.55.0"},
+					DesiredDeps:         []string{"golang.org/x/net@v0.56.0"},
+					RequiredGoVersion:   "1.26",
+					Simulated:           true,
+					SecurityBumpModules: []string{"golang.org/x/net"},
+				},
+			},
+		}},
+		BumpActions: []BumpAction{{Action: "needs_bump", Language: "go", Modroots: []string{"."}}},
+	}
+
+	require.NoError(t, applier.applyGoBumpChanges(t.Context(), gp, analysis))
+
+	content := string(gp.GetCurrentYAML())
+	assert.Contains(t, content, "golang.org/x/net@v0.56.0")
+	assert.Contains(t, content, `go-version: "1.26"`)
+	assert.Contains(t, content, "go-package: go-1.26", "pin floor = max(baseline 1.22, required 1.26)")
+	assert.NotContains(t, content, "go-1.22")
+	assert.True(t, gp.ActualChangesApplied)
+}
+
+// golangDeps parses a go.mod through the golang ecosystem, for analyses that
+// need a pristine modfile behind ModrootAnalysis.Deps.
+func golangDeps(t *testing.T, goMod string) (*ecosystem.ModuleDeps, error) {
+	t.Helper()
+	return ecogolang.New().Analyze(t.Context(), map[string][]byte{"go.mod": []byte(goMod)})
 }
 
 // TestReconcileBumpSteps_CompactFileStaysCompact: a melange file without the

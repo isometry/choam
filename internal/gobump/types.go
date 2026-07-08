@@ -89,6 +89,20 @@ type ModrootAnalysis struct {
 	ExistingReplaces []string `json:"existing_replaces,omitempty" yaml:"existing_replaces,omitempty"`
 	DesiredReplaces  []string `json:"desired_replaces,omitempty" yaml:"desired_replaces,omitempty"`
 
+	// RequiredGoVersion is the Go language version demanded by the proven
+	// candidate set (bare form, e.g. "1.25"); set only when it exceeds the
+	// module's own baseline (go directive / toolchain directive max - see
+	// pristineGoBaseline). Empty = no raise needed or unknown. Populated by
+	// the simulation (proven) or, when simulation didn't run, by the
+	// best-effort proxy fallback (direct candidates only). Go only.
+	RequiredGoVersion string `json:"required_go_version,omitempty" yaml:"required_go_version,omitempty"`
+
+	// ExistingGoVersion is the highest with.go-version carried by existing
+	// bump/go-bump steps covering this modroot (bare form); empty when none.
+	// Carried so reconciliation can never lower a previously written value.
+	// Go only.
+	ExistingGoVersion string `json:"existing_go_version,omitempty" yaml:"existing_go_version,omitempty"`
+
 	// SecurityBumpModules lists the rendered-grammar coordinates (see
 	// splitCoordVersion and Ecosystem.BumpCoords) of the dependencies OSV
 	// actually flagged as vulnerable for this modroot - i.e.

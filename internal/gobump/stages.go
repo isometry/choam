@@ -12,6 +12,7 @@ import (
 	melange "chainguard.dev/melange/pkg/config"
 	"github.com/isometry/choam/internal/config"
 	"github.com/isometry/choam/internal/ecosystem"
+	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/processor"
 	"github.com/isometry/choam/internal/processor/stages"
 	"github.com/isometry/choam/internal/scan"
@@ -23,6 +24,11 @@ import (
 type Analyzer struct {
 	fetcher              *ecosystem.Fetcher
 	vulnerabilityScanner *scan.VulnerabilityScanner
+
+	// httpClient is the client the fetcher/scanner were built with, retained
+	// so the applier's best-effort go-version fallback (see
+	// fallbackRequiredGoVersion) shares the same transport and timeouts.
+	httpClient *http.Client
 }
 
 // NewAnalyzer creates a new analyzer with the provided HTTP client
@@ -33,6 +39,7 @@ func NewAnalyzer(httpClient *http.Client) *Analyzer {
 	return &Analyzer{
 		fetcher:              ecosystem.NewFetcher(httpClient),
 		vulnerabilityScanner: scan.NewVulnerabilityScanner(httpClient),
+		httpClient:           httpClient,
 	}
 }
 
@@ -81,6 +88,10 @@ func (v *VulnerabilityChecker) Check(ctx context.Context, p processor.Processor)
 type GoBumpApplier struct {
 	processor.BaseStage
 	Analyzer *Analyzer
+
+	// goProxyURL is the module proxy the best-effort go-version fallback
+	// queries; tests point it at an httptest server.
+	goProxyURL string
 }
 
 func NewGoBumpApplier(analyzer *Analyzer) *GoBumpApplier {
@@ -89,8 +100,18 @@ func NewGoBumpApplier(analyzer *Analyzer) *GoBumpApplier {
 			StageName:        "gobump_apply",
 			StageDescription: "Apply bump/go-bump pipeline changes",
 		},
-		Analyzer: analyzer,
+		Analyzer:   analyzer,
+		goProxyURL: defaultGoProxyURL,
 	}
+}
+
+// httpClient returns the analyzer's HTTP client, falling back to the default
+// client when the applier was built without one (tests).
+func (g *GoBumpApplier) httpClient() *http.Client {
+	if g.Analyzer != nil && g.Analyzer.httpClient != nil {
+		return g.Analyzer.httpClient
+	}
+	return http.DefaultClient
 }
 
 func (g *GoBumpApplier) ShouldRun(ctx context.Context, p processor.Processor) (bool, error) {
@@ -285,6 +306,13 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 	modroots := unitRoots(langUnits)
 	existingDepsByRoot := existingDepsForModroots(modroots, bumpSteps)
 	existingReplacesByRoot := existingReplacesForModroots(modroots, bumpSteps)
+	// go-version is a Go-only pipeline input - other languages' analyses must
+	// never carry one (the coalesce key includes it; a stray value would
+	// split their groups).
+	existingGoVersionByRoot := make(map[string]string)
+	if language == "go" {
+		existingGoVersionByRoot = existingGoVersionsForModroots(modroots, bumpSteps)
+	}
 	manifestFiles := eco.ManifestFiles()
 
 	result := &languageResult{
@@ -355,6 +383,7 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 			// This also keeps the --no-validate degrade path a pass-through.
 			ExistingReplaces:     existingReplaces,
 			DesiredReplaces:      existingReplaces,
+			ExistingGoVersion:    existingGoVersionByRoot[root],
 			SecurityBumpModules:  securityBumpModules,
 			SecurityBumpsByCoord: bumpCoords,
 		})
@@ -384,6 +413,31 @@ func existingDepsForModroots(modroots []string, bumpSteps []config.BumpStep) map
 // existingDepsForModroots.
 func existingReplacesForModroots(modroots []string, bumpSteps []config.BumpStep) map[string][]string {
 	return existingEntriesForModroots(modroots, bumpSteps, func(step config.BumpStep) []string { return step.Replaces })
+}
+
+// existingGoVersionsForModroots returns, for each modroot, the highest
+// with.go-version carried by any existing go-language bump/go-bump step that
+// covers it ("" when none). It mirrors existingDepsForModroots' matching
+// semantics (a step covers a root when its modroot list contains it), but is
+// additionally filtered to go-language steps - go-version is meaningless
+// elsewhere. Values goversion can't order (templated expressions) are ignored
+// here; the fast-path reconciler warns about them instead of editing.
+func existingGoVersionsForModroots(modroots []string, bumpSteps []config.BumpStep) map[string]string {
+	result := make(map[string]string, len(modroots))
+	for _, root := range modroots {
+		var highest string
+		for _, step := range bumpSteps {
+			if step.GoVersion == "" || !slices.Contains(step.Modroots, root) {
+				continue
+			}
+			if stepLanguage := step.Language; stepLanguage != "" && stepLanguage != "go" {
+				continue
+			}
+			highest = goversion.Max(highest, step.GoVersion)
+		}
+		result[root] = highest
+	}
+	return result
 }
 
 func existingEntriesForModroots(modroots []string, bumpSteps []config.BumpStep, entries func(config.BumpStep) []string) map[string][]string {
@@ -492,13 +546,58 @@ func (g *GoBumpApplier) applyGoBumpChanges(ctx context.Context, gp *GoBumpProces
 		return nil
 	}
 
+	// Best-effort go-version computation for modroots the simulation didn't
+	// prove (--no-validate, degrade, or per-root skips) - must run before
+	// reconciliation so the value feeds step emission and the pin floor.
+	g.fallbackGoVersions(ctx, gp, analysis)
+
 	loader := newMelangeLoader()
 
 	if err := g.reconcileBumpSteps(gp, analysis, loader); err != nil {
 		return fmt.Errorf("reconciling bump steps: %w", err)
 	}
 
+	if err := g.reconcileGoPackagePins(gp, goPinFloor(analysis)); err != nil {
+		return fmt.Errorf("reconciling go-package pins: %w", err)
+	}
+
 	return nil
+}
+
+// fallbackGoVersions populates RequiredGoVersion for go modroots the
+// simulation didn't cover, from the best-effort proxy probe (see
+// fallbackRequiredGoVersion), gated against the pristine baseline exactly
+// like the simulation path. Fail-open throughout: any failure just leaves
+// RequiredGoVersion empty (with a warning), never blocks the apply.
+func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis) {
+	for li := range analysis.ByLanguage {
+		lang := &analysis.ByLanguage[li]
+		if lang.Language != "go" {
+			continue
+		}
+		for mi := range lang.ByModroot {
+			m := &lang.ByModroot[mi]
+			if m.Simulated || m.RequiredGoVersion != "" {
+				continue
+			}
+			if len(m.DesiredDeps) == 0 && len(m.DesiredReplaces) == 0 {
+				continue
+			}
+			required, err := fallbackRequiredGoVersion(ctx, g.httpClient(), g.goProxyURL, m)
+			if err != nil {
+				slog.Warn("could not determine required Go version (best-effort probe failed)",
+					"modroot", m.Modroot, "error", err)
+				gp.AddMessage(fmt.Sprintf("modroot %s: could not determine required Go version (best-effort probe failed): %v", m.Modroot, err))
+				continue
+			}
+			if required == "" || goversion.Compare(required, pristineGoBaseline(m)) <= 0 {
+				continue
+			}
+			m.RequiredGoVersion = required
+			gp.AddMessage(fmt.Sprintf("modroot %s: candidate dependencies require Go %s (module baseline %s) - best-effort (direct candidates only); run with simulation for a proven result",
+				m.Modroot, required, baselineWord(pristineGoBaseline(m))))
+		}
+	}
 }
 
 // reconcileBumpSteps writes the desired per-modroot dependency sets back into
@@ -563,12 +662,14 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(gp *GoBumpProcessor, langAnal
 	if len(existingSteps) == 1 &&
 		sameRootSet(existingSteps[0].Modroots, allModroots(langAnalysis.ByModroot)) &&
 		allRootsShareDeps(langAnalysis.ByModroot) &&
-		allRootsShareReplaces(langAnalysis.ByModroot) {
+		allRootsShareReplaces(langAnalysis.ByModroot) &&
+		allRootsShareGoVersion(langAnalysis.ByModroot) {
 		step := existingSteps[0]
 		desired := desiredDepsForSingleGroup(langAnalysis.ByModroot)
 		desiredReplaces := desiredReplacesForSingleGroup(langAnalysis.ByModroot)
+		goVersion := g.fastPathGoVersion(gp, step, effectiveGoVersionForSingleGroup(langAnalysis.ByModroot))
 
-		updated, err := loader.UpdateGoBumpStep(gp.GetCurrentYAML(), step.Index, desired, desiredReplaces, "")
+		updated, err := loader.UpdateGoBumpStep(gp.GetCurrentYAML(), step.Index, desired, desiredReplaces, goVersion)
 		if err != nil {
 			return fmt.Errorf("updating %s pipeline[%d]: %w", step.Action, step.Index, err)
 		}
@@ -578,6 +679,22 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(gp *GoBumpProcessor, langAnal
 		gp.AddMessage(fmt.Sprintf("Updated %s pipeline[%d] with %d dependencies and %d replaces", step.Action, step.Index, len(desired), len(desiredReplaces)))
 		g.recordSecurityFixes(gp, langAnalysis, addedAcrossRoots(langAnalysis.ByModroot))
 		return nil
+	}
+
+	// A step carrying a templated/unorderable go-version cannot be preserved
+	// through this rebuild: InsertBumpPipelineStep only accepts plain version
+	// characters ([0-9A-Za-z._+-]), so the raw templated value can never be
+	// re-emitted (existingGoVersionsForModroots above already silently drops
+	// it from the effective-go-version computation). Warn loudly instead of
+	// letting it vanish.
+	for _, step := range existingSteps {
+		if step.GoVersion != "" && !goversion.IsValid(step.GoVersion) {
+			msg := fmt.Sprintf("%s pipeline[%d] go-version %q is not a plain version (templated?) and could not be preserved across the bump pipeline rebuild (modroots: %s) - reapply it manually",
+				step.Action, step.Index, step.GoVersion, strings.Join(step.Modroots, ", "))
+			gp.AddMessage(msg)
+			slog.Warn("go-version could not be preserved across bump pipeline rebuild",
+				"action", step.Action, "index", step.Index, "go_version", step.GoVersion, "modroots", step.Modroots)
+		}
 	}
 
 	groups := coalesceModroots(langAnalysis.ByModroot)
@@ -613,11 +730,12 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(gp *GoBumpProcessor, langAnal
 
 	for _, group := range groups {
 		spec := config.BumpStepSpec{
-			Action:   "bump",
-			Language: langAnalysis.Language,
-			Modroots: group.Modroots,
-			Deps:     group.Deps,
-			Replaces: group.Replaces,
+			Action:    "bump",
+			Language:  langAnalysis.Language,
+			GoVersion: group.GoVersion,
+			Modroots:  group.Modroots,
+			Deps:      group.Deps,
+			Replaces:  group.Replaces,
 		}
 		updated, err := loader.InsertBumpPipelineStep(yamlContent, insertPos, spec, hasBlankLines)
 		if err != nil {
@@ -635,17 +753,46 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(gp *GoBumpProcessor, langAnal
 	return nil
 }
 
+// fastPathGoVersion decides the go-version argument for a fast-path in-place
+// update of step: the group's effective value when it genuinely raises the
+// step's current one, "" (leave the field untouched, byte-for-byte) when the
+// step already carries an equal-or-higher value - so re-running the applier
+// on already-updated YAML never churns it, and an existing value is NEVER
+// lowered. A step value goversion can't order (templated expression) is
+// warned about, never overwritten.
+func (g *GoBumpApplier) fastPathGoVersion(gp *GoBumpProcessor, step config.BumpStep, effective string) string {
+	if effective == "" {
+		return ""
+	}
+	switch {
+	case step.GoVersion == "":
+		return effective
+	case !goversion.IsValid(step.GoVersion):
+		gp.AddMessage(fmt.Sprintf("%s pipeline[%d] go-version %q is not a plain version (templated?); required Go %s - not rewritten, update it manually",
+			step.Action, step.Index, step.GoVersion, effective))
+		return ""
+	case goversion.Compare(effective, step.GoVersion) > 0:
+		return effective
+	default:
+		return ""
+	}
+}
+
 // modrootGroup is a set of modroots that share identical desired dependency
-// and replace sets.
+// and replace sets and (for Go) an identical effective go-version.
 type modrootGroup struct {
-	Modroots []string
-	Deps     []string
-	Replaces []string
+	Modroots  []string
+	Deps      []string
+	Replaces  []string
+	GoVersion string // effective go-version shared by the group; "" for none (and always for non-Go languages)
 }
 
 // coalesceModroots groups modroots that end up with identical desired
-// dependency AND replace sets into a single step, in first-seen order. Roots
-// with neither desired deps nor replaces are omitted entirely.
+// dependency AND replace sets AND effective go-version into a single step, in
+// first-seen order. Roots with neither desired deps nor replaces are omitted
+// entirely. The go-version key component is only ever non-empty for Go
+// modroots (RequiredGoVersion/ExistingGoVersion are Go-only fields), so other
+// languages' grouping is unaffected; empty values group together as before.
 func coalesceModroots(byModroot []ModrootAnalysis) []modrootGroup {
 	var order []string
 	byKey := make(map[string]*modrootGroup)
@@ -654,10 +801,11 @@ func coalesceModroots(byModroot []ModrootAnalysis) []modrootGroup {
 		if len(m.DesiredDeps) == 0 && len(m.DesiredReplaces) == 0 {
 			continue
 		}
-		key := groupKey(m.DesiredDeps) + "\x00" + groupKey(m.DesiredReplaces)
+		goVersion := effectiveGoVersion(m)
+		key := groupKey(m.DesiredDeps) + "\x00" + groupKey(m.DesiredReplaces) + "\x00" + goVersion
 		group, ok := byKey[key]
 		if !ok {
-			group = &modrootGroup{Deps: sortedCopy(m.DesiredDeps), Replaces: sortedCopy(m.DesiredReplaces)}
+			group = &modrootGroup{Deps: sortedCopy(m.DesiredDeps), Replaces: sortedCopy(m.DesiredReplaces), GoVersion: goVersion}
 			byKey[key] = group
 			order = append(order, key)
 		}
@@ -726,6 +874,40 @@ func allRootsShareReplaces(byModroot []ModrootAnalysis) bool {
 		}
 	}
 	return true
+}
+
+// effectiveGoVersion is the go-version a modroot's bump step should end up
+// carrying: the max of what its existing steps already declare and what the
+// proven/probed candidate set requires. Max never picks the lower of two
+// valid values, so an existing value is never lowered. "" for non-Go
+// modroots (both fields are Go-only) and when neither side has a value.
+func effectiveGoVersion(m ModrootAnalysis) string {
+	return goversion.Max(m.ExistingGoVersion, m.RequiredGoVersion)
+}
+
+// allRootsShareGoVersion reports whether every analyzed modroot has an
+// identical effective go-version (the go-version analogue of
+// allRootsShareReplaces).
+func allRootsShareGoVersion(byModroot []ModrootAnalysis) bool {
+	if len(byModroot) <= 1 {
+		return true
+	}
+	first := effectiveGoVersion(byModroot[0])
+	for _, m := range byModroot[1:] {
+		if effectiveGoVersion(m) != first {
+			return false
+		}
+	}
+	return true
+}
+
+// effectiveGoVersionForSingleGroup returns the effective go-version shared by
+// every analyzed modroot (only valid when allRootsShareGoVersion is true).
+func effectiveGoVersionForSingleGroup(byModroot []ModrootAnalysis) string {
+	if len(byModroot) == 0 {
+		return ""
+	}
+	return effectiveGoVersion(byModroot[0])
 }
 
 // desiredDepsForSingleGroup returns the desired deps shared by every

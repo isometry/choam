@@ -574,6 +574,116 @@ func TestSimulationStage_CoUpdateFixpoint(t *testing.T) {
 	}, m.DesiredDeps)
 }
 
+// TestSimulationStage_RequiredGoVersion: the simulation's MaxDepGoVersion
+// lands in ModrootAnalysis.RequiredGoVersion iff it exceeds the module's own
+// pristine baseline (go directive / toolchain directive max).
+func TestSimulationStage_RequiredGoVersion(t *testing.T) {
+	tests := []struct {
+		name            string
+		goMod           string // "" means no parsed go.mod (Deps stays nil)
+		maxDepGoVersion string
+		wantRequired    string
+	}{
+		{
+			name:            "greater than go directive - set",
+			goMod:           "module example.com/app\n\ngo 1.22\n",
+			maxDepGoVersion: "1.25",
+			wantRequired:    "1.25",
+		},
+		{
+			name:            "equal to go directive - not set",
+			goMod:           "module example.com/app\n\ngo 1.25\n",
+			maxDepGoVersion: "1.25",
+			wantRequired:    "",
+		},
+		{
+			name:            "lower than go directive - not set",
+			goMod:           "module example.com/app\n\ngo 1.25\n",
+			maxDepGoVersion: "1.24",
+			wantRequired:    "",
+		},
+		{
+			name:            "unavailable from simulation - not set",
+			goMod:           "module example.com/app\n\ngo 1.22\n",
+			maxDepGoVersion: "",
+			wantRequired:    "",
+		},
+		{
+			name:            "toolchain directive raises the baseline - not set",
+			goMod:           "module example.com/app\n\ngo 1.22\n\ntoolchain go1.25.1\n",
+			maxDepGoVersion: "1.24",
+			wantRequired:    "",
+		},
+		{
+			name:            "exceeds even the toolchain directive - set",
+			goMod:           "module example.com/app\n\ngo 1.22\n\ntoolchain go1.25.1\n",
+			maxDepGoVersion: "1.26",
+			wantRequired:    "1.26",
+		},
+		{
+			name:            "no pristine go.mod - fail open toward emitting",
+			goMod:           "",
+			maxDepGoVersion: "1.25",
+			wantRequired:    "1.25",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gp := newSimulationProcessor()
+			if tt.goMod != "" {
+				deps, err := ecogolang.New().Analyze(t.Context(), map[string][]byte{"go.mod": []byte(tt.goMod)})
+				require.NoError(t, err)
+				gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0].Deps = deps
+			}
+
+			fake := &fakeBumpSimulator{
+				results: map[string]*simulate.ModrootResult{
+					".": {
+						Modroot:          ".",
+						FinalDeps:        []string{"example.com/old@v1.2.0"},
+						CVEBackedModules: []string{"example.com/old"},
+						Converged:        true, Iterations: 1,
+						MaxDepGoVersion: tt.maxDepGoVersion,
+					},
+				},
+			}
+			stage := newStageWithFake(fake)
+
+			require.NoError(t, stage.Apply(t.Context(), gp))
+
+			m := gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0]
+			assert.Equal(t, tt.wantRequired, m.RequiredGoVersion)
+
+			var messaged bool
+			for _, msg := range gp.GetMessages() {
+				if strings.Contains(msg, "require Go") {
+					messaged = true
+				}
+			}
+			assert.Equal(t, tt.wantRequired != "", messaged, "raise message iff a raise was recorded; messages: %v", gp.GetMessages())
+		})
+	}
+}
+
+func TestPristineGoBaseline(t *testing.T) {
+	t.Run("nil deps", func(t *testing.T) {
+		assert.Equal(t, "", pristineGoBaseline(&ModrootAnalysis{}))
+	})
+
+	t.Run("go directive only", func(t *testing.T) {
+		deps, err := ecogolang.New().Analyze(t.Context(), map[string][]byte{"go.mod": []byte("module m\n\ngo 1.24\n")})
+		require.NoError(t, err)
+		assert.Equal(t, "1.24", pristineGoBaseline(&ModrootAnalysis{Deps: deps}))
+	})
+
+	t.Run("toolchain directive wins when higher", func(t *testing.T) {
+		deps, err := ecogolang.New().Analyze(t.Context(), map[string][]byte{"go.mod": []byte("module m\n\ngo 1.22\n\ntoolchain go1.25.3\n")})
+		require.NoError(t, err)
+		assert.Equal(t, "1.25.3", pristineGoBaseline(&ModrootAnalysis{Deps: deps}))
+	})
+}
+
 // TestSimulationStage_PackageUnreachableClassifiedAsInfo: the x/sys/windows
 // shape end-to-end at the stage level - the module is linked but the
 // advisory's vulnerable packages are not; the advisory must land in the

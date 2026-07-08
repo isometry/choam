@@ -1,6 +1,7 @@
 package gobump
 
 import (
+	"fmt"
 	"log/slog"
 	"regexp"
 	"sort"
@@ -103,6 +104,131 @@ func goToolchainPins(cfg *melange.Configuration) []GoToolchainPin {
 	}
 
 	return pins
+}
+
+// goPinFloor is the Go language version every go-package pin in the file
+// must satisfy: the file-wide max, across go modroots, of each root's own
+// pristine baseline and its (proven or best-effort) required raise. "" when
+// nothing demands anything (no go modroots, or no baseline information).
+func goPinFloor(analysis *VulnerabilityAnalysis) string {
+	var floor string
+	for li := range analysis.ByLanguage {
+		lang := &analysis.ByLanguage[li]
+		if lang.Language != "go" {
+			continue
+		}
+		for mi := range lang.ByModroot {
+			m := &lang.ByModroot[mi]
+			floor = goversion.Max(floor, pristineGoBaseline(m), m.RequiredGoVersion)
+		}
+	}
+	return floor
+}
+
+// reconcileGoPackagePins raises too-old go-package pins on go/build|go/install
+// steps (top-level and subpackage pipelines) to satisfy pinFloor (a bare Go
+// version), comment-preservingly, only ever raising a pin's minor - never
+// lowering one. Values it cannot safely rewrite are warned about instead:
+// templated pins (the melange variable must be updated manually) and values
+// that aren't a recognizable go toolchain package name. Unversioned pins
+// ("go", "go-fips") already float to the latest toolchain and are left alone.
+// pinFloor "" is a no-op.
+//
+// Scope note: this only runs when the applier runs at all
+// (GoBumpApplier.ShouldRun gates on bump actions), so a package whose pins
+// are stale but whose deps need no bump is not rewritten - an accepted v1
+// limitation.
+func (g *GoBumpApplier) reconcileGoPackagePins(gp *GoBumpProcessor, pinFloor string) error {
+	if pinFloor == "" {
+		return nil
+	}
+	floorMinor := goversion.Minor(pinFloor)
+	if floorMinor == "" {
+		return nil
+	}
+
+	loader := config.NewLoader()
+	yamlContent := gp.GetCurrentYAML()
+	pins, err := loader.FindGoPackagePins(yamlContent)
+	if err != nil {
+		return fmt.Errorf("finding go-package pins: %w", err)
+	}
+	if len(pins) == 0 {
+		return nil
+	}
+
+	var renderer *config.Renderer
+	if gp.Config != nil {
+		renderer, err = config.NewRenderer(gp.Config)
+		if err != nil {
+			slog.Debug("could not build template renderer for go-package pin reconciliation", "error", err)
+			renderer = nil
+		}
+	}
+
+	changed := false
+	for _, pin := range pins {
+		where := "pipeline"
+		if pin.Subpackage != "" {
+			where = "subpackage " + pin.Subpackage
+		}
+
+		if strings.Contains(pin.Value, "${{") {
+			if renderer == nil {
+				// Degraded path (no gp.Config, or the renderer failed to
+				// build): the templated value can't be evaluated at all, so
+				// raw-value parsing below would silently misjudge or skip it.
+				// Warn instead of going quiet.
+				gp.AddMessage(fmt.Sprintf("go-package %q (%s) is templated and could not be evaluated; verify manually against required Go %s",
+					pin.Value, where, pinFloor))
+				continue
+			}
+			// Templated pin: judge the rendered value, but never edit the
+			// template - the variable behind it is the user's to update.
+			rendered := pin.Value
+			if r, err := renderer.RenderString(pin.Value); err == nil {
+				rendered = r
+			} else {
+				slog.Debug("could not render go-package pin", "value", pin.Value, "error", err)
+			}
+			_, minor, ok := parseGoPackagePin(rendered)
+			if ok && minor != "" && goversion.Compare(minor, floorMinor) < 0 {
+				gp.AddMessage(fmt.Sprintf("go-package %q (%s) is templated and resolves to Go %s, below required Go %s; update the variable manually",
+					pin.Value, where, minor, pinFloor))
+			}
+			continue
+		}
+
+		base, minor, ok := parseGoPackagePin(pin.Value)
+		if !ok {
+			gp.AddMessage(fmt.Sprintf("unrecognized go-package %q (%s); required Go %s - not rewritten", pin.Value, where, pinFloor))
+			continue
+		}
+		if minor == "" {
+			// Unversioned toolchain package ("go", "go-fips"): tracks the
+			// latest release already, nothing to raise.
+			slog.Debug("go-package pin is unversioned - leaving untouched", "value", pin.Value, "where", where)
+			continue
+		}
+		if goversion.Compare(minor, floorMinor) >= 0 {
+			continue
+		}
+
+		newValue := base + "-" + floorMinor
+		updated, err := loader.UpdateField(yamlContent, pin.Path, newValue)
+		if err != nil {
+			return fmt.Errorf("updating go-package pin %s: %w", pin.Path, err)
+		}
+		yamlContent = updated
+		changed = true
+		gp.AddMessage(fmt.Sprintf("raised go-package pin %s -> %s (%s; dependencies require Go %s)", pin.Value, newValue, where, pinFloor))
+	}
+
+	if changed {
+		gp.SetCurrentYAML(yamlContent)
+		gp.MarkActualChangesApplied()
+	}
+	return nil
 }
 
 // distinctMinorConstraints reduces pins to the sorted distinct set of minor

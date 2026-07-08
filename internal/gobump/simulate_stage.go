@@ -11,6 +11,7 @@ import (
 
 	omnibumpgolang "github.com/chainguard-dev/omnibump/pkg/languages/golang"
 	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
+	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/processor"
 	"github.com/isometry/choam/internal/scan"
 	"github.com/isometry/choam/internal/simulate"
@@ -157,6 +158,19 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			unlinkedHere := reach.observe(*m, result.Linked, result.LinkedPackages, true)
 
 			s.declareCoUpdates(ctx, gp, m, result)
+
+			// The proven graph's Go language requirement, gated against the
+			// module's own pristine baseline: only a genuine raise is recorded
+			// (an existing step's go-version is additionally never lowered -
+			// see the reconcilers' effectiveGoVersion handling).
+			if result.MaxDepGoVersion != "" {
+				baseline := pristineGoBaseline(m)
+				if goversion.Compare(result.MaxDepGoVersion, baseline) > 0 {
+					m.RequiredGoVersion = result.MaxDepGoVersion
+					gp.AddMessage(fmt.Sprintf("modroot %s: validated dependencies require Go %s (module baseline %s)",
+						m.Modroot, result.MaxDepGoVersion, baselineWord(baseline)))
+				}
+			}
 
 			gp.AddMessage(fmt.Sprintf(
 				"simulation: modroot %s %s in %d iteration(s): %d validated dep(s), %d replace(s), %d dropped, %d residual advisory(ies), %d advisory(ies) in unlinked modules",
@@ -607,6 +621,35 @@ func trimMajorSuffix(module string) string {
 		return module
 	}
 	return module[:idx]
+}
+
+// pristineGoBaseline is the Go language version the modroot's own pristine
+// go.mod already demands: the max of its go directive and toolchain directive
+// (bare form). Empty when the parsed go.mod is unavailable (non-Go analyses,
+// or fixtures without a manifest) - callers gating on "required > baseline"
+// then fail open toward emitting the requirement, which is always safe (it
+// only ever selects at least the toolchain the module would need anyway).
+func pristineGoBaseline(m *ModrootAnalysis) string {
+	modFile := ecogolang.ModFileOf(m.Deps)
+	if modFile == nil {
+		return ""
+	}
+	var goDirective, toolchainDirective string
+	if modFile.Go != nil {
+		goDirective = modFile.Go.Version
+	}
+	if modFile.Toolchain != nil {
+		toolchainDirective = strings.TrimPrefix(modFile.Toolchain.Name, "go")
+	}
+	return goversion.Max(goDirective, toolchainDirective)
+}
+
+// baselineWord renders a possibly-unknown baseline for messages.
+func baselineWord(baseline string) string {
+	if baseline == "" {
+		return "unknown"
+	}
+	return baseline
 }
 
 func convergedWord(converged bool) string {

@@ -1,0 +1,147 @@
+package gobump
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/isometry/choam/internal/goversion"
+	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/module"
+)
+
+// defaultGoProxyURL is the module proxy the best-effort go-version fallback
+// fetches candidate go.mod files from (overridden in tests via
+// GoBumpApplier.goProxyURL).
+const defaultGoProxyURL = "https://proxy.golang.org"
+
+// fallbackGoVersionBudget bounds one modroot's whole fallback probe - it is
+// best-effort by design (see fallbackRequiredGoVersion) and must never stall
+// the apply phase.
+const fallbackGoVersionBudget = 30 * time.Second
+
+// maxGoModBytes caps how much of a proxy .mod response is read; real go.mod
+// files are tiny, so anything beyond this is not one.
+const maxGoModBytes = 1 << 20
+
+// fallbackRequiredGoVersion computes, without simulation, the max go
+// directive across the modroot's candidate deps' own go.mod files, fetched
+// from the module proxy at proxyBaseURL. Candidates are the coordinates in
+// DesiredDeps plus the "new@version" side of DesiredReplaces. This is
+// best-effort and fail-open: it only sees direct candidates (not the resolved
+// graph the simulation proves), individual fetch/parse failures are skipped
+// with a debug log, and an error is returned only when nothing at all could
+// be fetched (the caller warns and proceeds without a value).
+func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBaseURL string, m *ModrootAnalysis) (string, error) {
+	candidates := fallbackCandidates(m)
+	if len(candidates) == 0 {
+		return "", nil
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, fallbackGoVersionBudget)
+	defer cancel()
+
+	var maxGo string
+	fetched := 0
+	for _, candidate := range candidates {
+		goDirective, err := fetchModGoDirective(ctx, client, proxyBaseURL, candidate.module, candidate.version)
+		if err != nil {
+			slog.Debug("go-version fallback: could not fetch candidate go.mod - skipping",
+				"modroot", m.Modroot, "module", candidate.module, "version", candidate.version, "error", err)
+			continue
+		}
+		fetched++
+		maxGo = goversion.Max(maxGo, goDirective)
+	}
+
+	if fetched == 0 {
+		return "", fmt.Errorf("none of the %d candidate go.mod files could be fetched", len(candidates))
+	}
+	return maxGo, nil
+}
+
+// moduleVersion is one fallback candidate coordinate.
+type moduleVersion struct {
+	module  string
+	version string
+}
+
+// fallbackCandidates projects a modroot's desired deps ("module@version") and
+// replaces ("old=new@version", new side) onto deduplicated module@version
+// coordinates, in declaration order.
+func fallbackCandidates(m *ModrootAnalysis) []moduleVersion {
+	seen := make(map[string]struct{}, len(m.DesiredDeps)+len(m.DesiredReplaces))
+	candidates := make([]moduleVersion, 0, len(m.DesiredDeps)+len(m.DesiredReplaces))
+	add := func(mod, version string) {
+		if mod == "" || version == "" {
+			return
+		}
+		key := mod + "@" + version
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		candidates = append(candidates, moduleVersion{module: mod, version: version})
+	}
+
+	for _, dep := range m.DesiredDeps {
+		if mod, version, ok := splitCoordVersion(dep); ok {
+			add(mod, version)
+		}
+	}
+	for _, replace := range m.DesiredReplaces {
+		coord, version, ok := splitCoordVersion(replace)
+		if !ok {
+			continue
+		}
+		if _, newPath, found := strings.Cut(coord, "="); found {
+			add(newPath, version)
+		}
+	}
+	return candidates
+}
+
+// fetchModGoDirective fetches {proxy}/{module}/@v/{version}.mod and returns
+// its go directive ("" when the file has none - very old modules).
+func fetchModGoDirective(ctx context.Context, client *http.Client, proxyBaseURL, modulePath, version string) (string, error) {
+	escapedPath, err := module.EscapePath(modulePath)
+	if err != nil {
+		return "", fmt.Errorf("escaping module path: %w", err)
+	}
+	escapedVersion, err := module.EscapeVersion(version)
+	if err != nil {
+		return "", fmt.Errorf("escaping version: %w", err)
+	}
+
+	url := fmt.Sprintf("%s/%s/@v/%s.mod", strings.TrimSuffix(proxyBaseURL, "/"), escapedPath, escapedVersion)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return "", err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("GET %s: %s", url, resp.Status)
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxGoModBytes))
+	if err != nil {
+		return "", err
+	}
+	modFile, err := modfile.ParseLax(modulePath+"@"+version+"/go.mod", body, nil)
+	if err != nil {
+		return "", fmt.Errorf("parsing go.mod: %w", err)
+	}
+	if modFile.Go == nil {
+		return "", nil
+	}
+	return modFile.Go.Version, nil
+}
