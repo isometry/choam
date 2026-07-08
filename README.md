@@ -103,6 +103,58 @@ choam update --force package.yaml
 - `--shared`: Update shared dependencies (default: true)
 - `--verbose, -v`: Increase verbosity
 
+### Fix Vulnerabilities
+
+Scan module dependencies for known vulnerabilities and fix them by adding or updating `bump`/`go/bump` pipeline steps, incrementing `package.epoch` when a fix is applied. `gobump` is retained as a command alias for `bump`:
+
+```bash
+# Scan and fix (simulation proves the fix set resolves and covers advisories; needs a go toolchain)
+choam bump ./packages/
+
+# Dry run to preview changes
+choam bump --dry-run ./packages/
+
+# Skip simulation (writes deps without proving resolution/coverage or artifact-reachability filtering; no toolchain required)
+choam bump --no-validate ./packages/
+
+# Skip the Go stdlib staleness check (no epoch bump for toolchain-fixed vulnerabilities)
+choam bump --no-stdlib ./packages/
+
+# Create backups before fixing
+choam bump --backup-suffix .bak ./packages/
+```
+
+#### Flags
+
+- `--format, -f`: Output format (table, json, yaml)
+- `--dry-run`: Show what would be changed without writing
+- `--backup-suffix`: Create backup files (e.g., `.bak`)
+- `--no-validate`: Skip bump simulation (writes deps without proving they resolve or cover all advisories, and skips artifact-reachability filtering; go.sum narrowing still applies)
+- `--simulation-timeout`: Per-package budget for bump simulation (default: 10m)
+- `--no-stdlib`: Skip the Go stdlib staleness check
+- `--verbose, -v`: Increase verbosity
+
+#### Go version handling
+
+When simulation proves a candidate dependency set, `bump` also computes the Go language version that set requires and, if it exceeds the module's existing `go`/`toolchain` directive (never lowering an existing value), emits a `go-version: "X"` input into the `bump`/`go/bump` pipeline step. Under `--no-validate`, a best-effort fallback fetches candidate `go.mod` files from the Go module proxy to approximate the same value. Any `go-package` toolchain pin on `go/build`/`go/install` steps that's now too old (e.g. `go-1.24`) is raised to satisfy the requirement (e.g. `go-1.25`); templated or unrecognized pins are left alone with a warning instead of being edited. Note: the emitted `go-version` only takes effect once the generic `bump` pipeline exposes a `go-version` input (melange's native `go/bump` already supports it).
+
+#### Stdlib staleness
+
+On by default (`--no-stdlib` to disable). `bump` assumes a package was built with the latest upstream Go release as of the melange file's last git commit (constrained by any `go-package` pins), then compares OSV `stdlib` advisories at that assumed release against the newest allowed release. When a rebuild would fix advisories affecting stdlib packages actually linked into the build artifacts, `package.epoch` is bumped by 1 to force a rebuild - even with zero dependency changes. Artifact-linked-import filtering only applies when simulation runs; under `--no-validate` findings are unfiltered. The check is skipped automatically for files that are untracked, outside a git repository, or have uncommitted changes (doubling as an idempotency guard so repeated runs don't stack bumps); shallow clones are still checked but produce a warning about possible false negatives.
+
+Both checks are best-effort and fail open: any failure degrades to a skip-with-message rather than aborting the run. They rely on network access to `proxy.golang.org` (the Go release index and the go-version fallback), in addition to the `api.osv.dev` vulnerability scanning CHOAM already uses.
+
+#### Example Output
+
+```
+PACKAGE         FOUND  FIXED  RESIDUAL  UNLINKED  BUMPED  STDLIB  OLD EPOCH  NEW EPOCH  STATUS
+go-package      2      2      0         0         1       1       5          6          FIXED
+stale-package   0      0      0         0         0       2       3          4          STDLIB-REBUILD
+safe-package    0      0      0         0         0       -       3          3          NO VULNS
+
+Summary: 3 files processed, 1 with vulnerabilities, 1 fixed, 0 errors (2 advisories found, 2 fixed, 0 residual, 0 in unlinked modules; 1 modules bumped); 2 stdlib-stale
+```
+
 ## Configuration
 
 CHOAM reads standard melange `update:` configurations:
@@ -175,7 +227,7 @@ make clean             # Remove artifacts
 ### Project Structure
 
 ```
-cmd/              CLI commands (check, update, gobump)
+cmd/              CLI commands (check, update, bump)
 internal/
   processor/      Processing pipeline architecture
   updater/        Update detection and application
@@ -185,46 +237,6 @@ internal/
   git/            Git operations client
   anitya/         Release monitoring client
   config/         YAML configuration handling
-```
-
-## Experimental Features
-
-⚠️ **WARNING**: The following features are experimental and hidden from standard CLI help. They may change or be removed without notice. Use at your own risk in production environments.
-
-### gobump - Vulnerability Scanning (Hidden Command)
-
-The `gobump` command scans and fixes Go module vulnerabilities using go/bump pipelines. This command is currently **hidden** (not shown in `choam --help`) and should be considered **unstable**.
-
-**Why hidden?** This feature is under active development. The API, behavior, and output format may change between releases without deprecation warnings.
-
-#### Usage
-
-```bash
-# Scan for vulnerabilities (hidden command)
-choam gobump ./packages/
-
-# Dry run to preview fixes
-choam gobump --dry-run ./packages/
-
-# Create backups before fixing
-choam gobump --backup-suffix .bak ./packages/
-```
-
-#### Flags
-
-- `--format, -f`: Output format (table, json)
-- `--dry-run`: Show what would be changed without writing
-- `--backup-suffix`: Create backup files
-- `--verbose, -v`: Increase verbosity
-
-#### Example Output
-
-```
-PACKAGE              VULNS FOUND    VULNS FIXED    OLD EPOCH    NEW EPOCH    STATUS
-go-package           2              2              5            6            FIXED
-safe-package         0              0              3            3            NO VULNS
-
-Summary: 2 files processed, 1 with vulnerabilities, 1 fixed, 0 errors (2 vulnerabilities found, 2 fixed)
 ```
 
 ## Example Output
