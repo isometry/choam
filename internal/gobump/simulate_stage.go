@@ -157,6 +157,19 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			gp.AddResiduals(result.Residuals)
 			unlinkedHere := reach.observe(*m, result.Linked, result.LinkedPackages, true)
 
+			// Union the linked stdlib slice into the processor for the
+			// stdlib staleness stage (Go only - this loop already is), so
+			// it can filter stdlib advisories by artifact reachability
+			// without its own checkout. nil = unknown, contributes nothing.
+			if result.StdPackages != nil {
+				if gp.LinkedStdPackages == nil {
+					gp.LinkedStdPackages = make(map[string]struct{}, len(result.StdPackages))
+				}
+				for pkg := range result.StdPackages {
+					gp.LinkedStdPackages[pkg] = struct{}{}
+				}
+			}
+
 			s.declareCoUpdates(ctx, gp, m, result)
 
 			// The proven graph's Go language requirement, gated against the

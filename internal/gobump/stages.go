@@ -12,6 +12,7 @@ import (
 	melange "chainguard.dev/melange/pkg/config"
 	"github.com/isometry/choam/internal/config"
 	"github.com/isometry/choam/internal/ecosystem"
+	"github.com/isometry/choam/internal/gorelease"
 	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/processor"
 	"github.com/isometry/choam/internal/processor/stages"
@@ -24,6 +25,11 @@ import (
 type Analyzer struct {
 	fetcher              *ecosystem.Fetcher
 	vulnerabilityScanner *scan.VulnerabilityScanner
+
+	// goReleases answers "latest stable Go release (as of T)" queries for
+	// the stdlib staleness check; shared across every package in a run so
+	// the release list is fetched and memoized once.
+	goReleases *gorelease.Index
 
 	// httpClient is the client the fetcher/scanner were built with, retained
 	// so the applier's best-effort go-version fallback (see
@@ -39,6 +45,7 @@ func NewAnalyzer(httpClient *http.Client) *Analyzer {
 	return &Analyzer{
 		fetcher:              ecosystem.NewFetcher(httpClient),
 		vulnerabilityScanner: scan.NewVulnerabilityScanner(httpClient),
+		goReleases:           gorelease.NewIndex(httpClient),
 		httpClient:           httpClient,
 	}
 }
@@ -165,13 +172,23 @@ func NewGoBumpPipeline(analyzer *Analyzer, opts ProcessorOptions) *processor.Pip
 		// Apply phase
 		NewGoBumpApplier(analyzer),
 
+		// Stdlib staleness: does rebuilding with a newer Go toolchain fix
+		// stdlib vulnerabilities baked into the last build? Runs even when
+		// no dependency changes exist (the pipeline runner evaluates each
+		// stage's ShouldRun independently), because the fix IS the rebuild.
+		NewStdlibStage(analyzer, opts),
+
 		// Epoch handling - ONLY bump if actual changes were applied
 		// This is the critical fix that solves the issue described in the implementation plan
 		stages.NewEpochStage(&stages.BumpOnSecurityFixStrategy{
 			CheckFunc: func(p processor.Processor) bool {
 				if gp, ok := p.(*GoBumpProcessor); ok {
-					// Critical fix: Only bump epoch if actual changes were applied AND security fixes exist
-					return gp.ActualChangesApplied && len(gp.SecurityFixes) > 0
+					// Dependency fixes only count when actual changes were
+					// applied AND security fixes exist (the critical fix). A
+					// stdlib staleness finding justifies a bump on its own -
+					// the epoch bump itself is what triggers the fixing
+					// rebuild, with zero dependency changes.
+					return (gp.ActualChangesApplied && len(gp.SecurityFixes) > 0) || len(gp.StdlibBumps) > 0
 				}
 				return false
 			},

@@ -66,6 +66,7 @@ func runBump(cmd *cobra.Command, args []string) error {
 		TempDir:           os.TempDir(),
 		Validate:          !noValidate,
 		SimulationTimeout: simulationTimeout,
+		StdlibCheck:       true, // on by default; CLI opt-out arrives with --no-stdlib
 	}
 
 	if dryRun {

@@ -28,6 +28,19 @@ type GoBumpProcessor struct {
 	// SimulationStage's reachability diff) - informational: no bump is
 	// proposed for them and they count neither as fixed nor residual.
 	UnreachableVulnIDs []string `json:"unreachable_vuln_ids,omitempty"`
+
+	// StdlibBumps are the Go stdlib staleness findings (see StdlibStage) -
+	// each justifies an epoch bump on its own, independent of dependency
+	// changes. StdlibChecked is true when the staleness check ran to
+	// completion (false when skipped or degraded).
+	StdlibBumps   []StdlibBump `json:"stdlib_bumps,omitempty"`
+	StdlibChecked bool         `json:"stdlib_checked"`
+
+	// LinkedStdPackages is the union, across simulated Go modroots, of
+	// standard-library import paths linked into the build artifacts
+	// (GOOS=linux; see simulate.ModrootResult.StdPackages). nil = unknown
+	// (simulation didn't run or the toolchain walk failed open).
+	LinkedStdPackages map[string]struct{} `json:"-"`
 }
 
 // NewGoBumpProcessor creates a new gobump processor
@@ -165,6 +178,8 @@ func (p *GoBumpProcessor) ToResult() *GoBumpResult {
 		ModulesBumped:              modulesBumped,
 		Validated:                  p.Validated,
 		Residuals:                  p.Residuals,
+		StdlibBumps:                p.StdlibBumps,
+		StdlibChecked:              p.StdlibChecked,
 		SecurityFixes:              p.SecurityFixes,
 		ActionsApplied:             actionsApplied,
 		OldEpoch:                   p.OldEpoch,

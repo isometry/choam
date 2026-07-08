@@ -19,6 +19,21 @@ type BumpAction struct {
 	Reason       string   `json:"reason" yaml:"reason"`                         // human-readable reason
 }
 
+// StdlibBump records why a stdlib-driven epoch bump is (or would be)
+// applied: rebuilding with the newest allowed Go release would fix stdlib
+// advisories present in the toolchain the package was (estimatedly) last
+// built with. One entry per go-package pin constraint that yields fixable
+// vulnerabilities (see evaluateStdlibStaleness).
+type StdlibBump struct {
+	AssumedGoVersion string   `json:"assumed_go_version" yaml:"assumed_go_version"`
+	AssumedFromDate  string   `json:"assumed_from_date" yaml:"assumed_from_date"`               // RFC3339 last-commit time
+	GoPackagePin     string   `json:"go_package_pin,omitempty" yaml:"go_package_pin,omitempty"` // minor constraint, "" = unpinned
+	RebuildGoVersion string   `json:"rebuild_go_version" yaml:"rebuild_go_version"`
+	VulnIDs          []string `json:"vuln_ids" yaml:"vuln_ids"`
+	UnlinkedVulnIDs  []string `json:"unlinked_vuln_ids,omitempty" yaml:"unlinked_vuln_ids,omitempty"`
+	Validated        bool     `json:"validated" yaml:"validated"` // linked-import filtering applied
+}
+
 // SecurityFix represents a security vulnerability fix applied
 type SecurityFix struct {
 	Module        string `json:"module" yaml:"module"`               // affected package
@@ -55,12 +70,18 @@ type GoBumpResult struct {
 	HighFixed                  int                 `json:"high_fixed" yaml:"high_fixed"`
 	SecurityFixes              []SecurityFix       `json:"security_fixes" yaml:"security_fixes"`
 	ActionsApplied             []BumpAction        `json:"actions_applied" yaml:"actions_applied"`
-	OldEpoch                   int64               `json:"old_epoch" yaml:"old_epoch"`
-	NewEpoch                   int64               `json:"new_epoch" yaml:"new_epoch"`
-	EpochChanged               bool                `json:"epoch_changed" yaml:"epoch_changed"`
-	FileWasWritten             bool                `json:"file_was_written" yaml:"file_was_written"`
-	Messages                   []string            `json:"messages" yaml:"messages"`
-	Error                      string              `json:"error,omitempty" yaml:"error,omitempty"`
+	// StdlibBumps are the Go stdlib staleness findings that (each) justify
+	// an epoch bump; StdlibChecked reports whether the staleness check ran
+	// to completion (false when disabled, inapplicable, or skipped).
+	StdlibBumps   []StdlibBump `json:"stdlib_bumps,omitempty" yaml:"stdlib_bumps,omitempty"`
+	StdlibChecked bool         `json:"stdlib_checked" yaml:"stdlib_checked"`
+
+	OldEpoch       int64    `json:"old_epoch" yaml:"old_epoch"`
+	NewEpoch       int64    `json:"new_epoch" yaml:"new_epoch"`
+	EpochChanged   bool     `json:"epoch_changed" yaml:"epoch_changed"`
+	FileWasWritten bool     `json:"file_was_written" yaml:"file_was_written"`
+	Messages       []string `json:"messages" yaml:"messages"`
+	Error          string   `json:"error,omitempty" yaml:"error,omitempty"`
 }
 
 // ModrootAnalysis contains the dependency analysis for a single module root.
@@ -172,4 +193,10 @@ type ProcessorOptions struct {
 
 	// SimulationTimeout bounds each package's bump simulation (default 10m).
 	SimulationTimeout time.Duration `json:"simulation_timeout" yaml:"simulation_timeout"`
+
+	// StdlibCheck enables the Go stdlib staleness check (see StdlibStage):
+	// estimate the toolchain the package was last built with and bump the
+	// epoch when a rebuild with the newest allowed Go release would fix
+	// stdlib vulnerabilities. On by default at the CLI.
+	StdlibCheck bool `json:"stdlib_check" yaml:"stdlib_check"`
 }
