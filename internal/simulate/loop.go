@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/scan"
 	"golang.org/x/mod/semver"
 )
@@ -162,6 +163,42 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 		}
 	}
 
+	// Dependency-graph capabilities (max go directive, linked stdlib set) are
+	// computed HERE: right after the fixpoint loop exits (converged or
+	// iteration-cap exhausted) and BEFORE confirmMinimalSet runs. At this
+	// exact point the checkout on disk is guaranteed to be the state that
+	// produced `resolved` - the loop body's last apply() is always
+	// immediately followed by ListModules/Requirements/Replaces/refreshLinked
+	// with no intervening disk mutation, and the inner sustain-loop only
+	// exits once dropUnsustained/dropUnreachable report no further change, so
+	// nothing after that last apply() touches go.mod/go.sum before here.
+	// confirmMinimalSet, by contrast, calls l.restore() (the pristine
+	// snapshot from savePristine) and reapplies only the essential candidate
+	// subset; on ANY failure partway through that reapply it returns the
+	// original `resolved` value unchanged but leaves the checkout in
+	// whatever partial "restored + some essentials" state the failed
+	// attempt produced, never resyncing disk back to the full converged
+	// state it's about to report. Querying the toolchain after that point
+	// could read a go.mod that doesn't correspond to `resolved` at all.
+	// Hooking in before confirmMinimalSet sidesteps that gap entirely.
+	//
+	// These values describe the converged FULL candidate set - a superset of
+	// whatever confirmMinimalSet may go on to adopt. For MaxDepGoVersion
+	// that's always a safe over-approximation: dropping redundant candidates
+	// can only lower or hold the max go directive, never raise it.
+	// StdPackages does NOT share that property - the minimal set can pin
+	// different (typically older) module versions than the full set, and an
+	// older version's import graph is not guaranteed to be a subset of the
+	// newer one's; it can reference stdlib packages the full set's versions
+	// never touched. So when confirmMinimalSet adopts a minimal set, it
+	// recomputes both fields itself, immediately before adoption (same
+	// fail-open helpers, same "disk == the graph just adopted" guarantee),
+	// and overwrites the superset values set here. A recompute failure there
+	// fails open by KEEPING these superset values rather than clobbering
+	// them with an empty/unknown result - see confirmMinimalSet.
+	result.MaxDepGoVersion = l.maxDepGoVersion(ctx)
+	result.StdPackages = l.linkedStdPackages(ctx)
+
 	if !result.Converged {
 		// The final rescan still wanted to move modules forward; surface
 		// those targets as residuals rather than looping further.
@@ -175,7 +212,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 			})
 		}
 	} else {
-		resolved = l.confirmMinimalSet(ctx, resolved)
+		resolved = l.confirmMinimalSet(ctx, resolved, result)
 	}
 
 	result.Resolved = resolved
@@ -669,6 +706,34 @@ func (l *loop) refreshLinked(ctx context.Context) {
 	l.linked, l.linkedPackages = linked, linkedPackages
 }
 
+// maxDepGoVersion computes the highest go directive across the current
+// resolved build list's non-main modules. Fail-open: a toolchain error is
+// logged and an empty string returned - never fails the simulation.
+func (l *loop) maxDepGoVersion(ctx context.Context) string {
+	versions, err := l.tc.DepGoVersions(ctx, l.dir)
+	if err != nil {
+		slog.Warn("dependency go directive lookup unavailable", "modroot", l.req.Modroot, "error", err)
+		return ""
+	}
+	vs := make([]string, 0, len(versions))
+	for _, v := range versions {
+		vs = append(vs, v)
+	}
+	return goversion.Max(vs...)
+}
+
+// linkedStdPackages computes the stdlib slice of the current artifact import
+// graph. Fail-open: a toolchain error is logged and nil returned.
+func (l *loop) linkedStdPackages(ctx context.Context) map[string]struct{} {
+	std, err := l.tc.LinkedStd(ctx, l.dir, l.buildPatterns)
+	if err != nil {
+		slog.Warn("linked stdlib package lookup unavailable",
+			"modroot", l.req.Modroot, "packages", strings.Join(l.buildPatterns, " "), "error", err)
+		return nil
+	}
+	return std
+}
+
 // isLinked reports whether module is linked into a build artifact; unknown
 // reachability (linked == nil) counts every module as linked (fail open).
 func (l *loop) isLinked(module string) bool {
@@ -1004,7 +1069,10 @@ func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]str
 // unvalidated vulnerable floors come from). Adopts the smaller set when the
 // confirmation apply succeeds and its rescan demands no further raises and
 // no new residual advisories; otherwise keeps the converged full set.
-func (l *loop) confirmMinimalSet(ctx context.Context, resolved map[string]string) map[string]string {
+// result's MaxDepGoVersion/StdPackages - set by the caller from the
+// converged full set - are refreshed in place on adoption; see the
+// recompute just before `adopted = true` below.
+func (l *loop) confirmMinimalSet(ctx context.Context, resolved map[string]string, result *ModrootResult) map[string]string {
 	// Essential candidates: CVE-backed fixes, remedies (they keep the graph
 	// resolvable at all), and user-authored replace seeds (load-bearing fork
 	// redirects - never dropped as redundant). Promoted replaces are
@@ -1111,6 +1179,25 @@ func (l *loop) confirmMinimalSet(ctx context.Context, resolved map[string]string
 	l.scanResiduals = residuals
 	l.requirements = minimalRequirements
 	l.replaces = minimalReplaces
+
+	// Disk now == minimalResolved (nothing below mutates go.mod/go.sum), so
+	// this is the same "checkout matches the graph being reported" guarantee
+	// the caller relied on for the full-set computation. Refresh both
+	// capability fields against the adopted minimal graph: MaxDepGoVersion
+	// could only have gone down, but StdPackages may have picked up stdlib
+	// packages an older pinned version touches that the newer full-set
+	// version never did (see the doc comment in RunLoop). A fail-open zero
+	// value here (toolchain error) means "unknown", not "empty" - keep the
+	// existing superset value in that case rather than clobbering a correct
+	// wider set with nothing; an over-approximation beats an unvalidated
+	// miss on a stdlib-CVE check.
+	if maxGo := l.maxDepGoVersion(ctx); maxGo != "" {
+		result.MaxDepGoVersion = maxGo
+	}
+	if std := l.linkedStdPackages(ctx); std != nil {
+		result.StdPackages = std
+	}
+
 	adopted = true
 	return minimalResolved
 }

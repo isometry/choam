@@ -96,10 +96,11 @@ func (t *GoToolchain) Get(ctx context.Context, dir, moduleAtVersion string) erro
 
 // goListModule is the subset of `go list -m -json` output the simulation needs.
 type goListModule struct {
-	Path    string
-	Version string
-	Main    bool
-	Replace *goListModule
+	Path      string
+	Version   string
+	Main      bool
+	GoVersion string // the module's `go` directive, bare form (e.g. "1.24.5")
+	Replace   *goListModule
 }
 
 func (t *GoToolchain) ListModules(ctx context.Context, dir string) (map[string]string, error) {
@@ -135,6 +136,46 @@ func (t *GoToolchain) ListModules(ctx context.Context, dir string) (map[string]s
 		resolved[path] = version
 	}
 	return resolved, nil
+}
+
+// DepGoVersions returns the go directive of every non-main module in the
+// build list (bare form, e.g. "1.24" or "1.24.5"), keyed by module path,
+// with replace directives applied - mirrors ListModules' decode loop and
+// skip-main/skip-local-replacement semantics exactly, substituting GoVersion
+// for Version throughout.
+func (t *GoToolchain) DepGoVersions(ctx context.Context, dir string) (map[string]string, error) {
+	output, err := t.run(ctx, dir, "list", "-m", "-json", "all")
+	if err != nil {
+		return nil, err
+	}
+
+	versions := make(map[string]string)
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	for {
+		var mod goListModule
+		if err := decoder.Decode(&mod); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("parsing go list -m -json output: %w", err)
+		}
+		if mod.Main {
+			continue
+		}
+		path, goVersion := mod.Path, mod.GoVersion
+		if mod.Replace != nil {
+			if mod.Replace.Version == "" {
+				// Local filesystem replacement - mirror ListModules' skip.
+				continue
+			}
+			path, goVersion = mod.Replace.Path, mod.Replace.GoVersion
+		}
+		if goVersion == "" {
+			continue
+		}
+		versions[path] = goVersion
+	}
+	return versions, nil
 }
 
 // Linked returns the modules AND packages in the transitive non-test import
@@ -177,6 +218,32 @@ func (t *GoToolchain) Linked(ctx context.Context, dir string, patterns []string)
 		modules[module] = struct{}{}
 	}
 	return modules, packages, nil
+}
+
+// LinkedStd returns the set of standard-library import paths in the
+// transitive non-test import graph of the given build patterns, evaluated
+// for GOOS=linux (same walk semantics as Linked, inverted filter: standard
+// library packages instead of non-standard ones).
+func (t *GoToolchain) LinkedStd(ctx context.Context, dir string, patterns []string) (map[string]struct{}, error) {
+	if len(patterns) == 0 {
+		patterns = []string{"./..."}
+	}
+	const tmpl = `{{if .Standard}}{{.ImportPath}}{{end}}`
+	args := append([]string{"list", "-deps", "-f", tmpl}, patterns...)
+	output, err := t.runEnv(ctx, dir, []string{"GOOS=linux"}, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	std := make(map[string]struct{})
+	for line := range strings.SplitSeq(string(output), "\n") {
+		pkg := strings.TrimSpace(line)
+		if pkg == "" {
+			continue
+		}
+		std[pkg] = struct{}{}
+	}
+	return std, nil
 }
 
 // Replace applies a replace directive with gobump parity: dropreplace first

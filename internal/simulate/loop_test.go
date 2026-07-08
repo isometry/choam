@@ -41,6 +41,25 @@ type fakeToolchain struct {
 	linkedPkgs []string
 	linkedErr  error
 
+	// depGoVersions models DepGoVersions' module -> go directive map;
+	// depGoVersionsErr makes it fail (the loop must fail open: empty field,
+	// no loop failure). depGoVersionsFn, when set, takes priority over both
+	// and computes the answer from the current attempt's applied set - lets
+	// a test assert the value differs between the full converged graph and
+	// confirmMinimalSet's minimal graph.
+	depGoVersions    map[string]string
+	depGoVersionsErr error
+	depGoVersionsFn  func(applied map[string]string) (map[string]string, error)
+
+	// linkedStd models LinkedStd's stdlib import-path set; linkedStdErr
+	// makes it fail (the loop must fail open: nil field, no loop failure).
+	// linkedStdFn, when set, takes priority over both and computes the
+	// answer from the current attempt's applied set, mirroring
+	// depGoVersionsFn.
+	linkedStd    []string
+	linkedStdErr error
+	linkedStdFn  func(applied map[string]string) ([]string, error)
+
 	applied  map[string]string
 	replaced map[string]ReplaceTarget // replace edits of the current apply attempt
 	lastCall string
@@ -79,6 +98,34 @@ func (f *fakeToolchain) Linked(ctx context.Context, dir string, _ []string) (map
 		modules[module] = struct{}{}
 	}
 	return modules, packages, nil
+}
+
+func (f *fakeToolchain) DepGoVersions(_ context.Context, _ string) (map[string]string, error) {
+	if f.depGoVersionsFn != nil {
+		return f.depGoVersionsFn(f.applied)
+	}
+	if f.depGoVersionsErr != nil {
+		return nil, f.depGoVersionsErr
+	}
+	return f.depGoVersions, nil
+}
+
+func (f *fakeToolchain) LinkedStd(_ context.Context, _ string, _ []string) (map[string]struct{}, error) {
+	linkedStd, linkedStdErr := f.linkedStd, f.linkedStdErr
+	if f.linkedStdFn != nil {
+		linkedStd, linkedStdErr = f.linkedStdFn(f.applied)
+	}
+	if linkedStdErr != nil {
+		return nil, linkedStdErr
+	}
+	if linkedStd == nil {
+		return nil, nil
+	}
+	std := make(map[string]struct{}, len(linkedStd))
+	for _, pkg := range linkedStd {
+		std[pkg] = struct{}{}
+	}
+	return std, nil
 }
 
 func (f *fakeToolchain) ModTidy(_ context.Context, _ string) error {
@@ -494,6 +541,115 @@ func TestRunLoop_ConfirmationKeepsProtectivePins(t *testing.T) {
 	assert.ElementsMatch(t, []string{"example.com/pin@v1.5.0", "example.com/vuln@v2.0.0"}, result.FinalDeps)
 	assert.Empty(t, result.Dropped)
 	assert.Empty(t, result.Residuals)
+}
+
+// depsGoVersionsByPin and stdByPin key a stateful DepGoVersions/LinkedStd
+// answer off whether "example.com/pin" is still part of the current apply
+// attempt: present models the full converged set (main-loop apply, both
+// candidates active), absent models confirmMinimalSet's essential-only
+// reapply once the redundant pin has been provisionally dropped. The
+// minimal-state answer deliberately is NOT a subset of the full-state
+// answer (it both loses "net/http" and gains "crypto/subtle") to prove
+// StdPackages genuinely needs a recompute, not just a shrink, on adoption.
+func depGoVersionsByPin(applied map[string]string) (map[string]string, error) {
+	if _, pinned := applied["example.com/pin"]; pinned {
+		return map[string]string{"example.com/pin": "1.26", "example.com/vuln": "1.24"}, nil
+	}
+	return map[string]string{"example.com/vuln": "1.24"}, nil
+}
+
+func stdByPin(applied map[string]string) ([]string, error) {
+	if _, pinned := applied["example.com/pin"]; pinned {
+		return []string{"fmt", "net/http"}, nil
+	}
+	return []string{"fmt", "crypto/subtle"}, nil
+}
+
+// TestRunLoop_ConfirmMinimalSetRecomputesCapabilitiesOnAdoption: when the
+// confirmation pass adopts the minimal (redundant-pin-dropped) graph, the
+// MaxDepGoVersion/StdPackages fields set from the converged full set must be
+// refreshed against the adopted graph - not left describing the superset.
+// This pins the fix for the gap where StdPackages, computed only once
+// pre-minimization, could silently miss stdlib packages the adopted
+// (differently-versioned) minimal graph actually links.
+func TestRunLoop_ConfirmMinimalSetRecomputesCapabilitiesOnAdoption(t *testing.T) {
+	tc := &fakeToolchain{
+		base: map[string]string{
+			"example.com/pin":  "v1.0.0",
+			"example.com/vuln": "v1.9.0",
+		},
+		depGoVersionsFn: depGoVersionsByPin,
+		linkedStdFn:     stdByPin,
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/vuln", id: "GO-VULN-1", fixed: "v2.0.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/pin", Version: "v1.5.0"},
+			{Module: "example.com/vuln", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-VULN-1"}},
+		},
+		Baseline: map[string]string{
+			"example.com/pin":  "v1.0.0",
+			"example.com/vuln": "v1.9.0",
+		},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	require.Len(t, result.Dropped, 1, "pin must be dropped as redundant for this to exercise adoption")
+	assert.Equal(t, "example.com/pin", result.Dropped[0].Module)
+
+	// Minimal-state answers, not the full-set superset the loop would have
+	// reported without the adoption-time recompute.
+	assert.Equal(t, "1.24", result.MaxDepGoVersion)
+	assert.Equal(t, map[string]struct{}{"fmt": {}, "crypto/subtle": {}}, result.StdPackages)
+}
+
+// TestRunLoop_ConfirmMinimalSetKeepsCapabilitiesOnRejection: mirrors
+// TestRunLoop_ConfirmationKeepsProtectivePins, but with the same
+// applied-set-keyed fake capability answers as the adoption test above.
+// Because dropping the pin here regresses it below its own fix version,
+// confirmMinimalSet must reject the minimal set - and the capability
+// fields must stay at the full-set values computed post-convergence,
+// never having been touched by the (never-reached) adoption-time
+// recompute.
+func TestRunLoop_ConfirmMinimalSetKeepsCapabilitiesOnRejection(t *testing.T) {
+	tc := &fakeToolchain{
+		base: map[string]string{
+			"example.com/pin":  "v1.0.0",
+			"example.com/vuln": "v1.9.0",
+		},
+		depGoVersionsFn: depGoVersionsByPin,
+		linkedStdFn:     stdByPin,
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/vuln", id: "GO-VULN-1", fixed: "v2.0.0"},
+		{module: "example.com/pin", id: "GO-PIN-1", fixed: "v1.5.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/pin", Version: "v1.5.0"},
+			{Module: "example.com/vuln", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-VULN-1"}},
+		},
+		Baseline: map[string]string{
+			"example.com/pin":  "v1.0.0",
+			"example.com/vuln": "v1.9.0",
+		},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Empty(t, result.Dropped, "the minimal set must be rejected, keeping both candidates")
+
+	// Full-set (superset) answers - the minimal-state recompute never runs
+	// because adoption is rejected.
+	assert.Equal(t, "1.26", result.MaxDepGoVersion)
+	assert.Equal(t, map[string]struct{}{"fmt": {}, "net/http": {}}, result.StdPackages)
 }
 
 const genprotoAmbiguityErr = `go mod tidy: exit status 1: 	google.golang.org/grpc/status imports
@@ -1163,6 +1319,80 @@ func TestRunLoop_PackageReachableFindingStillRaised(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, result.Converged)
 	assert.Equal(t, []string{"golang.org/x/sys@v0.44.0"}, result.FinalDeps)
+}
+
+// TestRunLoop_MaxDepGoVersion: the max is computed across every module in the
+// fake's DepGoVersions map, mixing bare-minor and patch forms.
+func TestRunLoop_MaxDepGoVersion(t *testing.T) {
+	tc := &fakeToolchain{
+		base: map[string]string{"example.com/mod": "v1.0.0"},
+		depGoVersions: map[string]string{
+			"example.com/mod":   "1.24",
+			"example.com/other": "1.25.2",
+		},
+	}
+	sc := &fakeScanner{}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Equal(t, "1.25.2", result.MaxDepGoVersion)
+}
+
+// TestRunLoop_MaxDepGoVersionFailsOpen: a DepGoVersions error leaves the
+// field empty without failing the loop.
+func TestRunLoop_MaxDepGoVersionFailsOpen(t *testing.T) {
+	tc := &fakeToolchain{
+		base:             map[string]string{"example.com/mod": "v1.0.0"},
+		depGoVersionsErr: errors.New("go list -m -json all: boom"),
+	}
+	sc := &fakeScanner{}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Empty(t, result.MaxDepGoVersion)
+}
+
+// TestRunLoop_StdPackages: the fake's linked stdlib set is propagated as-is.
+func TestRunLoop_StdPackages(t *testing.T) {
+	tc := &fakeToolchain{
+		base:      map[string]string{"example.com/mod": "v1.0.0"},
+		linkedStd: []string{"fmt", "os"},
+	}
+	sc := &fakeScanner{}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Equal(t, map[string]struct{}{"fmt": {}, "os": {}}, result.StdPackages)
+}
+
+// TestRunLoop_StdPackagesFailsOpen: a LinkedStd error leaves the field nil
+// without failing the loop.
+func TestRunLoop_StdPackagesFailsOpen(t *testing.T) {
+	tc := &fakeToolchain{
+		base:         map[string]string{"example.com/mod": "v1.0.0"},
+		linkedStdErr: errors.New("go list -deps: boom"),
+	}
+	sc := &fakeScanner{}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Nil(t, result.StdPackages)
 }
 
 // TestRunLoop_PackageGateFailsOpen: without package metadata (no

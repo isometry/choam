@@ -30,6 +30,11 @@ type Toolchain interface {
 	// dir's go.mod as written - the set melange's gobump verifies deps
 	// entries against after its final tidy.
 	Requirements(ctx context.Context, dir string) (map[string]string, error)
+	// DepGoVersions returns the go directive of every non-main module in the
+	// build list (bare form, e.g. "1.24" or "1.24.5"), keyed by module path,
+	// with replace directives applied (same skip-main semantics as
+	// ListModules).
+	DepGoVersions(ctx context.Context, dir string) (map[string]string, error)
 	// Replace applies a replace directive (gobump parity:
 	// `go mod edit -dropreplace=<old>` then `-replace=<old>=<new>@<version>`).
 	Replace(ctx context.Context, dir, oldPath, newPath, version string) error
@@ -43,6 +48,11 @@ type Toolchain interface {
 	// for checking advisories' vulnerable import paths. Errors make
 	// reachability filtering fail OPEN (treat everything as linked).
 	Linked(ctx context.Context, dir string, patterns []string) (modules, packages map[string]struct{}, err error)
+	// LinkedStd returns the set of standard-library import paths in the
+	// transitive non-test import graph of the given build patterns (empty
+	// means ./...), evaluated for GOOS=linux (same walk semantics as
+	// Linked, inverted filter).
+	LinkedStd(ctx context.Context, dir string, patterns []string) (map[string]struct{}, error)
 }
 
 // ReplaceTarget is the right-hand side of a go.mod replace directive.
@@ -141,6 +151,16 @@ type ModrootResult struct {
 	// deps entries against. A pin at (or below) its module's Requires
 	// version is proven; anything above is not.
 	Requires map[string]string `json:"-" yaml:"-"`
+
+	// MaxDepGoVersion is the highest go directive across the final resolved
+	// build list's non-main modules (bare form, e.g. "1.25"); empty when
+	// unavailable. The scratch main module's own directive is deliberately
+	// not consulted: the parity tidy rewrites it with -go=<host>.
+	MaxDepGoVersion string `json:"max_dep_go_version,omitempty" yaml:"max_dep_go_version,omitempty"`
+
+	// StdPackages is the stdlib slice of the final artifact import graph
+	// (LinkedStd over the converged checkout); nil when unknown.
+	StdPackages map[string]struct{} `json:"-" yaml:"-"`
 
 	// CVEBackedModules lists the modules in FinalDeps whose entries address
 	// at least one advisory (vs coherence-only pins) - the simulation-time

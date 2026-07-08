@@ -147,3 +147,29 @@ func TestGoToolchain_LinkedModules(t *testing.T) {
 	assert.NotContains(t, linkedPackages, "golang.org/x/text/number",
 		"never-imported subpackage of a linked module must be absent")
 }
+
+// TestGoToolchain_DepGoVersionsAndLinkedStd exercises DepGoVersions and
+// LinkedStd against the real go tool with a dependency-free fixture module -
+// no go.sum, no network: `go list -m -json all` reports only the (skipped)
+// main module, and `go list -deps` walks the standard library only.
+func TestGoToolchain_DepGoVersionsAndLinkedStd(t *testing.T) {
+	toolchain, err := NewToolchain(time.Minute)
+	if err != nil {
+		t.Skipf("go toolchain unavailable: %v", err)
+	}
+
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte(
+		"module example.com/stdlibfixture\n\ngo 1.21\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte(
+		"package main\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nfunc main() {\n\tfmt.Fprintln(os.Stdout, \"hi\")\n}\n"), 0o644))
+
+	versions, err := toolchain.DepGoVersions(t.Context(), dir)
+	require.NoError(t, err)
+	assert.Empty(t, versions, "dependency-free module has no non-main modules to report")
+
+	std, err := toolchain.LinkedStd(t.Context(), dir, nil) // nil -> ./...
+	require.NoError(t, err)
+	assert.Contains(t, std, "fmt")
+	assert.Contains(t, std, "os")
+}
