@@ -167,26 +167,68 @@ func (l *Loader) UpdateFieldWithBlockScalar(yamlContent []byte, path string, new
 	return []byte(file.String()), nil
 }
 
-// UpsertPipelineWithBlockScalar sets a pipeline step's with.<field> to a
-// block scalar (|-) value, creating the field when it doesn't exist yet.
-// UpdateFieldWithBlockScalar alone can't create fields (yamlPath.
-// ReplaceWithNode fails on a missing path), and goccy's renderer does not
-// reliably emit AST nodes appended to an existing mapping - so the append
-// case locates the end of the with block via the AST and splices correctly
-// indented lines into the source text directly.
-func (l *Loader) UpsertPipelineWithBlockScalar(yamlContent []byte, pipelineIndex int, field, value string) ([]byte, error) {
-	// ReplaceWithNode is a silent no-op on a missing path, so probe field
-	// existence explicitly rather than relying on an error.
-	withFields, err := l.GetPipelineWithField(yamlContent, pipelineIndex)
-	if err != nil {
-		return nil, fmt.Errorf("getting pipeline[%d] with fields: %w", pipelineIndex, err)
-	}
-	if _, exists := withFields[field]; exists {
-		path := fmt.Sprintf("$.pipeline[%d].with.%s", pipelineIndex, field)
-		return l.UpdateFieldWithBlockScalar(yamlContent, path, value)
+// pipelineWithHasField reports whether a pipeline step's with block contains
+// field, regardless of the field's value type. GetPipelineWithField can't be
+// used for this: it silently drops non-string values, so an existing
+// UNQUOTED scalar that YAML parses as a number or bool (e.g. "go-version:
+// 1.25" parsing as a float) would be invisible to a presence probe built on
+// it - the caller would then wrongly conclude the field is absent and splice
+// in a second, duplicate key.
+func (l *Loader) pipelineWithHasField(yamlContent []byte, pipelineIndex int, field string) (bool, error) {
+	var parsed map[string]any
+	if err := yaml.Unmarshal(yamlContent, &parsed); err != nil {
+		return false, fmt.Errorf("parsing YAML to get pipeline with field: %w", err)
 	}
 
-	// Field absent - splice it in after the with block's last line.
+	pipeline, ok := parsed["pipeline"].([]any)
+	if !ok || pipelineIndex >= len(pipeline) {
+		return false, fmt.Errorf("pipeline at index %d not found or has no with field", pipelineIndex)
+	}
+	stepMap, ok := pipeline[pipelineIndex].(map[string]any)
+	if !ok {
+		return false, fmt.Errorf("pipeline at index %d not found or has no with field", pipelineIndex)
+	}
+	withField, ok := stepMap["with"].(map[string]any)
+	if !ok {
+		return false, fmt.Errorf("pipeline at index %d not found or has no with field", pipelineIndex)
+	}
+
+	_, exists := withField[field]
+	return exists, nil
+}
+
+// quotableValuePattern matches the character set the Upsert*/InsertBump*
+// helpers below allow in a value they embed literally between double quotes
+// in hand-built YAML text (as opposed to via goccy's node/reader-based
+// replace APIs, which escape on the caller's behalf). It is deliberately
+// tight - alphanumerics plus the punctuation legal Go toolchain versions use
+// (".", "_", "+", "-") - rather than merely excluding '"' and '\\', since any
+// other character embedded unescaped could also affect how the surrounding
+// YAML parses.
+var quotableValuePattern = regexp.MustCompile(`^[0-9A-Za-z._+-]*$`)
+
+// validateQuotableValue rejects values unsafe to splice literally inside an
+// unescaped double-quoted YAML scalar. A '"' would terminate the scalar
+// early (producing unparseable or, worse, differently-structured YAML); a
+// backslash sequence like `\n` would silently become an escape (e.g. a
+// literal newline) rather than the two characters the caller intended.
+// Downstream callers pass validated Go versions, so rejecting is the
+// appropriate response rather than trying to escape the value.
+func validateQuotableValue(field, value string) error {
+	if !quotableValuePattern.MatchString(value) {
+		return fmt.Errorf("with.%s value %q contains characters unsafe for an unescaped quoted YAML scalar (allowed: [0-9A-Za-z._+-])", field, value)
+	}
+	return nil
+}
+
+// spliceIntoPipelineWith inserts insertedLines (already relative to the with
+// block's own indentation - the first line typically "field: ..." and any
+// further lines its continuation) after the last existing line of a pipeline
+// step's with block, re-indenting each to match the block's first key.
+// goccy's renderer does not reliably emit AST nodes appended to an existing
+// mapping, so this locates the insertion point via the AST and splices
+// correctly indented lines into the source text directly instead.
+func (l *Loader) spliceIntoPipelineWith(yamlContent []byte, pipelineIndex int, insertedLines []string) ([]byte, error) {
 	file, err := parser.ParseBytes(yamlContent, parser.ParseComments)
 	if err != nil {
 		return nil, fmt.Errorf("parsing YAML: %w", err)
@@ -209,9 +251,9 @@ func (l *Loader) UpsertPipelineWithBlockScalar(yamlContent []byte, pipelineIndex
 	keyIndent := strings.Repeat(" ", keyColumn-1)
 	endLine := nodeEndLine(mapping) // 1-based line of the block's last content
 
-	inserted := []string{keyIndent + field + ": |-"}
-	for _, line := range strings.Split(value, "\n") {
-		inserted = append(inserted, keyIndent+"  "+line)
+	inserted := make([]string, len(insertedLines))
+	for i, line := range insertedLines {
+		inserted[i] = keyIndent + line
 	}
 
 	lines := strings.Split(string(yamlContent), "\n")
@@ -224,6 +266,69 @@ func (l *Loader) UpsertPipelineWithBlockScalar(yamlContent []byte, pipelineIndex
 	result = append(result, lines[endLine:]...)
 
 	return []byte(strings.Join(result, "\n")), nil
+}
+
+// UpsertPipelineWithBlockScalar sets a pipeline step's with.<field> to a
+// block scalar (|-) value, creating the field when it doesn't exist yet.
+// UpdateFieldWithBlockScalar alone can't create fields (yamlPath.
+// ReplaceWithNode fails on a missing path), and goccy's renderer does not
+// reliably emit AST nodes appended to an existing mapping - so the append
+// case locates the end of the with block via the AST and splices correctly
+// indented lines into the source text directly.
+func (l *Loader) UpsertPipelineWithBlockScalar(yamlContent []byte, pipelineIndex int, field, value string) ([]byte, error) {
+	// ReplaceWithNode is a silent no-op on a missing path, so probe field
+	// existence explicitly rather than relying on an error. The probe must be
+	// type-blind (see pipelineWithHasField) or an existing field whose value
+	// doesn't happen to parse as a string would look absent.
+	exists, err := l.pipelineWithHasField(yamlContent, pipelineIndex, field)
+	if err != nil {
+		return nil, fmt.Errorf("getting pipeline[%d] with fields: %w", pipelineIndex, err)
+	}
+	if exists {
+		path := fmt.Sprintf("$.pipeline[%d].with.%s", pipelineIndex, field)
+		return l.UpdateFieldWithBlockScalar(yamlContent, path, value)
+	}
+
+	// Field absent - splice it in after the with block's last line.
+	inserted := []string{field + ": |-"}
+	for _, line := range strings.Split(value, "\n") {
+		inserted = append(inserted, "  "+line)
+	}
+	return l.spliceIntoPipelineWith(yamlContent, pipelineIndex, inserted)
+}
+
+// UpsertPipelineWithQuotedString sets a pipeline step's with.<field> to a
+// double-quoted scalar value, creating the field when it doesn't exist yet.
+// Modeled on UpsertPipelineWithBlockScalar: yamlPath.ReplaceWithNode is a
+// silent no-op on a missing path, so field existence is probed first via the
+// type-blind pipelineWithHasField; when the field already exists,
+// UpdateFieldAsQuotedString replaces it in place, otherwise the
+// `field: "value"` line is spliced into the source text directly, since
+// goccy's renderer does not reliably emit AST nodes appended to an existing
+// mapping. Both paths embed value literally between double quotes (the
+// replace path via createQuotedStringNode's rendered Origin, the splice path
+// in the text itself), so value is validated up front either way.
+func (l *Loader) UpsertPipelineWithQuotedString(yamlContent []byte, pipelineIndex int, field, value string) ([]byte, error) {
+	if err := validateQuotableValue(field, value); err != nil {
+		return nil, err
+	}
+
+	// ReplaceWithNode is a silent no-op on a missing path, so probe field
+	// existence explicitly rather than relying on an error. The probe must be
+	// type-blind (see pipelineWithHasField) or an existing field whose value
+	// doesn't happen to parse as a string would look absent.
+	exists, err := l.pipelineWithHasField(yamlContent, pipelineIndex, field)
+	if err != nil {
+		return nil, fmt.Errorf("getting pipeline[%d] with fields: %w", pipelineIndex, err)
+	}
+	if exists {
+		path := fmt.Sprintf("$.pipeline[%d].with.%s", pipelineIndex, field)
+		return l.UpdateFieldAsQuotedString(yamlContent, path, value)
+	}
+
+	// Field absent - splice it in after the with block's last line.
+	inserted := []string{field + `: "` + value + `"`}
+	return l.spliceIntoPipelineWith(yamlContent, pipelineIndex, inserted)
 }
 
 // nodeEndLine returns the last (1-based) source line covered by node,
@@ -283,14 +388,27 @@ func (l *Loader) UpdateFieldAsQuotedString(yamlContent []byte, path string, newV
 	return []byte(file.String()), nil
 }
 
+// BumpStepSpec describes a bump/go-bump pipeline step to insert via
+// InsertBumpPipelineStep. String/slice fields that are empty (or, for
+// Modroots, just ["."] - the pipeline's own default) are omitted from the
+// emitted YAML entirely rather than written as empty/default values.
+type BumpStepSpec struct {
+	Action    string   // "bump" or "go/bump"
+	Language  string   // omitted from YAML when empty
+	GoVersion string   // omitted when empty; rendered as a quoted scalar
+	Modroots  []string // omitted when just ["."]; block scalar list otherwise
+	Deps      []string // block scalar list
+	Replaces  []string // block scalar list
+}
+
 // InsertBumpPipelineStep inserts a bump or go/bump step with block-scalar deps
 // and replaces lists and, for multi-root bumps, a block-scalar modroot list.
 // blankLineBetweenSteps says whether the file's convention separates pipeline
 // steps with a blank line (see HasBlankLinesBetweenPipelineSteps) - it's the
 // caller's to supply because yamlContent may already have had steps removed,
 // leaving nothing to detect the original convention from.
-func (l *Loader) InsertBumpPipelineStep(yamlContent []byte, pipelineIndex int, action, language string, modroots, deps, replaces []string, blankLineBetweenSteps bool) ([]byte, error) {
-	if len(deps) == 0 && len(replaces) == 0 {
+func (l *Loader) InsertBumpPipelineStep(yamlContent []byte, pipelineIndex int, spec BumpStepSpec, blankLineBetweenSteps bool) ([]byte, error) {
+	if len(spec.Deps) == 0 && len(spec.Replaces) == 0 {
 		// Nothing to declare - don't insert anything
 		return yamlContent, nil
 	}
@@ -321,25 +439,33 @@ func (l *Loader) InsertBumpPipelineStep(yamlContent []byte, pipelineIndex int, a
 	// omitted since it's the pipeline's own default. language is written
 	// explicitly (rather than relying on the pipeline's own "auto" detection
 	// at build time) since the caller already knows definitively which
-	// language it analyzed.
-	stepYaml := "- uses: " + action + "\n  with:"
-	if len(deps) > 0 {
-		stepYaml += "\n    deps: |-\n      " + strings.Join(deps, "\n      ")
+	// language it analyzed. go-version is quoted inline in the template
+	// (rather than via UpsertPipelineWithQuotedString) since the whole step
+	// is freshly parsed here - there's no existing mapping to append to.
+	stepYaml := "- uses: " + spec.Action + "\n  with:"
+	if len(spec.Deps) > 0 {
+		stepYaml += "\n    deps: |-\n      " + strings.Join(spec.Deps, "\n      ")
 	}
-	if len(replaces) > 0 {
-		stepYaml += "\n    replaces: |-\n      " + strings.Join(replaces, "\n      ")
+	if len(spec.Replaces) > 0 {
+		stepYaml += "\n    replaces: |-\n      " + strings.Join(spec.Replaces, "\n      ")
 	}
-	if language != "" {
-		stepYaml += "\n    language: " + language
+	if spec.Language != "" {
+		stepYaml += "\n    language: " + spec.Language
 	}
-	if len(modroots) > 0 && (len(modroots) != 1 || modroots[0] != ".") {
-		stepYaml += "\n    modroot: |-\n      " + strings.Join(modroots, "\n      ")
+	if spec.GoVersion != "" {
+		if err := validateQuotableValue("go-version", spec.GoVersion); err != nil {
+			return nil, err
+		}
+		stepYaml += "\n    go-version: \"" + spec.GoVersion + "\""
+	}
+	if len(spec.Modroots) > 0 && (len(spec.Modroots) != 1 || spec.Modroots[0] != ".") {
+		stepYaml += "\n    modroot: |-\n      " + strings.Join(spec.Modroots, "\n      ")
 	}
 
 	// Parse this YAML to get a properly formed AST node
 	stepFile, err := parser.ParseBytes([]byte(stepYaml), 0)
 	if err != nil {
-		return nil, fmt.Errorf("parsing template %s step: %w", action, err)
+		return nil, fmt.Errorf("parsing template %s step: %w", spec.Action, err)
 	}
 
 	// Extract the step node from the parsed YAML

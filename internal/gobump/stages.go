@@ -568,7 +568,7 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(gp *GoBumpProcessor, langAnal
 		desired := desiredDepsForSingleGroup(langAnalysis.ByModroot)
 		desiredReplaces := desiredReplacesForSingleGroup(langAnalysis.ByModroot)
 
-		updated, err := loader.UpdateGoBumpStep(gp.GetCurrentYAML(), step.Index, desired, desiredReplaces)
+		updated, err := loader.UpdateGoBumpStep(gp.GetCurrentYAML(), step.Index, desired, desiredReplaces, "")
 		if err != nil {
 			return fmt.Errorf("updating %s pipeline[%d]: %w", step.Action, step.Index, err)
 		}
@@ -612,7 +612,14 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(gp *GoBumpProcessor, langAnal
 	}
 
 	for _, group := range groups {
-		updated, err := loader.InsertBumpPipelineStep(yamlContent, insertPos, "bump", langAnalysis.Language, group.Modroots, group.Deps, group.Replaces, hasBlankLines)
+		spec := config.BumpStepSpec{
+			Action:   "bump",
+			Language: langAnalysis.Language,
+			Modroots: group.Modroots,
+			Deps:     group.Deps,
+			Replaces: group.Replaces,
+		}
+		updated, err := loader.InsertBumpPipelineStep(yamlContent, insertPos, spec, hasBlankLines)
 		if err != nil {
 			return fmt.Errorf("inserting bump step: %w", err)
 		}

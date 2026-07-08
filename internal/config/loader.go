@@ -352,12 +352,13 @@ var bumpActions = []string{"bump", "go/bump"}
 
 // BumpStep describes a bump or go/bump pipeline step and its parsed with-fields.
 type BumpStep struct {
-	Index    int      // pipeline index
-	Action   string   // "bump" or "go/bump"
-	Language string   // parsed with.language entry ("" when absent)
-	Modroots []string // parsed with.modroot entries; defaults to ["."] when absent
-	Deps     []string // parsed with.deps entries ("module@version")
-	Replaces []string // parsed with.replaces entries ("old=new@version")
+	Index     int      // pipeline index
+	Action    string   // "bump" or "go/bump"
+	Language  string   // parsed with.language entry ("" when absent)
+	GoVersion string   // parsed with.go-version entry ("" when absent)
+	Modroots  []string // parsed with.modroot entries; defaults to ["."] when absent
+	Deps      []string // parsed with.deps entries ("module@version")
+	Replaces  []string // parsed with.replaces entries ("old=new@version")
 }
 
 // FindBumpSteps finds all bump and go/bump pipeline steps, in pipeline order,
@@ -387,18 +388,20 @@ func (l *Loader) FindBumpSteps(yamlContent []byte) ([]BumpStep, error) {
 				return nil, fmt.Errorf("getting replaces for pipeline[%d]: %w", idx, err)
 			}
 
-			var language string
+			var language, goVersion string
 			if withFields, err := l.GetPipelineWithField(yamlContent, idx); err == nil {
 				language = withFields["language"]
+				goVersion = withFields["go-version"]
 			}
 
 			steps = append(steps, BumpStep{
-				Index:    idx,
-				Action:   action,
-				Language: language,
-				Modroots: modroots,
-				Deps:     deps,
-				Replaces: replaces,
+				Index:     idx,
+				Action:    action,
+				Language:  language,
+				GoVersion: goVersion,
+				Modroots:  modroots,
+				Deps:      deps,
+				Replaces:  replaces,
 			})
 		}
 	}
@@ -427,14 +430,18 @@ func (l *Loader) GetBumpModroots(yamlContent []byte, pipelineIndex int) ([]strin
 
 // UpdateGoBumpDeps updates the deps field in a go/bump pipeline
 func (l *Loader) UpdateGoBumpDeps(yamlContent []byte, pipelineIndex int, newDeps []string) ([]byte, error) {
-	return l.UpdateGoBumpStep(yamlContent, pipelineIndex, newDeps, nil)
+	return l.UpdateGoBumpStep(yamlContent, pipelineIndex, newDeps, nil, "")
 }
 
-// UpdateGoBumpStep updates a bump/go-bump step's deps and replaces fields in
-// place. Both empty removes the whole step; deps empty with replaces present
-// keeps the step (gobump accepts a replaces-only invocation) and removes just
-// the deps field; an empty replaces list removes just that field.
-func (l *Loader) UpdateGoBumpStep(yamlContent []byte, pipelineIndex int, deps, replaces []string) ([]byte, error) {
+// UpdateGoBumpStep updates a bump/go-bump step's deps, replaces and
+// go-version fields in place. Both deps and replaces empty removes the whole
+// step; deps empty with replaces present keeps the step (gobump accepts a
+// replaces-only invocation) and removes just the deps field; an empty
+// replaces list removes just that field. goVersion == "" leaves any existing
+// go-version field untouched (it is never removed by this call); a non-empty
+// goVersion upserts go-version as a quoted scalar so it can never round-trip
+// as a YAML float.
+func (l *Loader) UpdateGoBumpStep(yamlContent []byte, pipelineIndex int, deps, replaces []string, goVersion string) ([]byte, error) {
 	if len(deps) == 0 && len(replaces) == 0 {
 		return l.RemovePipelineStep(yamlContent, pipelineIndex)
 	}
@@ -459,7 +466,89 @@ func (l *Loader) UpdateGoBumpStep(yamlContent []byte, pipelineIndex int, deps, r
 		return nil, fmt.Errorf("updating replaces for pipeline[%d]: %w", pipelineIndex, err)
 	}
 
+	if goVersion != "" {
+		yamlContent, err = l.UpsertPipelineWithQuotedString(yamlContent, pipelineIndex, "go-version", goVersion)
+		if err != nil {
+			return nil, fmt.Errorf("updating go-version for pipeline[%d]: %w", pipelineIndex, err)
+		}
+	}
+
 	return yamlContent, nil
+}
+
+// goPackagePinActions are the pipeline "uses" values that accept a
+// with.go-package pin (the go toolchain version a build/install step
+// compiles with).
+var goPackagePinActions = map[string]bool{"go/build": true, "go/install": true}
+
+// GoPackagePin locates one go/build|go/install step's with.go-package value.
+type GoPackagePin struct {
+	Path       string // goccy yaml path, e.g. "$.pipeline[3].with.go-package" or "$.subpackages[2].pipeline[0].with.go-package"
+	Subpackage string // subpackage name for messages; "" for top-level
+	Value      string // raw string value (possibly templated)
+}
+
+// FindGoPackagePins walks the top-level pipeline and every subpackage's
+// pipeline for go/build and go/install steps carrying a string
+// with.go-package pin, returning one GoPackagePin per pin found - in
+// top-level-then-subpackage, then pipeline order. Steps without a go-package
+// field are not returned; there's nothing to edit. Each pin's Path is a
+// goccy yaml path directly usable with UpdateField to rewrite it in place.
+func (l *Loader) FindGoPackagePins(yamlContent []byte) ([]GoPackagePin, error) {
+	var parsed map[string]any
+	if err := yaml.Unmarshal(yamlContent, &parsed); err != nil {
+		return nil, fmt.Errorf("parsing YAML to find go-package pins: %w", err)
+	}
+
+	var pins []GoPackagePin
+	collectGoPackagePins(&pins, parsed["pipeline"], "$", "")
+
+	if subpackages, ok := parsed["subpackages"].([]any); ok {
+		for i, sp := range subpackages {
+			spMap, ok := sp.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := spMap["name"].(string)
+			collectGoPackagePins(&pins, spMap["pipeline"], fmt.Sprintf("$.subpackages[%d]", i), name)
+		}
+	}
+
+	return pins, nil
+}
+
+// collectGoPackagePins appends a GoPackagePin for every go/build|go/install
+// step in pipeline (the raw, unmarshalled `pipeline:` sequence value) that
+// carries a string with.go-package, using pathPrefix (e.g. "$" or
+// "$.subpackages[2]") to build each pin's editable yaml path.
+func collectGoPackagePins(pins *[]GoPackagePin, pipeline any, pathPrefix, subpackage string) {
+	steps, ok := pipeline.([]any)
+	if !ok {
+		return
+	}
+	for i, step := range steps {
+		stepMap, ok := step.(map[string]any)
+		if !ok {
+			continue
+		}
+		uses, _ := stepMap["uses"].(string)
+		if !goPackagePinActions[uses] {
+			continue
+		}
+		withField, ok := stepMap["with"].(map[string]any)
+		if !ok {
+			continue
+		}
+		value, ok := withField["go-package"].(string)
+		if !ok {
+			continue
+		}
+		*pins = append(*pins, GoPackagePin{
+			Path:       fmt.Sprintf("%s.pipeline[%d].with.go-package", pathPrefix, i),
+			Subpackage: subpackage,
+			Value:      value,
+		})
+	}
 }
 
 // RemovePipelineStep removes a single pipeline step by index while preserving formatting

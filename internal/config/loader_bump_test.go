@@ -105,10 +105,58 @@ func TestLoader_FindBumpSteps_Language(t *testing.T) {
 	assert.Equal(t, "", noLangSteps[0].Language)
 }
 
+func TestLoader_FindBumpSteps_GoVersion(t *testing.T) {
+	const withQuotedGoVersion = `pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      go-version: "1.25"
+      deps: |-
+        golang.org/x/net@v0.55.0
+`
+	loader := NewLoader()
+	steps, err := loader.FindBumpSteps([]byte(withQuotedGoVersion))
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, "1.25", steps[0].GoVersion)
+
+	// A step with no with.go-version reads back as "".
+	noGoVersionSteps, err := loader.FindBumpSteps([]byte(singleGoBumpYAML))
+	require.NoError(t, err)
+	require.Len(t, noGoVersionSteps, 1)
+	assert.Equal(t, "", noGoVersionSteps[0].GoVersion)
+
+	// The hazard the loader must avoid on the write side: an UNQUOTED
+	// go-version parses as a YAML float, not a string, so it is silently
+	// dropped by the with-field reader (GetPipelineWithField only collects
+	// string values) rather than misread. This is exactly why
+	// UpsertPipelineWithQuotedString/InsertBumpPipelineStep always quote it.
+	const withUnquotedGoVersion = `pipeline:
+  - uses: bump
+    with:
+      go-version: 1.25
+      deps: |-
+        golang.org/x/net@v0.55.0
+`
+	unquotedSteps, err := loader.FindBumpSteps([]byte(withUnquotedGoVersion))
+	require.NoError(t, err)
+	require.Len(t, unquotedSteps, 1)
+	assert.Equal(t, "", unquotedSteps[0].GoVersion, "unquoted go-version is a YAML float, not a string - it must not be misread")
+}
+
 func TestLoader_InsertBumpPipelineStep_WritesLanguage(t *testing.T) {
 	loader := NewLoader()
 
-	updated, err := loader.InsertBumpPipelineStep([]byte(singleGoBumpYAML), 1, "bump", "rust", []string{"."}, []string{"serde@1.0.200"}, nil, true)
+	updated, err := loader.InsertBumpPipelineStep([]byte(singleGoBumpYAML), 1, BumpStepSpec{
+		Action:   "bump",
+		Language: "rust",
+		Modroots: []string{"."},
+		Deps:     []string{"serde@1.0.200"},
+	}, true)
 	require.NoError(t, err)
 
 	steps, err := loader.FindBumpSteps(updated)
@@ -137,7 +185,11 @@ func TestLoader_GetBumpModroots_DefaultsToDot(t *testing.T) {
 func TestLoader_InsertBumpPipelineStep_SingleRootOmitsModroot(t *testing.T) {
 	loader := NewLoader()
 
-	updated, err := loader.InsertBumpPipelineStep([]byte(singleGoBumpYAML), 1, "bump", "", []string{"."}, []string{"github.com/foo/bar@v1.0.0"}, nil, true)
+	updated, err := loader.InsertBumpPipelineStep([]byte(singleGoBumpYAML), 1, BumpStepSpec{
+		Action:   "bump",
+		Modroots: []string{"."},
+		Deps:     []string{"github.com/foo/bar@v1.0.0"},
+	}, true)
 	require.NoError(t, err)
 
 	content := string(updated)
@@ -150,8 +202,11 @@ func TestLoader_InsertBumpPipelineStep_SingleRootOmitsModroot(t *testing.T) {
 func TestLoader_InsertBumpPipelineStep_MultiRootWritesModroot(t *testing.T) {
 	loader := NewLoader()
 
-	updated, err := loader.InsertBumpPipelineStep([]byte(singleGoBumpYAML), 1, "bump", "",
-		[]string{"cmd/a", "cmd/b", "."}, []string{"github.com/foo/bar@v1.0.0"}, nil, true)
+	updated, err := loader.InsertBumpPipelineStep([]byte(singleGoBumpYAML), 1, BumpStepSpec{
+		Action:   "bump",
+		Modroots: []string{"cmd/a", "cmd/b", "."},
+		Deps:     []string{"github.com/foo/bar@v1.0.0"},
+	}, true)
 	require.NoError(t, err)
 
 	content := string(updated)
@@ -276,7 +331,7 @@ func TestLoader_UpdateGoBumpStep_UpsertsReplaces(t *testing.T) {
 	// singleGoBumpYAML's go/bump step (index 2) has no replaces field yet.
 	updated, err := loader.UpdateGoBumpStep([]byte(singleGoBumpYAML), 2,
 		[]string{"golang.org/x/net@v0.55.0"},
-		[]string{"golang.org/x/crypto=golang.org/x/crypto@v0.52.0"})
+		[]string{"golang.org/x/crypto=golang.org/x/crypto@v0.52.0"}, "")
 	require.NoError(t, err)
 
 	steps, err := loader.FindBumpSteps(updated)
@@ -292,7 +347,7 @@ func TestLoader_UpdateGoBumpStep_UpdatesAndClearsReplaces(t *testing.T) {
 	// Update existing replaces in place.
 	updated, err := loader.UpdateGoBumpStep([]byte(replacesGoBumpYAML), 1,
 		[]string{"golang.org/x/net@v0.55.0"},
-		[]string{"github.com/aws/aws-sdk-go=github.com/aws/aws-sdk-go@v1.55.0"})
+		[]string{"github.com/aws/aws-sdk-go=github.com/aws/aws-sdk-go@v1.55.0"}, "")
 	require.NoError(t, err)
 	steps, err := loader.FindBumpSteps(updated)
 	require.NoError(t, err)
@@ -302,7 +357,7 @@ func TestLoader_UpdateGoBumpStep_UpdatesAndClearsReplaces(t *testing.T) {
 
 	// Empty replaces removes just the field, keeping the step.
 	cleared, err := loader.UpdateGoBumpStep([]byte(replacesGoBumpYAML), 1,
-		[]string{"golang.org/x/net@v0.55.0"}, nil)
+		[]string{"golang.org/x/net@v0.55.0"}, nil, "")
 	require.NoError(t, err)
 	steps, err = loader.FindBumpSteps(cleared)
 	require.NoError(t, err)
@@ -317,7 +372,7 @@ func TestLoader_UpdateGoBumpStep_ReplacesOnlyKeepsStep(t *testing.T) {
 	// Deps empty + replaces non-empty must keep the step (gobump accepts a
 	// replaces-only invocation) with only the deps field removed.
 	updated, err := loader.UpdateGoBumpStep([]byte(replacesGoBumpYAML), 1,
-		nil, []string{"github.com/aws/aws-sdk-go=github.com/aws/aws-sdk-go@v1.34.0"})
+		nil, []string{"github.com/aws/aws-sdk-go=github.com/aws/aws-sdk-go@v1.34.0"}, "")
 	require.NoError(t, err)
 
 	steps, err := loader.FindBumpSteps(updated)
@@ -330,7 +385,7 @@ func TestLoader_UpdateGoBumpStep_ReplacesOnlyKeepsStep(t *testing.T) {
 func TestLoader_UpdateGoBumpStep_BothEmptyRemovesStep(t *testing.T) {
 	loader := NewLoader()
 
-	updated, err := loader.UpdateGoBumpStep([]byte(replacesGoBumpYAML), 1, nil, nil)
+	updated, err := loader.UpdateGoBumpStep([]byte(replacesGoBumpYAML), 1, nil, nil, "")
 	require.NoError(t, err)
 
 	steps, err := loader.FindBumpSteps(updated)
@@ -338,13 +393,222 @@ func TestLoader_UpdateGoBumpStep_BothEmptyRemovesStep(t *testing.T) {
 	assert.Empty(t, steps)
 }
 
+func TestLoader_UpdateGoBumpStep_GoVersionEmptyLeavesExistingUntouched(t *testing.T) {
+	loader := NewLoader()
+
+	const withGoVersion = `pipeline:
+  - uses: go/bump
+    with:
+      go-version: "1.24"
+      deps: |-
+        golang.org/x/net@v0.55.0
+`
+	// goVersion == "" must never remove or alter an already-present go-version.
+	updated, err := loader.UpdateGoBumpStep([]byte(withGoVersion), 0,
+		[]string{"golang.org/x/net@v0.56.0"}, nil, "")
+	require.NoError(t, err)
+	assert.Contains(t, string(updated), `go-version: "1.24"`)
+
+	steps, err := loader.FindBumpSteps(updated)
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, "1.24", steps[0].GoVersion)
+	assert.Equal(t, []string{"golang.org/x/net@v0.56.0"}, steps[0].Deps)
+}
+
+func TestLoader_UpdateGoBumpStep_AddsGoVersionToStepLackingIt(t *testing.T) {
+	loader := NewLoader()
+
+	// singleGoBumpYAML's go/bump step (index 2) has no go-version field yet.
+	updated, err := loader.UpdateGoBumpStep([]byte(singleGoBumpYAML), 2,
+		[]string{"golang.org/x/net@v0.56.0"}, nil, "1.25")
+	require.NoError(t, err)
+	assert.Contains(t, string(updated), `go-version: "1.25"`, "go-version must be rendered as a quoted scalar")
+
+	steps, err := loader.FindBumpSteps(updated)
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, "1.25", steps[0].GoVersion)
+}
+
+func TestLoader_UpdateGoBumpStep_UpdatesExistingGoVersion(t *testing.T) {
+	loader := NewLoader()
+
+	const withGoVersionAndComment = `pipeline:
+  # keep me
+  - uses: go/bump
+    with:
+      go-version: "1.24"
+      deps: |-
+        golang.org/x/net@v0.55.0
+`
+	updated, err := loader.UpdateGoBumpStep([]byte(withGoVersionAndComment), 0,
+		[]string{"golang.org/x/net@v0.56.0"}, nil, "1.25")
+	require.NoError(t, err)
+	assert.Contains(t, string(updated), `go-version: "1.25"`)
+	assert.NotContains(t, string(updated), `go-version: "1.24"`)
+	assert.Contains(t, string(updated), "# keep me", "comments must be preserved")
+
+	steps, err := loader.FindBumpSteps(updated)
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, "1.25", steps[0].GoVersion)
+}
+
+func TestLoader_UpsertPipelineWithQuotedString(t *testing.T) {
+	loader := NewLoader()
+
+	t.Run("creates field on step lacking it", func(t *testing.T) {
+		updated, err := loader.UpsertPipelineWithQuotedString([]byte(singleGoBumpYAML), 2, "go-version", "1.25")
+		require.NoError(t, err)
+		assert.Contains(t, string(updated), `go-version: "1.25"`)
+	})
+
+	t.Run("updates existing field in place, preserving comments", func(t *testing.T) {
+		const withGoVersionAndComment = `pipeline:
+  # keep me
+  - uses: go/bump
+    with:
+      go-version: "1.24"
+      deps: |-
+        golang.org/x/net@v0.55.0
+`
+		updated, err := loader.UpsertPipelineWithQuotedString([]byte(withGoVersionAndComment), 0, "go-version", "1.25")
+		require.NoError(t, err)
+		assert.Contains(t, string(updated), `go-version: "1.25"`)
+		assert.NotContains(t, string(updated), `go-version: "1.24"`)
+		assert.Contains(t, string(updated), "# keep me")
+	})
+
+	// Regression test: an existing UNQUOTED "go-version: 1.25" parses as a
+	// YAML float, not a string. GetPipelineWithField (which the existence
+	// probe used to rely on) silently drops non-string values, so the probe
+	// would see the field as absent and splice in a second go-version key,
+	// producing an unparseable duplicate-key YAML document.
+	t.Run("replaces unquoted float-typed go-version instead of duplicating the key", func(t *testing.T) {
+		const withUnquotedGoVersionAndComment = `pipeline:
+  # keep me
+  - uses: go/bump
+    with:
+      go-version: 1.25
+      deps: |-
+        golang.org/x/net@v0.55.0
+`
+		updated, err := loader.UpsertPipelineWithQuotedString([]byte(withUnquotedGoVersionAndComment), 0, "go-version", "1.26")
+		require.NoError(t, err)
+
+		content := string(updated)
+		assert.Equal(t, 1, strings.Count(content, "go-version:"), "must not duplicate the go-version key")
+		assert.Contains(t, content, `go-version: "1.26"`)
+		assert.NotContains(t, content, "go-version: 1.25")
+		assert.Contains(t, content, "# keep me", "comments must be preserved")
+
+		// A duplicate go-version key would make this unparseable, so a
+		// successful round-trip through FindBumpSteps proves the YAML is valid.
+		steps, err := loader.FindBumpSteps(updated)
+		require.NoError(t, err)
+		require.Len(t, steps, 1)
+		assert.Equal(t, "1.26", steps[0].GoVersion)
+	})
+}
+
+// TestLoader_UpsertPipelineWithQuotedString_RejectsUnsafeValue covers the
+// hardening half of the go-version fix: values containing '"' or '\' can't
+// be embedded literally inside an unescaped double-quoted YAML scalar
+// without either breaking the YAML or silently mutating the value (e.g. a
+// literal "\n" becoming a newline), so they must be rejected outright.
+func TestLoader_UpsertPipelineWithQuotedString_RejectsUnsafeValue(t *testing.T) {
+	loader := NewLoader()
+
+	for _, value := range []string{
+		`1.25"`,
+		`1.25\n`,
+		`1.25" }, deps: [evil]; #`,
+		"1.25\ttab",
+	} {
+		t.Run(value, func(t *testing.T) {
+			_, err := loader.UpsertPipelineWithQuotedString([]byte(singleGoBumpYAML), 2, "go-version", value)
+			require.Error(t, err)
+		})
+	}
+}
+
+func TestLoader_InsertBumpPipelineStep_WritesGoVersion(t *testing.T) {
+	loader := NewLoader()
+
+	updated, err := loader.InsertBumpPipelineStep([]byte(singleGoBumpYAML), 1, BumpStepSpec{
+		Action:    "bump",
+		Language:  "go",
+		GoVersion: "1.25",
+		Modroots:  []string{"."},
+		Deps:      []string{"golang.org/x/net@v0.56.0"},
+	}, true)
+	require.NoError(t, err)
+	assert.Contains(t, string(updated), `go-version: "1.25"`)
+
+	steps, err := loader.FindBumpSteps(updated)
+	require.NoError(t, err)
+	require.Len(t, steps, 2)
+
+	var inserted *BumpStep
+	for i := range steps {
+		if steps[i].GoVersion == "1.25" {
+			inserted = &steps[i]
+		}
+	}
+	require.NotNil(t, inserted)
+	assert.Equal(t, []string{"golang.org/x/net@v0.56.0"}, inserted.Deps)
+}
+
+// TestLoader_InsertBumpPipelineStep_RejectsUnsafeGoVersion mirrors
+// TestLoader_UpsertPipelineWithQuotedString_RejectsUnsafeValue: the template
+// path embeds spec.GoVersion literally between double quotes too, so it
+// needs the same rejection for values containing '"' or '\'.
+func TestLoader_InsertBumpPipelineStep_RejectsUnsafeGoVersion(t *testing.T) {
+	loader := NewLoader()
+
+	_, err := loader.InsertBumpPipelineStep([]byte(singleGoBumpYAML), 1, BumpStepSpec{
+		Action:    "bump",
+		Language:  "go",
+		GoVersion: `1.25"`,
+		Modroots:  []string{"."},
+		Deps:      []string{"golang.org/x/net@v0.56.0"},
+	}, true)
+	require.Error(t, err)
+}
+
+// TestLoader_InsertBumpPipelineStep_NoGoVersionOmitsField is the byte-for-byte
+// emission regression the brief calls for: a spec without GoVersion must
+// render identically to before the BumpStepSpec refactor (mirrors
+// TestLoader_InsertBumpPipelineStep_SingleRootOmitsModroot's assertions).
+func TestLoader_InsertBumpPipelineStep_NoGoVersionOmitsField(t *testing.T) {
+	loader := NewLoader()
+
+	updated, err := loader.InsertBumpPipelineStep([]byte(singleGoBumpYAML), 1, BumpStepSpec{
+		Action:   "bump",
+		Modroots: []string{"."},
+		Deps:     []string{"github.com/foo/bar@v1.0.0"},
+	}, true)
+	require.NoError(t, err)
+
+	content := string(updated)
+	assert.Contains(t, content, "- uses: bump")
+	assert.Contains(t, content, "github.com/foo/bar@v1.0.0")
+	assert.NotContains(t, content, "go-version")
+	assert.NotContains(t, content, "modroot")
+	assert.NotContains(t, content, "language")
+}
+
 func TestLoader_InsertBumpPipelineStep_WritesReplaces(t *testing.T) {
 	loader := NewLoader()
 
-	updated, err := loader.InsertBumpPipelineStep([]byte(singleGoBumpYAML), 1, "bump", "go",
-		[]string{"."},
-		[]string{"golang.org/x/net@v0.55.0"},
-		[]string{"github.com/aws/aws-sdk-go=github.com/aws/aws-sdk-go@v1.34.0"}, true)
+	updated, err := loader.InsertBumpPipelineStep([]byte(singleGoBumpYAML), 1, BumpStepSpec{
+		Action:   "bump",
+		Language: "go",
+		Modroots: []string{"."},
+		Deps:     []string{"golang.org/x/net@v0.55.0"},
+		Replaces: []string{"github.com/aws/aws-sdk-go=github.com/aws/aws-sdk-go@v1.34.0"},
+	}, true)
 	require.NoError(t, err)
 
 	assert.Contains(t, string(updated), "replaces: |-")
@@ -367,9 +631,12 @@ func TestLoader_InsertBumpPipelineStep_WritesReplaces(t *testing.T) {
 func TestLoader_InsertBumpPipelineStep_ReplacesOnly(t *testing.T) {
 	loader := NewLoader()
 
-	updated, err := loader.InsertBumpPipelineStep([]byte(singleGoBumpYAML), 1, "bump", "go",
-		[]string{"."}, nil,
-		[]string{"github.com/aws/aws-sdk-go=github.com/aws/aws-sdk-go@v1.34.0"}, true)
+	updated, err := loader.InsertBumpPipelineStep([]byte(singleGoBumpYAML), 1, BumpStepSpec{
+		Action:   "bump",
+		Language: "go",
+		Modroots: []string{"."},
+		Replaces: []string{"github.com/aws/aws-sdk-go=github.com/aws/aws-sdk-go@v1.34.0"},
+	}, true)
 	require.NoError(t, err)
 
 	steps, err := loader.FindBumpSteps(updated)
@@ -415,7 +682,7 @@ pipeline:
 	loader := NewLoader()
 	updated, err := loader.UpdateGoBumpStep([]byte(midPipelineYAML), 1,
 		[]string{"github.com/aws/aws-sdk-go@v1.34.0"},
-		[]string{"golang.org/x/crypto=golang.org/x/crypto@v0.52.0"})
+		[]string{"golang.org/x/crypto=golang.org/x/crypto@v0.52.0"}, "")
 	require.NoError(t, err)
 
 	steps, err := loader.FindBumpSteps(updated)
@@ -447,7 +714,12 @@ func TestLoader_InsertBumpPipelineStep_BlankLinesForEveryInsertedStep(t *testing
 		{"github.com/two/two@v2.0.0"},
 		{"github.com/three/three@v3.0.0"},
 	} {
-		updated, err := loader.InsertBumpPipelineStep(content, 1+i, "bump", "go", []string{"."}, deps, nil, true)
+		updated, err := loader.InsertBumpPipelineStep(content, 1+i, BumpStepSpec{
+			Action:   "bump",
+			Language: "go",
+			Modroots: []string{"."},
+			Deps:     deps,
+		}, true)
 		require.NoError(t, err)
 		content = updated
 	}
@@ -489,8 +761,12 @@ pipeline:
 `
 	loader := NewLoader()
 
-	updated, err := loader.InsertBumpPipelineStep([]byte(compactYAML), 1, "bump", "go", []string{"."},
-		[]string{"golang.org/x/net@v0.56.0"}, nil, false)
+	updated, err := loader.InsertBumpPipelineStep([]byte(compactYAML), 1, BumpStepSpec{
+		Action:   "bump",
+		Language: "go",
+		Modroots: []string{"."},
+		Deps:     []string{"golang.org/x/net@v0.56.0"},
+	}, false)
 	require.NoError(t, err)
 
 	pipelinePart := string(updated)[strings.Index(string(updated), "pipeline:"):]
@@ -499,4 +775,108 @@ pipeline:
 	steps, err := loader.FindBumpSteps(updated)
 	require.NoError(t, err)
 	require.Len(t, steps, 1)
+}
+
+const goPackagePinYAML = `package:
+  name: example
+  version: "1.0.0"
+  epoch: 0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  - uses: go/build
+    with:
+      packages: .
+      go-package: go-1.24
+
+subpackages:
+  - name: example-extra
+    pipeline:
+      - uses: go/install
+        with:
+          # pinned pending toolchain support for the new build tag
+          go-package: go-1.23
+          packages: ./cmd/extra
+
+  - name: example-templated
+    pipeline:
+      - uses: go/build
+        with:
+          go-package: go-${{vars.go-version}}
+
+  - name: example-no-pin
+    pipeline:
+      - uses: go/build
+        with:
+          packages: ./cmd/other
+`
+
+func TestLoader_FindGoPackagePins(t *testing.T) {
+	loader := NewLoader()
+
+	pins, err := loader.FindGoPackagePins([]byte(goPackagePinYAML))
+	require.NoError(t, err)
+	require.Len(t, pins, 3)
+
+	assert.Equal(t, "$.pipeline[1].with.go-package", pins[0].Path)
+	assert.Equal(t, "", pins[0].Subpackage)
+	assert.Equal(t, "go-1.24", pins[0].Value)
+
+	assert.Equal(t, "$.subpackages[0].pipeline[0].with.go-package", pins[1].Path)
+	assert.Equal(t, "example-extra", pins[1].Subpackage)
+	assert.Equal(t, "go-1.23", pins[1].Value)
+
+	// A templated value is returned raw, untouched by rendering.
+	assert.Equal(t, "$.subpackages[1].pipeline[0].with.go-package", pins[2].Path)
+	assert.Equal(t, "example-templated", pins[2].Subpackage)
+	assert.Equal(t, "go-${{vars.go-version}}", pins[2].Value)
+}
+
+func TestLoader_FindGoPackagePins_None(t *testing.T) {
+	loader := NewLoader()
+
+	// singleGoBumpYAML's go/build step has no go-package field.
+	pins, err := loader.FindGoPackagePins([]byte(singleGoBumpYAML))
+	require.NoError(t, err)
+	assert.Empty(t, pins)
+}
+
+// TestLoader_FindGoPackagePins_SubpackageWriteBack proves the write-back path
+// the brief requires: a pin found in a SUBPACKAGE pipeline (with a comment
+// nearby) must be rewritable via its own Path using UpdateField, changing
+// only that value and leaving comments/formatting/everything else intact.
+func TestLoader_FindGoPackagePins_SubpackageWriteBack(t *testing.T) {
+	loader := NewLoader()
+
+	pins, err := loader.FindGoPackagePins([]byte(goPackagePinYAML))
+	require.NoError(t, err)
+	require.Len(t, pins, 3)
+
+	pin := pins[1] // $.subpackages[0].pipeline[0].with.go-package
+	require.Equal(t, "example-extra", pin.Subpackage)
+	require.Equal(t, "go-1.23", pin.Value)
+
+	updated, err := loader.UpdateField([]byte(goPackagePinYAML), pin.Path, "go-1.25")
+	require.NoError(t, err)
+
+	content := string(updated)
+	// (a) the value changed
+	assert.Contains(t, content, "go-package: go-1.25")
+	assert.NotContains(t, content, "go-package: go-1.23")
+	// (b) comments/formatting preserved
+	assert.Contains(t, content, "# pinned pending toolchain support for the new build tag")
+	// (c) nothing else changed: every other pin's value is untouched
+	assert.Contains(t, content, "go-package: go-1.24")
+	assert.Contains(t, content, "go-package: go-${{vars.go-version}}")
+
+	rePins, err := loader.FindGoPackagePins(updated)
+	require.NoError(t, err)
+	require.Len(t, rePins, 3)
+	assert.Equal(t, "go-1.25", rePins[1].Value)
+	assert.Equal(t, "go-1.24", rePins[0].Value)
+	assert.Equal(t, "go-${{vars.go-version}}", rePins[2].Value)
 }
