@@ -33,9 +33,15 @@ type stdlibScanner interface {
 // import paths are actually linked into the build artifacts.
 type stdlibInput struct {
 	CommitTime  time.Time
-	Constraints []string            // distinct minor constraints ("" = unpinned)
-	Linked      map[string]struct{} // linked stdlib import paths; nil = unknown
-	Validated   bool                // whether Linked-based filtering applies
+	Constraints []string // distinct minor constraints ("" = unpinned)
+	// RebuildConstraints maps an entry of Constraints to the constraint the
+	// NEXT build will actually use (a same-run go-package pin raise, see
+	// rebuildConstraintsFor); a missing key - or a nil map - means the
+	// constraint is unchanged. The assumed side always uses Constraints (the
+	// pristine config is the historical truth).
+	RebuildConstraints map[string]string
+	Linked             map[string]struct{} // linked stdlib import paths; nil = unknown
+	Validated          bool                // whether Linked-based filtering applies
 }
 
 // stdlibTargetGOOS mirrors internal/scan's targetGOOS: melange builds linux
@@ -47,29 +53,67 @@ const stdlibTargetGOOS = "linux"
 // rebuilding with the newest allowed Go release would fix stdlib advisories
 // present in the release the package was (estimatedly) last built with. The
 // estimate is "latest release as of the melange file's last commit", per
-// constraint. Fix availability is a two-scan diff: advisories affecting the
-// assumed release whose IDs are absent at the rebuild release (the scanner's
-// own fix-version logic decides what each release is affected by - nothing is
-// re-derived here). When a validated linked-stdlib set is provided, advisories
-// whose vulnerable imports are all outside it are demoted to informational
-// (UnlinkedVulnIDs). Returns one StdlibBump per constraint with fixable,
-// applicable advisories, plus human-readable messages; any index/scan failure
-// returns an error for the caller to degrade on.
+// constraint (always the pristine config's pin - the historical truth); the
+// rebuild target uses the mapped rebuild constraint when this run raised the
+// pin (in.RebuildConstraints). Fix availability is a two-scan diff: advisories
+// affecting the assumed release whose IDs are absent at the rebuild release
+// (the scanner's own fix-version logic decides what each release is affected
+// by - nothing is re-derived here). When a validated linked-stdlib set is
+// provided, advisories whose vulnerable imports are all outside it are demoted
+// to informational (UnlinkedVulnIDs). Advisories a pinned rebuild cannot fix
+// but an unconstrained newer Go minor would (checked lazily, one extra scan at
+// most) yield an informational raise-the-pin message, never a bump. Returns
+// one StdlibBump per constraint with fixable, applicable advisories, plus
+// human-readable messages; any index/scan failure returns an error for the
+// caller to degrade on.
 func evaluateStdlibStaleness(ctx context.Context, index goReleaseIndex, scanner stdlibScanner, in stdlibInput) ([]StdlibBump, []string, error) {
 	var bumps []StdlibBump
 	var messages []string
 
 	filter := in.Linked != nil && in.Validated
 
+	// Lazy, memoized view of the newest Go release overall - only consulted
+	// when a pinned constraint's rebuild leaves residual advisories behind.
+	var latestVersion string
+	resolveLatestVersion := func() (string, error) {
+		if latestVersion == "" {
+			v, err := index.LatestAvailable(ctx, "")
+			if err != nil {
+				return "", fmt.Errorf("resolving latest available Go release (pin %s): %w", pinWord(""), err)
+			}
+			latestVersion = v
+		}
+		return latestVersion, nil
+	}
+	var latestVulnIDs map[string]struct{}
+	resolveLatestVulnIDs := func(version string) (map[string]struct{}, error) {
+		if latestVulnIDs == nil {
+			vulns, err := scanStdlib(ctx, scanner, version)
+			if err != nil {
+				return nil, err
+			}
+			latestVulnIDs = make(map[string]struct{}, len(vulns))
+			for _, vuln := range vulns {
+				latestVulnIDs[vuln.ID] = struct{}{}
+			}
+		}
+		return latestVulnIDs, nil
+	}
+
 	for _, constraint := range in.Constraints {
+		rebuildConstraint := constraint
+		if mapped, ok := in.RebuildConstraints[constraint]; ok && mapped != "" {
+			rebuildConstraint = mapped
+		}
+
 		assumed, err := index.LatestAsOf(ctx, in.CommitTime, constraint)
 		if err != nil {
 			return nil, nil, fmt.Errorf("resolving Go release as of %s (pin %s): %w",
 				in.CommitTime.Format(time.RFC3339), pinWord(constraint), err)
 		}
-		rebuild, err := index.LatestAvailable(ctx, constraint)
+		rebuild, err := index.LatestAvailable(ctx, rebuildConstraint)
 		if err != nil {
-			return nil, nil, fmt.Errorf("resolving latest available Go release (pin %s): %w", pinWord(constraint), err)
+			return nil, nil, fmt.Errorf("resolving latest available Go release (pin %s): %w", pinWord(rebuildConstraint), err)
 		}
 
 		// Already on (or somehow past) the newest allowed release: a rebuild
@@ -96,15 +140,18 @@ func evaluateStdlibStaleness(ctx context.Context, index goReleaseIndex, scanner 
 		}
 
 		seen := make(map[string]struct{}, len(atAssumed))
-		var fixableIDs, unlinkedIDs []string
+		var fixableIDs, unlinkedIDs, residualIDs []string
 		for _, vuln := range atAssumed {
-			if _, still := remaining[vuln.ID]; still {
-				continue // not fixed by the rebuild release either
-			}
 			if _, dup := seen[vuln.ID]; dup {
 				continue
 			}
 			seen[vuln.ID] = struct{}{}
+			if _, still := remaining[vuln.ID]; still {
+				// Not fixed by the rebuild release either - a candidate for
+				// the raise-the-pin hint below when this constraint is pinned.
+				residualIDs = append(residualIDs, vuln.ID)
+				continue
+			}
 			if filter && !stdlibVulnLinked(vuln, in.Linked) {
 				unlinkedIDs = append(unlinkedIDs, vuln.ID)
 				continue
@@ -114,26 +161,78 @@ func evaluateStdlibStaleness(ctx context.Context, index goReleaseIndex, scanner 
 		sort.Strings(fixableIDs)
 		sort.Strings(unlinkedIDs)
 
+		rebuildPin := ""
+		if rebuildConstraint != constraint {
+			rebuildPin = rebuildConstraint
+		}
+
 		switch {
 		case len(fixableIDs) > 0:
 			bumps = append(bumps, StdlibBump{
-				AssumedGoVersion: assumed,
-				AssumedFromDate:  in.CommitTime.UTC().Format(time.RFC3339),
-				GoPackagePin:     constraint,
-				RebuildGoVersion: rebuild,
-				VulnIDs:          fixableIDs,
-				UnlinkedVulnIDs:  unlinkedIDs,
-				Validated:        filter,
+				AssumedGoVersion:    assumed,
+				AssumedFromDate:     in.CommitTime.UTC().Format(time.RFC3339),
+				GoPackagePin:        constraint,
+				RebuildGoPackagePin: rebuildPin,
+				RebuildGoVersion:    rebuild,
+				VulnIDs:             fixableIDs,
+				UnlinkedVulnIDs:     unlinkedIDs,
+				Validated:           filter,
 			})
-			messages = append(messages, fmt.Sprintf("stdlib: assumed go%s (last commit %s, pin %s); rebuilding with go%s fixes %s",
-				assumed, in.CommitTime.UTC().Format("2006-01-02"), pinWord(constraint), rebuild, strings.Join(fixableIDs, ", ")))
+			if rebuildPin != "" {
+				messages = append(messages, fmt.Sprintf("stdlib: assumed go%s (last commit %s, pin %s); rebuilding with go%s (pin raised to %s) fixes %s",
+					assumed, in.CommitTime.UTC().Format("2006-01-02"), pinWord(constraint), rebuild, rebuildConstraint, strings.Join(fixableIDs, ", ")))
+			} else {
+				messages = append(messages, fmt.Sprintf("stdlib: assumed go%s (last commit %s, pin %s); rebuilding with go%s fixes %s",
+					assumed, in.CommitTime.UTC().Format("2006-01-02"), pinWord(constraint), rebuild, strings.Join(fixableIDs, ", ")))
+			}
 		case len(unlinkedIDs) > 0:
 			messages = append(messages, fmt.Sprintf("info: stdlib advisories a go%s rebuild would fix affect only packages not linked into build artifacts (%s; assumed go%s, pin %s) - no epoch bump proposed",
 				rebuild, strings.Join(unlinkedIDs, ", "), assumed, pinWord(constraint)))
 		}
+
+		// Unfixable-within-pin hint: advisories the pinned rebuild leaves
+		// behind that the newest Go overall has fixed only exist above the
+		// pin's minor - message only, never a bump (raising the pin is the
+		// user's call; this run's own raises are already reflected in
+		// rebuildConstraint).
+		if rebuildConstraint == "" || len(residualIDs) == 0 {
+			continue
+		}
+		latest, err := resolveLatestVersion()
+		if err != nil {
+			return nil, nil, err
+		}
+		if latest == rebuild {
+			continue // the pin already allows the newest Go - nothing above it
+		}
+		atLatest, err := resolveLatestVulnIDs(latest)
+		if err != nil {
+			return nil, nil, err
+		}
+		var unfixableIDs []string
+		for _, id := range residualIDs {
+			if _, still := atLatest[id]; !still {
+				unfixableIDs = append(unfixableIDs, id)
+			}
+		}
+		if len(unfixableIDs) == 0 {
+			continue
+		}
+		sort.Strings(unfixableIDs)
+		messages = append(messages, fmt.Sprintf("stdlib: %d %s (%s) affecting the go%s-pinned build %s only fixed in newer Go minors - consider raising the go-package pin",
+			len(unfixableIDs), pluralize(len(unfixableIDs), "vulnerability", "vulnerabilities"), strings.Join(unfixableIDs, ", "),
+			rebuildConstraint, pluralize(len(unfixableIDs), "is", "are")))
 	}
 
 	return bumps, messages, nil
+}
+
+// pluralize picks the singular or plural word for a count.
+func pluralize(n int, singular, plural string) string {
+	if n == 1 {
+		return singular
+	}
+	return plural
 }
 
 // scanStdlib OSV-scans the Go standard library at one release version.

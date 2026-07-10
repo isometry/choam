@@ -130,6 +130,37 @@ func TestStdlibStage_RecordsBump(t *testing.T) {
 	assert.Empty(t, gp.GetErrors())
 }
 
+// TestStdlibStage_RebuildSideReflectsSameRunPinRaise: when this run's applier
+// raised a go-package pin (recorded on the processor), the stdlib check's
+// rebuild target must come from the RAISED pin while the assumed side stays on
+// the pristine config's pin.
+func TestStdlibStage_RebuildSideReflectsSameRunPinRaise(t *testing.T) {
+	index := &fakeReleaseIndex{
+		asOf: map[string]string{"1.21": "1.21.11"},
+		// Only the raised constraint resolves: a stale "1.21" rebuild lookup
+		// would error the evaluation and fail this test.
+		available: map[string]string{"1.25": "1.25.4"},
+	}
+	scanner := &fakeStdlibScanner{vulnsByVersion: map[string][]scan.Vulnerability{
+		"1.21.11": {stdlibVuln("GO-STD-1", scan.VulnerableImport{Path: "net/http"})},
+		"1.25.4":  nil,
+	}}
+	stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true}, index, scanner)
+
+	gp := newStdlibTestProcessor()
+	gp.Config.Pipeline[1].With["go-package"] = "go-1.21" // the pristine pin
+	gp.RaisedPinMinors = map[string]string{"1.21": "1.25"}
+
+	require.NoError(t, stage.Apply(t.Context(), gp))
+
+	require.Len(t, gp.StdlibBumps, 1)
+	assert.Equal(t, "1.21.11", gp.StdlibBumps[0].AssumedGoVersion)
+	assert.Equal(t, "1.21", gp.StdlibBumps[0].GoPackagePin)
+	assert.Equal(t, "1.25", gp.StdlibBumps[0].RebuildGoPackagePin)
+	assert.Equal(t, "1.25.4", gp.StdlibBumps[0].RebuildGoVersion)
+	messagesContain(t, gp, "rebuilding with go1.25.4 (pin raised to 1.25) fixes GO-STD-1")
+}
+
 func TestStdlibStage_SkipGates(t *testing.T) {
 	tests := []struct {
 		name        string

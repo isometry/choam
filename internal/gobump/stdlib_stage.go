@@ -118,11 +118,16 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 		gp.AddMessage("stdlib: repository history is shallow - the assumed build toolchain may be newer than reality")
 	}
 
+	// Constraints come from the pristine config (the historical truth the
+	// assumed side needs); the rebuild side additionally reflects go-package
+	// pins this same run raised (the applier runs before this stage).
+	constraints := distinctMinorConstraints(goToolchainPins(gp.Config))
 	in := stdlibInput{
-		CommitTime:  info.Time,
-		Constraints: distinctMinorConstraints(goToolchainPins(gp.Config)),
-		Linked:      gp.LinkedStdPackages,
-		Validated:   gp.LinkedStdPackages != nil,
+		CommitTime:         info.Time,
+		Constraints:        constraints,
+		RebuildConstraints: rebuildConstraintsFor(constraints, gp.RaisedPinMinors),
+		Linked:             gp.LinkedStdPackages,
+		Validated:          gp.LinkedStdPackages != nil,
 	}
 
 	bumps, messages, err := evaluateStdlibStaleness(ctx, s.index, s.scanner, in)

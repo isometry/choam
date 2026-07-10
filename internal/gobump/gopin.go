@@ -211,8 +211,10 @@ func (g *GoBumpApplier) reconcileGoPackagePins(gp *GoBumpProcessor, pinFloor str
 			continue
 		}
 		if goversion.Compare(minor, floorMinor) >= 0 {
+			recordPinOutcome(gp, minor, minor)
 			continue
 		}
+		recordPinOutcome(gp, minor, floorMinor)
 
 		newValue := base + "-" + floorMinor
 		updated, err := loader.UpdateField(yamlContent, pin.Path, newValue)
@@ -229,6 +231,41 @@ func (g *GoBumpApplier) reconcileGoPackagePins(gp *GoBumpProcessor, pinFloor str
 		gp.MarkActualChangesApplied()
 	}
 	return nil
+}
+
+// recordPinOutcome notes one versioned go-package pin's effective minor after
+// reconciliation (identity when the pin was already sufficient) on the
+// processor, for the stdlib staleness check's rebuild-side constraints.
+func recordPinOutcome(gp *GoBumpProcessor, original, effective string) {
+	if gp.RaisedPinMinors == nil {
+		gp.RaisedPinMinors = make(map[string]string)
+	}
+	gp.RaisedPinMinors[original] = effective
+}
+
+// rebuildConstraintsFor maps each pristine-config pin constraint to the
+// constraint the NEXT build will actually use, applying same-run go-package
+// pin raises (GoBumpProcessor.RaisedPinMinors). Unpinned ("") and untouched
+// constraints map to themselves and are omitted; nil is returned when no
+// raise changes anything. Note the deliberate coarseness: constraints are
+// distinct minors, so a raised raw pin also stands in for a templated pin
+// that renders to the same minor (templated pins record nothing but share
+// the constraint) - acceptable, the raise message already tells the user to
+// update the variable manually.
+func rebuildConstraintsFor(constraints []string, raised map[string]string) map[string]string {
+	var out map[string]string
+	for _, constraint := range constraints {
+		if constraint == "" {
+			continue
+		}
+		if effective, ok := raised[constraint]; ok && effective != constraint {
+			if out == nil {
+				out = make(map[string]string)
+			}
+			out[constraint] = effective
+		}
+	}
+	return out
 }
 
 // distinctMinorConstraints reduces pins to the sorted distinct set of minor

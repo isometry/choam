@@ -25,13 +25,17 @@ type BumpAction struct {
 // built with. One entry per go-package pin constraint that yields fixable
 // vulnerabilities (see evaluateStdlibStaleness).
 type StdlibBump struct {
-	AssumedGoVersion string   `json:"assumed_go_version" yaml:"assumed_go_version"`
-	AssumedFromDate  string   `json:"assumed_from_date" yaml:"assumed_from_date"`               // RFC3339 last-commit time
-	GoPackagePin     string   `json:"go_package_pin,omitempty" yaml:"go_package_pin,omitempty"` // minor constraint, "" = unpinned
-	RebuildGoVersion string   `json:"rebuild_go_version" yaml:"rebuild_go_version"`
-	VulnIDs          []string `json:"vuln_ids" yaml:"vuln_ids"`
-	UnlinkedVulnIDs  []string `json:"unlinked_vuln_ids,omitempty" yaml:"unlinked_vuln_ids,omitempty"`
-	Validated        bool     `json:"validated" yaml:"validated"` // linked-import filtering applied
+	AssumedGoVersion string `json:"assumed_go_version" yaml:"assumed_go_version"`
+	AssumedFromDate  string `json:"assumed_from_date" yaml:"assumed_from_date"`               // RFC3339 last-commit time
+	GoPackagePin     string `json:"go_package_pin,omitempty" yaml:"go_package_pin,omitempty"` // minor constraint the package was built under, "" = unpinned
+	// RebuildGoPackagePin is the minor constraint the NEXT build will use,
+	// set only when it differs from GoPackagePin (a same-run go-package pin
+	// raise, see reconcileGoPackagePins).
+	RebuildGoPackagePin string   `json:"rebuild_go_package_pin,omitempty" yaml:"rebuild_go_package_pin,omitempty"`
+	RebuildGoVersion    string   `json:"rebuild_go_version" yaml:"rebuild_go_version"`
+	VulnIDs             []string `json:"vuln_ids" yaml:"vuln_ids"`
+	UnlinkedVulnIDs     []string `json:"unlinked_vuln_ids,omitempty" yaml:"unlinked_vuln_ids,omitempty"`
+	Validated           bool     `json:"validated" yaml:"validated"` // linked-import filtering applied
 }
 
 // SecurityFix represents a security vulnerability fix applied

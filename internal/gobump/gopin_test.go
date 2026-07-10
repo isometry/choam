@@ -254,6 +254,15 @@ func TestReconcileGoPackagePins(t *testing.T) {
 			values = append(values, pin.Value)
 		}
 		assert.ElementsMatch(t, []string{"go-1.25", "go", "go-fips-1.25", "${{vars.go-pkg}}", "golang", "go-1.30"}, values)
+
+		// Every versioned raw pin's outcome is recorded (raised or identity)
+		// for the stdlib check's rebuild side; templated, unversioned, and
+		// unrecognized pins record nothing.
+		assert.Equal(t, map[string]string{
+			"1.22": "1.25", // raised
+			"1.23": "1.25", // raised (go-fips)
+			"1.30": "1.30", // already sufficient - identity
+		}, gp.RaisedPinMinors)
 	})
 
 	t.Run("templated pin resolving at or above the floor stays silent", func(t *testing.T) {
@@ -294,9 +303,10 @@ func TestReconcileGoPackagePins(t *testing.T) {
 		assert.Equal(t, goPinFixtureYAML, string(gp.GetCurrentYAML()))
 		assert.False(t, gp.ActualChangesApplied)
 		assert.Empty(t, gp.GetMessages())
+		assert.Nil(t, gp.RaisedPinMinors, "a no-op reconciliation must record nothing")
 	})
 
-	t.Run("all pins sufficient - no rewrite, no change flag", func(t *testing.T) {
+	t.Run("all pins sufficient - no rewrite, no change flag, identity outcomes recorded", func(t *testing.T) {
 		gp := goPinTestProcessor(t)
 		applier := NewGoBumpApplier(nil)
 
@@ -304,6 +314,22 @@ func TestReconcileGoPackagePins(t *testing.T) {
 
 		assert.Equal(t, goPinFixtureYAML, string(gp.GetCurrentYAML()))
 		assert.False(t, gp.ActualChangesApplied)
+		assert.Equal(t, map[string]string{
+			"1.22": "1.22",
+			"1.23": "1.23",
+			"1.30": "1.30",
+		}, gp.RaisedPinMinors)
+	})
+
+	t.Run("templated pin below the floor records nothing", func(t *testing.T) {
+		gp := goPinTestProcessor(t)
+		gp.Config.Vars["go-pkg"] = "go-1.21" // templated pin renders below the floor
+		applier := NewGoBumpApplier(nil)
+
+		require.NoError(t, applier.reconcileGoPackagePins(gp, "1.25"))
+
+		_, templatedRecorded := gp.RaisedPinMinors["1.21"]
+		assert.False(t, templatedRecorded, "templated pins are never edited, so they must not record an outcome")
 	})
 
 	t.Run("double run is byte-stable", func(t *testing.T) {
@@ -314,5 +340,25 @@ func TestReconcileGoPackagePins(t *testing.T) {
 		firstPass := string(gp.GetCurrentYAML())
 		require.NoError(t, applier.reconcileGoPackagePins(gp, "1.25"))
 		assert.Equal(t, firstPass, string(gp.GetCurrentYAML()))
+	})
+}
+
+func TestRebuildConstraintsFor(t *testing.T) {
+	t.Run("nil recordings map to nil", func(t *testing.T) {
+		assert.Nil(t, rebuildConstraintsFor([]string{"", "1.21"}, nil))
+	})
+
+	t.Run("identity-only recordings map to nil", func(t *testing.T) {
+		assert.Nil(t, rebuildConstraintsFor([]string{"1.21"}, map[string]string{"1.21": "1.21"}))
+	})
+
+	t.Run("raises apply; unpinned and unrecorded constraints stay put", func(t *testing.T) {
+		raised := map[string]string{"1.21": "1.25", "1.24": "1.24"}
+		got := rebuildConstraintsFor([]string{"", "1.21", "1.23", "1.24"}, raised)
+		assert.Equal(t, map[string]string{"1.21": "1.25"}, got)
+	})
+
+	t.Run("recordings for minors absent from the constraints are ignored", func(t *testing.T) {
+		assert.Nil(t, rebuildConstraintsFor([]string{""}, map[string]string{"1.21": "1.25"}))
 	})
 }

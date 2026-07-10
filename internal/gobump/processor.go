@@ -41,6 +41,14 @@ type GoBumpProcessor struct {
 	// (GOOS=linux; see simulate.ModrootResult.StdPackages). nil = unknown
 	// (simulation didn't run or the toolchain walk failed open).
 	LinkedStdPackages map[string]struct{} `json:"-"`
+
+	// RaisedPinMinors records the effective outcome of this run's go-package
+	// pin reconciliation (see reconcileGoPackagePins): original pin minor ->
+	// post-run minor, identity when the pin was already sufficient. Only
+	// versioned, non-templated pins record entries; nil when reconciliation
+	// didn't run. The stdlib staleness check applies it so the rebuild-side
+	// constraint reflects same-run pin raises.
+	RaisedPinMinors map[string]string `json:"-"`
 }
 
 // NewGoBumpProcessor creates a new gobump processor

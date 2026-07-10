@@ -355,6 +355,244 @@ func TestEvaluateStdlibStaleness_MultipleConstraints(t *testing.T) {
 	assert.Equal(t, []string{"GO-OLD-1"}, bumps[1].VulnIDs)
 }
 
+// A same-run pin raise: the assumed side stays on the historical constraint,
+// the rebuild side uses the raised one - vulns fixed only above the original
+// pin's minor are now counted, and the record/message name the raised pin.
+func TestEvaluateStdlibStaleness_RebuildConstraintRaised(t *testing.T) {
+	index := &fakeReleaseIndex{
+		asOf: map[string]string{"1.21": "1.21.11"},
+		// No "1.21" key: LatestAvailable must be queried with the RAISED
+		// constraint only (a "1.21" lookup would error the evaluation).
+		available: map[string]string{"1.25": "1.25.4"},
+	}
+	scanner := &fakeStdlibScanner{
+		vulnsByVersion: map[string][]scan.Vulnerability{
+			// GO-2024-0002 is fixed in 1.22 - invisible to a 1.21-constrained
+			// rebuild, fixable once the pin is raised to 1.25.
+			"1.21.11": {stdlibVuln("GO-2024-0001"), stdlibVuln("GO-2024-0002")},
+			"1.25.4":  nil,
+		},
+	}
+
+	bumps, messages, err := evaluateStdlibStaleness(t.Context(), index, scanner, stdlibInput{
+		CommitTime:         stdlibCommitTime,
+		Constraints:        []string{"1.21"},
+		RebuildConstraints: map[string]string{"1.21": "1.25"},
+	})
+	require.NoError(t, err)
+
+	require.Len(t, bumps, 1)
+	assert.Equal(t, StdlibBump{
+		AssumedGoVersion:    "1.21.11",
+		AssumedFromDate:     "2024-03-15T12:00:00Z",
+		GoPackagePin:        "1.21",
+		RebuildGoPackagePin: "1.25",
+		RebuildGoVersion:    "1.25.4",
+		VulnIDs:             []string{"GO-2024-0001", "GO-2024-0002"},
+		Validated:           false,
+	}, bumps[0])
+
+	require.Len(t, messages, 1)
+	assert.Contains(t, messages[0], "assumed go1.21.11")
+	assert.Contains(t, messages[0], "pin 1.21")
+	assert.Contains(t, messages[0], "rebuilding with go1.25.4 (pin raised to 1.25) fixes GO-2024-0001, GO-2024-0002")
+
+	assert.Equal(t, []string{"1.21.11", "1.25.4"}, scanner.scanned)
+}
+
+// An identity mapping (pin evaluated but not raised) must behave exactly like
+// no mapping at all: same rebuild target, no RebuildGoPackagePin, old message.
+func TestEvaluateStdlibStaleness_IdentityRebuildConstraintUnchanged(t *testing.T) {
+	index := &fakeReleaseIndex{
+		asOf:      map[string]string{"1.21": "1.21.0"},
+		available: map[string]string{"1.21": "1.21.13"},
+	}
+	scanner := &fakeStdlibScanner{
+		vulnsByVersion: map[string][]scan.Vulnerability{
+			"1.21.0":  {stdlibVuln("GO-2024-0001")},
+			"1.21.13": nil,
+		},
+	}
+
+	bumps, messages, err := evaluateStdlibStaleness(t.Context(), index, scanner, stdlibInput{
+		CommitTime:         stdlibCommitTime,
+		Constraints:        []string{"1.21"},
+		RebuildConstraints: map[string]string{"1.21": "1.21"},
+	})
+	require.NoError(t, err)
+	require.Len(t, bumps, 1)
+	assert.Empty(t, bumps[0].RebuildGoPackagePin)
+	assert.Equal(t, "1.21.13", bumps[0].RebuildGoVersion)
+	require.Len(t, messages, 1)
+	assert.NotContains(t, messages[0], "pin raised")
+}
+
+func TestEvaluateStdlibStaleness_UnfixableWithinPin(t *testing.T) {
+	t.Run("residual above pin warns, no bump for it", func(t *testing.T) {
+		index := &fakeReleaseIndex{
+			asOf:      map[string]string{"1.21": "1.21.0"},
+			available: map[string]string{"1.21": "1.21.13", "": "1.26.0"},
+		}
+		scanner := &fakeStdlibScanner{
+			vulnsByVersion: map[string][]scan.Vulnerability{
+				"1.21.0":  {stdlibVuln("GO-FIXABLE"), stdlibVuln("GO-ABOVE-PIN")},
+				"1.21.13": {stdlibVuln("GO-ABOVE-PIN")}, // never fixed in the 1.21 series
+				"1.26.0":  nil,                          // fixed in a newer minor
+			},
+		}
+
+		bumps, messages, err := evaluateStdlibStaleness(t.Context(), index, scanner, stdlibInput{
+			CommitTime:  stdlibCommitTime,
+			Constraints: []string{"1.21"},
+		})
+		require.NoError(t, err)
+
+		require.Len(t, bumps, 1)
+		assert.Equal(t, []string{"GO-FIXABLE"}, bumps[0].VulnIDs, "the above-pin residual must not count as fixable")
+
+		require.Len(t, messages, 2)
+		assert.Equal(t, "stdlib: 1 vulnerability (GO-ABOVE-PIN) affecting the go1.21-pinned build is only fixed in newer Go minors - consider raising the go-package pin", messages[1])
+
+		assert.Equal(t, []string{"1.21.0", "1.21.13", "1.26.0"}, scanner.scanned)
+	})
+
+	t.Run("residual still present at latest - no warning", func(t *testing.T) {
+		index := &fakeReleaseIndex{
+			asOf:      map[string]string{"1.21": "1.21.0"},
+			available: map[string]string{"1.21": "1.21.13", "": "1.26.0"},
+		}
+		scanner := &fakeStdlibScanner{
+			vulnsByVersion: map[string][]scan.Vulnerability{
+				"1.21.0":  {stdlibVuln("GO-FIXABLE"), stdlibVuln("GO-EVERYWHERE")},
+				"1.21.13": {stdlibVuln("GO-EVERYWHERE")},
+				"1.26.0":  {stdlibVuln("GO-EVERYWHERE")}, // no Go release fixes it
+			},
+		}
+
+		_, messages, err := evaluateStdlibStaleness(t.Context(), index, scanner, stdlibInput{
+			CommitTime:  stdlibCommitTime,
+			Constraints: []string{"1.21"},
+		})
+		require.NoError(t, err)
+		require.Len(t, messages, 1, "no raise-the-pin hint when newer minors don't fix it either")
+		assert.NotContains(t, messages[0], "consider raising")
+	})
+
+	t.Run("all fixable within pin - no extra lookup or scan", func(t *testing.T) {
+		index := &fakeReleaseIndex{
+			asOf: map[string]string{"1.21": "1.21.0"},
+			// No "" key: an unconstrained LatestAvailable call would error.
+			available: map[string]string{"1.21": "1.21.13"},
+		}
+		scanner := &fakeStdlibScanner{
+			vulnsByVersion: map[string][]scan.Vulnerability{
+				"1.21.0":  {stdlibVuln("GO-FIXABLE")},
+				"1.21.13": nil,
+			},
+		}
+
+		bumps, messages, err := evaluateStdlibStaleness(t.Context(), index, scanner, stdlibInput{
+			CommitTime:  stdlibCommitTime,
+			Constraints: []string{"1.21"},
+		})
+		require.NoError(t, err)
+		require.Len(t, bumps, 1)
+		require.Len(t, messages, 1)
+		assert.Equal(t, 1, index.availableCalls, "the unconstrained lookup must stay lazy")
+		assert.Equal(t, []string{"1.21.0", "1.21.13"}, scanner.scanned)
+	})
+
+	t.Run("unpinned residual - no warning, no extra work", func(t *testing.T) {
+		index := &fakeReleaseIndex{
+			asOf:      map[string]string{"": "1.21.0"},
+			available: map[string]string{"": "1.26.0"},
+		}
+		scanner := &fakeStdlibScanner{
+			vulnsByVersion: map[string][]scan.Vulnerability{
+				"1.21.0": {stdlibVuln("GO-EVERYWHERE")},
+				"1.26.0": {stdlibVuln("GO-EVERYWHERE")},
+			},
+		}
+
+		_, messages, err := evaluateStdlibStaleness(t.Context(), index, scanner, stdlibInput{
+			CommitTime:  stdlibCommitTime,
+			Constraints: []string{""},
+		})
+		require.NoError(t, err)
+		assert.Empty(t, messages, "an unpinned rebuild IS the newest Go - nothing above it")
+		assert.Equal(t, 1, index.availableCalls)
+		assert.Equal(t, []string{"1.21.0", "1.26.0"}, scanner.scanned)
+	})
+
+	t.Run("pin already allows the newest Go - version lookup but no third scan", func(t *testing.T) {
+		index := &fakeReleaseIndex{
+			asOf:      map[string]string{"1.26": "1.26.0"},
+			available: map[string]string{"1.26": "1.26.3", "": "1.26.3"},
+		}
+		scanner := &fakeStdlibScanner{
+			vulnsByVersion: map[string][]scan.Vulnerability{
+				"1.26.0": {stdlibVuln("GO-EVERYWHERE")},
+				"1.26.3": {stdlibVuln("GO-EVERYWHERE")},
+			},
+		}
+
+		_, messages, err := evaluateStdlibStaleness(t.Context(), index, scanner, stdlibInput{
+			CommitTime:  stdlibCommitTime,
+			Constraints: []string{"1.26"},
+		})
+		require.NoError(t, err)
+		assert.Empty(t, messages)
+		assert.Equal(t, []string{"1.26.0", "1.26.3"}, scanner.scanned, "latest == rebuild must not scan a third time")
+	})
+
+	t.Run("two pinned constraints share one memoized latest scan", func(t *testing.T) {
+		index := &fakeReleaseIndex{
+			asOf:      map[string]string{"1.21": "1.21.0", "1.22": "1.22.0"},
+			available: map[string]string{"1.21": "1.21.13", "1.22": "1.22.9", "": "1.26.0"},
+		}
+		scanner := &fakeStdlibScanner{
+			vulnsByVersion: map[string][]scan.Vulnerability{
+				"1.21.0":  {stdlibVuln("GO-ABOVE-21")},
+				"1.21.13": {stdlibVuln("GO-ABOVE-21")},
+				"1.22.0":  {stdlibVuln("GO-ABOVE-22A"), stdlibVuln("GO-ABOVE-22B")},
+				"1.22.9":  {stdlibVuln("GO-ABOVE-22A"), stdlibVuln("GO-ABOVE-22B")},
+				"1.26.0":  nil,
+			},
+		}
+
+		bumps, messages, err := evaluateStdlibStaleness(t.Context(), index, scanner, stdlibInput{
+			CommitTime:  stdlibCommitTime,
+			Constraints: []string{"1.21", "1.22"},
+		})
+		require.NoError(t, err)
+		assert.Empty(t, bumps)
+		require.Len(t, messages, 2)
+		assert.Contains(t, messages[0], "go1.21-pinned")
+		assert.Equal(t, "stdlib: 2 vulnerabilities (GO-ABOVE-22A, GO-ABOVE-22B) affecting the go1.22-pinned build are only fixed in newer Go minors - consider raising the go-package pin", messages[1])
+		assert.Equal(t, []string{"1.21.0", "1.21.13", "1.26.0", "1.22.0", "1.22.9"}, scanner.scanned, "the unconstrained latest is scanned exactly once")
+		assert.Equal(t, 3, index.availableCalls)
+	})
+
+	t.Run("unconstrained lookup failure propagates", func(t *testing.T) {
+		index := &fakeReleaseIndex{
+			asOf:      map[string]string{"1.21": "1.21.0"},
+			available: map[string]string{"1.21": "1.21.13"}, // "" lookup errors
+		}
+		scanner := &fakeStdlibScanner{
+			vulnsByVersion: map[string][]scan.Vulnerability{
+				"1.21.0":  {stdlibVuln("GO-ABOVE-PIN")},
+				"1.21.13": {stdlibVuln("GO-ABOVE-PIN")},
+			},
+		}
+
+		_, _, err := evaluateStdlibStaleness(t.Context(), index, scanner, stdlibInput{
+			CommitTime:  stdlibCommitTime,
+			Constraints: []string{"1.21"},
+		})
+		require.ErrorContains(t, err, `no matching stable Go releases for constraint ""`)
+	})
+}
+
 func TestPinWord(t *testing.T) {
 	assert.Equal(t, "unpinned", pinWord(""))
 	assert.Equal(t, "1.24", pinWord("1.24"))
