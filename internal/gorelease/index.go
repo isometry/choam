@@ -21,19 +21,21 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/isometry/choam/internal/goproxy"
 	"github.com/isometry/choam/internal/goversion"
 )
 
 const (
 	// defaultBaseURL is the default Go module proxy used to source release
 	// data.
-	defaultBaseURL = "https://proxy.golang.org"
+	defaultBaseURL = goproxy.DefaultProxyURL
 
 	// defaultTimeout is used for the HTTP client NewIndex installs when
 	// called with a nil *http.Client.
@@ -87,10 +89,13 @@ type Index struct {
 	times        map[string]time.Time // bare release version -> memoized publish time
 }
 
-// NewIndex returns an Index backed by proxy.golang.org. A nil httpClient
-// falls back to a default client with a ~30s timeout.
+// NewIndex returns an Index backed by the first usable entry of the
+// process's GOPROXY (falling back to proxy.golang.org when GOPROXY's first
+// entry is "direct", "off", or otherwise unusable - the toolchain index is
+// public release metadata, so this fallback carries no privacy concern). A
+// nil httpClient falls back to a default client with a ~30s timeout.
 func NewIndex(httpClient *http.Client) *Index {
-	return newIndexWithBaseURL(httpClient, defaultBaseURL)
+	return newIndexWithBaseURL(httpClient, goproxy.IndexBaseURL(os.Getenv("GOPROXY")))
 }
 
 // newIndexWithBaseURL is the seam tests use to point an Index at an

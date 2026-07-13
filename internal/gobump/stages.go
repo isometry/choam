@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	melange "chainguard.dev/melange/pkg/config"
 	"github.com/isometry/choam/internal/config"
 	"github.com/isometry/choam/internal/ecosystem"
+	"github.com/isometry/choam/internal/goproxy"
 	"github.com/isometry/choam/internal/gorelease"
 	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/processor"
@@ -99,17 +101,43 @@ type GoBumpApplier struct {
 	// goProxyURL is the module proxy the best-effort go-version fallback
 	// queries; tests point it at an httptest server.
 	goProxyURL string
+
+	// probeDisabled mirrors GOPROXY=off: the best-effort go-version fallback
+	// probe is entirely skipped (it would just fail every fetch) and each
+	// affected modroot gets one explanatory message instead.
+	probeDisabled bool
+
+	// goPrivate/goNoProxy are GOPRIVATE/GONOPROXY captured once at
+	// construction (see internal/goproxy.IsPrivate) so the fallback probe
+	// never sends a private module's name/version to a public proxy.
+	goPrivate string
+	goNoProxy string
 }
 
 func NewGoBumpApplier(analyzer *Analyzer) *GoBumpApplier {
+	proxyURL, ok := goproxy.FirstURL(os.Getenv("GOPROXY"))
+	if !ok {
+		proxyURL = defaultGoProxyURL
+	}
 	return &GoBumpApplier{
 		BaseStage: processor.BaseStage{
 			StageName:        "gobump_apply",
 			StageDescription: "Apply bump/go-bump pipeline changes",
 		},
-		Analyzer:   analyzer,
-		goProxyURL: defaultGoProxyURL,
+		Analyzer:      analyzer,
+		goProxyURL:    proxyURL,
+		probeDisabled: goproxy.Disabled(os.Getenv("GOPROXY")),
+		goPrivate:     os.Getenv("GOPRIVATE"),
+		goNoProxy:     os.Getenv("GONOPROXY"),
 	}
+}
+
+// skipPrivateModule reports whether modulePath is private per the
+// applier's captured GOPRIVATE/GONOPROXY - the skip func the best-effort
+// go-version fallback probe uses to avoid leaking private module
+// names/versions to a public proxy.
+func (g *GoBumpApplier) skipPrivateModule(modulePath string) bool {
+	return goproxy.IsPrivate(modulePath, g.goPrivate, g.goNoProxy)
 }
 
 // httpClient returns the analyzer's HTTP client, falling back to the default
@@ -585,7 +613,10 @@ func (g *GoBumpApplier) applyGoBumpChanges(ctx context.Context, gp *GoBumpProces
 // simulation didn't cover, from the best-effort proxy probe (see
 // fallbackRequiredGoVersion), gated against the pristine baseline exactly
 // like the simulation path. Fail-open throughout: any failure just leaves
-// RequiredGoVersion empty (with a warning), never blocks the apply.
+// RequiredGoVersion empty (with a warning), never blocks the apply. When
+// GOPROXY=off (probeDisabled), the probe is skipped entirely - it would
+// only fail every fetch - and each affected modroot gets one message
+// instead.
 func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis) {
 	for li := range analysis.ByLanguage {
 		lang := &analysis.ByLanguage[li]
@@ -600,7 +631,12 @@ func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProces
 			if len(m.DesiredDeps) == 0 && len(m.DesiredReplaces) == 0 {
 				continue
 			}
-			required, err := fallbackRequiredGoVersion(ctx, g.httpClient(), g.goProxyURL, m)
+			if g.probeDisabled {
+				slog.Debug("go-version fallback: probe disabled (GOPROXY=off) - skipping", "modroot", m.Modroot)
+				gp.AddMessage(fmt.Sprintf("modroot %s: GOPROXY=off - skipping best-effort Go version probe", m.Modroot))
+				continue
+			}
+			required, err := fallbackRequiredGoVersion(ctx, g.httpClient(), g.goProxyURL, m, g.skipPrivateModule)
 			if err != nil {
 				slog.Warn("could not determine required Go version (best-effort probe failed)",
 					"modroot", m.Modroot, "error", err)

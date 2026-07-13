@@ -585,6 +585,7 @@ func TestErrorPaths(t *testing.T) {
 }
 
 func TestNewIndex_NilClientDefaults(t *testing.T) {
+	t.Setenv("GOPROXY", "") // pin: an inherited ambient GOPROXY must not affect this test
 	ix := NewIndex(nil)
 	if ix == nil {
 		t.Fatal("NewIndex(nil) returned nil")
@@ -601,10 +602,36 @@ func TestNewIndex_NilClientDefaults(t *testing.T) {
 }
 
 func TestNewIndex_CustomClientPreserved(t *testing.T) {
+	t.Setenv("GOPROXY", "")
 	custom := &http.Client{Timeout: 7 * time.Second}
 	ix := NewIndex(custom)
 	if ix.httpClient != custom {
 		t.Error("NewIndex(custom) did not preserve the provided client")
+	}
+}
+
+func TestNewIndex_HonoursGOPROXY(t *testing.T) {
+	tests := []struct {
+		name    string
+		goproxy string
+		want    string
+	}{
+		{name: "unset - default proxy", goproxy: "", want: defaultBaseURL},
+		{name: "usable URL used directly", goproxy: "https://proxy.example.com", want: "https://proxy.example.com"},
+		{name: "usable URL with fallback list - first entry used", goproxy: "https://proxy.example.com,direct", want: "https://proxy.example.com"},
+		{name: "direct - falls back to default (public metadata, no privacy leak)", goproxy: "direct", want: defaultBaseURL},
+		{name: "off - falls back to default", goproxy: "off", want: defaultBaseURL},
+		{name: "garbage - falls back to default", goproxy: "banana", want: defaultBaseURL},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GOPROXY", tt.goproxy)
+			ix := NewIndex(nil)
+			if ix.baseURL != tt.want {
+				t.Errorf("NewIndex() with GOPROXY=%q baseURL = %q, want %q", tt.goproxy, ix.baseURL, tt.want)
+			}
+		})
 	}
 }
 

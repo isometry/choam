@@ -31,12 +31,18 @@ const maxGoModBytes = 1 << 20
 // fallbackRequiredGoVersion computes, without simulation, the max go
 // directive across the modroot's candidate deps' own go.mod files, fetched
 // from the module proxy at proxyBaseURL. Candidates are the coordinates in
-// DesiredDeps plus the "new@version" side of DesiredReplaces. This is
-// best-effort and fail-open: it only sees direct candidates (not the resolved
-// graph the simulation proves), individual fetch/parse failures are skipped
-// with a debug log, and an error is returned only when nothing at all could
-// be fetched (the caller warns and proceeds without a value).
-func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBaseURL string, m *ModrootAnalysis) (string, error) {
+// DesiredDeps plus the "new@version" side of DesiredReplaces. Candidates
+// whose module path skip reports true for (GOPRIVATE/GONOPROXY - see
+// internal/goproxy.IsPrivate) are never fetched, since doing so would leak
+// the private module's name and version to a public proxy and 404 anyway;
+// skip may be nil to probe every candidate. This is best-effort and
+// fail-open: it only sees direct candidates (not the resolved graph the
+// simulation proves), individual fetch/parse failures are skipped with a
+// debug log, and an error is returned only when nothing at all could be
+// fetched (the caller warns and proceeds without a value) - the error notes
+// how many candidates were skipped as private so an all-private modroot is
+// reported honestly rather than silently omitting the raise.
+func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBaseURL string, m *ModrootAnalysis, skip func(modulePath string) bool) (string, error) {
 	candidates := fallbackCandidates(m)
 	if len(candidates) == 0 {
 		return "", nil
@@ -47,7 +53,14 @@ func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBa
 
 	var maxGo string
 	fetched := 0
+	skippedPrivate := 0
 	for _, candidate := range candidates {
+		if skip != nil && skip(candidate.module) {
+			skippedPrivate++
+			slog.Debug("go-version fallback: private module - skipping probe",
+				"modroot", m.Modroot, "module", candidate.module, "version", candidate.version)
+			continue
+		}
 		goDirective, err := fetchModGoDirective(ctx, client, proxyBaseURL, candidate.module, candidate.version)
 		if err != nil {
 			slog.Debug("go-version fallback: could not fetch candidate go.mod - skipping",
@@ -59,6 +72,9 @@ func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBa
 	}
 
 	if fetched == 0 {
+		if skippedPrivate > 0 {
+			return "", fmt.Errorf("none of the %d candidate go.mod files could be fetched (%d private modules skipped)", len(candidates), skippedPrivate)
+		}
 		return "", fmt.Errorf("none of the %d candidate go.mod files could be fetched", len(candidates))
 	}
 	return maxGo, nil
