@@ -258,6 +258,21 @@ func (l *Loader) spliceIntoPipelineWith(yamlContent []byte, pipelineIndex int, i
 	}
 
 	lines := strings.Split(string(yamlContent), "\n")
+	// When the with block being spliced into holds the file's very last
+	// content, goccy can position a multi-line block scalar's content node on
+	// its LAST source line rather than its first; nodeEndLine's "start line +
+	// embedded newline count" heuristic then overshoots by one, landing on
+	// the phantom empty element strings.Split appends for the file's trailing
+	// newline instead of the real last content line. That phantom element is
+	// unambiguous - the file ends in "\n" and endLine ran off the end - so
+	// correct for it here rather than reworking the line-counting heuristic
+	// for every node kind. Left uncorrected, the phantom line would be
+	// consumed into the "before insertion" half, leaving a spurious blank
+	// line before the insertion and no trailing newline after it: harmless
+	// once, but non-idempotent on a second splice into the same spot.
+	if endLine >= len(lines) && len(lines) > 0 && lines[len(lines)-1] == "" {
+		endLine = len(lines) - 1
+	}
 	if endLine > len(lines) {
 		endLine = len(lines)
 	}

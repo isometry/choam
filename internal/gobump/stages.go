@@ -719,15 +719,23 @@ func (g *GoBumpApplier) reconcileBumpSteps(gp *GoBumpProcessor, analysis *Vulner
 //
 // Fast path: when a single existing step of this language already covers
 // exactly its analyzed modroot set and every one of those roots desires an
-// identical dependency set, its deps are updated in place, preserving its
-// action (bump or go/bump), modroot list, and language.
+// identical dependency set and replace set, its deps/replaces are updated in
+// place, preserving its action (bump or go/bump), modroot list, and
+// language. Per-root effective go-versions are NOT required to match to take
+// this path: go-version is a floor (never-lowered downstream by
+// fastPathGoVersion), so the single step is simply raised to the highest
+// effective go-version across all covered roots (maxEffectiveGoVersion),
+// which safely satisfies the most demanding root even when roots diverge.
+// Forcing a rebuild over a go-version mismatch alone would destroy the
+// step's comments for no safety benefit.
 //
 // General path: otherwise, all of this language's existing steps are
 // removed and replaced with freshly coalesced "bump" steps - one per
-// distinct desired dependency set, each covering every modroot that shares
-// it, with an explicit with.language. This is what produces
-// cert-manager-style multi-step output when modroots genuinely diverge,
-// while collapsing to a single step when they agree.
+// distinct desired dependency set (deps, replaces, AND effective
+// go-version), each covering every modroot that shares it, with an explicit
+// with.language. This is what produces cert-manager-style multi-step output
+// when modroots genuinely diverge, while collapsing to a single step when
+// they agree.
 func (g *GoBumpApplier) reconcileLanguageBumpSteps(gp *GoBumpProcessor, langAnalysis LanguageAnalysis, loader *config.Loader) error {
 	allSteps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
 	if err != nil {
@@ -748,12 +756,11 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(gp *GoBumpProcessor, langAnal
 	if len(existingSteps) == 1 &&
 		sameRootSet(existingSteps[0].Modroots, allModroots(langAnalysis.ByModroot)) &&
 		allRootsShareDeps(langAnalysis.ByModroot) &&
-		allRootsShareReplaces(langAnalysis.ByModroot) &&
-		allRootsShareGoVersion(langAnalysis.ByModroot) {
+		allRootsShareReplaces(langAnalysis.ByModroot) {
 		step := existingSteps[0]
 		desired := desiredDepsForSingleGroup(langAnalysis.ByModroot)
 		desiredReplaces := desiredReplacesForSingleGroup(langAnalysis.ByModroot)
-		goVersion := g.fastPathGoVersion(gp, step, effectiveGoVersionForSingleGroup(langAnalysis.ByModroot))
+		goVersion := g.fastPathGoVersion(gp, step, maxEffectiveGoVersion(langAnalysis.ByModroot))
 
 		updated, err := loader.UpdateGoBumpStep(gp.GetCurrentYAML(), step.Index, desired, desiredReplaces, goVersion)
 		if err != nil {
@@ -971,29 +978,19 @@ func effectiveGoVersion(m ModrootAnalysis) string {
 	return goversion.Max(m.ExistingGoVersion, m.RequiredGoVersion)
 }
 
-// allRootsShareGoVersion reports whether every analyzed modroot has an
-// identical effective go-version (the go-version analogue of
-// allRootsShareReplaces).
-func allRootsShareGoVersion(byModroot []ModrootAnalysis) bool {
-	if len(byModroot) <= 1 {
-		return true
+// maxEffectiveGoVersion returns the highest effective go-version
+// (effectiveGoVersion) across all analyzed modroots, "" if none has one. Used
+// by the fast path, whose single step must satisfy every covered root at
+// once: go-version is a floor, not an exact requirement, so raising to the
+// maximum is always safe even when roots' effective versions diverge -
+// fastPathGoVersion still enforces never-lower against the step's current
+// value on top of this.
+func maxEffectiveGoVersion(byModroot []ModrootAnalysis) string {
+	var max string
+	for _, m := range byModroot {
+		max = goversion.Max(max, effectiveGoVersion(m))
 	}
-	first := effectiveGoVersion(byModroot[0])
-	for _, m := range byModroot[1:] {
-		if effectiveGoVersion(m) != first {
-			return false
-		}
-	}
-	return true
-}
-
-// effectiveGoVersionForSingleGroup returns the effective go-version shared by
-// every analyzed modroot (only valid when allRootsShareGoVersion is true).
-func effectiveGoVersionForSingleGroup(byModroot []ModrootAnalysis) string {
-	if len(byModroot) == 0 {
-		return ""
-	}
-	return effectiveGoVersion(byModroot[0])
+	return max
 }
 
 // desiredDepsForSingleGroup returns the desired deps shared by every

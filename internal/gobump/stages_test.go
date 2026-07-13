@@ -835,14 +835,15 @@ func TestEffectiveGoVersionHelpers(t *testing.T) {
 	assert.Equal(t, "1.27", effectiveGoVersion(ModrootAnalysis{ExistingGoVersion: "1.26", RequiredGoVersion: "1.27"}))
 	assert.Equal(t, "", effectiveGoVersion(ModrootAnalysis{}))
 
-	assert.True(t, allRootsShareGoVersion([]ModrootAnalysis{
+	assert.Equal(t, "1.26", maxEffectiveGoVersion([]ModrootAnalysis{
 		{Modroot: "a", RequiredGoVersion: "1.26"},
 		{Modroot: "b", ExistingGoVersion: "1.26"},
-	}))
-	assert.False(t, allRootsShareGoVersion([]ModrootAnalysis{
+	}), "shared roots: max equals the common value")
+	assert.Equal(t, "1.26", maxEffectiveGoVersion([]ModrootAnalysis{
 		{Modroot: "a", RequiredGoVersion: "1.26"},
 		{Modroot: "b"},
-	}))
+	}), "divergent roots: max is the highest, not the empty one")
+	assert.Equal(t, "", maxEffectiveGoVersion(nil))
 }
 
 // TestCoalesceModroots_SplitsByGoVersion: identical desired deps with
@@ -971,6 +972,163 @@ pipeline:
 	require.NoError(t, err)
 	require.Len(t, steps, 1)
 	assert.Equal(t, "1.26", steps[0].GoVersion)
+}
+
+// TestReconcileBumpSteps_FastPathDivergentGoVersionsWriteMax: divergent
+// per-root effective go-versions must NOT force the rebuild path - go-version
+// is a floor, so the fast path writes the max across all covered roots into
+// the single existing step in place, preserving its comments. Falling back
+// to rebuild here would destroy user comments, violating the
+// comment-preservation invariant.
+func TestReconcileBumpSteps_FastPathDivergentGoVersionsWriteMax(t *testing.T) {
+	const divergentGoVersionYAML = `package:
+  name: example
+  version: "1.0.0"
+  epoch: 0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  # keep me
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.55.0
+      modroot: |-
+        .
+        cmd/a
+`
+	gp := newTestProcessor(t, divergentGoVersionYAML)
+	loader := config.NewLoader()
+	applier := NewGoBumpApplier(nil)
+
+	analysis := &VulnerabilityAnalysis{
+		ByLanguage: []LanguageAnalysis{{
+			Language: "go",
+			ByModroot: []ModrootAnalysis{
+				{
+					Modroot:           ".",
+					ExistingDeps:      []string{"golang.org/x/net@v0.55.0"},
+					DesiredDeps:       []string{"golang.org/x/net@v0.56.0"},
+					RequiredGoVersion: "1.24",
+				},
+				{
+					Modroot:           "cmd/a",
+					ExistingDeps:      []string{"golang.org/x/net@v0.55.0"},
+					DesiredDeps:       []string{"golang.org/x/net@v0.56.0"},
+					RequiredGoVersion: "1.26",
+				},
+			},
+		}},
+		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{".", "cmd/a"}}},
+	}
+
+	require.NoError(t, applier.reconcileBumpSteps(gp, analysis, loader))
+
+	firstPass := string(gp.GetCurrentYAML())
+	assert.Contains(t, firstPass, `go-version: "1.26"`, "single step must satisfy the most demanding root")
+	assert.Contains(t, firstPass, "# keep me", "fast path must preserve comments, not rebuild")
+
+	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
+	require.NoError(t, err)
+	require.Len(t, steps, 1, "must stay a single step, not split by divergent go-version")
+	assert.Equal(t, "go/bump", steps[0].Action)
+	assert.ElementsMatch(t, []string{".", "cmd/a"}, steps[0].Modroots)
+	assert.Equal(t, "1.26", steps[0].GoVersion)
+
+	// Second run, as a real re-run would see it: ExistingGoVersion now comes
+	// from the just-written max, so fastPathGoVersion returns "" for both
+	// roots. Must be byte-for-byte stable.
+	secondAnalysis := &VulnerabilityAnalysis{
+		ByLanguage: []LanguageAnalysis{{
+			Language: "go",
+			ByModroot: []ModrootAnalysis{
+				{
+					Modroot:           ".",
+					ExistingDeps:      []string{"golang.org/x/net@v0.56.0"},
+					DesiredDeps:       []string{"golang.org/x/net@v0.56.0"},
+					ExistingGoVersion: existingGoVersionsForModroots([]string{"."}, steps)["."],
+					RequiredGoVersion: "1.24",
+				},
+				{
+					Modroot:           "cmd/a",
+					ExistingDeps:      []string{"golang.org/x/net@v0.56.0"},
+					DesiredDeps:       []string{"golang.org/x/net@v0.56.0"},
+					ExistingGoVersion: existingGoVersionsForModroots([]string{"cmd/a"}, steps)["cmd/a"],
+					RequiredGoVersion: "1.26",
+				},
+			},
+		}},
+		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{".", "cmd/a"}}},
+	}
+	require.NoError(t, applier.reconcileBumpSteps(gp, secondAnalysis, loader))
+	assert.Equal(t, firstPass, string(gp.GetCurrentYAML()), "re-running the fast path on divergent-go-version roots must be byte-stable")
+}
+
+// TestReconcileBumpSteps_FastPathDivergentGoVersionsNeverLowers: even with
+// diverging per-root effective go-versions, an existing step's go-version
+// above the computed maximum is kept, byte-for-byte - maxEffectiveGoVersion
+// feeds fastPathGoVersion, which never lowers an existing value.
+func TestReconcileBumpSteps_FastPathDivergentGoVersionsNeverLowers(t *testing.T) {
+	const pinnedDivergentGoVersionYAML = `package:
+  name: example
+  version: "1.0.0"
+  epoch: 0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.55.0
+      modroot: |-
+        .
+        cmd/a
+      go-version: "1.27"
+`
+	gp := newTestProcessor(t, pinnedDivergentGoVersionYAML)
+	loader := config.NewLoader()
+	applier := NewGoBumpApplier(nil)
+
+	analysis := &VulnerabilityAnalysis{
+		ByLanguage: []LanguageAnalysis{{
+			Language: "go",
+			ByModroot: []ModrootAnalysis{
+				{
+					Modroot:           ".",
+					ExistingDeps:      []string{"golang.org/x/net@v0.55.0"},
+					DesiredDeps:       []string{"golang.org/x/net@v0.56.0"},
+					ExistingGoVersion: "1.27",
+					RequiredGoVersion: "1.24",
+				},
+				{
+					Modroot:           "cmd/a",
+					ExistingDeps:      []string{"golang.org/x/net@v0.55.0"},
+					DesiredDeps:       []string{"golang.org/x/net@v0.56.0"},
+					RequiredGoVersion: "1.26",
+				},
+			},
+		}},
+		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{".", "cmd/a"}}},
+	}
+
+	require.NoError(t, applier.reconcileBumpSteps(gp, analysis, loader))
+
+	content := string(gp.GetCurrentYAML())
+	assert.Contains(t, content, `go-version: "1.27"`)
+	assert.NotContains(t, content, "1.26")
+
+	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, "1.27", steps[0].GoVersion)
 }
 
 // TestReconcileBumpSteps_TemplatedGoVersionWarnedNotRewritten: a step whose

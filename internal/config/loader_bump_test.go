@@ -558,6 +558,47 @@ func TestLoader_UpdateGoBumpStep_AddsGoVersionToStepLackingIt(t *testing.T) {
 	assert.Equal(t, "1.25", steps[0].GoVersion)
 }
 
+// TestLoader_UpdateGoBumpStep_AddsGoVersionAfterModrootAtEOF is a regression
+// test for a spliceIntoPipelineWith off-by-one: appending a brand-new field
+// (go-version) after an existing block-scalar field (modroot) that is both
+// the with-block's last field AND the file's last content must not eat the
+// file's own trailing newline into the "before insertion" half - which
+// produced a spurious blank line before the new field and, on any subsequent
+// splice into the same spot, a non-idempotent extra trailing newline.
+func TestLoader_UpdateGoBumpStep_AddsGoVersionAfterModrootAtEOF(t *testing.T) {
+	loader := NewLoader()
+
+	const withModrootLastAtEOF = `pipeline:
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.55.0
+      modroot: |-
+        .
+        cmd/a
+`
+	updated, err := loader.UpdateGoBumpStep([]byte(withModrootLastAtEOF), 0,
+		[]string{"golang.org/x/net@v0.56.0"}, nil, "1.26")
+	require.NoError(t, err)
+
+	content := string(updated)
+	assert.Equal(t, `pipeline:
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.56.0
+      modroot: |-
+        .
+        cmd/a
+      go-version: "1.26"
+`, content, "no spurious blank line before go-version, and the file's trailing newline is preserved")
+
+	// A second splice into the same already-updated spot must be byte-stable.
+	again, err := loader.UpsertPipelineWithQuotedString(updated, 0, "go-version", "1.26")
+	require.NoError(t, err)
+	assert.Equal(t, content, string(again), "re-splicing at EOF must be idempotent")
+}
+
 func TestLoader_UpdateGoBumpStep_UpdatesExistingGoVersion(t *testing.T) {
 	loader := NewLoader()
 
