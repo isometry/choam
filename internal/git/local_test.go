@@ -206,3 +206,109 @@ func TestLastCommitInfo_Rename(t *testing.T) {
 	assert.Equal(t, renameSHA, info.Hash)
 	assert.True(t, renamedAt.Equal(info.Time))
 }
+
+// TestRunGitStatus exercises the CLI-preferred dirty check directly, mirroring
+// TestRunGitLog's approach of testing the shell-out helper in isolation from
+// LastCommitInfo.
+func TestRunGitStatus(t *testing.T) {
+	requireGit(t)
+	dir, _, _ := newLocalFixtureRepo(t)
+
+	t.Run("clean", func(t *testing.T) {
+		dirty, invoked, err := runGitStatus(dir, "melange.yaml")
+		require.NoError(t, err)
+		assert.True(t, invoked)
+		assert.False(t, dirty)
+	})
+
+	t.Run("modified", func(t *testing.T) {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "melange.yaml"), []byte("package:\n  name: fixture-modified\n"), 0o644))
+
+		dirty, invoked, err := runGitStatus(dir, "melange.yaml")
+		require.NoError(t, err)
+		assert.True(t, invoked)
+		assert.True(t, dirty)
+	})
+}
+
+// TestRunGitStatus_NotInvoked covers runGitStatus's invoked=false paths: a
+// failing git invocation (non-existent root directory) and a missing git
+// binary (empty PATH). Both must report invoked=false with a nil error so
+// the caller falls back to isDirty.
+func TestRunGitStatus_NotInvoked(t *testing.T) {
+	requireGit(t)
+
+	t.Run("command failure", func(t *testing.T) {
+		dirty, invoked, err := runGitStatus(filepath.Join(t.TempDir(), "does-not-exist"), "melange.yaml")
+		require.NoError(t, err)
+		assert.False(t, invoked)
+		assert.False(t, dirty)
+	})
+
+	t.Run("missing binary", func(t *testing.T) {
+		t.Setenv("PATH", t.TempDir()) // empty dir: exec.LookPath("git") fails
+		dirty, invoked, err := runGitStatus(t.TempDir(), "melange.yaml")
+		require.NoError(t, err)
+		assert.False(t, invoked)
+		assert.False(t, dirty)
+	})
+}
+
+// TestFileDirty_FallsBackToIsDirty covers fileDirty's fallback line: when the
+// git CLI cannot be invoked (here: root points at a non-existent directory,
+// so `git -C root status` fails), it must fall back to the go-git isDirty
+// byte-compare against the still-valid repo handle.
+func TestFileDirty_FallsBackToIsDirty(t *testing.T) {
+	requireGit(t)
+	dir, _, _ := newLocalFixtureRepo(t)
+
+	repo, err := gogit.PlainOpen(dir)
+	require.NoError(t, err)
+
+	badRoot := filepath.Join(t.TempDir(), "does-not-exist")
+	filePath := filepath.Join(dir, "melange.yaml")
+
+	dirty, err := fileDirty(repo, badRoot, filePath, "melange.yaml")
+	require.NoError(t, err)
+	assert.False(t, dirty, "clean fixture should read clean via the isDirty fallback")
+
+	require.NoError(t, os.WriteFile(filePath, []byte("package:\n  name: fixture-modified\n"), 0o644))
+
+	dirty, err = fileDirty(repo, badRoot, filePath, "melange.yaml")
+	require.NoError(t, err)
+	assert.True(t, dirty, "modified fixture should read dirty via the isDirty fallback")
+}
+
+// TestLastCommitInfo_ContentFilteredClean is a regression test: a repository
+// with content filters (core.autocrlf plus a .gitattributes eol rule) must
+// not be reported permanently dirty just because the raw on-disk bytes
+// differ from the raw HEAD blob. LastCommitInfo must defer to `git status
+// --porcelain`, which applies the same filters git used to populate the
+// working tree and therefore gets this right; the isDirty raw byte-compare
+// fallback does not, which is asserted directly below to document exactly
+// why the CLI path is preferred over the go-git fallback for this check.
+func TestLastCommitInfo_ContentFilteredClean(t *testing.T) {
+	requireGit(t)
+	dir := t.TempDir()
+	initLocalRepo(t, dir)
+	runGit(t, dir, "config", "core.autocrlf", "input")
+
+	require.NoError(t, os.WriteFile(filepath.Join(dir, ".gitattributes"), []byte("*.yaml text\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "melange.yaml"), []byte("package:\r\n  name: fixture\r\n"), 0o644))
+	runGit(t, dir, "add", ".gitattributes", "melange.yaml")
+
+	committedAt := time.Date(2024, 3, 15, 10, 30, 0, 0, time.UTC)
+	runGitWithEnv(t, dir, commitEnv(committedAt), "commit", "-q", "-m", "add CRLF melange.yaml")
+
+	filePath := filepath.Join(dir, "melange.yaml")
+
+	info, err := LastCommitInfo(filePath)
+	require.NoError(t, err)
+	assert.False(t, info.Dirty, "content-filtered CRLF file should read clean via git status")
+
+	repo, err := gogit.PlainOpen(dir)
+	require.NoError(t, err)
+	rawDirty, err := isDirty(repo, filePath, "melange.yaml")
+	require.NoError(t, err)
+	assert.True(t, rawDirty, "raw byte-compare fallback is expected to (incorrectly) report dirty here, unlike the CLI-preferred path")
+}

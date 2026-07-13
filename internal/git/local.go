@@ -87,7 +87,7 @@ func LastCommitInfo(filePath string) (*FileCommitInfo, error) {
 		return nil, err
 	}
 
-	dirty, err := isDirty(repo, absPath, relPath)
+	dirty, err := fileDirty(repo, root, absPath, relPath)
 	if err != nil {
 		return nil, err
 	}
@@ -179,9 +179,54 @@ func logViaGoGit(repo *gogit.Repository, relPath string) (plumbing.Hash, time.Ti
 	return commit.Hash, commit.Committer.When, nil
 }
 
+// fileDirty reports whether relPath has uncommitted changes. It prefers
+// shelling out to the real git binary via runGitStatus, which honours
+// content filters (core.autocrlf, .gitattributes eol rules) the same way
+// git itself does when populating the working tree, and falls back to the
+// isDirty raw byte-compare when the binary is unavailable or fails to
+// execute.
+func fileDirty(repo *gogit.Repository, root, absPath, relPath string) (bool, error) {
+	dirty, invoked, err := runGitStatus(root, relPath)
+	if invoked {
+		return dirty, err
+	}
+	return isDirty(repo, absPath, relPath)
+}
+
+// runGitStatus shells out to `git -C root status --porcelain -- relPath`.
+// invoked reports whether the git binary was found and executed
+// successfully; callers should fall back to isDirty when it is false,
+// regardless of the returned error (which will be nil in that case).
+// err is currently always nil even when invoked is true; it is kept in the
+// signature for symmetry with runGitLog's fast-path/fallback contract.
+func runGitStatus(root, relPath string) (dirty bool, invoked bool, err error) {
+	if _, lookErr := exec.LookPath("git"); lookErr != nil {
+		return false, false, nil
+	}
+
+	cmd := exec.Command("git", "-C", root, "status", "--porcelain", "--", relPath)
+	var stdout bytes.Buffer
+	cmd.Stdout = &stdout
+	if runErr := cmd.Run(); runErr != nil {
+		// Fall back to the go-git byte-compare rather than surfacing an exec
+		// failure.
+		return false, false, nil
+	}
+
+	return strings.TrimSpace(stdout.String()) != "", true, nil
+}
+
 // isDirty reports whether the on-disk content at absPath differs from the
 // relPath blob in the HEAD tree. It deliberately avoids worktree.Status(),
 // which walks the entire working tree and is too slow on large repositories.
+//
+// It also deliberately avoids applying any git content filters (core.autocrlf,
+// .gitattributes eol rules): it byte-compares the raw worktree file against
+// the raw HEAD blob, so a filtered repository (e.g. CRLF checkouts normalized
+// to LF on commit) reads as permanently dirty even when git itself considers
+// the file clean. It exists purely as the fileDirty fallback for when the git
+// binary isn't invocable; prefer runGitStatus (via fileDirty), which shells
+// out to real git and therefore honours those filters correctly.
 //
 // If relPath is absent from the HEAD tree (the file has commit history, per
 // lastCommitTouching, but was since deleted at HEAD), the file is treated as
