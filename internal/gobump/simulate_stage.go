@@ -138,6 +138,13 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 		}
 
 		reach := newReachabilityDiff()
+		// stdUnion accumulates the linked-stdlib packages across every
+		// modroot in this language; stdComplete tracks whether every one of
+		// them actually contributed a validated set. A skipped modroot or a
+		// failed-open stdlib walk in ANY modroot must invalidate the whole
+		// union - see below.
+		stdUnion := map[string]struct{}{}
+		stdComplete := true
 		for mi := range lang.ByModroot {
 			m := &lang.ByModroot[mi]
 			result := results[m.Modroot]
@@ -145,6 +152,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 				// Skipped/unsimulated modroot: everything it found counts as
 				// reachable (fail open).
 				reach.observe(*m, nil, nil, false)
+				stdComplete = false
 				continue
 			}
 			m.DesiredDeps = result.FinalDeps
@@ -157,17 +165,18 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			gp.AddResiduals(result.Residuals)
 			unlinkedHere := reach.observe(*m, result.Linked, result.LinkedPackages, true)
 
-			// Union the linked stdlib slice into the processor for the
-			// stdlib staleness stage (Go only - this loop already is), so
-			// it can filter stdlib advisories by artifact reachability
-			// without its own checkout. nil = unknown, contributes nothing.
+			// Union the linked stdlib slice into a local set for the stdlib
+			// staleness stage (Go only - this loop already is), so it can
+			// filter stdlib advisories by artifact reachability without its
+			// own checkout. nil = this modroot's walk failed open, which
+			// taints the whole union (see below) rather than just
+			// contributing nothing.
 			if result.StdPackages != nil {
-				if gp.LinkedStdPackages == nil {
-					gp.LinkedStdPackages = make(map[string]struct{}, len(result.StdPackages))
-				}
 				for pkg := range result.StdPackages {
-					gp.LinkedStdPackages[pkg] = struct{}{}
+					stdUnion[pkg] = struct{}{}
 				}
+			} else {
+				stdComplete = false
 			}
 
 			s.declareCoUpdates(ctx, gp, m, result)
@@ -199,6 +208,18 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 					"resolved", residual.ResolvedVersion, "fix", residual.FixedVersion,
 					"vulns", strings.Join(residual.VulnIDs, ","), "reason", residual.Reason)
 			}
+		}
+
+		// Publish the union only when every modroot actually contributed a
+		// validated stdlib set - a partial union must not masquerade as
+		// complete (the stdlib stage treats non-nil as proof it can safely
+		// demote unlinked-package advisories). Otherwise leave
+		// gp.LinkedStdPackages nil: unknown, so the stdlib stage fails open.
+		if stdComplete && len(stdUnion) > 0 {
+			gp.LinkedStdPackages = stdUnion
+		} else if !stdComplete {
+			slog.Debug("discarding partial linked-stdlib union: not every go modroot contributed a validated stdlib package set",
+				"language", lang.Language, "modroot_count", len(lang.ByModroot))
 		}
 
 		// Advisories whose modules were unlinked in EVERY modroot that saw

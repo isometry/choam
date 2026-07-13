@@ -38,8 +38,13 @@ type GoBumpProcessor struct {
 
 	// LinkedStdPackages is the union, across simulated Go modroots, of
 	// standard-library import paths linked into the build artifacts
-	// (GOOS=linux; see simulate.ModrootResult.StdPackages). nil = unknown
-	// (simulation didn't run or the toolchain walk failed open).
+	// (GOOS=linux; see simulate.ModrootResult.StdPackages). Non-nil only
+	// when EVERY simulated Go modroot contributed a validated set (see
+	// SimulationStage.Apply's stdComplete tracking); a modroot that was
+	// skipped or whose stdlib walk failed open discards the whole union
+	// rather than publishing a partial one. nil = unknown (simulation
+	// didn't run, a modroot was skipped, or any modroot's toolchain walk
+	// failed open) - the stdlib staleness stage then fails open.
 	LinkedStdPackages map[string]struct{} `json:"-"`
 
 	// RaisedPinMinors records the effective outcome of this run's go-package

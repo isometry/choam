@@ -751,3 +751,121 @@ func TestSimulationStage_PackageUnreachableClassifiedAsInfo(t *testing.T) {
 	assert.Equal(t, 1, result.VulnerabilitiesUnreachable)
 	assert.Equal(t, 0, result.VulnerabilitiesFixed)
 }
+
+// newTwoModrootSimulationProcessor builds a VulnerabilityAnalysis with two Go
+// modroots ("." and "sub"), each with its own advisory, for exercising the
+// linked-stdlib union's completeness gating across modroots.
+func newTwoModrootSimulationProcessor() *GoBumpProcessor {
+	gp := NewGoBumpProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
+	gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{
+		RepoURL:        "https://github.com/example/repo",
+		Tag:            "v1.0.0",
+		ExpectedCommit: "abc123",
+		ByLanguage: []LanguageAnalysis{
+			{
+				Language: "go",
+				ByModroot: []ModrootAnalysis{
+					{
+						Modroot:       ".",
+						BuildPackages: []string{"./cmd/app"},
+						ExistingDeps:  []string{"example.com/old@v1.0.0"},
+						DesiredDeps:   []string{"example.com/old@v1.2.0"},
+						ScanResult: &scan.ScanResult{
+							SecurityBumps: []scan.SecurityBump{
+								{Name: "example.com/old", Ecosystem: "Go", CurrentVersion: "v1.0.0", FixedVersion: "v1.2.0", VulnIDs: []string{"GO-OLD-1"}},
+							},
+						},
+						SecurityBumpModules: []string{"example.com/old"},
+					},
+					{
+						Modroot:       "sub",
+						BuildPackages: []string{"./cmd/sub"},
+						ExistingDeps:  []string{"example.com/other@v1.0.0"},
+						DesiredDeps:   []string{"example.com/other@v1.2.0"},
+						ScanResult: &scan.ScanResult{
+							SecurityBumps: []scan.SecurityBump{
+								{Name: "example.com/other", Ecosystem: "Go", CurrentVersion: "v1.0.0", FixedVersion: "v1.2.0", VulnIDs: []string{"GO-OTHER-1"}},
+							},
+						},
+						SecurityBumpModules: []string{"example.com/other"},
+					},
+				},
+			},
+		},
+		VulnerabilitiesFound: 2,
+		BumpActions: []BumpAction{
+			{Action: "needs_bump", Language: "go", Modroots: []string{".", "sub"}, Dependencies: []string{"example.com/old@v1.2.0", "example.com/other@v1.2.0"}},
+		},
+	}
+	return gp
+}
+
+func TestSimulationStage_LinkedStdPackages_UnionWhenAllModrootsContribute(t *testing.T) {
+	fake := &fakeBumpSimulator{
+		results: map[string]*simulate.ModrootResult{
+			".": {
+				Modroot: ".", Converged: true, Iterations: 1,
+				FinalDeps:        []string{"example.com/old@v1.2.0"},
+				CVEBackedModules: []string{"example.com/old"},
+				StdPackages:      map[string]struct{}{"fmt": {}, "os": {}},
+			},
+			"sub": {
+				Modroot: "sub", Converged: true, Iterations: 1,
+				FinalDeps:        []string{"example.com/other@v1.2.0"},
+				CVEBackedModules: []string{"example.com/other"},
+				StdPackages:      map[string]struct{}{"net/http": {}},
+			},
+		},
+	}
+	stage := newStageWithFake(fake)
+	gp := newTwoModrootSimulationProcessor()
+
+	require.NoError(t, stage.Apply(t.Context(), gp))
+
+	assert.Equal(t, map[string]struct{}{"fmt": {}, "os": {}, "net/http": {}}, gp.LinkedStdPackages)
+}
+
+func TestSimulationStage_LinkedStdPackages_NilWhenModrootSkipped(t *testing.T) {
+	fake := &fakeBumpSimulator{
+		results: map[string]*simulate.ModrootResult{
+			".": {
+				Modroot: ".", Converged: true, Iterations: 1,
+				FinalDeps:        []string{"example.com/old@v1.2.0"},
+				CVEBackedModules: []string{"example.com/old"},
+				StdPackages:      map[string]struct{}{"fmt": {}, "os": {}},
+			},
+			// "sub" absent from results: an unsimulated/skipped modroot.
+		},
+	}
+	stage := newStageWithFake(fake)
+	gp := newTwoModrootSimulationProcessor()
+
+	require.NoError(t, stage.Apply(t.Context(), gp))
+
+	assert.Nil(t, gp.LinkedStdPackages, "a skipped modroot must invalidate the union - partial data must not masquerade as complete")
+}
+
+func TestSimulationStage_LinkedStdPackages_NilWhenModrootStdWalkFailedOpen(t *testing.T) {
+	fake := &fakeBumpSimulator{
+		results: map[string]*simulate.ModrootResult{
+			".": {
+				Modroot: ".", Converged: true, Iterations: 1,
+				FinalDeps:        []string{"example.com/old@v1.2.0"},
+				CVEBackedModules: []string{"example.com/old"},
+				StdPackages:      map[string]struct{}{"fmt": {}, "os": {}},
+			},
+			"sub": {
+				Modroot: "sub", Converged: true, Iterations: 1,
+				FinalDeps:        []string{"example.com/other@v1.2.0"},
+				CVEBackedModules: []string{"example.com/other"},
+				StdPackages:      nil, // this modroot's stdlib walk failed open
+			},
+		},
+	}
+	stage := newStageWithFake(fake)
+	gp := newTwoModrootSimulationProcessor()
+
+	require.NoError(t, stage.Apply(t.Context(), gp))
+
+	assert.Nil(t, gp.LinkedStdPackages, "one modroot's failed-open stdlib walk must invalidate the whole union")
+}
