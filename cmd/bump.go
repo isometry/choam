@@ -219,7 +219,7 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 			totalVulnsFixed += result.VulnerabilitiesFixed
 			totalVulnsResidual += result.VulnerabilitiesResidual
 			totalVulnsUnreachable += result.VulnerabilitiesUnreachable
-			if result.VulnerabilitiesFixed > 0 || result.EpochChanged {
+			if dependencyFixApplied(result) {
 				filesFixed++
 			}
 		}
@@ -306,6 +306,15 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 	return nil
 }
 
+// dependencyFixApplied returns true if the result includes any dependency-level
+// fix attempt: either vulnerabilities were fixed (proven by simulation or
+// approximated by module changes) or modules were bumped (attempted fix).
+// This decouples dependency-fix status from epoch changes that may result
+// solely from stdlib staleness checks.
+func dependencyFixApplied(result *gobump.GoBumpResult) bool {
+	return result.VulnerabilitiesFixed > 0 || result.ModulesBumped > 0
+}
+
 // bumpRowStatus computes the table STATUS cell for one result, mirroring the
 // found/fixed/residual precedence used for dependency vulnerabilities and
 // adding a distinct status for files whose only change is a stdlib-driven
@@ -319,7 +328,7 @@ func bumpRowStatus(result *gobump.GoBumpResult, stdlibVulns int) string {
 		return "ERROR"
 	case result.VulnerabilitiesFound > 0:
 		switch {
-		case result.VulnerabilitiesFixed > 0 || result.EpochChanged:
+		case dependencyFixApplied(result):
 			switch {
 			case !result.Validated:
 				return "UNVALIDATED"

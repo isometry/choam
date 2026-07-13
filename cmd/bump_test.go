@@ -131,6 +131,22 @@ func TestBumpRowStatus(t *testing.T) {
 			result: &gobump.GoBumpResult{VulnerabilitiesFound: 1, VulnerabilitiesResidual: 1, Validated: true},
 			want:   "PARTIAL",
 		},
+		{
+			name:   "regression: dep vulns found, zero fixed, stdlib-only epoch => UP-TO-DATE, was FIXED",
+			result: &gobump.GoBumpResult{VulnerabilitiesFound: 1, VulnerabilitiesFixed: 0, ModulesBumped: 0, EpochChanged: true, Validated: true},
+			want:   "UP-TO-DATE",
+		},
+		{
+			name:        "stdlib+residual: dependency fixed with residuals and stdlib bump",
+			result:      &gobump.GoBumpResult{VulnerabilitiesFound: 2, VulnerabilitiesFixed: 1, VulnerabilitiesResidual: 1, ModulesBumped: 1, EpochChanged: true, Validated: true},
+			stdlibVulns: 2,
+			want:        "PARTIAL",
+		},
+		{
+			name:   "ModulesBumped-only: attempted fix with residuals remain",
+			result: &gobump.GoBumpResult{VulnerabilitiesFound: 1, VulnerabilitiesFixed: 0, VulnerabilitiesResidual: 1, ModulesBumped: 1, Validated: true},
+			want:   "PARTIAL",
+		},
 	}
 
 	for _, tt := range tests {
@@ -273,4 +289,52 @@ func TestOutputBumpStructured_StdlibSummary(t *testing.T) {
 	require.Contains(t, resp.Results, "pkg-a.yaml")
 	assert.True(t, resp.Results["pkg-a.yaml"].StdlibChecked)
 	assert.Len(t, resp.Results["pkg-a.yaml"].StdlibBumps, 2)
+}
+
+// TestDependencyFixApplied verifies the dependencyFixApplied helper correctly
+// identifies when a dependency-level fix was attempted (regardless of epoch
+// changes from stdlib alone).
+func TestDependencyFixApplied(t *testing.T) {
+	tests := []struct {
+		name        string
+		result      *gobump.GoBumpResult
+		want        bool
+	}{
+		{
+			name:   "no vulnerabilities, no modules bumped",
+			result: &gobump.GoBumpResult{},
+			want:   false,
+		},
+		{
+			name:   "vulnerabilities fixed",
+			result: &gobump.GoBumpResult{VulnerabilitiesFixed: 1},
+			want:   true,
+		},
+		{
+			name:   "modules bumped",
+			result: &gobump.GoBumpResult{ModulesBumped: 1},
+			want:   true,
+		},
+		{
+			name:   "both vulnerabilities fixed and modules bumped",
+			result: &gobump.GoBumpResult{VulnerabilitiesFixed: 1, ModulesBumped: 1},
+			want:   true,
+		},
+		{
+			name:   "epoch changed from stdlib but no dependency fix applied",
+			result: &gobump.GoBumpResult{EpochChanged: true, VulnerabilitiesFixed: 0, ModulesBumped: 0},
+			want:   false,
+		},
+		{
+			name:   "vulnerabilities found and fixed despite stdlib-only epoch",
+			result: &gobump.GoBumpResult{VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, EpochChanged: true, ModulesBumped: 0},
+			want:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, dependencyFixApplied(tt.result))
+		})
+	}
 }
