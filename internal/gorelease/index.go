@@ -45,6 +45,14 @@ const (
 	maxBodyBytes = 10 << 20 // 10MB
 
 	toolchainModulePath = "golang.org/toolchain"
+
+	// maxLoadAttempts bounds how many times ensureLoaded will retry a
+	// failed @v/list fetch before memoizing the failure and giving up.
+	// This keeps a single transient network blip from permanently
+	// disabling the index for the lifetime of a shared Index instance
+	// (e.g. across an entire `choam bump` directory run), while still
+	// avoiding unbounded retries against a persistently failing proxy.
+	maxLoadAttempts = 3
 )
 
 // listLineRe matches a single line of the golang.org/toolchain module's
@@ -71,11 +79,12 @@ type Index struct {
 	httpClient *http.Client
 	baseURL    string
 
-	mu       sync.Mutex
-	loaded   bool
-	loadErr  error
-	releases map[string]string    // bare release version (e.g. "1.24.5") -> full toolchain module version chosen for .info fetches
-	times    map[string]time.Time // bare release version -> memoized publish time
+	mu           sync.Mutex
+	loaded       bool // true once @v/list has been successfully fetched and parsed
+	loadErr      error
+	loadAttempts int
+	releases     map[string]string    // bare release version (e.g. "1.24.5") -> full toolchain module version chosen for .info fetches
+	times        map[string]time.Time // bare release version -> memoized publish time
 }
 
 // NewIndex returns an Index backed by proxy.golang.org. A nil httpClient
@@ -160,23 +169,37 @@ func (ix *Index) LatestAsOf(ctx context.Context, t time.Time, minorConstraint st
 	return oldest, nil
 }
 
-// ensureLoaded fetches and parses @v/list exactly once, memoizing either
-// the parsed release set or the error for all subsequent calls.
+// ensureLoaded fetches and parses @v/list, memoizing the parsed release set
+// once it succeeds. A failed fetch is retried (not memoized as permanent) up
+// to maxLoadAttempts times, so a transient network blip on one package in a
+// `choam bump` directory run doesn't permanently disable the index for every
+// remaining package sharing it; only once that cap is reached is the last
+// error memoized and returned for all subsequent calls. Failures caused by
+// caller-side context cancellation (ctx.Err() != nil) don't count against
+// the cap, since they aren't attributable to the remote service.
 func (ix *Index) ensureLoaded(ctx context.Context) error {
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
 
 	if ix.loaded {
+		return nil
+	}
+	if ix.loadAttempts >= maxLoadAttempts {
 		return ix.loadErr
 	}
-	ix.loaded = true
 
 	releases, err := ix.fetchList(ctx)
 	if err != nil {
+		if ctx.Err() == nil {
+			ix.loadAttempts++
+		}
 		ix.loadErr = fmt.Errorf("loading %s release list: %w", toolchainModulePath, err)
 		return ix.loadErr
 	}
+
 	ix.releases = releases
+	ix.loaded = true
+	ix.loadErr = nil
 	return nil
 }
 

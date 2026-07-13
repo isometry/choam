@@ -396,10 +396,94 @@ func TestErrorPaths(t *testing.T) {
 		fs.listStatus = http.StatusInternalServerError
 		ix, _ := newTestIndex(t, fs)
 
-		for i := 0; i < 3; i++ {
+		for i := 0; i < 5; i++ {
 			if _, err := ix.LatestAvailable(context.Background(), ""); err == nil {
 				t.Fatal("expected persistent error after list failure")
 			}
+		}
+
+		// Retries are capped at maxLoadAttempts: further calls beyond that
+		// must not keep hitting the network.
+		if n := fs.listRequests(); n != maxLoadAttempts {
+			t.Errorf("@v/list fetched %d times across 5 failing calls, want exactly %d (capped)", n, maxLoadAttempts)
+		}
+	})
+
+	t.Run("transient failure then success retries and succeeds", func(t *testing.T) {
+		fs := newFixtureServer(fixtureList, fixtureInfoTimes())
+		fs.listStatus = http.StatusInternalServerError
+		ix, _ := newTestIndex(t, fs)
+
+		if _, err := ix.LatestAvailable(context.Background(), ""); err == nil {
+			t.Fatal("expected error on first call while @v/list is failing")
+		}
+		if n := fs.listRequests(); n != 1 {
+			t.Fatalf("@v/list fetched %d times after first failing call, want 1", n)
+		}
+
+		fs.listStatus = 0 // recover: subsequent fetches succeed
+
+		got, err := ix.LatestAvailable(context.Background(), "")
+		if err != nil {
+			t.Fatalf("LatestAvailable() after recovery = error %v, want success", err)
+		}
+		if got != "1.25.0" {
+			t.Errorf("LatestAvailable() after recovery = %q, want %q", got, "1.25.0")
+		}
+		if n := fs.listRequests(); n != 2 {
+			t.Errorf("@v/list fetched %d times across failure+recovery, want exactly 2", n)
+		}
+
+		// Once loaded, further calls must not re-fetch.
+		if _, err := ix.LatestAvailable(context.Background(), ""); err != nil {
+			t.Fatalf("LatestAvailable() after successful load = unexpected error %v", err)
+		}
+		if n := fs.listRequests(); n != 2 {
+			t.Errorf("@v/list fetched %d times after successful load, want still 2 (memoized)", n)
+		}
+	})
+
+	t.Run("permanent failure caps retries at maxLoadAttempts", func(t *testing.T) {
+		fs := newFixtureServer(fixtureList, fixtureInfoTimes())
+		fs.listStatus = http.StatusInternalServerError
+		ix, _ := newTestIndex(t, fs)
+
+		for i := 0; i < maxLoadAttempts+2; i++ {
+			if _, err := ix.LatestAvailable(context.Background(), ""); err == nil {
+				t.Fatalf("call %d: expected persistent error", i)
+			}
+		}
+
+		if n := fs.listRequests(); n != maxLoadAttempts {
+			t.Errorf("@v/list fetched %d times, want capped at maxLoadAttempts (%d)", n, maxLoadAttempts)
+		}
+	})
+
+	t.Run("context cancellation does not burn a load attempt", func(t *testing.T) {
+		fs := newFixtureServer(fixtureList, fixtureInfoTimes())
+		fs.listStatus = http.StatusInternalServerError
+		ix, _ := newTestIndex(t, fs)
+
+		cancelledCtx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		// Cancelled-context calls must fail but must not count toward
+		// maxLoadAttempts, since the failure isn't attributable to the
+		// remote service.
+		for i := 0; i < maxLoadAttempts+2; i++ {
+			if _, err := ix.LatestAvailable(cancelledCtx, ""); err == nil {
+				t.Fatalf("call %d: expected error from cancelled context", i)
+			}
+		}
+
+		// Now retry with a live context: since no attempts were burned by
+		// the cancelled-context calls, this must still be willing to try
+		// the network (and fail, since the server is still erroring).
+		if _, err := ix.LatestAvailable(context.Background(), ""); err == nil {
+			t.Fatal("expected error: server still returning 500")
+		}
+		if n := fs.listRequests(); n != 1 {
+			t.Errorf("@v/list fetched %d times, want exactly 1 (cancelled-context calls must not reach the network attempt count, only this one live attempt)", n)
 		}
 	})
 }
