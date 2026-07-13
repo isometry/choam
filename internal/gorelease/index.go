@@ -138,6 +138,27 @@ func (ix *Index) LatestAvailable(ctx context.Context, minorConstraint string) (s
 // to detect stdlib exposure, so it is safer to over-detect ("this looks
 // like an old Go release") than to silently miss a release entirely.
 func (ix *Index) LatestAsOf(ctx context.Context, t time.Time, minorConstraint string) (string, error) {
+	return ix.latestNotAfter(ctx, t, minorConstraint, true)
+}
+
+// LatestAvailableAsOf returns the highest stable Go release (bare form, e.g.
+// "1.24.5") whose publish time is <= cutoff, restricted to minorConstraint
+// (e.g. "1.24") when non-empty. Unlike LatestAsOf it is STRICT: when nothing
+// qualifies (the cutoff predates every matching release, or the constraint has
+// no stable releases at all) it returns an error wrapping ErrNoReleases rather
+// than falling back to the oldest release. Callers use it to age the rebuild
+// target back behind a publication-age margin, where under-detecting ("no
+// release old enough yet") is the safe direction.
+func (ix *Index) LatestAvailableAsOf(ctx context.Context, cutoff time.Time, minorConstraint string) (string, error) {
+	return ix.latestNotAfter(ctx, cutoff, minorConstraint, false)
+}
+
+// latestNotAfter is the shared point-in-time scan behind LatestAsOf and
+// LatestAvailableAsOf: it returns the highest stable release published on or
+// before t within minorConstraint. When t predates every matching release,
+// fallbackOldest decides the outcome - true returns the oldest matching
+// release (over-detect), false returns an ErrNoReleases error (strict).
+func (ix *Index) latestNotAfter(ctx context.Context, t time.Time, minorConstraint string, fallbackOldest bool) (string, error) {
 	if err := ix.ensureLoaded(ctx); err != nil {
 		return "", err
 	}
@@ -165,8 +186,12 @@ func (ix *Index) LatestAsOf(ctx context.Context, t time.Time, minorConstraint st
 		}
 	}
 
-	// t predates every matching release: fail toward "old Go".
-	return oldest, nil
+	if fallbackOldest {
+		// t predates every matching release: fail toward "old Go".
+		return oldest, nil
+	}
+	return "", fmt.Errorf("%w published on or before %s for constraint %q",
+		ErrNoReleases, t.UTC().Format(time.RFC3339), minorConstraint)
 }
 
 // ensureLoaded fetches and parses @v/list, memoizing the parsed release set

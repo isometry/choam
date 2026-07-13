@@ -26,7 +26,7 @@ type BumpAction struct {
 // vulnerabilities (see evaluateStdlibStaleness).
 type StdlibBump struct {
 	AssumedGoVersion string `json:"assumed_go_version" yaml:"assumed_go_version"`
-	AssumedFromDate  string `json:"assumed_from_date" yaml:"assumed_from_date"`               // RFC3339 last-commit time
+	AssumedFromDate  string `json:"assumed_from_date" yaml:"assumed_from_date"`               // RFC3339 raw last-commit time (the assumed-version lookup subtracts a publication-age lag margin; see stdlibToolchainLagMargin)
 	GoPackagePin     string `json:"go_package_pin,omitempty" yaml:"go_package_pin,omitempty"` // minor constraint the package was built under, "" = unpinned
 	// RebuildGoPackagePin is the minor constraint the NEXT build will use,
 	// set only when it differs from GoPackagePin (a same-run go-package pin

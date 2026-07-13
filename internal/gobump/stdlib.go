@@ -2,23 +2,36 @@ package gobump
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"sort"
 	"strings"
 	"time"
 
+	"github.com/isometry/choam/internal/gorelease"
 	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/scan"
 )
 
+// stdlibToolchainLagMargin models how far the distro (Wolfi) Go toolchain
+// package trails an upstream Go release: proxy.golang.org can list a release
+// hours after it is tagged, but the toolchain package that actually rebuilds
+// the artifact lags by days. Applied to BOTH sides of the staleness diff so a
+// release-day proxy entry can't produce a false "fixed" claim (the epoch-bump
+// commit would then anchor the next run's assumed version and the gap would
+// never be re-flagged).
+const stdlibToolchainLagMargin = 3 * 24 * time.Hour
+
 // goReleaseIndex is the release-lookup seam between the stdlib staleness
-// check and gorelease.Index, injectable for tests. Both methods return bare
+// check and gorelease.Index, injectable for tests. All methods return bare
 // versions ("1.24.5") and error when the constrained release set is empty or
-// the index cannot be loaded.
+// the index cannot be loaded; LatestAvailableAsOf reports gorelease.ErrNoReleases
+// when nothing is published early enough to satisfy the cutoff.
 type goReleaseIndex interface {
 	LatestAsOf(ctx context.Context, t time.Time, minorConstraint string) (string, error)
 	LatestAvailable(ctx context.Context, minorConstraint string) (string, error)
+	LatestAvailableAsOf(ctx context.Context, cutoff time.Time, minorConstraint string) (string, error)
 }
 
 // stdlibScanner is the OSV seam for the stdlib staleness check;
@@ -42,6 +55,10 @@ type stdlibInput struct {
 	RebuildConstraints map[string]string
 	Linked             map[string]struct{} // linked stdlib import paths; nil = unknown
 	Validated          bool                // whether Linked-based filtering applies
+	// Now is the reference time for the rebuild side's publication-age margin
+	// (the rebuild target is the newest release published <= Now - margin). A
+	// zero value defaults to time.Now(); tests set it explicitly.
+	Now time.Time
 }
 
 // stdlibTargetGOOS mirrors internal/scan's targetGOOS: melange builds linux
@@ -62,15 +79,31 @@ const stdlibTargetGOOS = "linux"
 // provided, advisories whose vulnerable imports are all outside it are demoted
 // to informational (UnlinkedVulnIDs). Advisories a pinned rebuild cannot fix
 // but an unconstrained newer Go minor would (checked lazily, one extra scan at
-// most) yield an informational raise-the-pin message, never a bump. Returns
-// one StdlibBump per constraint with fixable, applicable advisories, plus
-// human-readable messages; any index/scan failure returns an error for the
+// most) yield an informational raise-the-pin message, never a bump.
+//
+// A publication-age lag margin (stdlibToolchainLagMargin) is applied to BOTH
+// sides so a release the module proxy lists but the distro toolchain hasn't
+// shipped yet can't yield a false "fixed" claim: the assumed side subtracts
+// the margin from CommitTime (over-detecting a slightly older toolchain is
+// safe), and the rebuild target is the newest release published on or before
+// in.Now minus the margin. When the margin defers a fresher release an
+// informational message names both; a brand-new minor whose only releases fall
+// entirely inside the margin is skipped with a message rather than bumped.
+//
+// Returns one StdlibBump per constraint with fixable, applicable advisories,
+// plus human-readable messages; any index/scan failure returns an error for the
 // caller to degrade on.
 func evaluateStdlibStaleness(ctx context.Context, index goReleaseIndex, scanner stdlibScanner, in stdlibInput) ([]StdlibBump, []string, error) {
 	var bumps []StdlibBump
 	var messages []string
 
 	filter := in.Linked != nil && in.Validated
+
+	now := in.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	rebuildCutoff := now.Add(-stdlibToolchainLagMargin)
 
 	// Lazy, memoized view of the newest Go release overall - only consulted
 	// when a pinned constraint's rebuild leaves residual advisories behind.
@@ -106,14 +139,40 @@ func evaluateStdlibStaleness(ctx context.Context, index goReleaseIndex, scanner 
 			rebuildConstraint = mapped
 		}
 
-		assumed, err := index.LatestAsOf(ctx, in.CommitTime, constraint)
+		// Assumed side: subtract the lag margin from the commit time. This
+		// over-detects only (a slightly older toolchain than reality), which is
+		// the safe direction for exposure detection.
+		assumed, err := index.LatestAsOf(ctx, in.CommitTime.Add(-stdlibToolchainLagMargin), constraint)
 		if err != nil {
 			return nil, nil, fmt.Errorf("resolving Go release as of %s (pin %s): %w",
 				in.CommitTime.Format(time.RFC3339), pinWord(constraint), err)
 		}
-		rebuild, err := index.LatestAvailable(ctx, rebuildConstraint)
+
+		// Rebuild side: LatestAvailable first so an unknown pin still hard-errors
+		// (and to name the fresher release the margin might defer)...
+		latestAvailable, err := index.LatestAvailable(ctx, rebuildConstraint)
 		if err != nil {
 			return nil, nil, fmt.Errorf("resolving latest available Go release (pin %s): %w", pinWord(rebuildConstraint), err)
+		}
+		// ...then age the actual rebuild target back behind the publication-age
+		// margin: the distro toolchain package trails the module proxy.
+		rebuild, err := index.LatestAvailableAsOf(ctx, rebuildCutoff, rebuildConstraint)
+		if err != nil {
+			if errors.Is(err, gorelease.ErrNoReleases) {
+				// A brand-new minor whose only release(s) fall entirely inside
+				// the margin: nothing publication-aged enough to rebuild against
+				// yet. Skip with a message rather than bump or error.
+				messages = append(messages, fmt.Sprintf("info: latest go%s release (pin %s) is within the %d-day publication-age margin - deferring the stdlib rebuild target until a release is old enough",
+					latestAvailable, pinWord(rebuildConstraint), marginDays()))
+				continue
+			}
+			return nil, nil, fmt.Errorf("resolving latest available Go release within publication-age margin (pin %s): %w", pinWord(rebuildConstraint), err)
+		}
+		if goversion.Compare(latestAvailable, rebuild) > 0 {
+			// The margin defers a fresher release the distro toolchain likely
+			// hasn't shipped: rebuild against the aged target and name both.
+			messages = append(messages, fmt.Sprintf("info: go%s (pin %s) is within the %d-day publication-age margin - using go%s as the stdlib rebuild target for now",
+				latestAvailable, pinWord(rebuildConstraint), marginDays(), rebuild))
 		}
 
 		// Already on (or somehow past) the newest allowed release: a rebuild
@@ -225,6 +284,11 @@ func evaluateStdlibStaleness(ctx context.Context, index goReleaseIndex, scanner 
 	}
 
 	return bumps, messages, nil
+}
+
+// marginDays renders stdlibToolchainLagMargin in whole days for messages.
+func marginDays() int {
+	return int(stdlibToolchainLagMargin / (24 * time.Hour))
 }
 
 // pluralize picks the singular or plural word for a count.

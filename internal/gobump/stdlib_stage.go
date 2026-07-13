@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"time"
 
 	"github.com/isometry/choam/internal/git"
 	"github.com/isometry/choam/internal/processor"
@@ -128,6 +129,7 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 		RebuildConstraints: rebuildConstraintsFor(constraints, gp.RaisedPinMinors),
 		Linked:             gp.LinkedStdPackages,
 		Validated:          gp.LinkedStdPackages != nil,
+		Now:                time.Now(),
 	}
 
 	bumps, messages, err := evaluateStdlibStaleness(ctx, s.index, s.scanner, in)

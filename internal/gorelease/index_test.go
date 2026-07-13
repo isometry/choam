@@ -310,6 +310,102 @@ func TestLatestAsOf_Boundaries(t *testing.T) {
 	}
 }
 
+func TestLatestAvailableAsOf(t *testing.T) {
+	fs := newFixtureServer(fixtureList, fixtureInfoTimes())
+	ix, _ := newTestIndex(t, fs)
+	ctx := context.Background()
+
+	mustParse := func(s string) time.Time {
+		tm, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			t.Fatalf("parsing test time %q: %v", s, err)
+		}
+		return tm
+	}
+
+	tests := []struct {
+		name       string
+		cutoff     time.Time
+		constraint string
+		want       string
+		wantErr    bool
+	}{
+		{
+			name:       "cutoff after every release picks global max",
+			cutoff:     mustParse("2025-09-15T00:00:00Z"),
+			constraint: "",
+			want:       "1.25.0",
+		},
+		{
+			name:       "cutoff excludes a too-recent release",
+			cutoff:     mustParse("2025-09-05T00:00:00Z"),
+			constraint: "",
+			want:       "1.24.8", // 1.25.0 (2025-09-10) is too recent
+		},
+		{
+			name:       "exact boundary: cutoff equals release time",
+			cutoff:     mustParse("2025-02-11T00:00:00Z"),
+			constraint: "",
+			want:       "1.24.0",
+		},
+		{
+			name:       "constrained cutoff (non-linux-amd64 dedup winner)",
+			cutoff:     mustParse("2025-04-01T00:00:00Z"),
+			constraint: "1.24",
+			want:       "1.24.2",
+		},
+		{
+			name:       "cutoff before every matching release is a STRICT error (no oldest fallback)",
+			cutoff:     mustParse("2000-01-01T00:00:00Z"),
+			constraint: "",
+			wantErr:    true,
+		},
+		{
+			name:       "cutoff before every matching release, constrained, strict error",
+			cutoff:     mustParse("2000-01-01T00:00:00Z"),
+			constraint: "1.24",
+			wantErr:    true,
+		},
+		{
+			name:       "constraint with no stable matches",
+			cutoff:     mustParse("2025-01-01T00:00:00Z"),
+			constraint: "1.26",
+			wantErr:    true,
+		},
+		{
+			name:       "unknown minor",
+			cutoff:     mustParse("2025-01-01T00:00:00Z"),
+			constraint: "9.9",
+			wantErr:    true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ix.LatestAvailableAsOf(ctx, tt.cutoff, tt.constraint)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("LatestAvailableAsOf(%s, %q) = %q, want error", tt.cutoff, tt.constraint, got)
+				}
+				if !errors.Is(err, ErrNoReleases) {
+					t.Errorf("LatestAvailableAsOf(%s, %q) error = %v, want wrapping ErrNoReleases", tt.cutoff, tt.constraint, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LatestAvailableAsOf(%s, %q) unexpected error: %v", tt.cutoff, tt.constraint, err)
+			}
+			if got != tt.want {
+				t.Errorf("LatestAvailableAsOf(%s, %q) = %q, want %q", tt.cutoff, tt.constraint, got, tt.want)
+			}
+		})
+	}
+
+	if n := fs.listRequests(); n != 1 {
+		t.Errorf("@v/list fetched %d times across all LatestAvailableAsOf calls, want exactly 1 (memoized)", n)
+	}
+}
+
 func TestLatestAsOf_Memoization(t *testing.T) {
 	fs := newFixtureServer(fixtureList, fixtureInfoTimes())
 	ix, _ := newTestIndex(t, fs)

@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/isometry/choam/internal/gorelease"
 	"github.com/isometry/choam/internal/scan"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,16 +19,27 @@ import (
 type fakeReleaseIndex struct {
 	asOf      map[string]string // constraint -> release as of the commit time
 	available map[string]string // constraint -> latest available release
+	// availableAsOf answers LatestAvailableAsOf (the publication-age-margined
+	// rebuild target); nil falls back to available so existing tables that only
+	// set available see the margin as a no-op.
+	availableAsOf map[string]string
 
-	asOfErr      error
-	availableErr error
+	asOfErr          error
+	availableErr     error
+	availableAsOfErr error
 
-	asOfCalls      int
-	availableCalls int
+	asOfCalls          int
+	availableCalls     int
+	availableAsOfCalls int
+
+	// lastAsOfArg captures the time argument of the most recent LatestAsOf
+	// call, so tests can assert the assumed side subtracts the lag margin.
+	lastAsOfArg time.Time
 }
 
-func (f *fakeReleaseIndex) LatestAsOf(_ context.Context, _ time.Time, constraint string) (string, error) {
+func (f *fakeReleaseIndex) LatestAsOf(_ context.Context, t time.Time, constraint string) (string, error) {
 	f.asOfCalls++
+	f.lastAsOfArg = t
 	if f.asOfErr != nil {
 		return "", f.asOfErr
 	}
@@ -46,6 +58,22 @@ func (f *fakeReleaseIndex) LatestAvailable(_ context.Context, constraint string)
 	release, ok := f.available[constraint]
 	if !ok {
 		return "", fmt.Errorf("no matching stable Go releases for constraint %q", constraint)
+	}
+	return release, nil
+}
+
+func (f *fakeReleaseIndex) LatestAvailableAsOf(_ context.Context, _ time.Time, constraint string) (string, error) {
+	f.availableAsOfCalls++
+	if f.availableAsOfErr != nil {
+		return "", f.availableAsOfErr
+	}
+	m := f.availableAsOf
+	if m == nil {
+		m = f.available
+	}
+	release, ok := m[constraint]
+	if !ok {
+		return "", fmt.Errorf("%w for constraint %q", gorelease.ErrNoReleases, constraint)
 	}
 	return release, nil
 }
@@ -591,6 +619,147 @@ func TestEvaluateStdlibStaleness_UnfixableWithinPin(t *testing.T) {
 		})
 		require.ErrorContains(t, err, `no matching stable Go releases for constraint ""`)
 	})
+}
+
+// stdlibNow is a fixed "now" for margin tests: the rebuild-side margin is
+// applied relative to it (Now - stdlibToolchainLagMargin).
+var stdlibNow = time.Date(2025, 6, 10, 12, 0, 0, 0, time.UTC)
+
+// TestEvaluateStdlibStaleness_AssumedSideAppliesMargin captures the time
+// argument passed to LatestAsOf and asserts the assumed side subtracts the
+// publication-age lag margin from the commit time (over-detect direction).
+func TestEvaluateStdlibStaleness_AssumedSideAppliesMargin(t *testing.T) {
+	index := &fakeReleaseIndex{
+		asOf:      map[string]string{"": "1.22.0"},
+		available: map[string]string{"": "1.24.5"},
+	}
+	scanner := &fakeStdlibScanner{vulnsByVersion: map[string][]scan.Vulnerability{
+		"1.22.0": {stdlibVuln("GO-X")},
+	}}
+
+	bumps, _, err := evaluateStdlibStaleness(t.Context(), index, scanner, stdlibInput{
+		CommitTime:  stdlibCommitTime,
+		Constraints: []string{""},
+		Now:         stdlibNow,
+	})
+	require.NoError(t, err)
+	require.Len(t, bumps, 1)
+
+	assert.Equal(t, stdlibCommitTime.Add(-stdlibToolchainLagMargin), index.lastAsOfArg,
+		"assumed side must query LatestAsOf at commit time minus the lag margin")
+	// The raw commit time (not the margined one) is recorded on the bump.
+	assert.Equal(t, "2024-03-15T12:00:00Z", bumps[0].AssumedFromDate)
+}
+
+// TestEvaluateStdlibStaleness_ReleaseDayDefersRebuildTarget models Go release
+// day: proxy.golang.org already lists a release the distro toolchain package
+// hasn't shipped. The margin defers the rebuild target to the previous release
+// and emits an info message naming both versions; no bump claims the new CVEs.
+func TestEvaluateStdlibStaleness_ReleaseDayDefersRebuildTarget(t *testing.T) {
+	index := &fakeReleaseIndex{
+		asOf:      map[string]string{"": "1.24.4"},
+		available: map[string]string{"": "1.24.5"}, // upstream just published 1.24.5
+		// Within the publication-age margin only 1.24.4 is old enough.
+		availableAsOf: map[string]string{"": "1.24.4"},
+	}
+	scanner := &fakeStdlibScanner{vulnsByVersion: map[string][]scan.Vulnerability{
+		"1.24.4": {stdlibVuln("GO-2025-FRESH")},
+		"1.24.5": nil, // upstream 1.24.5 fixes it - but it's too fresh to trust
+	}}
+
+	bumps, messages, err := evaluateStdlibStaleness(t.Context(), index, scanner, stdlibInput{
+		CommitTime:  stdlibCommitTime,
+		Constraints: []string{""},
+		Now:         stdlibNow,
+	})
+	require.NoError(t, err)
+
+	assert.Empty(t, bumps, "the release-day fix must not be claimed while it's inside the margin")
+	require.Len(t, messages, 1)
+	assert.Contains(t, messages[0], "1.24.5")
+	assert.Contains(t, messages[0], "1.24.4")
+	// Only the aged target is scanned on each side (assumed and rebuild both
+	// resolve to 1.24.4), so the fresh 1.24.5 is never even scanned here.
+	assert.NotContains(t, scanner.scanned, "1.24.5")
+}
+
+// TestEvaluateStdlibStaleness_ReleaseDayStillFixesOlderTarget: the margin
+// defers a brand-new patch, but the AGED target still fixes advisories present
+// at the assumed release - that bump stands, and the deferral is noted.
+func TestEvaluateStdlibStaleness_ReleaseDayStillFixesOlderTarget(t *testing.T) {
+	index := &fakeReleaseIndex{
+		asOf:          map[string]string{"": "1.24.1"},
+		available:     map[string]string{"": "1.24.5"}, // fresh upstream
+		availableAsOf: map[string]string{"": "1.24.4"}, // aged target
+	}
+	scanner := &fakeStdlibScanner{vulnsByVersion: map[string][]scan.Vulnerability{
+		"1.24.1": {stdlibVuln("GO-OLD")},
+		"1.24.4": nil, // aged target already fixes GO-OLD
+	}}
+
+	bumps, messages, err := evaluateStdlibStaleness(t.Context(), index, scanner, stdlibInput{
+		CommitTime:  stdlibCommitTime,
+		Constraints: []string{""},
+		Now:         stdlibNow,
+	})
+	require.NoError(t, err)
+	require.Len(t, bumps, 1)
+	assert.Equal(t, "1.24.4", bumps[0].RebuildGoVersion, "the aged target, not the fresh upstream release")
+	assert.Equal(t, []string{"GO-OLD"}, bumps[0].VulnIDs)
+	// One deferral info message plus the fix message.
+	require.Len(t, messages, 2)
+	assert.Contains(t, messages[0], "1.24.5")
+	assert.Contains(t, messages[0], "1.24.4")
+	assert.Contains(t, messages[1], "rebuilding with go1.24.4 fixes GO-OLD")
+	assert.Equal(t, []string{"1.24.1", "1.24.4"}, scanner.scanned)
+}
+
+// TestEvaluateStdlibStaleness_BrandNewMinorInsideMarginSkips: an entire minor
+// so new that NOTHING in it is publication-aged enough yields ErrNoReleases
+// from LatestAvailableAsOf. The constraint is skipped with an info message and
+// no bump - never an error.
+func TestEvaluateStdlibStaleness_BrandNewMinorInsideMarginSkips(t *testing.T) {
+	index := &fakeReleaseIndex{
+		asOf:      map[string]string{"1.26": "1.26.0"},
+		available: map[string]string{"1.26": "1.26.0"},
+		// No availableAsOf key for 1.26: LatestAvailableAsOf returns ErrNoReleases.
+		availableAsOf: map[string]string{},
+	}
+	scanner := &fakeStdlibScanner{vulnsByVersion: map[string][]scan.Vulnerability{
+		"1.26.0": {stdlibVuln("GO-NEW")},
+	}}
+
+	bumps, messages, err := evaluateStdlibStaleness(t.Context(), index, scanner, stdlibInput{
+		CommitTime:  stdlibCommitTime,
+		Constraints: []string{"1.26"},
+		Now:         stdlibNow,
+	})
+	require.NoError(t, err, "a brand-new minor inside the margin must degrade, never error")
+	assert.Empty(t, bumps)
+	require.Len(t, messages, 1)
+	assert.Contains(t, messages[0], "publication-age")
+	assert.Empty(t, scanner.scanned, "nothing to scan when there is no aged rebuild target")
+}
+
+// TestEvaluateStdlibStaleness_MarginErrorPropagates: a non-ErrNoReleases
+// failure from LatestAvailableAsOf must surface as an error for the caller to
+// degrade on, not be swallowed as a skip.
+func TestEvaluateStdlibStaleness_MarginErrorPropagates(t *testing.T) {
+	index := &fakeReleaseIndex{
+		asOf:             map[string]string{"": "1.22.0"},
+		available:        map[string]string{"": "1.24.5"},
+		availableAsOfErr: errors.New("proxy unreachable"),
+	}
+	scanner := &fakeStdlibScanner{vulnsByVersion: map[string][]scan.Vulnerability{
+		"1.22.0": {stdlibVuln("GO-X")},
+	}}
+
+	_, _, err := evaluateStdlibStaleness(t.Context(), index, scanner, stdlibInput{
+		CommitTime:  stdlibCommitTime,
+		Constraints: []string{""},
+		Now:         stdlibNow,
+	})
+	require.ErrorContains(t, err, "proxy unreachable")
 }
 
 func TestPinWord(t *testing.T) {
