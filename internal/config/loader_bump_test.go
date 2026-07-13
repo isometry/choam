@@ -130,11 +130,11 @@ func TestLoader_FindBumpSteps_GoVersion(t *testing.T) {
 	require.Len(t, noGoVersionSteps, 1)
 	assert.Equal(t, "", noGoVersionSteps[0].GoVersion)
 
-	// The hazard the loader must avoid on the write side: an UNQUOTED
-	// go-version parses as a YAML float, not a string, so it is silently
-	// dropped by the with-field reader (GetPipelineWithField only collects
-	// string values) rather than misread. This is exactly why
-	// UpsertPipelineWithQuotedString/InsertBumpPipelineStep always quote it.
+	// An UNQUOTED go-version parses as a YAML float, but the AST-based reader
+	// preserves its raw token text ("1.25"), so it must be read back verbatim -
+	// NOT dropped (silently lowering/vanishing a user's pin) and NOT coerced
+	// through float64 (which would turn "1.30" into "1.3", a 27-minor
+	// corruption).
 	const withUnquotedGoVersion = `pipeline:
   - uses: bump
     with:
@@ -145,7 +145,134 @@ func TestLoader_FindBumpSteps_GoVersion(t *testing.T) {
 	unquotedSteps, err := loader.FindBumpSteps([]byte(withUnquotedGoVersion))
 	require.NoError(t, err)
 	require.Len(t, unquotedSteps, 1)
-	assert.Equal(t, "", unquotedSteps[0].GoVersion, "unquoted go-version is a YAML float, not a string - it must not be misread")
+	assert.Equal(t, "1.25", unquotedSteps[0].GoVersion, "unquoted go-version must be read from its raw token text, not dropped")
+
+	// Load-bearing: an unquoted "1.30" must NOT be coerced through float64 to
+	// "1.3". goversion.Compare("1.3", "1.30") differ by 27 minors, so a float
+	// round-trip here would silently corrupt a pinned toolchain.
+	const withUnquotedTrailingZero = `pipeline:
+  - uses: bump
+    with:
+      go-version: 1.30
+      deps: |-
+        golang.org/x/net@v0.55.0
+`
+	trailingZeroSteps, err := loader.FindBumpSteps([]byte(withUnquotedTrailingZero))
+	require.NoError(t, err)
+	require.Len(t, trailingZeroSteps, 1)
+	assert.Equal(t, "1.30", trailingZeroSteps[0].GoVersion, "unquoted 1.30 must survive as raw text, not float64(1.3)")
+}
+
+// TestLoader_GetPipelineWithField_ScalarTypes pins the AST-based reader's
+// behaviour across scalar kinds: strings keep their interpreted value (quotes
+// stripped), non-string scalars (int/float/bool) surface their raw token text
+// rather than being coerced or dropped, block scalars are interpreted, and
+// null/sequence/mapping values are skipped.
+func TestLoader_GetPipelineWithField_ScalarTypes(t *testing.T) {
+	loader := NewLoader()
+
+	t.Run("quoted string strips quotes", func(t *testing.T) {
+		const y = `pipeline:
+  - uses: bump
+    with:
+      go-version: "1.25"
+`
+		fields, err := loader.GetPipelineWithField([]byte(y), 0)
+		require.NoError(t, err)
+		assert.Equal(t, "1.25", fields["go-version"])
+	})
+
+	t.Run("unquoted float keeps raw token text", func(t *testing.T) {
+		const y = `pipeline:
+  - uses: bump
+    with:
+      go-version: 1.30
+`
+		fields, err := loader.GetPipelineWithField([]byte(y), 0)
+		require.NoError(t, err)
+		assert.Equal(t, "1.30", fields["go-version"], "must not coerce through float64(1.3)")
+	})
+
+	t.Run("single-key with block (MappingValueNode path)", func(t *testing.T) {
+		const y = `pipeline:
+  - uses: bump
+    with:
+      go-version: 1.25
+`
+		fields, err := loader.GetPipelineWithField([]byte(y), 0)
+		require.NoError(t, err)
+		assert.Equal(t, map[string]string{"go-version": "1.25"}, fields)
+	})
+
+	t.Run("int and bool scalars surface raw text", func(t *testing.T) {
+		const y = `pipeline:
+  - uses: bump
+    with:
+      go-version: 1.25
+      some-int: 42
+      some-bool: true
+`
+		fields, err := loader.GetPipelineWithField([]byte(y), 0)
+		require.NoError(t, err)
+		assert.Equal(t, "1.25", fields["go-version"])
+		assert.Equal(t, "42", fields["some-int"])
+		assert.Equal(t, "true", fields["some-bool"])
+	})
+
+	t.Run("block scalar deps interpreted, sequence/null skipped", func(t *testing.T) {
+		const y = `pipeline:
+  - uses: bump
+    with:
+      deps: |-
+        github.com/foo/bar@v1.1.1
+        golang.org/x/net@v0.55.0
+      empty:
+      seq:
+        - a
+        - b
+`
+		fields, err := loader.GetPipelineWithField([]byte(y), 0)
+		require.NoError(t, err)
+		assert.Equal(t, "github.com/foo/bar@v1.1.1\ngolang.org/x/net@v0.55.0", fields["deps"])
+		_, hasEmpty := fields["empty"]
+		assert.False(t, hasEmpty, "null value must be skipped")
+		_, hasSeq := fields["seq"]
+		assert.False(t, hasSeq, "sequence value must be skipped")
+	})
+}
+
+// TestLoader_FindBumpSteps_UnquotedGoVersionRoundTrip proves the never-lower
+// path: an unquoted go-version read as its raw text ("1.30") can be re-quoted
+// in place without lowering it and without disturbing comments.
+func TestLoader_FindBumpSteps_UnquotedGoVersionRoundTrip(t *testing.T) {
+	loader := NewLoader()
+
+	const withUnquotedAndComment = `pipeline:
+  # keep me
+  - uses: go/bump
+    with:
+      go-version: 1.30
+      deps: |-
+        golang.org/x/net@v0.55.0
+`
+	steps, err := loader.FindBumpSteps([]byte(withUnquotedAndComment))
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	require.Equal(t, "1.30", steps[0].GoVersion)
+
+	// Re-quoting at the same version must not lower it and must keep comments.
+	updated, err := loader.UpsertPipelineWithQuotedString([]byte(withUnquotedAndComment), 0, "go-version", steps[0].GoVersion)
+	require.NoError(t, err)
+
+	content := string(updated)
+	assert.Contains(t, content, `go-version: "1.30"`)
+	assert.Equal(t, 1, strings.Count(content, "go-version:"), "must not duplicate the key")
+	assert.Contains(t, content, "# keep me", "comments must be preserved")
+
+	reread, err := loader.FindBumpSteps(updated)
+	require.NoError(t, err)
+	require.Len(t, reread, 1)
+	assert.Equal(t, "1.30", reread[0].GoVersion, "round-trip must never lower the pinned version")
 }
 
 func TestLoader_InsertBumpPipelineStep_WritesLanguage(t *testing.T) {

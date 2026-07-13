@@ -168,12 +168,13 @@ func (l *Loader) UpdateFieldWithBlockScalar(yamlContent []byte, path string, new
 }
 
 // pipelineWithHasField reports whether a pipeline step's with block contains
-// field, regardless of the field's value type. GetPipelineWithField can't be
-// used for this: it silently drops non-string values, so an existing
-// UNQUOTED scalar that YAML parses as a number or bool (e.g. "go-version:
-// 1.25" parsing as a float) would be invisible to a presence probe built on
-// it - the caller would then wrongly conclude the field is absent and splice
-// in a second, duplicate key.
+// field, regardless of the field's value type. GetPipelineWithField now reads
+// non-string scalars (its AST reader surfaces their raw token text), but it
+// still skips values with no scalar text - a null-valued key ("go-version:"
+// with nothing after it) is absent from its map. A presence probe built on it
+// would therefore see such a field as missing and splice in a second,
+// duplicate key. This function stays type-blind (including null values) so the
+// Upsert helpers never duplicate an already-present key.
 func (l *Loader) pipelineWithHasField(yamlContent []byte, pipelineIndex int, field string) (bool, error) {
 	var parsed map[string]any
 	if err := yaml.Unmarshal(yamlContent, &parsed); err != nil {

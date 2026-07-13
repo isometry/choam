@@ -134,30 +134,82 @@ func (l *Loader) FindPipelinesByUse(yamlContent []byte, useType string) ([]int, 
 	return indices, nil
 }
 
-// GetPipelineWithField gets the with field map for a specific pipeline
+// GetPipelineWithField gets the with field map for a specific pipeline.
+//
+// It reads the with block off the comment-preserving AST (rather than via
+// yaml.Unmarshal) so that non-string scalars surface their raw token text
+// instead of being dropped or coerced. An UNQUOTED "go-version: 1.30" parses
+// as a YAML float; unmarshalling would either drop it (map[string]string only
+// keeps string values) or, worse, coerce it through float64 to "1.3" - a
+// 27-minor corruption of a pinned toolchain. Reading the AST token keeps the
+// text exactly as written ("1.30"). Values with no meaningful scalar text
+// (null, sequences, nested mappings) are skipped, matching the prior reader.
 func (l *Loader) GetPipelineWithField(yamlContent []byte, pipelineIndex int) (map[string]string, error) {
-	var parsed map[string]any
-	if err := yaml.Unmarshal(yamlContent, &parsed); err != nil {
+	withPath, err := yaml.PathString(fmt.Sprintf("$.pipeline[%d].with", pipelineIndex))
+	if err != nil {
+		return nil, fmt.Errorf("creating with path: %w", err)
+	}
+
+	file, err := parser.ParseBytes(yamlContent, parser.ParseComments)
+	if err != nil {
 		return nil, fmt.Errorf("parsing YAML to get pipeline with field: %w", err)
 	}
 
-	if pipeline, ok := parsed["pipeline"].([]any); ok {
-		if pipelineIndex < len(pipeline) {
-			if stepMap, ok := pipeline[pipelineIndex].(map[string]any); ok {
-				if withField, ok := stepMap["with"].(map[string]any); ok {
-					result := make(map[string]string)
-					for k, v := range withField {
-						if str, ok := v.(string); ok {
-							result[k] = str
-						}
-					}
-					return result, nil
-				}
-			}
-		}
+	node, err := withPath.FilterFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline at index %d not found or has no with field", pipelineIndex)
 	}
 
-	return nil, fmt.Errorf("pipeline at index %d not found or has no with field", pipelineIndex)
+	values, ok := mappingValues(node)
+	if !ok {
+		return nil, fmt.Errorf("pipeline at index %d not found or has no with field", pipelineIndex)
+	}
+
+	result := make(map[string]string)
+	for _, mv := range values {
+		if text, ok := scalarText(mv.Value); ok {
+			result[mv.Key.GetToken().Value] = text
+		}
+	}
+	return result, nil
+}
+
+// mappingValues normalises the node a "$....with" path resolves to into a
+// slice of key/value entries. goccy represents a multi-entry mapping as
+// *ast.MappingNode but a single-entry one as a bare *ast.MappingValueNode, so
+// both shapes must be handled to avoid silently ignoring a single-key with
+// block.
+func mappingValues(node ast.Node) ([]*ast.MappingValueNode, bool) {
+	switch n := node.(type) {
+	case *ast.MappingNode:
+		return n.Values, true
+	case *ast.MappingValueNode:
+		return []*ast.MappingValueNode{n}, true
+	default:
+		return nil, false
+	}
+}
+
+// scalarText extracts the string content of a with-field value node. String
+// scalars yield their interpreted value (quotes stripped); block/literal
+// scalars yield their interpreted body; integer/float/bool scalars yield their
+// raw token text exactly as written (so "1.30" never becomes float64(1.3)).
+// Null, sequence and mapping values have no meaningful scalar text and return
+// false so the caller skips them.
+func scalarText(n ast.Node) (string, bool) {
+	switch v := n.(type) {
+	case *ast.StringNode:
+		return v.Value, true
+	case *ast.LiteralNode:
+		// Interpreted block-scalar content (e.g. a "deps: |-" body).
+		return v.Value.Value, true
+	case *ast.IntegerNode, *ast.FloatNode, *ast.BoolNode:
+		// Raw token text as written - never coerced through the parsed
+		// numeric/bool value.
+		return v.GetToken().Value, true
+	default:
+		return "", false
+	}
 }
 
 // RemovePipelineWithField removes a single field from a pipeline step's with
