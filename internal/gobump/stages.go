@@ -602,7 +602,7 @@ func (g *GoBumpApplier) applyGoBumpChanges(ctx context.Context, gp *GoBumpProces
 		return fmt.Errorf("reconciling bump steps: %w", err)
 	}
 
-	if err := g.reconcileGoPackagePins(gp, goPinFloor(analysis)); err != nil {
+	if err := g.reconcileGoPackagePins(ctx, gp, goPinFloors(analysis)); err != nil {
 		return fmt.Errorf("reconciling go-package pins: %w", err)
 	}
 

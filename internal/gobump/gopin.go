@@ -1,6 +1,7 @@
 package gobump
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -106,12 +107,17 @@ func goToolchainPins(cfg *melange.Configuration) []GoToolchainPin {
 	return pins
 }
 
-// goPinFloor is the Go language version every go-package pin in the file
-// must satisfy: the file-wide max, across go modroots, of each root's own
-// pristine baseline and its (proven or best-effort) required raise. "" when
-// nothing demands anything (no go modroots, or no baseline information).
-func goPinFloor(analysis *VulnerabilityAnalysis) string {
-	var floor string
+// goPinFloors is the per-modroot Go language version each go-package pin must
+// satisfy, keyed by the modroot the requirement was proven for. Each modroot's
+// floor is the max of its own pristine baseline and its (proven or
+// best-effort) required raise. A modroot absent from the map (or mapped to "")
+// demands nothing, so a go/build pin keyed to it is left alone - the fix for
+// the FIPS/variant hazard where a raise in one modroot used to rewrite a
+// deliberately held-back pin building a different, lower-requirement modroot.
+// go/install pins carry no modroot and instead use the file-wide max (see
+// reconcileGoPackagePins).
+func goPinFloors(analysis *VulnerabilityAnalysis) map[string]string {
+	floors := make(map[string]string)
 	for li := range analysis.ByLanguage {
 		lang := &analysis.ByLanguage[li]
 		if lang.Language != "go" {
@@ -119,32 +125,53 @@ func goPinFloor(analysis *VulnerabilityAnalysis) string {
 		}
 		for mi := range lang.ByModroot {
 			m := &lang.ByModroot[mi]
-			floor = goversion.Max(floor, pristineGoBaseline(m), m.RequiredGoVersion)
+			floors[m.Modroot] = goversion.Max(floors[m.Modroot], pristineGoBaseline(m), m.RequiredGoVersion)
 		}
 	}
-	return floor
+	return floors
 }
 
 // reconcileGoPackagePins raises too-old go-package pins on go/build|go/install
-// steps (top-level and subpackage pipelines) to satisfy pinFloor (a bare Go
-// version), comment-preservingly, only ever raising a pin's minor - never
-// lowering one. Values it cannot safely rewrite are warned about instead:
-// templated pins (the melange variable must be updated manually) and values
-// that aren't a recognizable go toolchain package name. Unversioned pins
-// ("go", "go-fips") already float to the latest toolchain and are left alone.
-// pinFloor "" is a no-op.
+// steps (top-level and subpackage pipelines) to satisfy each pin's OWN floor,
+// comment-preservingly, only ever raising a pin's minor - never lowering one.
+//
+// Floors are per-modroot (floors, keyed by modroot): a go/build pin is checked
+// against floors[pin.Modroot] (its templated modroot rendered first), so a
+// raise proven for one modroot never rewrites a pin building a different,
+// lower-requirement modroot - the FIPS/variant hazard fix. A modroot with no
+// floor (absent, or "") leaves its pin alone. go/install steps carry no
+// modroot, so they fall back to the file-wide max floor (a documented
+// trade-off: a go/install pin can still be raised by a requirement proven for
+// an unrelated modroot).
+//
+// Variant toolchains (base != "go", e.g. go-fips) are never auto-rewritten:
+// they have separate release/validation cadences and compliance implications,
+// so a needed raise is surfaced as a warning for the maintainer to apply
+// manually. Only base == "go" auto-raises.
+//
+// Values it cannot safely rewrite are warned about instead: templated pins
+// (the melange variable must be updated manually) and values that aren't a
+// recognizable go toolchain package name. Unversioned pins ("go", "go-fips")
+// already float to the latest toolchain and are left alone. Empty floors
+// (nothing demands anything) make this a no-op.
+//
+// The context parameter is threaded for release-existence validation added in
+// a follow-up task; this implementation does not yet consult it.
 //
 // Scope note: this only runs when the applier runs at all
 // (GoBumpApplier.ShouldRun gates on bump actions), so a package whose pins
 // are stale but whose deps need no bump is not rewritten - an accepted v1
 // limitation.
-func (g *GoBumpApplier) reconcileGoPackagePins(gp *GoBumpProcessor, pinFloor string) error {
-	if pinFloor == "" {
+func (g *GoBumpApplier) reconcileGoPackagePins(_ context.Context, gp *GoBumpProcessor, floors map[string]string) error {
+	if len(floors) == 0 {
 		return nil
 	}
-	floorMinor := goversion.Minor(pinFloor)
-	if floorMinor == "" {
-		return nil
+
+	// go/install pins have no modroot association, so they use the file-wide
+	// max floor (current behaviour, documented trade-off).
+	var maxFloor string
+	for _, f := range floors {
+		maxFloor = goversion.Max(maxFloor, f)
 	}
 
 	loader := config.NewLoader()
@@ -165,43 +192,70 @@ func (g *GoBumpApplier) reconcileGoPackagePins(gp *GoBumpProcessor, pinFloor str
 			renderer = nil
 		}
 	}
+	render := func(value string) string {
+		if renderer == nil || !strings.Contains(value, "${{") {
+			return value
+		}
+		r, err := renderer.RenderString(value)
+		if err != nil {
+			slog.Debug("could not render templated value during pin reconciliation", "value", value, "error", err)
+			return value
+		}
+		return r
+	}
+
+	// pinFloor is the Go version the given pin must satisfy: floors[modroot]
+	// for go/build (its templated modroot rendered), maxFloor for go/install.
+	// "" means this pin's target proved no requirement - leave it alone.
+	pinFloor := func(pin config.GoPackagePin) string {
+		if pin.Uses == "go/install" {
+			return maxFloor
+		}
+		modroot := render(pin.Modroot)
+		floor, ok := floors[modroot]
+		if !ok {
+			slog.Debug("go-package pin modroot not in analysis - no floor, leaving untouched",
+				"modroot", modroot, "value", pin.Value)
+		}
+		return floor
+	}
 
 	changed := false
 	for _, pin := range pins {
-		where := "pipeline"
-		if pin.Subpackage != "" {
-			where = "subpackage " + pin.Subpackage
-		}
+		where := describePinLocation(pin)
+		floor := pinFloor(pin)
+		floorMinor := goversion.Minor(floor)
 
 		if strings.Contains(pin.Value, "${{") {
+			if floorMinor == "" {
+				// This pin's target demands nothing; nothing to check.
+				continue
+			}
 			if renderer == nil {
 				// Degraded path (no gp.Config, or the renderer failed to
 				// build): the templated value can't be evaluated at all, so
 				// raw-value parsing below would silently misjudge or skip it.
 				// Warn instead of going quiet.
 				gp.AddMessage(fmt.Sprintf("go-package %q (%s) is templated and could not be evaluated; verify manually against required Go %s",
-					pin.Value, where, pinFloor))
+					pin.Value, where, floor))
 				continue
 			}
 			// Templated pin: judge the rendered value, but never edit the
 			// template - the variable behind it is the user's to update.
-			rendered := pin.Value
-			if r, err := renderer.RenderString(pin.Value); err == nil {
-				rendered = r
-			} else {
-				slog.Debug("could not render go-package pin", "value", pin.Value, "error", err)
-			}
-			_, minor, ok := parseGoPackagePin(rendered)
+			_, minor, ok := parseGoPackagePin(render(pin.Value))
 			if ok && minor != "" && goversion.Compare(minor, floorMinor) < 0 {
 				gp.AddMessage(fmt.Sprintf("go-package %q (%s) is templated and resolves to Go %s, below required Go %s; update the variable manually",
-					pin.Value, where, minor, pinFloor))
+					pin.Value, where, minor, floor))
 			}
 			continue
 		}
 
 		base, minor, ok := parseGoPackagePin(pin.Value)
 		if !ok {
-			gp.AddMessage(fmt.Sprintf("unrecognized go-package %q (%s); required Go %s - not rewritten", pin.Value, where, pinFloor))
+			if floorMinor == "" {
+				continue // no requirement for this pin's target
+			}
+			gp.AddMessage(fmt.Sprintf("unrecognized go-package %q (%s); required Go %s - not rewritten", pin.Value, where, floor))
 			continue
 		}
 		if minor == "" {
@@ -210,8 +264,19 @@ func (g *GoBumpApplier) reconcileGoPackagePins(gp *GoBumpProcessor, pinFloor str
 			slog.Debug("go-package pin is unversioned - leaving untouched", "value", pin.Value, "where", where)
 			continue
 		}
-		if goversion.Compare(minor, floorMinor) >= 0 {
+		if floorMinor == "" || goversion.Compare(minor, floorMinor) >= 0 {
+			// No requirement, or already sufficient: effective minor is its own.
 			recordPinOutcome(gp, minor, minor)
+			continue
+		}
+		if base != "go" {
+			// Variant toolchain (go-fips, ...): separate release/validation
+			// cadences and compliance implications mean we must not silently
+			// rewrite it - surface it for manual attention. The pin keeps its
+			// current minor, so its effective outcome is the identity.
+			recordPinOutcome(gp, minor, minor)
+			gp.AddMessage(fmt.Sprintf("go-package pin %s (%s) needs Go %s but is a variant toolchain with separate release/validation cadences and compliance implications; raise it manually",
+				pin.Value, where, floor))
 			continue
 		}
 		recordPinOutcome(gp, minor, floorMinor)
@@ -223,7 +288,7 @@ func (g *GoBumpApplier) reconcileGoPackagePins(gp *GoBumpProcessor, pinFloor str
 		}
 		yamlContent = updated
 		changed = true
-		gp.AddMessage(fmt.Sprintf("raised go-package pin %s -> %s (%s; dependencies require Go %s)", pin.Value, newValue, where, pinFloor))
+		gp.AddMessage(fmt.Sprintf("raised go-package pin %s -> %s (%s; dependencies require Go %s)", pin.Value, newValue, where, floor))
 	}
 
 	if changed {
@@ -233,12 +298,36 @@ func (g *GoBumpApplier) reconcileGoPackagePins(gp *GoBumpProcessor, pinFloor str
 	return nil
 }
 
+// describePinLocation renders a human-readable location for a pin's messages,
+// naming its pipeline (top-level or subpackage) and its modroot.
+func describePinLocation(pin config.GoPackagePin) string {
+	where := "pipeline"
+	if pin.Subpackage != "" {
+		where = "subpackage " + pin.Subpackage
+	}
+	// go/install has no modroot; only name one when it's meaningful.
+	if pin.Uses == "go/install" {
+		return where
+	}
+	return fmt.Sprintf("%s, modroot %s", where, pin.Modroot)
+}
+
 // recordPinOutcome notes one versioned go-package pin's effective minor after
-// reconciliation (identity when the pin was already sufficient) on the
-// processor, for the stdlib staleness check's rebuild-side constraints.
+// reconciliation (identity when the pin was already sufficient, or when a
+// variant toolchain was warned-not-rewritten) on the processor, for the
+// stdlib staleness check's rebuild-side constraints.
+//
+// Per-modroot floors and the variant guard mean pins sharing an ORIGINAL minor
+// can now diverge (one raised, another held back). We record the MINIMUM
+// effective per original minor so the stdlib rebuild side assumes the oldest
+// toolchain that will actually be used - over-detecting staleness, the safe
+// direction (a rebuild the older pin still triggers is never missed).
 func recordPinOutcome(gp *GoBumpProcessor, original, effective string) {
 	if gp.RaisedPinMinors == nil {
 		gp.RaisedPinMinors = make(map[string]string)
+	}
+	if existing, ok := gp.RaisedPinMinors[original]; ok && goversion.Compare(existing, effective) <= 0 {
+		return // keep the smaller (older) effective already recorded
 	}
 	gp.RaisedPinMinors[original] = effective
 }

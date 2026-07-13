@@ -538,6 +538,8 @@ type GoPackagePin struct {
 	Path       string // goccy yaml path, e.g. "$.pipeline[3].with.go-package" or "$.subpackages[2].pipeline[0].with.go-package"
 	Subpackage string // subpackage name for messages; "" for top-level
 	Value      string // raw string value (possibly templated)
+	Uses       string // the step's uses: value ("go/build" or "go/install")
+	Modroot    string // raw with.modroot (possibly templated); "." when absent - go/build only, go/install has none
 }
 
 // FindGoPackagePins walks the top-level pipeline and every subpackage's
@@ -595,10 +597,36 @@ func collectGoPackagePins(pins *[]GoPackagePin, pipeline any, pathPrefix, subpac
 		if !ok {
 			continue
 		}
+		// with.modroot associates a go/build pin with its module root (the
+		// pin's own floor is keyed by it); default "." matches the pipeline's
+		// own default. go/install has no modroot. Usually a string, but an
+		// unquoted numeric-looking value ("modroot: 2024") unmarshals as a
+		// non-string scalar, so fall back to its printed form - matching
+		// melange's own map[string]string coercion on the discovery side,
+		// which keys the floors map - rather than mis-defaulting to ".".
+		// Null and non-scalar (sequence/mapping) values carry no usable
+		// modroot and keep the default.
+		modroot := "."
+		if raw, exists := withField["modroot"]; exists && raw != nil {
+			mr, ok := raw.(string)
+			if !ok {
+				switch raw.(type) {
+				case map[string]any, []any:
+					// Not a scalar - no usable modroot.
+				default:
+					mr = fmt.Sprint(raw)
+				}
+			}
+			if strings.TrimSpace(mr) != "" {
+				modroot = mr
+			}
+		}
 		*pins = append(*pins, GoPackagePin{
 			Path:       fmt.Sprintf("%s.pipeline[%d].with.go-package", pathPrefix, i),
 			Subpackage: subpackage,
 			Value:      value,
+			Uses:       uses,
+			Modroot:    modroot,
 		})
 	}
 }

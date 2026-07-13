@@ -919,6 +919,7 @@ pipeline:
     with:
       packages: .
       go-package: go-1.24
+      modroot: ./cmd/app
 
 subpackages:
   - name: example-extra
@@ -940,6 +941,14 @@ subpackages:
       - uses: go/build
         with:
           packages: ./cmd/other
+
+  - name: example-numeric-modroot
+    pipeline:
+      - uses: go/build
+        with:
+          go-package: go-1.24
+          # unquoted numeric-looking modroot parses as a YAML integer
+          modroot: 2024
 `
 
 func TestLoader_FindGoPackagePins(t *testing.T) {
@@ -947,20 +956,35 @@ func TestLoader_FindGoPackagePins(t *testing.T) {
 
 	pins, err := loader.FindGoPackagePins([]byte(goPackagePinYAML))
 	require.NoError(t, err)
-	require.Len(t, pins, 3)
+	require.Len(t, pins, 4)
 
 	assert.Equal(t, "$.pipeline[1].with.go-package", pins[0].Path)
 	assert.Equal(t, "", pins[0].Subpackage)
 	assert.Equal(t, "go-1.24", pins[0].Value)
+	assert.Equal(t, "go/build", pins[0].Uses)
+	assert.Equal(t, "./cmd/app", pins[0].Modroot, "explicit with.modroot read verbatim")
 
 	assert.Equal(t, "$.subpackages[0].pipeline[0].with.go-package", pins[1].Path)
 	assert.Equal(t, "example-extra", pins[1].Subpackage)
 	assert.Equal(t, "go-1.23", pins[1].Value)
+	assert.Equal(t, "go/install", pins[1].Uses)
+	assert.Equal(t, ".", pins[1].Modroot, "go/install carries no modroot - defaults to \".\"")
 
 	// A templated value is returned raw, untouched by rendering.
 	assert.Equal(t, "$.subpackages[1].pipeline[0].with.go-package", pins[2].Path)
 	assert.Equal(t, "example-templated", pins[2].Subpackage)
 	assert.Equal(t, "go-${{vars.go-version}}", pins[2].Value)
+	assert.Equal(t, "go/build", pins[2].Uses)
+	assert.Equal(t, ".", pins[2].Modroot, "go/build without with.modroot defaults to \".\"")
+
+	// An unquoted numeric-looking modroot unmarshals as a YAML integer; it
+	// must coerce to its string form (matching melange's map[string]string
+	// coercion, which keys the floors map) - never mis-default to ".".
+	assert.Equal(t, "$.subpackages[3].pipeline[0].with.go-package", pins[3].Path)
+	assert.Equal(t, "example-numeric-modroot", pins[3].Subpackage)
+	assert.Equal(t, "go-1.24", pins[3].Value)
+	assert.Equal(t, "go/build", pins[3].Uses)
+	assert.Equal(t, "2024", pins[3].Modroot, "unquoted numeric modroot coerced to string, not defaulted")
 }
 
 func TestLoader_FindGoPackagePins_None(t *testing.T) {
@@ -981,7 +1005,7 @@ func TestLoader_FindGoPackagePins_SubpackageWriteBack(t *testing.T) {
 
 	pins, err := loader.FindGoPackagePins([]byte(goPackagePinYAML))
 	require.NoError(t, err)
-	require.Len(t, pins, 3)
+	require.Len(t, pins, 4)
 
 	pin := pins[1] // $.subpackages[0].pipeline[0].with.go-package
 	require.Equal(t, "example-extra", pin.Subpackage)
@@ -1002,7 +1026,7 @@ func TestLoader_FindGoPackagePins_SubpackageWriteBack(t *testing.T) {
 
 	rePins, err := loader.FindGoPackagePins(updated)
 	require.NoError(t, err)
-	require.Len(t, rePins, 3)
+	require.Len(t, rePins, 4)
 	assert.Equal(t, "go-1.25", rePins[1].Value)
 	assert.Equal(t, "go-1.24", rePins[0].Value)
 	assert.Equal(t, "go-${{vars.go-version}}", rePins[2].Value)
