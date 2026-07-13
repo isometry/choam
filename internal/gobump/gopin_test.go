@@ -2,6 +2,8 @@ package gobump
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -532,5 +534,66 @@ func TestRebuildConstraintsFor(t *testing.T) {
 		// recordPinOutcome collapsed a divergent 1.22 to identity, so the
 		// rebuild side sees no raise for it - a 1.22 build still happens.
 		assert.Nil(t, rebuildConstraintsFor([]string{"1.22"}, map[string]string{"1.22": "1.22"}))
+	})
+}
+
+// TestReconcileGoPackagePins_FloorValidation covers the defense-in-depth
+// floor validation at the pin write site (B2): a floor that isn't a known Go
+// release must never be written into a pin, even though fallbackGoVersions
+// already validates its own RequiredGoVersion input - this also catches a
+// bogus pristineGoBaseline, which is never filtered.
+func TestReconcileGoPackagePins_FloorValidation(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("unknown floor leaves every pin untouched, warns per pin", func(t *testing.T) {
+		releaseServer := releaseFixtureServer(t, "1.25.3") // no 1.99 series ever shipped
+		t.Setenv("GOPROXY", releaseServer.URL)
+		analyzer := NewAnalyzer(releaseServer.Client())
+		applier := NewGoBumpApplier(analyzer)
+
+		gp := goPinTestProcessor(t)
+		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, dotFloor("1.99")))
+
+		assert.Equal(t, goPinFixtureYAML, string(gp.GetCurrentYAML()),
+			"an unknown Go release must never be written as a pin floor")
+		assert.False(t, gp.ActualChangesApplied)
+
+		messages := strings.Join(gp.GetMessages(), "\n")
+		assert.Contains(t, messages, "not a known Go release")
+		assert.Contains(t, messages, "check the dependency's go.mod")
+	})
+
+	t.Run("known floor still raises when a release index is wired", func(t *testing.T) {
+		releaseServer := releaseFixtureServer(t, "1.25.3")
+		t.Setenv("GOPROXY", releaseServer.URL)
+		analyzer := NewAnalyzer(releaseServer.Client())
+		applier := NewGoBumpApplier(analyzer)
+
+		gp := goPinTestProcessor(t)
+		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, dotFloor("1.25.3")))
+
+		content := string(gp.GetCurrentYAML())
+		assert.Contains(t, content, "go-package: go-1.25\n")
+		assert.True(t, gp.ActualChangesApplied)
+	})
+
+	t.Run("release index offline fails open: raise proceeds with a warning", func(t *testing.T) {
+		failingIndex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+		}))
+		t.Cleanup(failingIndex.Close)
+		t.Setenv("GOPROXY", failingIndex.URL)
+		analyzer := NewAnalyzer(failingIndex.Client())
+		applier := NewGoBumpApplier(analyzer)
+
+		gp := goPinTestProcessor(t)
+		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, dotFloor("1.25.3")))
+
+		content := string(gp.GetCurrentYAML())
+		assert.Contains(t, content, "go-package: go-1.25\n", "an unreachable index must fail open")
+		assert.True(t, gp.ActualChangesApplied)
+
+		messages := strings.Join(gp.GetMessages(), "\n")
+		assert.Contains(t, messages, "index unavailable")
 	})
 }

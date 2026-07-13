@@ -2,6 +2,7 @@ package gobump
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/isometry/choam/internal/gorelease"
 	"github.com/isometry/choam/internal/goversion"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
@@ -160,4 +162,56 @@ func fetchModGoDirective(ctx context.Context, client *http.Client, proxyBaseURL,
 		return "", nil
 	}
 	return modFile.Go.Version, nil
+}
+
+// validateGoVersionFloor decides whether minor (a bare Go minor series, e.g.
+// "1.26") should be trusted as a go-version floor, consulting the shared
+// per-run gorelease.Index (see GoBumpApplier.releaseIndex). It implements the
+// fail-open policy shared by both validation sites - the fallback probe
+// result here in fallbackGoVersions, and the go-package pin floor write in
+// reconcileGoPackagePins:
+//
+//   - index == nil (no Analyzer wired) or minor == "" (nothing to check):
+//     always valid - nothing to validate against.
+//   - gorelease.ErrNoReleases - a definitive "no stable release ever shipped
+//     for this series" answer - rejects the candidate (valid=false,
+//     offlineErr=nil). This is the case a hostile or typo'd upstream go
+//     directive (e.g. "go 1.99") must not silently become a floor.
+//   - any other error (the release index itself is unreachable) fails open
+//     (valid=true) but returns the error so the caller can warn: this check
+//     runs right after the same module proxy already served the go.mod
+//     file(s) minor was derived from, so an index-unreachable-but-go.mod-
+//     fetchable failure is rare, and rejecting a legitimate version over a
+//     transient blip would regress the common raise.
+func validateGoVersionFloor(ctx context.Context, index *gorelease.Index, minor string) (valid bool, offlineErr error) {
+	if index == nil || minor == "" {
+		return true, nil
+	}
+	if _, err := index.LatestAvailable(ctx, minor); err != nil {
+		if errors.Is(err, gorelease.ErrNoReleases) {
+			return false, nil
+		}
+		return true, err
+	}
+	return true, nil
+}
+
+// newFloorValidator returns a validateGoVersionFloor closure that memoizes
+// results per minor - used by reconcileGoPackagePins' per-pin loop, where the
+// same modroot floor commonly recurs across several pins and would otherwise
+// repeat the same index lookup (and, on failure, the same warning).
+func newFloorValidator(ctx context.Context, index *gorelease.Index) func(minor string) (valid bool, offlineErr error) {
+	type result struct {
+		valid      bool
+		offlineErr error
+	}
+	cache := make(map[string]result)
+	return func(minor string) (bool, error) {
+		if cached, ok := cache[minor]; ok {
+			return cached.valid, cached.offlineErr
+		}
+		valid, offlineErr := validateGoVersionFloor(ctx, index, minor)
+		cache[minor] = result{valid: valid, offlineErr: offlineErr}
+		return valid, offlineErr
+	}
 }

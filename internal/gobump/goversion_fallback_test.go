@@ -25,6 +25,24 @@ func fakeGoProxy(t *testing.T, mods map[string]string) *httptest.Server {
 	return server
 }
 
+// releaseFixtureServer serves a golang.org/toolchain module @v/list naming
+// exactly the given bare release versions (e.g. "1.26.0") as linux/amd64
+// entries - all LatestAvailable needs, since it never fetches .info. Any
+// other path 404s (via fakeGoProxy). Pointing GOPROXY at this server and
+// constructing a gorelease.Index (gorelease.NewIndex, e.g. via NewAnalyzer)
+// exercises the same newIndexWithBaseURL seam gorelease's own tests use,
+// just through the public, GOPROXY-driven constructor.
+func releaseFixtureServer(t *testing.T, releases ...string) *httptest.Server {
+	t.Helper()
+	var body strings.Builder
+	for _, v := range releases {
+		body.WriteString("v0.0.1-go" + v + ".linux-amd64\n")
+	}
+	return fakeGoProxy(t, map[string]string{
+		"/golang.org/toolchain/@v/list": body.String(),
+	})
+}
+
 func TestFallbackCandidates(t *testing.T) {
 	m := &ModrootAnalysis{
 		DesiredDeps: []string{
@@ -249,6 +267,94 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 		assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 	})
 
+	t.Run("validates the probed required Go version against known releases", func(t *testing.T) {
+		t.Run("known minor accepted", func(t *testing.T) {
+			t.Setenv("GOPRIVATE", "")
+			t.Setenv("GONOPROXY", "")
+			modServer := fakeGoProxy(t, map[string]string{
+				"/example.com/a/@v/v1.2.0.mod": "module example.com/a\n\ngo 1.26\n",
+			})
+			releaseServer := releaseFixtureServer(t, "1.26.0")
+			t.Setenv("GOPROXY", releaseServer.URL) // wires Analyzer.goReleases via gorelease.NewIndex
+
+			analyzer := NewAnalyzer(releaseServer.Client())
+			applier := NewGoBumpApplier(analyzer)
+			applier.goProxyURL = modServer.URL // separate server for the go.mod probe
+
+			gp := newTestProcessor(t, singleGoBumpYAML)
+			analysis := fallbackAnalysis(t, "1.22")
+
+			applier.fallbackGoVersions(t.Context(), gp, analysis)
+
+			assert.Equal(t, "1.26", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
+			for _, msg := range gp.GetMessages() {
+				assert.NotContains(t, msg, "not a known Go release")
+			}
+		})
+
+		t.Run("1.99 rejected + message", func(t *testing.T) {
+			t.Setenv("GOPRIVATE", "")
+			t.Setenv("GONOPROXY", "")
+			modServer := fakeGoProxy(t, map[string]string{
+				"/example.com/a/@v/v1.2.0.mod": "module example.com/a\n\ngo 1.99\n",
+			})
+			releaseServer := releaseFixtureServer(t, "1.26.0") // 1.99 was never released
+			t.Setenv("GOPROXY", releaseServer.URL)
+
+			analyzer := NewAnalyzer(releaseServer.Client())
+			applier := NewGoBumpApplier(analyzer)
+			applier.goProxyURL = modServer.URL
+
+			gp := newTestProcessor(t, singleGoBumpYAML)
+			analysis := fallbackAnalysis(t, "1.22")
+
+			applier.fallbackGoVersions(t.Context(), gp, analysis)
+
+			assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion,
+				"an unknown Go release must never become a floor")
+			var rejected bool
+			for _, msg := range gp.GetMessages() {
+				if strings.Contains(msg, "candidate dependencies claim to require Go 1.99, which is not a known Go release") &&
+					strings.Contains(msg, "check the dependency's go.mod") {
+					rejected = true
+				}
+			}
+			assert.True(t, rejected, "expected the unknown-release rejection message, got %v", gp.GetMessages())
+		})
+
+		t.Run("release index offline fails open with a warning", func(t *testing.T) {
+			t.Setenv("GOPRIVATE", "")
+			t.Setenv("GONOPROXY", "")
+			modServer := fakeGoProxy(t, map[string]string{
+				"/example.com/a/@v/v1.2.0.mod": "module example.com/a\n\ngo 1.26\n",
+			})
+			failingIndex := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "boom", http.StatusInternalServerError)
+			}))
+			t.Cleanup(failingIndex.Close)
+			t.Setenv("GOPROXY", failingIndex.URL)
+
+			analyzer := NewAnalyzer(failingIndex.Client())
+			applier := NewGoBumpApplier(analyzer)
+			applier.goProxyURL = modServer.URL
+
+			gp := newTestProcessor(t, singleGoBumpYAML)
+			analysis := fallbackAnalysis(t, "1.22")
+
+			applier.fallbackGoVersions(t.Context(), gp, analysis)
+
+			assert.Equal(t, "1.26", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion,
+				"an unreachable release index must fail open and keep the probed result")
+			var warned bool
+			for _, msg := range gp.GetMessages() {
+				if strings.Contains(msg, "could not validate required Go 1.26") && strings.Contains(msg, "index unavailable") {
+					warned = true
+				}
+			}
+			assert.True(t, warned, "expected an index-unavailable warning, got %v", gp.GetMessages())
+		})
+	})
+
 	t.Run("GOPROXY=off disables the probe entirely and messages once per modroot", func(t *testing.T) {
 		t.Setenv("GOPROXY", "off")
 		t.Setenv("GOPRIVATE", "")
@@ -293,6 +399,23 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 			}
 		}
 		assert.True(t, warned, "expected an all-private warning naming the skipped count, got %v", gp.GetMessages())
+	})
+}
+
+// TestGoBumpApplier_ReleaseIndex covers the releaseIndex() accessor: nil-safe
+// like httpClient() when no Analyzer is wired, and otherwise sourced from
+// Analyzer.goReleases - the per-run gorelease.Index both validation sites
+// consult.
+func TestGoBumpApplier_ReleaseIndex(t *testing.T) {
+	t.Run("nil Analyzer - nil index", func(t *testing.T) {
+		applier := &GoBumpApplier{}
+		assert.Nil(t, applier.releaseIndex())
+	})
+
+	t.Run("wired from Analyzer.goReleases", func(t *testing.T) {
+		analyzer := NewAnalyzer(nil)
+		applier := &GoBumpApplier{Analyzer: analyzer}
+		assert.Same(t, analyzer.goReleases, applier.releaseIndex())
 	})
 }
 

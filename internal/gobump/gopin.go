@@ -162,7 +162,7 @@ func goPinFloors(analysis *VulnerabilityAnalysis) map[string]string {
 // (GoBumpApplier.ShouldRun gates on bump actions), so a package whose pins
 // are stale but whose deps need no bump is not rewritten - an accepted v1
 // limitation.
-func (g *GoBumpApplier) reconcileGoPackagePins(_ context.Context, gp *GoBumpProcessor, floors map[string]string) error {
+func (g *GoBumpApplier) reconcileGoPackagePins(ctx context.Context, gp *GoBumpProcessor, floors map[string]string) error {
 	if len(floors) == 0 {
 		return nil
 	}
@@ -219,6 +219,15 @@ func (g *GoBumpApplier) reconcileGoPackagePins(_ context.Context, gp *GoBumpProc
 		}
 		return floor
 	}
+
+	// validateFloor is defense in depth against an untrusted floor reaching
+	// the write below: floors come from goPinFloors, which takes the max of
+	// pristineGoBaseline (the modroot's own, pre-existing config - never
+	// filtered) and RequiredGoVersion (validated in fallbackGoVersions only
+	// on that path; simulation-proven values are untouched by design). A
+	// typo'd or otherwise bogus floor must never be written into a pin.
+	// Memoized per minor since the same floor commonly recurs across pins.
+	validateFloor := newFloorValidator(ctx, g.releaseIndex())
 
 	changed := false
 	for _, pin := range pins {
@@ -279,6 +288,19 @@ func (g *GoBumpApplier) reconcileGoPackagePins(_ context.Context, gp *GoBumpProc
 				pin.Value, where, floor))
 			continue
 		}
+
+		valid, offlineErr := validateFloor(floorMinor)
+		if offlineErr != nil {
+			gp.AddMessage(fmt.Sprintf("go-package pin %s (%s): could not validate required Go %s against known releases (index unavailable) - proceeding without validation: %v",
+				pin.Value, where, floor, offlineErr))
+		}
+		if !valid {
+			recordPinOutcome(gp, minor, minor)
+			gp.AddMessage(fmt.Sprintf("go-package pin %s (%s) required Go %s, which is not a known Go release — leaving pin unchanged (check the dependency's go.mod)",
+				pin.Value, where, floor))
+			continue
+		}
+
 		recordPinOutcome(gp, minor, floorMinor)
 
 		newValue := base + "-" + floorMinor

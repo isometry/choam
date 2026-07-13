@@ -149,6 +149,19 @@ func (g *GoBumpApplier) httpClient() *http.Client {
 	return http.DefaultClient
 }
 
+// releaseIndex returns the shared per-run Go release index (nil-safe,
+// mirroring httpClient above): the fallback go-version probe and the
+// go-package pin floor write both consult it to reject a floor that names no
+// real Go release. A nil Analyzer (some unit tests construct GoBumpApplier
+// directly) means no index is available - callers treat that as "nothing to
+// validate against" rather than an error.
+func (g *GoBumpApplier) releaseIndex() *gorelease.Index {
+	if g.Analyzer != nil {
+		return g.Analyzer.goReleases
+	}
+	return nil
+}
+
 func (g *GoBumpApplier) ShouldRun(ctx context.Context, p processor.Processor) (bool, error) {
 	gp, ok := p.(*GoBumpProcessor)
 	if !ok {
@@ -646,6 +659,26 @@ func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProces
 			if required == "" || goversion.Compare(required, pristineGoBaseline(m)) <= 0 {
 				continue
 			}
+
+			// The probed floor is unvalidated external input (a remote
+			// go.mod's go directive): before it can become RequiredGoVersion
+			// - which feeds both the go-version field and the go-package pin
+			// floor - confirm it names a real Go release.
+			valid, offlineErr := validateGoVersionFloor(ctx, g.releaseIndex(), goversion.Minor(required))
+			if offlineErr != nil {
+				slog.Warn("could not validate required Go version against known releases (index unavailable) - proceeding",
+					"modroot", m.Modroot, "version", required, "error", offlineErr)
+				gp.AddMessage(fmt.Sprintf("modroot %s: could not validate required Go %s against known releases (index unavailable) - proceeding without validation: %v",
+					m.Modroot, required, offlineErr))
+			}
+			if !valid {
+				slog.Warn("candidate dependencies claim to require an unknown Go release - ignoring",
+					"modroot", m.Modroot, "version", required)
+				gp.AddMessage(fmt.Sprintf("modroot %s: candidate dependencies claim to require Go %s, which is not a known Go release — ignoring (check the dependency's go.mod)",
+					m.Modroot, required))
+				continue
+			}
+
 			m.RequiredGoVersion = required
 			gp.AddMessage(fmt.Sprintf("modroot %s: candidate dependencies require Go %s (module baseline %s) - best-effort (direct candidates only); run with simulation for a proven result",
 				m.Modroot, required, baselineWord(pristineGoBaseline(m))))
