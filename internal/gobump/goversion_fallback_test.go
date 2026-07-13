@@ -453,3 +453,34 @@ func TestNewGoBumpApplier_GOPRIVATEWiring(t *testing.T) {
 	assert.True(t, applier.skipPrivateModule("example.com/private/foo"))
 	assert.False(t, applier.skipPrivateModule("example.com/public/foo"))
 }
+
+// TestGoBumpApplier_PublicFallbackSkipsGOPRIVATEUnion covers the residual
+// private-name-leak fix: GOPROXY=direct is unusable as a probe base URL, so
+// the applier falls back to the public proxy.golang.org (goProxyIsPublic
+// becomes true). Go's own GONOPROXY-precedence rule would, applied naively,
+// consult only GONOPROXY's pattern ("other/*") here and let a GOPRIVATE-only
+// module's name/version leak to that public proxy. skipPrivateModule must
+// instead skip the UNION of GOPRIVATE and GONOPROXY whenever the probe is
+// public, so the GOPRIVATE-matched candidate below is skipped and the fake
+// proxy never receives a request for it.
+func TestGoBumpApplier_PublicFallbackSkipsGOPRIVATEUnion(t *testing.T) {
+	t.Setenv("GOPROXY", "direct")
+	t.Setenv("GOPRIVATE", "secret.corp/*")
+	t.Setenv("GONOPROXY", "other/*")
+
+	applier := NewGoBumpApplier(nil)
+	require.True(t, applier.goProxyIsPublic, "GOPROXY=direct falls back to the public proxy")
+
+	var hitPaths []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hitPaths = append(hitPaths, r.URL.Path)
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(server.Close)
+
+	m := &ModrootAnalysis{DesiredDeps: []string{"secret.corp/private@v1.0.0"}}
+	got, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, applier.skipPrivateModule)
+	require.Error(t, err) // the only candidate is private, so nothing was fetched.
+	assert.Equal(t, "", got)
+	assert.Empty(t, hitPaths, "GOPRIVATE-matched module must never reach the public proxy fallback")
+}

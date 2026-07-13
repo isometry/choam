@@ -296,9 +296,9 @@ func TestOutputBumpStructured_StdlibSummary(t *testing.T) {
 // changes from stdlib alone).
 func TestDependencyFixApplied(t *testing.T) {
 	tests := []struct {
-		name        string
-		result      *gobump.GoBumpResult
-		want        bool
+		name   string
+		result *gobump.GoBumpResult
+		want   bool
 	}{
 		{
 			name:   "no vulnerabilities, no modules bumped",

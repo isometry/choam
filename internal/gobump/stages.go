@@ -112,6 +112,13 @@ type GoBumpApplier struct {
 	// never sends a private module's name/version to a public proxy.
 	goPrivate string
 	goNoProxy string
+
+	// goProxyIsPublic is true when goProxyURL is (or falls back to) the
+	// public https://proxy.golang.org - either because GOPROXY named it
+	// directly, or because GOPROXY's first entry was unusable ("direct",
+	// "off", unset, or garbage) and the probe fell back to it. See
+	// skipPrivateModule for why this changes which modules get skipped.
+	goProxyIsPublic bool
 }
 
 func NewGoBumpApplier(analyzer *Analyzer) *GoBumpApplier {
@@ -124,11 +131,12 @@ func NewGoBumpApplier(analyzer *Analyzer) *GoBumpApplier {
 			StageName:        "gobump_apply",
 			StageDescription: "Apply bump/go-bump pipeline changes",
 		},
-		Analyzer:      analyzer,
-		goProxyURL:    proxyURL,
-		probeDisabled: goproxy.Disabled(os.Getenv("GOPROXY")),
-		goPrivate:     os.Getenv("GOPRIVATE"),
-		goNoProxy:     os.Getenv("GONOPROXY"),
+		Analyzer:        analyzer,
+		goProxyURL:      proxyURL,
+		probeDisabled:   goproxy.Disabled(os.Getenv("GOPROXY")),
+		goPrivate:       os.Getenv("GOPRIVATE"),
+		goNoProxy:       os.Getenv("GONOPROXY"),
+		goProxyIsPublic: proxyURL == defaultGoProxyURL,
 	}
 }
 
@@ -136,7 +144,22 @@ func NewGoBumpApplier(analyzer *Analyzer) *GoBumpApplier {
 // applier's captured GOPRIVATE/GONOPROXY - the skip func the best-effort
 // go-version fallback probe uses to avoid leaking private module
 // names/versions to a public proxy.
+//
+// When the probe queries the user's own configured proxy, Go's own
+// GONOPROXY-precedence rule applies (a non-empty GONOPROXY governs
+// exclusively; GOPRIVATE is only consulted as its default) - that precedence
+// exists to let a private proxy see modules that are GOPRIVATE-only but not
+// GONOPROXY-listed. But when goProxyIsPublic is true there is no private
+// proxy in play: the probe is talking to the public proxy.golang.org
+// regardless, so applying the same precedence would leak a module that
+// matches GOPRIVATE but not a (possibly unrelated, non-empty) GONOPROXY.
+// Skip on the UNION of GOPRIVATE and GONOPROXY instead, expressed by
+// consulting goproxy.IsPrivate once per pattern list with the other left
+// empty.
 func (g *GoBumpApplier) skipPrivateModule(modulePath string) bool {
+	if g.goProxyIsPublic {
+		return goproxy.IsPrivate(modulePath, g.goPrivate, "") || goproxy.IsPrivate(modulePath, "", g.goNoProxy)
+	}
 	return goproxy.IsPrivate(modulePath, g.goPrivate, g.goNoProxy)
 }
 

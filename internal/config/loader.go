@@ -231,6 +231,11 @@ func (l *Loader) RemovePipelineWithField(yamlContent []byte, pipelineIndex int, 
 		return yamlContent, nil
 	}
 
+	// Only *ast.MappingNode is handled here - a single-entry with-block
+	// (bare *ast.MappingValueNode, see mappingValues above) silently no-ops
+	// instead of removing the field. This is a known pre-existing gap;
+	// mappingValues exists to normalise both shapes if this ever needs
+	// closing.
 	mapping, ok := node.(*ast.MappingNode)
 	if !ok {
 		return yamlContent, nil

@@ -199,7 +199,9 @@ func validateGoVersionFloor(ctx context.Context, index *gorelease.Index, minor s
 // newFloorValidator returns a validateGoVersionFloor closure that memoizes
 // results per minor - used by reconcileGoPackagePins' per-pin loop, where the
 // same modroot floor commonly recurs across several pins and would otherwise
-// repeat the same index lookup (and, on failure, the same warning).
+// repeat the same index lookup. Warnings are still emitted per pin at the
+// call site by design (each names its own pin), so memoization only avoids
+// redundant lookups, not redundant warnings.
 func newFloorValidator(ctx context.Context, index *gorelease.Index) func(minor string) (valid bool, offlineErr error) {
 	type result struct {
 		valid      bool
