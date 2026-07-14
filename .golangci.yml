@@ -1,0 +1,7 @@
+version: "2"
+
+# Linters: intentionally unset — keeps golangci-lint's standard default set.
+
+formatters:
+  enable:
+    - gofmt # `make fmt` parity; `make lint` now fails on gofmt-dirty code
