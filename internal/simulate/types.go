@@ -111,6 +111,12 @@ type Residual struct {
 	FixedVersion    string   `json:"fixed_version,omitempty" yaml:"fixed_version,omitempty"` // empty: no released fix
 	VulnIDs         []string `json:"vuln_ids,omitempty" yaml:"vuln_ids,omitempty"`
 	Reason          string   `json:"reason" yaml:"reason"`
+
+	// Introduced marks an advisory absent from the baseline analysis scan -
+	// it applies only to a version the bump itself moved to, not to the
+	// original graph. Accounting must not subtract introduced residuals from
+	// the baseline "found" count.
+	Introduced bool `json:"introduced,omitempty" yaml:"introduced,omitempty"`
 }
 
 // ModrootResult is the outcome of simulating one module root.
@@ -197,6 +203,12 @@ type ModrootRequest struct {
 	// advisories all live in unlinked packages are dropped before the
 	// first apply. Absent/empty entries fail open.
 	VulnImports map[string][]string
+	// BaselineVulnIDs are the advisory IDs the analysis scan found in the
+	// pristine graph. Residual advisories with no ID in this set were
+	// INTRODUCED by the bump (they apply only to a bumped-to version) and
+	// are reported and counted separately. Nil disables introduced-vuln
+	// classification (fail open).
+	BaselineVulnIDs map[string]struct{}
 }
 
 // Options tunes the simulation.

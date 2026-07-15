@@ -123,11 +123,12 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 		reqs := make([]simulate.ModrootRequest, 0, len(lang.ByModroot))
 		for _, m := range lang.ByModroot {
 			reqs = append(reqs, simulate.ModrootRequest{
-				Modroot:     m.Modroot,
-				Seeds:       seedCandidates(m),
-				Baseline:    goEco.EffectiveVersions(m.Deps),
-				Packages:    m.BuildPackages,
-				VulnImports: vulnImportPaths(m.ScanResult),
+				Modroot:         m.Modroot,
+				Seeds:           seedCandidates(m),
+				Baseline:        goEco.EffectiveVersions(m.Deps),
+				Packages:        m.BuildPackages,
+				VulnImports:     vulnImportPaths(m.ScanResult),
+				BaselineVulnIDs: baselineVulnIDs(m.ScanResult),
 			})
 		}
 
@@ -638,6 +639,21 @@ func vulnImportPaths(scanResult *scan.ScanResult) map[string][]string {
 		return nil
 	}
 	return paths
+}
+
+// baselineVulnIDs collects the advisory IDs the analysis scan found in the
+// pristine graph - the simulation's baseline for classifying residual
+// advisories as pre-existing vs introduced by the bump itself. Nil (fail
+// open, classification disabled) when there is no scan result.
+func baselineVulnIDs(scanResult *scan.ScanResult) map[string]struct{} {
+	if scanResult == nil || len(scanResult.Vulnerabilities) == 0 {
+		return nil
+	}
+	ids := make(map[string]struct{}, len(scanResult.Vulnerabilities))
+	for _, vuln := range scanResult.Vulnerabilities {
+		ids[vuln.ID] = struct{}{}
+	}
+	return ids
 }
 
 // trimMajorSuffix strips a trailing /vN major-version path element

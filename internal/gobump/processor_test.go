@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/isometry/choam/internal/processor"
+	"github.com/isometry/choam/internal/simulate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -491,6 +492,28 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 			assert.Equal(t, tt.wantError, result.Error)
 		})
 	}
+}
+
+// Validated-path advisory accounting: residual IDs are deduplicated across
+// entries, and residuals the bump itself INTRODUCED (advisories absent from
+// the baseline scan) must not subtract from the baseline found count.
+func TestGoBumpProcessor_ToResult_IntroducedResidualAccounting(t *testing.T) {
+	proc := NewGoBumpProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
+	proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{VulnerabilitiesFound: 4}
+	proc.Validated = true
+	proc.AddResiduals([]simulate.Residual{
+		{Module: "example.com/old", VulnIDs: []string{"GO-1", "GO-2"}, Reason: "no released fix"},
+		{Module: "example.com/dup", VulnIDs: []string{"GO-2"}, Reason: "no released fix"},
+		{Module: "example.com/new", VulnIDs: []string{"GO-9"}, Introduced: true,
+			Reason: "introduced by bump to v2.0.0; not present at baseline; no released fix"},
+	})
+
+	result := proc.ToResult()
+
+	assert.Equal(t, 4, result.VulnerabilitiesFound)
+	assert.Equal(t, 3, result.VulnerabilitiesResidual, "deduplicated across residual entries")
+	assert.Equal(t, 2, result.VulnerabilitiesFixed,
+		"found(4) - baseline residual IDs(2); introduced GO-9 must not subtract")
 }
 
 func TestGoBumpProcessor_Integration(t *testing.T) {

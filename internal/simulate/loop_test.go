@@ -30,6 +30,14 @@ type fakeToolchain struct {
 	pruned   map[string]bool                                               // modules `go mod tidy` removes from the graph
 	capped   map[string]string                                             // module -> max version the tidied go.mod sustains
 
+	// getEffects models a get's transitive require changes, keyed by the
+	// exact "module@version" argument: each listed module's applied version
+	// is set alongside the got module itself - raised, or dragged back DOWN
+	// (a real `go get` of a lower version downgrades modules that require a
+	// higher one). Downgrades below base are not representable: baseGraph
+	// overlays applied over base only when higher.
+	getEffects map[string]map[string]string
+
 	pristineReplaces map[string]ReplaceTarget // upstream go.mod replace directives
 
 	// linked models `go list -deps` reachability: nil means "every module
@@ -187,6 +195,9 @@ func (f *fakeToolchain) Get(_ context.Context, _ string, moduleAtVersion string)
 	}
 	f.lastCall = "get"
 	f.applied[module] = version
+	for effectModule, effectVersion := range f.getEffects[moduleAtVersion] {
+		f.applied[effectModule] = effectVersion
+	}
 	f.getLog = append(f.getLog, moduleAtVersion)
 	return nil
 }
@@ -1415,4 +1426,309 @@ func TestRunLoop_PackageGateFailsOpen(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, []string{"golang.org/x/sys@v0.44.0"}, result.FinalDeps, "unknown package graph must not filter")
+}
+
+// TestRunLoop_SkipGuardPreventsDowngrade models the crossplane-2.0
+// sigstore-go/timestamp-authority cascade: getting sigstore-go@v1.2.0
+// transitively raises timestamp-authority past its own candidate version, so
+// the timestamp-authority get - which a real go toolchain would execute as a
+// DOWNGRADE dragging sigstore-go back to a vulnerable version - must be
+// skipped (gobump parity) and the superseded entry dropped from FinalDeps
+// entirely, with both advisory sets counted as fixed.
+func TestRunLoop_SkipGuardPreventsDowngrade(t *testing.T) {
+	const (
+		sigstoreGo = "github.com/sigstore/sigstore-go"
+		tsa        = "github.com/sigstore/timestamp-authority/v2"
+	)
+	tc := &fakeToolchain{
+		base: map[string]string{sigstoreGo: "v1.1.4", tsa: "v2.0.6"},
+		getEffects: map[string]map[string]string{
+			sigstoreGo + "@v1.2.0": {tsa: "v2.1.2"},
+			tsa + "@v2.1.0":        {sigstoreGo: "v1.1.4"}, // the downgrade, were it ever executed
+		},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: sigstoreGo, id: "GO-SIG-1", fixed: "v1.2.0"},
+		{module: tsa, id: "GO-TSA-1", fixed: "v2.1.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: sigstoreGo, Version: "v1.2.0", FromCVE: true, VulnIDs: []string{"GO-SIG-1"}},
+			{Module: tsa, Version: "v2.1.0", FromCVE: true, VulnIDs: []string{"GO-TSA-1"}},
+		},
+		Baseline: map[string]string{sigstoreGo: "v1.1.4", tsa: "v2.0.6"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.NotContains(t, tc.getLog, tsa+"@v2.1.0", "the downgrade get must be skipped")
+	assert.Equal(t, []string{sigstoreGo + "@v1.2.0"}, result.FinalDeps, "superseded entry must not be written")
+	assert.Equal(t, []string{sigstoreGo}, result.CVEBackedModules)
+	assert.Equal(t, "v2.1.2", result.Resolved[tsa], "transitively carried above its own candidate")
+	assert.Empty(t, result.Residuals, "both advisories are fixed by the surviving entry")
+	assert.Empty(t, result.RemainingVulnIDs)
+	var reasons []string
+	for _, d := range result.Dropped {
+		if d.Module == tsa {
+			reasons = append(reasons, d.Reason)
+		}
+	}
+	require.Len(t, reasons, 1)
+	assert.Contains(t, reasons[0], "superseded")
+	assert.Contains(t, reasons[0], "v2.1.2")
+}
+
+// TestRunLoop_SkipGuardEqualVersionStillGets: the guard is strict-exceed
+// (gobump parity) - a require raised to exactly the candidate version still
+// gets, and an exactly-satisfied entry is not a supersession suspect.
+func TestRunLoop_SkipGuardEqualVersionStillGets(t *testing.T) {
+	tc := &fakeToolchain{
+		base: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"},
+		getEffects: map[string]map[string]string{
+			"example.com/a@v2.0.0": {"example.com/b": "v2.0.0"},
+		},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/a", id: "GO-A-1", fixed: "v2.0.0"},
+		{module: "example.com/b", id: "GO-B-1", fixed: "v2.0.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/a", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-A-1"}},
+			{Module: "example.com/b", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-B-1"}},
+		},
+		Baseline: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Contains(t, tc.getLog, "example.com/b@v2.0.0", "equal require must still get")
+	assert.ElementsMatch(t, []string{"example.com/a@v2.0.0", "example.com/b@v2.0.0"}, result.FinalDeps)
+	assert.Equal(t, 1, sc.scans, "no suspects - no supersession trial")
+}
+
+// TestRunLoop_SkipGuardLatestNeverSkipped: an @latest fallback bypasses the
+// guard entirely - "latest" is not comparable to a require version.
+func TestRunLoop_SkipGuardLatestNeverSkipped(t *testing.T) {
+	tc := &fakeToolchain{
+		base:     map[string]string{"example.com/mod": "v2.5.0"},
+		latest:   map[string]string{"example.com/mod": "v3.1.0"},
+		failGets: map[string]error{"example.com/mod@v3.0.0": errors.New("unknown revision")},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/mod", id: "GO-M-1", fixed: "v3.0.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/mod", Version: "v3.0.0", FromCVE: true, VulnIDs: []string{"GO-M-1"}},
+		},
+		Baseline: map[string]string{"example.com/mod": "v2.5.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Contains(t, tc.getLog, "example.com/mod@latest")
+	assert.Equal(t, []string{"example.com/mod@v3.1.0"}, result.FinalDeps)
+	assert.Empty(t, result.Residuals)
+}
+
+// TestRunLoop_SupersessionTrialRejectedKeepsEntry: a suspect whose explicit
+// get had load-bearing side effects (its closure fixed a third, non-candidate
+// module) is kept - the trial without it re-exposes that module's advisory as
+// a raise, rejecting the reduced set.
+func TestRunLoop_SupersessionTrialRejectedKeepsEntry(t *testing.T) {
+	tc := &fakeToolchain{
+		base: map[string]string{
+			"example.com/a": "v1.0.0",
+			"example.com/b": "v1.0.0",
+			"example.com/d": "v1.0.0",
+		},
+		getEffects: map[string]map[string]string{
+			"example.com/b@v1.4.0": {"example.com/d": "v2.0.0"},
+			"example.com/a@v2.0.0": {"example.com/b": "v1.5.0"},
+		},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/a", id: "GO-A-1", fixed: "v2.0.0"},
+		{module: "example.com/b", id: "GO-B-1", fixed: "v1.4.0"},
+		{module: "example.com/d", id: "GO-D-1", fixed: "v2.0.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		// b first: its get executes (and fixes d) before a's closure raises b
+		// past its own candidate version, making b a supersession suspect.
+		Seeds: []Candidate{
+			{Module: "example.com/b", Version: "v1.4.0", FromCVE: true, VulnIDs: []string{"GO-B-1"}},
+			{Module: "example.com/a", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-A-1"}},
+		},
+		Baseline: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.ElementsMatch(t, []string{"example.com/a@v2.0.0", "example.com/b@v1.4.0"}, result.FinalDeps,
+		"the suspect is load-bearing and must be kept")
+	for _, d := range result.Dropped {
+		assert.NotContains(t, d.Reason, "superseded")
+	}
+	assert.Empty(t, result.Residuals)
+	assert.Equal(t, "v2.0.0", result.Resolved["example.com/d"])
+}
+
+// TestRunLoop_AbandonedFixResidualNotSilentlyVanished: a CVE candidate
+// dropped on the residual-free "pruned: not required" path, whose module is
+// nonetheless still in the resolved graph at a vulnerable version, must
+// surface as a residual - never vanish (and never count as fixed).
+func TestRunLoop_AbandonedFixResidualNotSilentlyVanished(t *testing.T) {
+	tc := &fakeToolchain{
+		base:   map[string]string{"example.com/ghost": "v1.0.0"},
+		pruned: map[string]bool{"example.com/ghost": true},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/ghost", id: "GO-G-1", fixed: "v1.5.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/ghost", Version: "v1.5.0", FromCVE: true, VulnIDs: []string{"GO-G-1"}},
+		},
+		Baseline: map[string]string{"example.com/ghost": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Empty(t, result.FinalDeps)
+	require.Len(t, result.Residuals, 1)
+	residual := result.Residuals[0]
+	assert.Equal(t, "example.com/ghost", residual.Module)
+	assert.Equal(t, "v1.0.0", residual.ResolvedVersion)
+	assert.Equal(t, []string{"GO-G-1"}, residual.VulnIDs)
+	assert.Contains(t, residual.Reason, "fix abandoned")
+	assert.Contains(t, residual.Reason, "pruned by go mod tidy")
+	assert.Contains(t, residual.Reason, "advisory persists at v1.0.0")
+	assert.Contains(t, result.RemainingVulnIDs, "GO-G-1")
+}
+
+// TestRunLoop_PrunedPromotedReplaceBackfillsResidual: same invariant through
+// checkReplaceCandidate's residual-free "replaced module no longer required"
+// path - the promoted replace's module still resolves vulnerable.
+func TestRunLoop_PrunedPromotedReplaceBackfillsResidual(t *testing.T) {
+	tc := &fakeToolchain{
+		base:   map[string]string{"example.com/phantom": "v1.0.0"},
+		pruned: map[string]bool{"example.com/phantom": true},
+		failGets: map[string]error{
+			"example.com/phantom@v1.5.0": errors.New("unknown revision"),
+			"example.com/phantom@latest": errors.New("proxy unavailable"),
+		},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/phantom", id: "GO-P-1", fixed: "v1.5.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/phantom", Version: "v1.5.0", FromCVE: true, VulnIDs: []string{"GO-P-1"}},
+		},
+		Baseline: map[string]string{"example.com/phantom": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Empty(t, result.FinalDeps)
+	assert.Empty(t, result.FinalReplaces)
+	require.Len(t, result.Residuals, 1)
+	residual := result.Residuals[0]
+	assert.Contains(t, residual.Reason, "fix abandoned")
+	assert.Contains(t, residual.Reason, "replaced module no longer required")
+	assert.Contains(t, result.RemainingVulnIDs, "GO-P-1")
+}
+
+// TestRunLoop_IntroducedFixableAdvisoryRaisedAndFixed: an advisory that
+// applies only to the bumped-to version and HAS a fix is raised and applied
+// by the fixpoint loop - nothing residual, nothing to classify.
+func TestRunLoop_IntroducedFixableAdvisoryRaisedAndFixed(t *testing.T) {
+	tc := &fakeToolchain{base: map[string]string{"example.com/step": "v1.0.0"}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/step", id: "GO-S-1", fixed: "v1.5.0"},
+		{module: "example.com/step", id: "GO-S-2", introduced: "v1.4.0", fixed: "v1.8.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/step", Version: "v1.5.0", FromCVE: true, VulnIDs: []string{"GO-S-1"}},
+		},
+		Baseline:        map[string]string{"example.com/step": "v1.0.0"},
+		BaselineVulnIDs: map[string]struct{}{"GO-S-1": {}},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Equal(t, 2, result.Iterations)
+	assert.Equal(t, []string{"example.com/step@v1.8.0"}, result.FinalDeps)
+	assert.Empty(t, result.Residuals)
+}
+
+// TestRunLoop_IntroducedUnfixableAdvisoryClassified: an advisory that applies
+// only to the bumped-to version with NO released fix is accepted (the fix
+// forward is still right) but classified and reported as introduced.
+func TestRunLoop_IntroducedUnfixableAdvisoryClassified(t *testing.T) {
+	tc := &fakeToolchain{base: map[string]string{"example.com/fwd": "v1.0.0"}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/fwd", id: "GO-OLD-1", fixed: "v2.0.0"},
+		{module: "example.com/fwd", id: "GO-NEW-1", introduced: "v2.0.0"}, // no released fix
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/fwd", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-OLD-1"}},
+		},
+		Baseline:        map[string]string{"example.com/fwd": "v1.0.0"},
+		BaselineVulnIDs: map[string]struct{}{"GO-OLD-1": {}},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Equal(t, []string{"example.com/fwd@v2.0.0"}, result.FinalDeps, "the forward fix still applies")
+	require.Len(t, result.Residuals, 1)
+	residual := result.Residuals[0]
+	assert.True(t, residual.Introduced)
+	assert.Equal(t, []string{"GO-NEW-1"}, residual.VulnIDs)
+	assert.Contains(t, residual.Reason, "introduced by bump to v2.0.0")
+	assert.Contains(t, residual.Reason, "not present at baseline")
+	assert.Contains(t, residual.Reason, "no released fix")
+}
+
+// TestRunLoop_NilBaselineSkipsClassification: without BaselineVulnIDs the
+// classification is disabled entirely (fail open) - existing callers see
+// unchanged residuals.
+func TestRunLoop_NilBaselineSkipsClassification(t *testing.T) {
+	tc := &fakeToolchain{base: map[string]string{"example.com/fwd": "v1.0.0"}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/fwd", id: "GO-OLD-1", fixed: "v2.0.0"},
+		{module: "example.com/fwd", id: "GO-NEW-1", introduced: "v2.0.0"}, // no released fix
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/fwd", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-OLD-1"}},
+		},
+		Baseline: map[string]string{"example.com/fwd": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	require.Len(t, result.Residuals, 1)
+	assert.False(t, result.Residuals[0].Introduced)
+	assert.Equal(t, "no released fix", result.Residuals[0].Reason)
 }

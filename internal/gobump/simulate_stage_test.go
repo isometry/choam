@@ -51,6 +51,9 @@ func newSimulationProcessor() *GoBumpProcessor {
 						ExistingDeps:  []string{"example.com/old@v1.0.0"},
 						DesiredDeps:   []string{"example.com/old@v1.2.0", "example.com/pin@v0.9.0"},
 						ScanResult: &scan.ScanResult{
+							Vulnerabilities: []scan.Vulnerability{
+								{ID: "GO-OLD-1", Module: "example.com/old", Ecosystem: "Go", CurrentVersion: "v1.0.0", FixedVersion: "v1.2.0"},
+							},
 							SecurityBumps: []scan.SecurityBump{
 								{Name: "example.com/old", Ecosystem: "Go", CurrentVersion: "v1.0.0", FixedVersion: "v1.2.0", VulnIDs: []string{"GO-OLD-1"}},
 							},
@@ -110,6 +113,8 @@ func TestSimulationStage_RewritesDesiredDeps(t *testing.T) {
 	// Seeds must carry CVE provenance from the scan result.
 	require.Len(t, fake.gotReqs, 1)
 	assert.Equal(t, []string{"./cmd/app"}, fake.gotReqs[0].Packages, "build packages must thread into the simulation request")
+	assert.Equal(t, map[string]struct{}{"GO-OLD-1": {}}, fake.gotReqs[0].BaselineVulnIDs,
+		"baseline advisory IDs must thread into the simulation request")
 	seeds := fake.gotReqs[0].Seeds
 	require.Len(t, seeds, 2)
 	assert.Equal(t, simulate.Candidate{Module: "example.com/old", Version: "v1.2.0", FromCVE: true, VulnIDs: []string{"GO-OLD-1"}}, seeds[0])

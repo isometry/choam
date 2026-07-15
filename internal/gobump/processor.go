@@ -128,10 +128,13 @@ func (p *GoBumpProcessor) HasActualChanges() bool {
 // ToResult converts the processor state to a GoBumpResult.
 //
 // Advisory accounting: VulnerabilitiesFound counts unique advisories across
-// the package. When the bump was validated by simulation, the residual
-// advisory count is exact (the final resolved graph was rescanned) and
-// unreachable advisories (unlinked modules, informational only) are known,
-// so VulnerabilitiesFixed = found - residual - unreachable. Without
+// the package (the baseline analysis scan). When the bump was validated by
+// simulation, the residual advisory count is exact (the final resolved graph
+// was rescanned) and unreachable advisories (unlinked modules, informational
+// only) are known, so VulnerabilitiesFixed = found - baseline residuals -
+// unreachable. Residuals the bump itself INTRODUCED (advisories absent from
+// the baseline scan - see simulate.Residual.Introduced) still count as
+// residual but must not subtract from found: they were never in it. Without
 // validation there is no proof of what the bump actually fixes, so Fixed
 // falls back to the historical approximation (modules changed), which is
 // also always reported separately as ModulesBumped.
@@ -147,13 +150,16 @@ func (p *GoBumpProcessor) ToResult() *GoBumpResult {
 	}
 
 	residualIDs := make(map[string]struct{})
-	vulnerabilitiesResidual := 0
+	baselineResidualIDs := make(map[string]struct{})
 	for _, r := range p.Residuals {
-		vulnerabilitiesResidual += len(r.VulnIDs)
 		for _, id := range r.VulnIDs {
 			residualIDs[id] = struct{}{}
+			if !r.Introduced {
+				baselineResidualIDs[id] = struct{}{}
+			}
 		}
 	}
+	vulnerabilitiesResidual := len(residualIDs)
 
 	// Defensive: an ID that ended up residual anywhere is accounted there,
 	// never double-counted as unreachable.
@@ -167,7 +173,7 @@ func (p *GoBumpProcessor) ToResult() *GoBumpResult {
 
 	vulnerabilitiesFixed := modulesBumped
 	if p.Validated {
-		vulnerabilitiesFixed = max(vulnerabilitiesFound-vulnerabilitiesResidual-vulnerabilitiesUnreachable, 0)
+		vulnerabilitiesFixed = max(vulnerabilitiesFound-len(baselineResidualIDs)-vulnerabilitiesUnreachable, 0)
 	}
 
 	var errorStr string
