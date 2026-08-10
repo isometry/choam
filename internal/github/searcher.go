@@ -7,7 +7,7 @@ import (
 	"net/http"
 
 	"github.com/chainguard-dev/omnibump/pkg/remote"
-	"github.com/google/go-github/v75/github"
+	"github.com/google/go-github/v81/github"
 )
 
 // Searcher satisfies omnibump's remote.GitHubSearcher interface.

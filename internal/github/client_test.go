@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/google/go-github/v75/github"
+	"github.com/google/go-github/v81/github"
 )
 
 func TestParseRepository(t *testing.T) {

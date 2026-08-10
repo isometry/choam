@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/google/go-github/v75/github"
+	"github.com/google/go-github/v81/github"
 	"github.com/isometry/choam/internal/types"
 	"golang.org/x/oauth2"
 )
