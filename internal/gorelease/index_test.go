@@ -492,7 +492,7 @@ func TestErrorPaths(t *testing.T) {
 		fs.listStatus = http.StatusInternalServerError
 		ix, _ := newTestIndex(t, fs)
 
-		for i := 0; i < 5; i++ {
+		for range 5 {
 			if _, err := ix.LatestAvailable(context.Background(), ""); err == nil {
 				t.Fatal("expected persistent error after list failure")
 			}
@@ -544,7 +544,7 @@ func TestErrorPaths(t *testing.T) {
 		fs.listStatus = http.StatusInternalServerError
 		ix, _ := newTestIndex(t, fs)
 
-		for i := 0; i < maxLoadAttempts+2; i++ {
+		for i := range maxLoadAttempts + 2 {
 			if _, err := ix.LatestAvailable(context.Background(), ""); err == nil {
 				t.Fatalf("call %d: expected persistent error", i)
 			}
@@ -566,7 +566,7 @@ func TestErrorPaths(t *testing.T) {
 		// Cancelled-context calls must fail but must not count toward
 		// maxLoadAttempts, since the failure isn't attributable to the
 		// remote service.
-		for i := 0; i < maxLoadAttempts+2; i++ {
+		for i := range maxLoadAttempts + 2 {
 			if _, err := ix.LatestAvailable(cancelledCtx, ""); err == nil {
 				t.Fatalf("call %d: expected error from cancelled context", i)
 			}

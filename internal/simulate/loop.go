@@ -1455,7 +1455,7 @@ func ambiguousImportModules(errText string) []string {
 	seen := make(map[string]struct{})
 
 	lines := strings.Split(errText, "\n")
-	for i := 0; i < len(lines); i++ {
+	for i := range lines {
 		if !strings.Contains(lines[i], "ambiguous import: found package") {
 			continue
 		}

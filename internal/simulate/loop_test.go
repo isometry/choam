@@ -195,9 +195,7 @@ func (f *fakeToolchain) Get(_ context.Context, _ string, moduleAtVersion string)
 	}
 	f.lastCall = "get"
 	f.applied[module] = version
-	for effectModule, effectVersion := range f.getEffects[moduleAtVersion] {
-		f.applied[effectModule] = effectVersion
-	}
+	maps.Copy(f.applied, f.getEffects[moduleAtVersion])
 	f.getLog = append(f.getLog, moduleAtVersion)
 	return nil
 }

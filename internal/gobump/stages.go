@@ -348,7 +348,7 @@ func epochFixedVulnIDs(gp *GoBumpProcessor) []string {
 			}
 		} else {
 			for _, fix := range gp.SecurityFixes {
-				for _, id := range strings.Split(fix.Vulnerability, ",") {
+				for id := range strings.SplitSeq(fix.Vulnerability, ",") {
 					id = strings.TrimSpace(id)
 					if id == "" || strings.ContainsRune(id, ' ') {
 						continue // free-text placeholder, not an advisory ID
@@ -479,9 +479,7 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoB
 		analysis.ByLanguage = append(analysis.ByLanguage, result.Analysis)
 		analysis.BumpActions = append(analysis.BumpActions, result.Actions...)
 		rawBumpsSeen = append(rawBumpsSeen, result.RawBumps...)
-		for id, vuln := range result.Vulns {
-			uniqueVulns[id] = vuln
-		}
+		maps.Copy(uniqueVulns, result.Vulns)
 
 		gp.AddMessage(fmt.Sprintf("%s analysis complete: %d modroot(s), %d action(s) needed", language, len(modroots), len(result.Actions)))
 	}

@@ -197,7 +197,7 @@ func modrootsFromAnnotations(cfg *melange.Configuration) map[string][]string {
 		}
 
 		var roots []string
-		for _, root := range strings.Split(value, ",") {
+		for root := range strings.SplitSeq(value, ",") {
 			root = strings.TrimSpace(root)
 			if root != "" {
 				roots = append(roots, root)

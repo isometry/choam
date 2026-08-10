@@ -291,7 +291,7 @@ func (s *SimulationStage) declareCoUpdates(ctx context.Context, gp *GoBumpProces
 	defer cancel()
 
 	const maxRounds = 3
-	for round := 0; round < maxRounds; round++ {
+	for range maxRounds {
 		// Build-time omnibump's update list spans deps AND replaces, so the
 		// parity check must too ("old=new@version" contributes new@version).
 		packagesToUpdate := make(map[string]string, len(m.DesiredDeps)+len(m.DesiredReplaces))

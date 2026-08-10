@@ -307,7 +307,7 @@ func (l *Loader) UpsertPipelineWithBlockScalar(yamlContent []byte, pipelineIndex
 
 	// Field absent - splice it in after the with block's last line.
 	inserted := []string{field + ": |-"}
-	for _, line := range strings.Split(value, "\n") {
+	for line := range strings.SplitSeq(value, "\n") {
 		inserted = append(inserted, "  "+line)
 	}
 	return l.spliceIntoPipelineWith(yamlContent, pipelineIndex, inserted)
