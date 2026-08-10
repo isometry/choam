@@ -519,9 +519,14 @@ type languageResult struct {
 // manifest files, scanning for vulnerabilities, and determining the desired
 // dependency set for that root by filtering candidate bumps (its existing
 // declared deps plus any new security bumps) against its own manifest. This
-// per-root filtering is essential: omnibump's single-module update path adds
-// any listed dependency that isn't already present in a modroot's manifest,
-// so a bump must never be declared for a root that doesn't actually depend on it.
+// per-root filtering applies to deps entries only: omnibump go-gets an
+// absent dep, and the final tidy prunes it back out (warn-skipped), so a
+// deps entry must never be declared for a root that doesn't actually depend
+// on it. Replaces entries are exempt - since omnibump v0.23.1 (AUTO-954) the
+// workspace path re-adds a replace pin for a module absent from a
+// sub-module's go.mod (the single-module path always applied replaces
+// unconditionally), because a replace directive, unlike a bare require,
+// survives go mod tidy. That's why replaces pass through unfiltered here.
 func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosystem.Ecosystem, language, repoURL, tag string, langUnits []analysisUnit, bumpSteps []config.BumpStep, gp *GoBumpProcessor) (*languageResult, error) {
 	fetcher := v.Analyzer.fetcher
 	scanner := v.Analyzer.vulnerabilityScanner

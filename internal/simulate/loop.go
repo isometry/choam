@@ -1352,8 +1352,10 @@ func (l *loop) finalOutputs(resolved map[string]string) ([]string, []string, []s
 
 		if _, required := l.requirements[c.Module]; !required {
 			// The final go mod tidy pruned this module from go.mod - and
-			// melange's gobump errors on any deps entry absent from the
-			// tidied go.mod, so writing it would break the build.
+			// melange's gobump go-gets an absent deps entry, then warns and
+			// skips it once the final tidy prunes it back out (with Tidy on;
+			// off, it hard-errors with ErrPackageNotFound instead). Writing
+			// it is at best a churn-prone no-op, so drop it here too.
 			l.drop(c, "pruned by go mod tidy: not required by the tidied go.mod")
 			if c.FromCVE && c.Version != latestQuery &&
 				resolved[c.Module] != "" && semver.Compare(resolved[c.Module], c.Version) < 0 {

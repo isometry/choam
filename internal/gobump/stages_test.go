@@ -1,6 +1,10 @@
 package gobump
 
 import (
+	"bytes"
+	"fmt"
+	"io"
+	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -369,6 +373,68 @@ func TestExistingDepsForModroots(t *testing.T) {
 	assert.ElementsMatch(t, []string{
 		"github.com/foo/bar@v1.1.1", "golang.org/x/net@v0.55.0", "github.com/foo/baz@v2.2.2",
 	}, got["."])
+}
+
+// fakeRawGitHubTransport serves goMod for any raw.githubusercontent.com
+// request whose path ends in "/go.mod", and empty content for anything else
+// (go.sum) - so performAnalysis's manifest fetch never touches the real
+// network. Any request to a different host fails outright, so a fallback to
+// the GitHub Contents API (see internal/github/searcher.go) is a hard test
+// failure rather than a silent real network call.
+type fakeRawGitHubTransport struct {
+	goMod []byte
+}
+
+func (f fakeRawGitHubTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Host != "raw.githubusercontent.com" {
+		return nil, fmt.Errorf("unexpected request to %s in test", req.URL)
+	}
+	body := []byte{}
+	if strings.HasSuffix(req.URL.Path, "/go.mod") {
+		body = f.goMod
+	}
+	return &http.Response{
+		StatusCode: http.StatusOK,
+		Body:       io.NopCloser(bytes.NewReader(body)),
+		Header:     make(http.Header),
+	}, nil
+}
+
+// TestPerformAnalysis_ReplacesPassThroughDepsFiltered locks the deps-vs-
+// replaces asymmetry at the analysis seam: a deps entry for a module absent
+// from the fetched go.mod is dropped by Ecosystem.FilterBumps, while a
+// replaces entry for that same absent module flows into DesiredReplaces
+// untouched (performAnalysis never filters replaces - see
+// ModrootAnalysis.DesiredReplaces). This is exactly the asymmetry omnibump
+// v0.23.1 (AUTO-954) requires: a bare require would be pruned back out by go
+// mod tidy, but a replace directive survives it.
+func TestPerformAnalysis_ReplacesPassThroughDepsFiltered(t *testing.T) {
+	goModContent := []byte("module example.com/thing\n\ngo 1.21\n")
+	httpClient := &http.Client{Transport: fakeRawGitHubTransport{goMod: goModContent}}
+
+	v := &VulnerabilityChecker{Analyzer: NewAnalyzer(httpClient)}
+	eco := ecogolang.New()
+	gp := newTestProcessor(t, singleGoBumpYAML)
+
+	bumpSteps := []config.BumpStep{
+		{
+			Action:   "go/bump",
+			Language: "go",
+			Modroots: []string{"."},
+			Deps:     []string{"example.com/absent@v1.0.0"},
+			Replaces: []string{"example.com/absent=example.com/absent@v1.0.0"},
+		},
+	}
+	langUnits := []analysisUnit{{Modroot: "."}}
+
+	result, err := v.performAnalysis(t.Context(), eco, "go", "https://github.com/testorg/testrepo", "v0.0.0", langUnits, bumpSteps, gp)
+	require.NoError(t, err)
+	require.Len(t, result.Analysis.ByModroot, 1)
+
+	m := result.Analysis.ByModroot[0]
+	assert.Empty(t, m.DesiredDeps, "deps entry for a module absent from go.mod must be filtered out")
+	assert.Equal(t, []string{"example.com/absent=example.com/absent@v1.0.0"}, m.DesiredReplaces,
+		"replaces entry for the same absent module must pass through untouched")
 }
 
 func TestNewlyAddedDeps(t *testing.T) {

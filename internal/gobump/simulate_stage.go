@@ -275,8 +275,9 @@ const coUpdateBudget = 2 * time.Minute
 // another simulation round. Best-effort throughout: any failure leaves the
 // deps list unchanged. Appended entries are absent from
 // SecurityBumpModules, so accounting never credits them as security fixes.
-// The build image may run a different omnibump version than CHOAM links,
-// so silence is parity-by-same-function, not a guarantee.
+// The build image may run a different omnibump version than the omnibump
+// v0.23.1 CHOAM links (the parity target), so silence is parity-by-
+// same-function, not a guarantee.
 func (s *SimulationStage) declareCoUpdates(ctx context.Context, gp *GoBumpProcessor, m *ModrootAnalysis, result *simulate.ModrootResult) {
 	if len(result.FinalDeps) == 0 || len(result.Requires) == 0 {
 		return

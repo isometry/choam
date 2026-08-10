@@ -959,6 +959,47 @@ func TestRunLoop_SeedReplacePreservedAndRaised(t *testing.T) {
 	assert.Empty(t, result.Residuals)
 }
 
+// TestRunLoop_SeedReplaceForModuleAbsentFromGoModSurvives: a replace pin for
+// a module in NO require line (purely transitive - never a direct or
+// indirect require, only reachable through the module graph) must still
+// survive checkReplaceCandidate and land in FinalReplaces. Unlike a deps
+// entry, a replace directive is never checked against Requirements for a
+// seed (only a PROMOTED replace is - see TestRunLoop_PrunedPromotedReplace-
+// BackfillsResidual for that contrast case); it only has to survive tidy.
+// This mirrors omnibump v0.23.1's AUTO-954: absentReplacePins re-adds
+// replace-type deps missing from a sub-module's go.mod because the
+// directive (unlike a bare require) survives go mod tidy.
+func TestRunLoop_SeedReplaceForModuleAbsentFromGoModSurvives(t *testing.T) {
+	tc := &fakeToolchain{
+		base: map[string]string{"example.com/app": "v1.0.0"},
+		// Reachability runs BEFORE the first apply (dropUnreachable checks
+		// the pre-replace graph), so a module with no other footprint needs
+		// an explicit linked entry or it would be shed as unlinked before
+		// the replace ever gets a chance to add it - a different mechanism
+		// than the one this test targets.
+		linked: []string{"example.com/app", "example.com/transitive"},
+	}
+	sc := &fakeScanner{}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/transitive", Version: "v2.0.0", Replace: true, ReplaceOld: "example.com/transitive"},
+		},
+		Baseline: map[string]string{"example.com/transitive": "v2.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Empty(t, result.FinalDeps)
+	assert.Equal(t, []string{"example.com/transitive=example.com/transitive@v2.0.0"}, result.FinalReplaces)
+	assert.Empty(t, result.Dropped, `absent-from-go.mod must not be treated as "pruned" or "not sustained"`)
+	assert.Empty(t, result.Residuals)
+	for _, get := range tc.getLog {
+		assert.NotContains(t, get, "example.com/transitive", "replace-pinned module must never be fetched via go get")
+	}
+}
+
 func TestRunLoop_DepsSeedSupersededByReplaceSeed(t *testing.T) {
 	// One channel per module: a deps seed for a module already claimed by a
 	// replace seed is superseded (gobump's replace overrides the deps entry
