@@ -15,7 +15,7 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 **Ecosystem Context:**
 - **Melange**: APK package builder that CHOAM manages
 - **Wolfi**: Container-optimized Linux distribution using CHOAM
-- **OSV Scanner**: Vulnerability database integration
+- **OSV database (api.osv.dev)**: Vulnerability data source, queried via the official osv.dev Go bindings
 - **omnibump**: Multi-ecosystem (Go/Rust/Java) dependency-bump tooling backing the `bump` command
 
 ## Architecture
