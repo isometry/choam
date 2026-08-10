@@ -11,6 +11,7 @@ import (
 
 	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/scan"
+	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
 )
 
@@ -83,6 +84,15 @@ type loop struct {
 	linked         map[string]struct{}
 	linkedPackages map[string]struct{}
 	linkedWarned   bool
+
+	// Degraded module-level reachability (see degradedUnlinked): tidiedModern
+	// tracks whether the current on-disk go.mod's go directive is >= 1.17 -
+	// the threshold at which the require block covers the main module's
+	// whole import closure. linkedStdWarned/degradedNoted are warn/info-once
+	// guards, mirroring linkedWarned.
+	tidiedModern    bool
+	linkedStdWarned bool
+	degradedNoted   bool
 }
 
 // raise is a rescan finding that requires moving a module further forward.
@@ -162,6 +172,16 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 			if err != nil {
 				return nil, err
 			}
+			// The tidied go.mod's go directive cannot change between tidies
+			// run with the same `-go=` flag (see GoToolchain.ModTidy), so
+			// this needs no recompute in adoptTrial - the trial's tidy uses
+			// the same flag as the main loop's.
+			l.tidiedModern = l.tidiedGoModern()
+			if l.tidiedModern && l.linked == nil && !l.degradedNoted {
+				l.degradedNoted = true
+				slog.Info("artifact reachability degraded: using tidied go.mod require membership as module-level reachability",
+					"modroot", l.req.Modroot)
+			}
 			l.replaces, err = l.tc.Replaces(ctx, l.dir)
 			if err != nil {
 				return nil, err
@@ -175,7 +195,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 			}
 		}
 
-		scanResult, err := l.sc.ScanPackages(ctx, l.scanTargets(resolved))
+		scanResult, err := l.sc.ScanPackages(ctx, l.scanTargets(resolved, l.requirements, l.replaces))
 		if err != nil {
 			return nil, err
 		}
@@ -247,6 +267,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	result.Linked = l.linked
 	result.LinkedPackages = l.linkedPackages
 	result.Requires = l.requirements
+	result.UnrequiredModules = l.unrequiredModules(resolved)
 	result.FinalDeps, result.FinalReplaces, result.CVEBackedModules = l.finalOutputs(resolved)
 	result.Dropped = l.dropped
 	result.Residuals = append(append([]Residual{}, l.persistentResiduals...), l.scanResiduals...)
@@ -778,8 +799,11 @@ func (l *loop) maxDepGoVersion(ctx context.Context) string {
 func (l *loop) linkedStdPackages(ctx context.Context) map[string]struct{} {
 	std, err := l.tc.LinkedStd(ctx, l.dir, l.buildPatterns)
 	if err != nil {
-		slog.Warn("linked stdlib package lookup unavailable",
-			"modroot", l.req.Modroot, "packages", strings.Join(l.buildPatterns, " "), "error", err)
+		if !l.linkedStdWarned {
+			slog.Warn("linked stdlib package lookup unavailable",
+				"modroot", l.req.Modroot, "packages", strings.Join(l.buildPatterns, " "), "error", err)
+			l.linkedStdWarned = true
+		}
 		return nil
 	}
 	return std
@@ -795,18 +819,86 @@ func (l *loop) isLinked(module string) bool {
 	return ok
 }
 
+// tidiedGoModern reports whether the current on-disk go.mod's go directive is
+// >= 1.17 - the module graph pruning threshold at which `go mod tidy` records
+// every module providing a package in the main module's import closure
+// (tests included) in the require block. Mirrors GoToolchain.Requirements'
+// read/parse. Any read or parse error fails open (false, disabling the
+// degraded signal) - a pre-tidy or malformed go.mod must never be trusted as
+// the tidied contract.
+func (l *loop) tidiedGoModern() bool {
+	path := filepath.Join(l.dir, "go.mod")
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	modFile, err := modfile.ParseLax(path, content, nil)
+	if err != nil {
+		return false
+	}
+	return modFile.Go != nil && goversion.Compare(modFile.Go.Version, "1.17") >= 0
+}
+
+// degradedUnlinked reports whether module is PROVABLY absent from build
+// artifacts under the degraded module-level signal: precise reachability is
+// unknown (l.linked == nil), the tidied go.mod's go directive is >= 1.17
+// (its require block covers every module providing a package in the main
+// module's import closure, tests included), and the module has no require
+// entry under any replace identity. linked => imported => required, so this
+// can never shed a real fix. Module-granular only - no package-level detail.
+func (l *loop) degradedUnlinked(module string, requirements map[string]string, replaces map[string]ReplaceTarget) bool {
+	if l.linked != nil || !l.tidiedModern || len(requirements) == 0 {
+		return false
+	}
+	if _, ok := requirements[module]; ok {
+		return false
+	}
+	// Replace-resolved identities: resolved/scan coordinates are the
+	// replacement path, the require block names the replaced path. Any
+	// replace involvement fails open (conservative).
+	if _, ok := replaces[module]; ok {
+		return false
+	}
+	for old, target := range replaces {
+		if target.Path == module {
+			if _, ok := requirements[old]; ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// unrequiredModules computes the degraded module-level reachability signal
+// (see degradedUnlinked) for the given resolved graph: nil unless precise
+// reachability is unavailable AND the tidied go.mod qualifies, else the set
+// of resolved modules degradedUnlinked proves absent from build artifacts.
+func (l *loop) unrequiredModules(resolved map[string]string) map[string]struct{} {
+	if l.linked != nil || !l.tidiedModern {
+		return nil
+	}
+	unrequired := make(map[string]struct{})
+	for module := range resolved {
+		if l.degradedUnlinked(module, l.requirements, l.replaces) {
+			unrequired[module] = struct{}{}
+		}
+	}
+	return unrequired
+}
+
 // scanTargets renders the resolved graph as OSV queries, restricted to
 // modules linked into a build artifact - findings in unlinked modules can't
 // affect anything that ships, and pre-filtering here (rather than
 // partitioning findings afterwards) keeps scanFindings two-way and cuts both
-// querybatch volume and per-finding detail fetches on every iteration.
-func (l *loop) scanTargets(resolved map[string]string) []scan.Package {
-	if l.linked == nil {
-		return packagesFor(resolved)
-	}
+// querybatch volume and per-finding detail fetches on every iteration. When
+// precise reachability is unavailable, the degraded module-level signal
+// (degradedUnlinked) still excludes modules PROVABLY absent from the require
+// block - requirements/replaces are passed explicitly so a trial scan
+// (trialApply) filters against the trial's own state, not the loop's.
+func (l *loop) scanTargets(resolved map[string]string, requirements map[string]string, replaces map[string]ReplaceTarget) []scan.Package {
 	filtered := make(map[string]string, len(resolved))
 	for module, version := range resolved {
-		if l.isLinked(module) {
+		if l.isLinked(module) && !l.degradedUnlinked(module, requirements, replaces) {
 			filtered[module] = version
 		}
 	}
@@ -992,6 +1084,15 @@ func (l *loop) processScan(scanResult *scan.ScanResult, resolved map[string]stri
 		if existing, ok := l.byModule[r.module]; ok && existing.dropped {
 			if existing.FromCVE {
 				if !existing.residualized {
+					if l.degradedUnlinked(r.module, l.requirements, l.replaces) {
+						// Mirror dropUnreachable's deliberately residual-free
+						// policy: the module cannot be linked, so the
+						// advisory affects nothing that ships (the
+						// orchestrator reports it separately, as info).
+						slog.Info("advisory persists only in a module not required by the tidied go.mod - cannot be linked; not residual",
+							"modroot", l.req.Modroot, "module", r.module, "vulns", strings.Join(r.vulnIDs, ","))
+						continue
+					}
 					// The drop assumed no code shipped, but the advisory is
 					// still present in the resolved graph (e.g. another
 					// candidate dragged the module back down). Surface it
@@ -1177,7 +1278,7 @@ func (l *loop) trialApply(ctx context.Context, keep []*candState) (*trialResult,
 	}
 	l.refreshLinked(ctx)
 
-	scanResult, err := l.sc.ScanPackages(ctx, l.scanTargets(tr.resolved))
+	scanResult, err := l.sc.ScanPackages(ctx, l.scanTargets(tr.resolved, tr.requirements, tr.replaces))
 	if err != nil {
 		return nil, err
 	}

@@ -158,6 +158,17 @@ type ModrootResult struct {
 	// version is proven; anything above is not.
 	Requires map[string]string `json:"-" yaml:"-"`
 
+	// UnrequiredModules is the degraded module-level reachability signal,
+	// populated ONLY when Linked is nil (the go list -deps walk failed open)
+	// and the tidied go.mod's go directive is >= 1.17: modules present in
+	// Resolved but absent from the tidied require block under any replace
+	// identity. Such modules provide no package in the main module's import
+	// closure and cannot be linked into any artifact. nil when unavailable or
+	// when Linked is authoritative. Module-granular: unlike Linked, membership
+	// of the COMPLEMENT does not imply linked (test-only deps are required but
+	// never ship).
+	UnrequiredModules map[string]struct{} `json:"-" yaml:"-"`
+
 	// MaxDepGoVersion is the highest go directive across the final resolved
 	// build list's non-main modules (bare form, e.g. "1.25"); empty when
 	// unavailable. The scratch main module's own directive is deliberately

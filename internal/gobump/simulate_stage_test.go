@@ -874,3 +874,180 @@ func TestSimulationStage_LinkedStdPackages_NilWhenModrootStdWalkFailedOpen(t *te
 
 	assert.Nil(t, gp.LinkedStdPackages, "one modroot's failed-open stdlib walk must invalidate the whole union")
 }
+
+// TestSimulationStage_DegradedUnreachableReportedAndPruned: mirrors
+// TestSimulationStage_UnreachableReportedAndPruned, but precise reachability
+// was unavailable (Linked nil) and the degraded module-level signal
+// (UnrequiredModules) classified the advisory's module as unlinked instead.
+// The wording and accounting must reflect the degraded (module-level-only)
+// signal, and the existing precise-wording test must remain untouched.
+func TestSimulationStage_DegradedUnreachableReportedAndPruned(t *testing.T) {
+	fake := &fakeBumpSimulator{
+		results: map[string]*simulate.ModrootResult{
+			".": {
+				Modroot:   ".",
+				FinalDeps: nil, // the unrequired seed did not survive
+				Converged: true, Iterations: 1,
+				Dropped: []simulate.DroppedCandidate{
+					{Module: "example.com/old", Version: "v1.2.0", Reason: "pruned by go mod tidy: not required by the tidied go.mod"},
+				},
+				Linked:            nil,
+				UnrequiredModules: map[string]struct{}{"example.com/old": {}},
+			},
+		},
+	}
+	stage := newStageWithFake(fake)
+	gp := newSimulationProcessor()
+
+	require.NoError(t, stage.Apply(t.Context(), gp))
+
+	modroot := gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0]
+	assert.Empty(t, modroot.DesiredDeps, "unrequired-and-unlinkable dep must be pruned")
+	assert.Empty(t, gp.Residuals)
+	assert.Equal(t, []string{"GO-OLD-1"}, gp.UnreachableVulnIDs)
+
+	var found bool
+	for _, msg := range gp.GetMessages() {
+		if strings.Contains(msg, "not required by the tidied go.mod - cannot be linked") &&
+			strings.Contains(msg, "example.com/old") {
+			found = true
+		}
+	}
+	assert.True(t, found, "expected a degraded info message, got %v", gp.GetMessages())
+
+	// Accounting: found=2, residual=0, unreachable=1 -> fixed=1 - identical
+	// shape to the precise-mode test, just via the degraded signal.
+	result := gp.ToResult()
+	assert.Equal(t, 1, result.VulnerabilitiesUnreachable)
+	assert.Equal(t, 0, result.VulnerabilitiesResidual)
+	assert.Equal(t, 1, result.VulnerabilitiesFixed)
+	assert.Equal(t, []string{"GO-OLD-1"}, result.UnreachableVulnIDs)
+}
+
+// TestSimulationStage_DegradedUnrequiredMajorSuffixAlias: degradedUnlinkedSet
+// pre-bakes a /vN-trimmed OSV-naming alias into the unrequired set ONLY when
+// it's unambiguous (absent from both Resolved and Requires). An ambiguous
+// alias (a distinct real module of that trimmed name exists) must fail open
+// - the advisory stays reachable rather than being misclassified.
+func TestSimulationStage_DegradedUnrequiredMajorSuffixAlias(t *testing.T) {
+	newAliasProcessor := func() *GoBumpProcessor {
+		gp := NewGoBumpProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
+		gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{
+			RepoURL: "https://github.com/example/repo", Tag: "v1.0.0",
+			ByLanguage: []LanguageAnalysis{{
+				Language: "go",
+				ByModroot: []ModrootAnalysis{{
+					Modroot: ".",
+					ScanResult: &scan.ScanResult{SecurityBumps: []scan.SecurityBump{
+						// OSV naming: no /v4 major-suffix, unlike the go.mod
+						// coordinate the simulation reports.
+						{Name: "example.com/mod", Ecosystem: "Go", CurrentVersion: "v4.0.0", FixedVersion: "v4.1.0", VulnIDs: []string{"GO-ALIAS-1"}},
+					}},
+				}},
+			}},
+			VulnerabilitiesFound: 1,
+			BumpActions:          []BumpAction{{Action: "needs_bump", Language: "go", Modroots: []string{"."}}},
+		}
+		return gp
+	}
+
+	t.Run("unambiguous alias classified unlinked", func(t *testing.T) {
+		fake := &fakeBumpSimulator{
+			results: map[string]*simulate.ModrootResult{
+				".": {
+					Modroot: ".", Converged: true, Iterations: 1,
+					Linked:            nil,
+					UnrequiredModules: map[string]struct{}{"example.com/mod/v4": {}},
+					Resolved:          map[string]string{"example.com/mod/v4": "v4.0.0"},
+					Requires:          map[string]string{"example.com/mod/v4": "v4.0.0"},
+				},
+			},
+		}
+		stage := newStageWithFake(fake)
+		gp := newAliasProcessor()
+
+		require.NoError(t, stage.Apply(t.Context(), gp))
+
+		assert.Equal(t, []string{"GO-ALIAS-1"}, gp.UnreachableVulnIDs)
+	})
+
+	t.Run("ambiguous alias fails open", func(t *testing.T) {
+		fake := &fakeBumpSimulator{
+			results: map[string]*simulate.ModrootResult{
+				".": {
+					Modroot: ".", Converged: true, Iterations: 1,
+					Linked:            nil,
+					UnrequiredModules: map[string]struct{}{"example.com/mod/v4": {}},
+					Resolved: map[string]string{
+						"example.com/mod/v4": "v4.0.0",
+						"example.com/mod":    "v1.2.0", // distinct real module - collides with the trimmed alias
+					},
+				},
+			},
+		}
+		stage := newStageWithFake(fake)
+		gp := newAliasProcessor()
+
+		require.NoError(t, stage.Apply(t.Context(), gp))
+
+		assert.Empty(t, gp.UnreachableVulnIDs, "an ambiguous alias must fail open, not be classified unlinked")
+	})
+}
+
+// TestSimulationStage_DegradedUnreachableCrossModrootReachable: mirrors
+// TestSimulationStage_UnreachableCrossModrootDedup, but the unlinked modroot
+// uses the degraded module-level signal (UnrequiredModules) rather than a
+// precise Linked set - an ID unlinked-by-degraded-signal in one modroot but
+// linked (and fixed) in another must still count as reachable.
+func TestSimulationStage_DegradedUnreachableCrossModrootReachable(t *testing.T) {
+	scanResult := &scan.ScanResult{
+		SecurityBumps: []scan.SecurityBump{
+			{Name: "example.com/old", Ecosystem: "Go", CurrentVersion: "v1.0.0", FixedVersion: "v1.2.0", VulnIDs: []string{"GO-OLD-1"}},
+		},
+	}
+	coords := map[string]scan.SecurityBump{
+		"example.com/old": scanResult.SecurityBumps[0],
+	}
+
+	gp := NewGoBumpProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
+	gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{
+		RepoURL: "https://github.com/example/repo", Tag: "v1.0.0",
+		ByLanguage: []LanguageAnalysis{{
+			Language: "go",
+			ByModroot: []ModrootAnalysis{
+				{Modroot: "cmd/a", ExistingDeps: nil, DesiredDeps: []string{"example.com/old@v1.2.0"},
+					ScanResult: scanResult, SecurityBumpsByCoord: coords},
+				{Modroot: "cmd/b", ExistingDeps: nil, DesiredDeps: []string{"example.com/old@v1.2.0"},
+					ScanResult: scanResult, SecurityBumpsByCoord: coords},
+			},
+		}},
+		VulnerabilitiesFound: 1,
+		BumpActions:          []BumpAction{{Action: "needs_bump", Language: "go", Modroots: []string{"cmd/a", "cmd/b"}}},
+	}
+
+	fake := &fakeBumpSimulator{
+		results: map[string]*simulate.ModrootResult{
+			// Degraded-unlinked (via UnrequiredModules, not precise Linked) in cmd/a...
+			"cmd/a": {
+				Modroot: "cmd/a", Converged: true, Iterations: 1,
+				Linked:            nil,
+				UnrequiredModules: map[string]struct{}{"example.com/old": {}},
+			},
+			// ...but linked (precise) and fixed in cmd/b.
+			"cmd/b": {
+				Modroot: "cmd/b", Converged: true, Iterations: 1,
+				FinalDeps:        []string{"example.com/old@v1.2.0"},
+				CVEBackedModules: []string{"example.com/old"},
+				Linked:           map[string]struct{}{"example.com/old": {}},
+			},
+		},
+	}
+	stage := newStageWithFake(fake)
+
+	require.NoError(t, stage.Apply(t.Context(), gp))
+
+	assert.Empty(t, gp.UnreachableVulnIDs, "an ID linked in any modroot counts as reachable")
+	result := gp.ToResult()
+	assert.Equal(t, 0, result.VulnerabilitiesUnreachable)
+	assert.Equal(t, 1, result.VulnerabilitiesFixed)
+}

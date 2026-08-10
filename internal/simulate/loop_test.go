@@ -3,10 +3,12 @@ package simulate
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/isometry/choam/internal/scan"
@@ -29,6 +31,20 @@ type fakeToolchain struct {
 	tidyErr  func(applied map[string]string) error                         // invoked on attempt-closing tidy only
 	pruned   map[string]bool                                               // modules `go mod tidy` removes from the graph
 	capped   map[string]string                                             // module -> max version the tidied go.mod sustains
+
+	// pruneUnless models a module whose require-block membership tracks
+	// whether a SPECIFIC other candidate's `go get` actually ran in the
+	// CURRENT attempt (unlike the static `pruned` above, which prunes the
+	// same way every attempt, main-loop or trial): Requirements() excludes
+	// the key module unless the value (trigger) module is present in
+	// f.applied. Lets a test express "Y only becomes required because X's
+	// closure pulls it in" - keyed off f.applied (reset every attempt, so
+	// a trialApply that excludes X sees Y drop back out) while Y stays
+	// resolvable via `base` regardless, exercising trialApply/scanTargets'
+	// requirements-vs-resolved distinction - the exact thing the static
+	// `pruned` set can't do, since it can't differ between a trial and the
+	// main loop.
+	pruneUnless map[string]string // module -> trigger module
 
 	// getEffects models a get's transitive require changes, keyed by the
 	// exact "module@version" argument: each listed module's applied version
@@ -244,6 +260,11 @@ func (f *fakeToolchain) Requirements(_ context.Context, _ string) (map[string]st
 	for module := range f.pruned {
 		delete(requirements, module)
 	}
+	for module, trigger := range f.pruneUnless {
+		if _, ok := f.applied[trigger]; !ok {
+			delete(requirements, module)
+		}
+	}
 	for module, capVersion := range f.capped {
 		if version, ok := requirements[module]; ok && semver.Compare(version, capVersion) > 0 {
 			requirements[module] = capVersion
@@ -308,10 +329,48 @@ func (f *fakeScanner) ScanPackages(_ context.Context, pkgs []scan.Package) (*sca
 
 func newTestModuleDir(t *testing.T) string {
 	t.Helper()
+	return newTestModuleDirWithGo(t, "1.21")
+}
+
+// newTestModuleDirWithGo mirrors newTestModuleDir with a caller-chosen go
+// directive, for exercising tidiedGoModern's >= 1.17 threshold. The fake
+// ModTidy never rewrites the fixture go.mod (unlike the real toolchain,
+// which tidies with -go=<host>), so the on-disk directive stays purely
+// fixture-controlled for the lifetime of the test.
+func newTestModuleDirWithGo(t *testing.T, goDirective string) string {
+	t.Helper()
 	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/test\n\ngo 1.21\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/test\n\ngo "+goDirective+"\n"), 0o644))
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.sum"), []byte(""), 0o644))
 	return dir
+}
+
+// countingHandler is a minimal slog.Handler that counts records by message,
+// for warn/info-once guard assertions.
+type countingHandler struct {
+	mu     sync.Mutex
+	counts map[string]int
+}
+
+func (h *countingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *countingHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.counts == nil {
+		h.counts = make(map[string]int)
+	}
+	h.counts[r.Message]++
+	return nil
+}
+
+func (h *countingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *countingHandler) WithGroup(string) slog.Handler      { return h }
+
+func (h *countingHandler) count(msg string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.counts[msg]
 }
 
 func TestRunLoop_RaisesToFixpoint(t *testing.T) {
@@ -1770,4 +1829,337 @@ func TestRunLoop_NilBaselineSkipsClassification(t *testing.T) {
 	require.Len(t, result.Residuals, 1)
 	assert.False(t, result.Residuals[0].Introduced)
 	assert.Equal(t, "no released fix", result.Residuals[0].Reason)
+}
+
+// TestRunLoop_DegradedReachability_UnrequiredModuleNotResidual: the flux
+// mirror. Precise reachability is unavailable (linkedErr), but the tidied
+// go.mod's go directive qualifies (>= 1.17, the default fixture), so the
+// degraded module-level signal takes over: graphonly is pruned by tidy
+// (never required) and must be reported as UNLINKED (via UnrequiredModules
+// and an empty Residuals set), never as a residual. The redundant coherence
+// seed on linkedmod forces confirmMinimalSet to run a trial - proving the
+// MANDATORY trialApply/scanTargets filtering (Step 2): without it, the
+// unfiltered trial rescan would see graphonly's advisory as newly introduced
+// (a major-version residual) and reject the trial.
+func TestRunLoop_DegradedReachability_UnrequiredModuleNotResidual(t *testing.T) {
+	tc := &fakeToolchain{
+		base: map[string]string{
+			"example.com/linkedmod": "v1.0.0",
+			"example.com/graphonly": "v1.0.0",
+		},
+		pruned:    map[string]bool{"example.com/graphonly": true},
+		linkedErr: errors.New("go list -deps: build constraints exclude all Go files"),
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/graphonly", id: "GO-GRAPH-1", fixed: "v2.0.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/graphonly", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-GRAPH-1"}},
+			{Module: "example.com/linkedmod", Version: "v1.1.0"}, // coherence-only
+		},
+		Baseline: map[string]string{
+			"example.com/linkedmod": "v1.0.0",
+			"example.com/graphonly": "v1.0.0",
+		},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Nil(t, result.Linked, "precise reachability unavailable")
+	assert.Empty(t, result.FinalDeps, "graphonly must not survive: pruned and unlinkable")
+	assert.Empty(t, result.Residuals, "an unrequired-and-unlinkable module is neither fixed nor residual")
+
+	var graphonlyDropped bool
+	for _, d := range result.Dropped {
+		if d.Module == "example.com/graphonly" {
+			graphonlyDropped = true
+			assert.Contains(t, d.Reason, "pruned by go mod tidy: not required by the tidied go.mod")
+		}
+	}
+	assert.True(t, graphonlyDropped, "graphonly must be recorded as dropped")
+
+	require.NotNil(t, result.UnrequiredModules)
+	assert.Equal(t, map[string]struct{}{"example.com/graphonly": {}}, result.UnrequiredModules)
+}
+
+// TestRunLoop_DegradedReachability_NoFixNotResidual: mirrors the "no
+// released fix" case - without the degraded filter, graphonly would surface
+// a "no released fix" residual purely because it's still in the resolved
+// build list; the degraded signal must exclude it from the rescan entirely
+// (it's provably never linked) so no residual is ever synthesized.
+func TestRunLoop_DegradedReachability_NoFixNotResidual(t *testing.T) {
+	tc := &fakeToolchain{
+		base: map[string]string{
+			"example.com/other":     "v1.0.0",
+			"example.com/graphonly": "v1.0.0",
+		},
+		pruned:    map[string]bool{"example.com/graphonly": true},
+		linkedErr: errors.New("go list -deps: build constraints exclude all Go files"),
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/graphonly", id: "GO-GRAPH-2"}, // no released fix
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Empty(t, result.Residuals, "graphonly's advisory must never be scanned in degraded mode")
+	require.NotNil(t, result.UnrequiredModules)
+	assert.Contains(t, result.UnrequiredModules, "example.com/graphonly")
+}
+
+// TestRunLoop_DegradedReachability_OldGoDirectiveDisablesSignal: the go
+// directive guard. A pre-1.17 tidied go.mod cannot be trusted to cover the
+// full import closure in its require block, so the degraded signal must stay
+// off entirely and behavior reverts to the OLD (pre-degraded-signal)
+// outcome: the abandoned fix surfaces as a residual, exactly like
+// TestRunLoop_AbandonedFixResidualNotSilentlyVanished.
+func TestRunLoop_DegradedReachability_OldGoDirectiveDisablesSignal(t *testing.T) {
+	tc := &fakeToolchain{
+		base:      map[string]string{"example.com/ghost": "v1.0.0"},
+		pruned:    map[string]bool{"example.com/ghost": true},
+		linkedErr: errors.New("go list -deps: build constraints exclude all Go files"),
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/ghost", id: "GO-G-1", fixed: "v1.5.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDirWithGo(t, "1.16"), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/ghost", Version: "v1.5.0", FromCVE: true, VulnIDs: []string{"GO-G-1"}},
+		},
+		Baseline: map[string]string{"example.com/ghost": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Empty(t, result.FinalDeps)
+	require.Len(t, result.Residuals, 1)
+	residual := result.Residuals[0]
+	assert.Equal(t, "example.com/ghost", residual.Module)
+	assert.Equal(t, "v1.0.0", residual.ResolvedVersion)
+	assert.Contains(t, residual.Reason, "fix abandoned")
+	assert.Contains(t, residual.Reason, "pruned by go mod tidy: not required by the tidied go.mod")
+	assert.Contains(t, residual.Reason, "advisory persists at v1.0.0")
+	assert.Nil(t, result.UnrequiredModules, "a pre-1.17 tidied go.mod must disable the degraded signal")
+}
+
+// TestRunLoop_DegradedReachability_ReplaceResolvedNotUnrequired: the
+// replace-resolved edge case. The require block names the OLD (replaced)
+// path; the resolved graph and the advisory both name the NEW (replacement)
+// path. degradedUnlinked must fail open through the replace identity - the
+// module is genuinely required (under its old name) and must neither land
+// in UnrequiredModules nor get an info-classification; the fix proceeds
+// normally via the replace channel.
+func TestRunLoop_DegradedReachability_ReplaceResolvedNotUnrequired(t *testing.T) {
+	tc := &fakeToolchain{
+		base: map[string]string{"example.com/old": "v1.0.0"},
+		pristineReplaces: map[string]ReplaceTarget{
+			"example.com/old": {Path: "example.com/new", Version: "v1.0.0"},
+		},
+		linkedErr: errors.New("go list -deps: build constraints exclude all Go files"),
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/new", id: "GO-NEW-1", fixed: "v2.0.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/new", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-NEW-1"}},
+		},
+		Baseline: map[string]string{"example.com/new": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Equal(t, []string{"example.com/old=example.com/new@v2.0.0"}, result.FinalReplaces,
+		"the fix must proceed via the replace channel")
+	assert.Empty(t, result.Residuals)
+
+	require.NotNil(t, result.UnrequiredModules)
+	assert.NotContains(t, result.UnrequiredModules, "example.com/new",
+		"the replace's old path is required, so the new path must not be classified unrequired")
+}
+
+// TestRunLoop_DegradedReachability_PrecisePathUnaffected: regression guard -
+// with precise reachability available (linked non-nil), UnrequiredModules
+// must stay nil and existing pruned-module residual behavior is byte-for-
+// byte identical to TestRunLoop_AbandonedFixResidualNotSilentlyVanished.
+func TestRunLoop_DegradedReachability_PrecisePathUnaffected(t *testing.T) {
+	tc := &fakeToolchain{
+		base:   map[string]string{"example.com/ghost": "v1.0.0"},
+		pruned: map[string]bool{"example.com/ghost": true},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/ghost", id: "GO-G-1", fixed: "v1.5.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/ghost", Version: "v1.5.0", FromCVE: true, VulnIDs: []string{"GO-G-1"}},
+		},
+		Baseline: map[string]string{"example.com/ghost": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	require.NotNil(t, result.Linked, "this fixture's default fake behavior reports precise reachability")
+	assert.Nil(t, result.UnrequiredModules, "precise reachability must disable the degraded signal")
+	require.Len(t, result.Residuals, 1)
+	assert.Contains(t, result.Residuals[0].Reason, "fix abandoned")
+}
+
+// TestRunLoop_DegradedReachability_LinkedStdWarnOnce: the linked-stdlib
+// lookup can fire twice per RunLoop call (once post-fixpoint, once more from
+// adoptTrial when a refinement phase adopts a trial) - the warning must log
+// only once. Mirrors TestRunLoop_ConfirmMinimalSetRecomputesCapabilitiesOnAdoption's
+// fixture (a redundant coherence pin forces confirmMinimalSet to adopt a
+// trial) with a failing LinkedStd instead of a fake capability function.
+func TestRunLoop_DegradedReachability_LinkedStdWarnOnce(t *testing.T) {
+	tc := &fakeToolchain{
+		base: map[string]string{
+			"example.com/pin":  "v1.0.0",
+			"example.com/vuln": "v1.9.0",
+		},
+		linkedStdErr: errors.New("go list -deps: boom"),
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/vuln", id: "GO-VULN-1", fixed: "v2.0.0"},
+	}}
+
+	handler := &countingHandler{}
+	prev := slog.Default()
+	slog.SetDefault(slog.New(handler))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/pin", Version: "v1.5.0"},
+			{Module: "example.com/vuln", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-VULN-1"}},
+		},
+		Baseline: map[string]string{
+			"example.com/pin":  "v1.0.0",
+			"example.com/vuln": "v1.9.0",
+		},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	require.Len(t, result.Dropped, 1, "pin must be dropped as redundant for adoptTrial to fire")
+	assert.Equal(t, 1, handler.count("linked stdlib package lookup unavailable"),
+		"the warning must be logged exactly once despite two lookup attempts")
+}
+
+// TestRunLoop_DegradedReachability_TrialUsesTrialRequirements: the
+// trialApply/scanTargets wiring is load-bearing (Step 2's "MANDATORY" call
+// site) - proven here by a fixture where the trial's requirements genuinely
+// differ from the main loop's, unlike every other degraded fixture (which
+// uses the fake's STATIC `pruned` set, identical in the main loop and every
+// trial). `pruneUnless` ties graphonly's presence in Requirements() to
+// whether pin's `go get` ran THIS attempt:
+//
+//   - Main loop: pin is applied (coherence seed, redundant), and its
+//     getEffects simultaneously raise graphonly to the fixed version -
+//     graphonly is required (pin's closure pulls it in) but not vulnerable
+//     there, so it scans clean and never becomes a residual.
+//   - confirmMinimalSet's trial drops pin (not essential: no CVE, no
+//     remedy, not a replace seed). Without pin's get, graphonly reverts to
+//     its base (vulnerable) version AND drops out of tr.requirements -
+//     degradedUnlinked correctly excludes it from the trial's rescan, the
+//     trial sees no new advisories, and pin is confirmed redundant.
+//
+// Mutating trialApply's scanTargets call to pass l.requirements/l.replaces
+// (the main loop's STALE, pin-applied requirements) instead of
+// tr.requirements/tr.replaces makes degradedUnlinked wrongly see graphonly
+// as required in the trial too - it gets scanned at its reverted vulnerable
+// version, "fix requires major version import path change" surfaces as a
+// brand-new residual (absent from the main loop's clean scan), and the
+// trial is wrongly rejected: pin survives. Verified by hand-applying that
+// exact mutation (see task-r1-report.md, Fix round 1) - it flips this
+// test's assertions and passes with the wiring restored.
+func TestRunLoop_DegradedReachability_TrialUsesTrialRequirements(t *testing.T) {
+	tc := &fakeToolchain{
+		base: map[string]string{
+			"example.com/pin":       "v1.0.0",
+			"example.com/graphonly": "v1.0.0",
+		},
+		pruneUnless: map[string]string{"example.com/graphonly": "example.com/pin"},
+		getEffects: map[string]map[string]string{
+			"example.com/pin@v1.1.0": {"example.com/graphonly": "v2.0.0"},
+		},
+		linkedErr: errors.New("go list -deps: build constraints exclude all Go files"),
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/graphonly", id: "GO-GRAPH-3", fixed: "v2.0.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/pin", Version: "v1.1.0"}, // coherence-only, redundant
+		},
+		Baseline: map[string]string{
+			"example.com/pin":       "v1.0.0",
+			"example.com/graphonly": "v1.0.0",
+		},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Nil(t, result.Linked, "precise reachability unavailable")
+
+	require.Len(t, result.Dropped, 1, "the trial-filtered rescan must confirm pin redundant")
+	assert.Equal(t, "example.com/pin", result.Dropped[0].Module)
+	assert.Contains(t, result.Dropped[0].Reason, "redundant")
+
+	assert.Empty(t, result.FinalDeps, "pin must not survive: confirmed redundant")
+	assert.Empty(t, result.Residuals,
+		"graphonly's advisory must never surface: clean in the main loop, correctly filtered from the trial")
+	assert.Contains(t, result.UnrequiredModules, "example.com/graphonly",
+		"the adopted (trial) graph must reclassify graphonly as unrequired")
+}
+
+// TestRunLoop_DegradedReachability_SelfReplaceKeyFailsOpen: degradedUnlinked's
+// first replace check (`replaces[module]` - a direct KEY hit) covers a
+// self-replace (`replace m => m vX`, OldPath == Module): the module appears
+// as a replace key AND is absent from the require block (a user-authored
+// self-pin the tidied go.mod never lists in require - distinct from
+// ReplaceResolvedNotUnrequired's old-path-required branch, which covers an
+// old != new replace instead). Must fail open (never classified unrequired).
+func TestRunLoop_DegradedReachability_SelfReplaceKeyFailsOpen(t *testing.T) {
+	tc := &fakeToolchain{
+		base: map[string]string{
+			"example.com/other":   "v1.0.0",
+			"example.com/selfpin": "v1.0.0",
+		},
+		pruned:    map[string]bool{"example.com/selfpin": true},
+		linkedErr: errors.New("go list -deps: build constraints exclude all Go files"),
+	}
+	sc := &fakeScanner{}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/selfpin", Version: "v1.0.0", Replace: true, ReplaceOld: "example.com/selfpin"},
+		},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Equal(t, []string{"example.com/selfpin=example.com/selfpin@v1.0.0"}, result.FinalReplaces,
+		"the self-replace must survive: checkReplaceCandidate never demands it be required")
+
+	require.NotNil(t, result.UnrequiredModules)
+	assert.NotContains(t, result.UnrequiredModules, "example.com/selfpin",
+		"a module present as a replace KEY must fail open, not be classified unrequired")
 }

@@ -152,7 +152,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			if result == nil {
 				// Skipped/unsimulated modroot: everything it found counts as
 				// reachable (fail open).
-				reach.observe(*m, nil, nil, false)
+				reach.observe(*m, nil, nil, false, nil)
 				stdComplete = false
 				continue
 			}
@@ -164,7 +164,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			m.Residuals = result.Residuals
 			m.Dropped = result.Dropped
 			gp.AddResiduals(result.Residuals)
-			unlinkedHere := reach.observe(*m, result.Linked, result.LinkedPackages, true)
+			unlinkedHere := reach.observe(*m, result.Linked, result.LinkedPackages, true, degradedUnlinkedSet(result))
 
 			// Union the linked stdlib slice into a local set for the stdlib
 			// staleness stage (Go only - this loop already is), so it can
@@ -230,14 +230,26 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 		unreachableIDs, unreachableModules := reach.finalize()
 		gp.AddUnreachableVulnIDs(unreachableIDs)
 		for _, module := range unreachableModules {
-			detail := ""
-			if module.moduleLinked {
-				detail = " (module is linked; the vulnerable packages are not)"
+			var msg string
+			switch {
+			case module.moduleLinked:
+				// Precise, package-only: the module IS in the artifact, the
+				// vulnerable packages are not.
+				msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - no bump proposed",
+					module.name, strings.Join(module.vulnIDs, ", "))
+			case module.degraded:
+				// Degraded module-level signal: precise reachability was
+				// unavailable, but the tidied go.mod's require block proves
+				// the module unlinkable.
+				msg = fmt.Sprintf("info: %s (%s) vulnerable but not required by the tidied go.mod - cannot be linked into build artifacts - no bump proposed (module-level signal; package import graph unavailable)",
+					module.name, strings.Join(module.vulnIDs, ", "))
+			default:
+				msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts - no bump proposed",
+					module.name, strings.Join(module.vulnIDs, ", "))
 			}
-			gp.AddMessage(fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts%s - no bump proposed",
-				module.name, strings.Join(module.vulnIDs, ", "), detail))
+			gp.AddMessage(msg)
 			slog.Info("advisory in unlinked code - no bump proposed",
-				"module", module.name, "module_linked", module.moduleLinked, "vulns", strings.Join(module.vulnIDs, ","))
+				"module", module.name, "module_linked", module.moduleLinked, "degraded", module.degraded, "vulns", strings.Join(module.vulnIDs, ","))
 		}
 
 		rebuildLanguageActions(analysis, lang)
@@ -458,6 +470,33 @@ func rebuildLanguageActions(analysis *VulnerabilityAnalysis, lang *LanguageAnaly
 	analysis.BumpActions = kept
 }
 
+// degradedUnlinkedSet copies result.UnrequiredModules (the degraded
+// module-level reachability signal - see simulate.ModrootResult) and adds,
+// for each /vN major-suffixed entry, the trimmed OSV-named alias when
+// unambiguous: absent from both Resolved and Requires, so it cannot collide
+// with a distinct module of that trimmed name. nil in, nil out.
+func degradedUnlinkedSet(result *simulate.ModrootResult) map[string]struct{} {
+	if result.UnrequiredModules == nil {
+		return nil
+	}
+	set := make(map[string]struct{}, len(result.UnrequiredModules))
+	for module := range result.UnrequiredModules {
+		set[module] = struct{}{}
+		trimmed := trimMajorSuffix(module)
+		if trimmed == module {
+			continue
+		}
+		if _, inResolved := result.Resolved[trimmed]; inResolved {
+			continue
+		}
+		if _, inRequires := result.Requires[trimmed]; inRequires {
+			continue
+		}
+		set[trimmed] = struct{}{}
+	}
+	return set
+}
+
 // reachabilityDiff accumulates, across a language's modroots, which
 // analysis-scan advisories affect only unlinked modules. The analysis scan
 // already paid for the full-graph findings (ModrootAnalysis.ScanResult);
@@ -485,16 +524,23 @@ func newReachabilityDiff() *reachabilityDiff {
 // unreachable when its module is unlinked, OR when the module IS linked but
 // the advisory's vulnerable packages (OSV ecosystem_specific.imports) are
 // all outside the artifact's import graph (e.g. x/sys/windows in a module
-// linked via x/sys/unix). Returns how many advisory IDs were unlinked in
-// THIS modroot.
-func (r *reachabilityDiff) observe(m ModrootAnalysis, linkedModules, linkedPackages map[string]struct{}, simulated bool) int {
+// linked via x/sys/unix). unrequired is the degraded module-level signal
+// (see degradedUnlinkedSet): consulted only when linkedModules is nil (no
+// precise signal) and non-nil (degraded signal available for this modroot).
+// Returns how many advisory IDs were unlinked in THIS modroot.
+func (r *reachabilityDiff) observe(m ModrootAnalysis, linkedModules, linkedPackages map[string]struct{}, simulated bool, unrequired map[string]struct{}) int {
 	if !simulated {
-		linkedModules, linkedPackages = nil, nil
+		linkedModules, linkedPackages, unrequired = nil, nil, nil
 	}
+	degradedMode := linkedModules == nil && unrequired != nil
 
 	moduleLinked := func(module string) bool {
 		if linkedModules == nil {
-			return true
+			if unrequired == nil {
+				return true // fail open: no precise or degraded signal
+			}
+			_, unreq := unrequired[module]
+			return !unreq
 		}
 		if _, ok := linkedModules[module]; ok {
 			return true
@@ -549,6 +595,7 @@ func (r *reachabilityDiff) observe(m ModrootAnalysis, linkedModules, linkedPacka
 				r.moduleIDs[module] = entry
 			}
 			entry.moduleLinked = entry.moduleLinked || modLinked
+			entry.degraded = entry.degraded || degradedMode
 			entry.idSet[id] = struct{}{}
 			r.unreachableIDs[id] = struct{}{}
 		}
@@ -582,11 +629,15 @@ func (r *reachabilityDiff) observe(m ModrootAnalysis, linkedModules, linkedPacka
 
 // unreachableModule is one unlinked module and its advisory IDs, for
 // reporting. moduleLinked distinguishes the package-only case (the module IS
-// in the artifact but the vulnerable packages are not).
+// in the artifact but the vulnerable packages are not). degraded marks a
+// module whose unlinked verdict came from the degraded module-level signal
+// (tidied go.mod require membership) rather than precise go list -deps
+// reachability.
 type unreachableModule struct {
 	name         string
 	vulnIDs      []string
 	moduleLinked bool
+	degraded     bool
 	idSet        map[string]struct{}
 }
 
@@ -604,7 +655,7 @@ func (r *reachabilityDiff) finalize() ([]string, []unreachableModule) {
 
 	var modules []unreachableModule
 	for name, entry := range r.moduleIDs {
-		module := unreachableModule{name: name, moduleLinked: entry.moduleLinked}
+		module := unreachableModule{name: name, moduleLinked: entry.moduleLinked, degraded: entry.degraded}
 		for id := range entry.idSet {
 			if _, ok := r.reachableIDs[id]; !ok {
 				module.vulnIDs = append(module.vulnIDs, id)
