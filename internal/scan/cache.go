@@ -3,7 +3,7 @@ package scan
 import (
 	"sync"
 
-	"github.com/google/osv-scanner/pkg/models"
+	"github.com/ossf/osv-schema/bindings/go/osvschema"
 )
 
 // Global vulnerability cache instance shared across the entire application
@@ -20,10 +20,12 @@ func GetGlobalCache() *VulnerabilityCache {
 }
 
 // VulnerabilityCache provides a thread-safe cache for vulnerability scan results
-// to avoid redundant API calls for the same package@version combinations within a single run
+// to avoid redundant API calls for the same package@version combinations within a single run.
+// Cached values are shared pointers returned directly to callers - treat them as
+// read-only; mutating a cached *osvschema.Vulnerability corrupts every other holder.
 type VulnerabilityCache struct {
 	mu      sync.RWMutex
-	entries map[string][]models.Vulnerability // Key: "ecosystem|package@version"
+	entries map[string][]*osvschema.Vulnerability // Key: "ecosystem|package@version"
 }
 
 // cacheKeyFor builds an ecosystem-qualified cache key, preventing collisions
@@ -36,13 +38,13 @@ func cacheKeyFor(ecosystem, name, version string) string {
 // NewVulnerabilityCache creates a new vulnerability cache
 func NewVulnerabilityCache() *VulnerabilityCache {
 	return &VulnerabilityCache{
-		entries: make(map[string][]models.Vulnerability),
+		entries: make(map[string][]*osvschema.Vulnerability),
 	}
 }
 
 // Get retrieves cached vulnerability results for a package@version key
 // Returns the vulnerabilities and true if found, empty slice and false if not found
-func (c *VulnerabilityCache) Get(key string) ([]models.Vulnerability, bool) {
+func (c *VulnerabilityCache) Get(key string) ([]*osvschema.Vulnerability, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	vulns, ok := c.entries[key]
@@ -50,7 +52,7 @@ func (c *VulnerabilityCache) Get(key string) ([]models.Vulnerability, bool) {
 }
 
 // Set stores vulnerability results for a package@version key
-func (c *VulnerabilityCache) Set(key string, vulns []models.Vulnerability) {
+func (c *VulnerabilityCache) Set(key string, vulns []*osvschema.Vulnerability) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries[key] = vulns
@@ -67,5 +69,5 @@ func (c *VulnerabilityCache) Size() int {
 func (c *VulnerabilityCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries = make(map[string][]models.Vulnerability)
+	c.entries = make(map[string][]*osvschema.Vulnerability)
 }

@@ -1,6 +1,6 @@
 module github.com/isometry/choam
 
-go 1.26.4
+go 1.26.5
 
 require (
 	chainguard.dev/melange v0.58.0
@@ -10,11 +10,13 @@ require (
 	github.com/go-git/go-git/v5 v5.19.2
 	github.com/goccy/go-yaml v1.19.2
 	github.com/google/go-github/v81 v81.0.0
-	github.com/google/osv-scanner v1.9.2
+	github.com/ossf/osv-schema/bindings/go v0.0.0-20260806060209-f3f826310aec
 	github.com/spf13/cobra v1.10.2
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/mod v0.38.0
 	golang.org/x/oauth2 v0.36.0
+	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af
+	osv.dev/bindings/go v0.0.0-20260810033517-9ff08a6f44a7
 )
 
 require (
@@ -110,7 +112,6 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20260807164820-c8921c73eeea // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260807164820-c8921c73eeea // indirect
 	google.golang.org/grpc v1.83.0 // indirect
-	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af // indirect
 	gopkg.in/ini.v1 v1.67.3 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
