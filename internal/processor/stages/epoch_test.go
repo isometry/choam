@@ -947,3 +947,52 @@ func TestEpochStage_MessageFormat(t *testing.T) {
 		})
 	}
 }
+
+// TestEpochStage_Apply_InlineComment: a strategy CommentFunc's output must
+// land as an inline comment on the epoch line; without a CommentFunc (or for
+// strategies that implement no EpochComment at all, like the updater's
+// reset-to-0) the epoch line stays comment-free.
+func TestEpochStage_Apply_InlineComment(t *testing.T) {
+	testYAML := `package:
+  name: test-package
+  version: "1.2.3"
+  epoch: 1 # stale intent
+`
+
+	newProc := func() *mockProcessor {
+		proc := newMockProcessor("test-package", "1.2.3", 1, processor.ProcessorOptions{})
+		proc.OriginalYAML = []byte(testYAML)
+		proc.CurrentYAML = []byte(testYAML)
+		proc.Changes = []processor.Change{{Type: "security", Description: "CVE fixed"}}
+		return proc
+	}
+
+	t.Run("CommentFunc output written inline, replacing stale comment", func(t *testing.T) {
+		stage := NewEpochStage(&BumpOnSecurityFixStrategy{
+			CommentFunc: func(processor.Processor) string {
+				return "updated bumps; fixes: GHSA-xxxx, +2 more"
+			},
+		})
+		proc := newProc()
+		require.NoError(t, stage.Apply(context.Background(), proc))
+		assert.Contains(t, string(proc.CurrentYAML), "epoch: 2 # updated bumps; fixes: GHSA-xxxx, +2 more\n")
+		assert.NotContains(t, string(proc.CurrentYAML), "stale intent")
+	})
+
+	t.Run("nil CommentFunc writes no comment", func(t *testing.T) {
+		stage := NewEpochStage(&BumpOnSecurityFixStrategy{})
+		proc := newProc()
+		require.NoError(t, stage.Apply(context.Background(), proc))
+		assert.Contains(t, string(proc.CurrentYAML), "epoch: 2\n")
+		assert.NotContains(t, string(proc.CurrentYAML), "epoch: 2 #")
+	})
+
+	t.Run("non-commenter strategy writes no comment", func(t *testing.T) {
+		stage := NewEpochStage(&ResetOnVersionChangeStrategy{})
+		proc := newProc()
+		proc.VersionChanged = true
+		require.NoError(t, stage.Apply(context.Background(), proc))
+		assert.Contains(t, string(proc.CurrentYAML), "epoch: 0\n")
+		assert.NotContains(t, string(proc.CurrentYAML), "epoch: 0 #")
+	})
+}

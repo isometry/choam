@@ -1072,3 +1072,55 @@ func TestLoader_FindGoPackagePins_SubpackageWriteBack(t *testing.T) {
 	assert.Equal(t, "go-1.24", rePins[0].Value)
 	assert.Equal(t, "go-${{vars.go-version}}", rePins[2].Value)
 }
+
+// SetEpochWithComment must write the new epoch AND an inline intent comment on
+// the same line, replacing any stale inline comment, while every other comment
+// in the document survives the re-render.
+func TestLoader_SetEpochWithComment(t *testing.T) {
+	loader := NewLoader()
+
+	t.Run("adds inline comment", func(t *testing.T) {
+		yaml := `# top-level comment
+package:
+  name: example
+  version: "1.0.0" # keep quoted
+  # epoch tracks rebuilds
+  epoch: 1
+
+pipeline:
+  - uses: git-checkout # checkout step
+`
+		updated, err := loader.SetEpochWithComment([]byte(yaml), 2, "updated bumps; fixes: GHSA-xxxx, +3 more")
+		require.NoError(t, err)
+		out := string(updated)
+		assert.Contains(t, out, "epoch: 2 # updated bumps; fixes: GHSA-xxxx, +3 more\n")
+		assert.Contains(t, out, "# top-level comment")
+		assert.Contains(t, out, `version: "1.0.0" # keep quoted`)
+		assert.Contains(t, out, "# epoch tracks rebuilds")
+		assert.Contains(t, out, "uses: git-checkout # checkout step")
+	})
+
+	t.Run("replaces existing inline comment", func(t *testing.T) {
+		yaml := `package:
+  name: example
+  version: "1.0.0"
+  epoch: 2 # updated bumps; fixes: GHSA-old
+`
+		updated, err := loader.SetEpochWithComment([]byte(yaml), 3, "rebuild with go1.26.5; fixes: GO-2026-4970")
+		require.NoError(t, err)
+		out := string(updated)
+		assert.Contains(t, out, "epoch: 3 # rebuild with go1.26.5; fixes: GO-2026-4970\n")
+		assert.NotContains(t, out, "GHSA-old")
+	})
+
+	t.Run("empty comment delegates to plain SetEpoch", func(t *testing.T) {
+		yaml := `package:
+  name: example
+  epoch: 4
+`
+		updated, err := loader.SetEpochWithComment([]byte(yaml), 5, "")
+		require.NoError(t, err)
+		assert.Contains(t, string(updated), "epoch: 5\n")
+		assert.NotContains(t, string(updated), "epoch: 5 #")
+	})
+}

@@ -14,6 +14,7 @@ import (
 	"github.com/goccy/go-yaml"
 	"github.com/goccy/go-yaml/ast"
 	"github.com/goccy/go-yaml/parser"
+	"github.com/goccy/go-yaml/token"
 )
 
 // Loader handles loading and saving melange configurations while preserving YAML structure
@@ -105,6 +106,42 @@ func (l *Loader) IncrementEpoch(yamlContent []byte) ([]byte, error) {
 // SetEpoch sets the epoch field to a specific value
 func (l *Loader) SetEpoch(yamlContent []byte, newEpoch int64) ([]byte, error) {
 	return l.UpdateIntField(yamlContent, "$.package.epoch", newEpoch)
+}
+
+// SetEpochWithComment sets the epoch field and attaches an inline intent
+// comment on the same line (`epoch: 2 # <comment>`), replacing any existing
+// inline comment there. The value write goes through the same
+// ReplaceWithReader path as SetEpoch - which discards the old value node and
+// its inline comment - so the comment is attached to the freshly written
+// value node afterwards, within the same parse/render cycle. An empty
+// comment behaves exactly like SetEpoch.
+func (l *Loader) SetEpochWithComment(yamlContent []byte, newEpoch int64, comment string) ([]byte, error) {
+	if comment == "" {
+		return l.SetEpoch(yamlContent, newEpoch)
+	}
+
+	yamlPath, err := yaml.PathString("$.package.epoch")
+	if err != nil {
+		return nil, fmt.Errorf("creating YAML path: %w", err)
+	}
+	file, err := parser.ParseBytes(yamlContent, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parsing YAML: %w", err)
+	}
+	if err := yamlPath.ReplaceWithReader(file, strings.NewReader(fmt.Sprintf("%d", newEpoch))); err != nil {
+		return nil, fmt.Errorf("updating epoch: %w", err)
+	}
+
+	valueNode, err := yamlPath.FilterFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("locating epoch value: %w", err)
+	}
+	commentToken := token.Comment(" "+comment, "# "+comment, valueNode.GetToken().Position)
+	if err := valueNode.SetComment(ast.CommentGroup([]*token.Token{commentToken})); err != nil {
+		return nil, fmt.Errorf("attaching epoch comment: %w", err)
+	}
+
+	return []byte(file.String()), nil
 }
 
 // UpdatePipelineField updates a field within a specific pipeline

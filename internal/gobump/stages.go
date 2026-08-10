@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"os"
 	"slices"
@@ -256,6 +257,12 @@ func NewGoBumpPipeline(analyzer *Analyzer, opts ProcessorOptions) *processor.Pip
 				}
 				return false
 			},
+			CommentFunc: func(p processor.Processor) string {
+				if gp, ok := p.(*GoBumpProcessor); ok {
+					return epochComment(gp)
+				}
+				return ""
+			},
 		}),
 
 		// File writing - only writes if there are actual file changes
@@ -266,6 +273,141 @@ func NewGoBumpPipeline(analyzer *Analyzer, opts ProcessorOptions) *processor.Pip
 	)
 
 	return pipeline
+}
+
+// epochCommentMaxIDs caps the fixes list in the epoch intent comment: the
+// most critical advisories lead, the rest collapse to "+N more" (the full
+// list is always in choam's own output).
+const epochCommentMaxIDs = 5
+
+// epochComment composes the inline intent comment the epoch stage writes on
+// the epoch line: which action(s) triggered the rebuild ("updated bumps",
+// "rebuild with go<V>") and the advisories it fixes, most critical first.
+// The clause conditions mirror the epoch CheckFunc exactly, so the comment
+// always states why the epoch actually bumped.
+func epochComment(gp *GoBumpProcessor) string {
+	var clauses []string
+	if gp.ActualChangesApplied && len(gp.SecurityFixes) > 0 {
+		clauses = append(clauses, "updated bumps")
+	}
+	if versions := stdlibRebuildVersions(gp.StdlibBumps); len(versions) > 0 {
+		clauses = append(clauses, "rebuild with "+strings.Join(versions, ", "))
+	}
+	if len(clauses) == 0 {
+		return ""
+	}
+
+	comment := strings.Join(clauses, ", ")
+	if list := renderFixList(epochFixedVulnIDs(gp), analysisSeverities(gp)); list != "" {
+		comment += "; fixes: " + list
+	}
+	return comment
+}
+
+// stdlibRebuildVersions collects the unique "go<version>" rebuild targets
+// across the stdlib bumps, sorted.
+func stdlibRebuildVersions(bumps []StdlibBump) []string {
+	seen := make(map[string]struct{}, len(bumps))
+	var versions []string
+	for _, bump := range bumps {
+		if bump.RebuildGoVersion == "" {
+			continue
+		}
+		name := "go" + bump.RebuildGoVersion
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		versions = append(versions, name)
+	}
+	sort.Strings(versions)
+	return versions
+}
+
+// epochFixedVulnIDs derives the advisory IDs this epoch bump fixes. For
+// validated dependency bumps that is the proven set: everything the analysis
+// scan found, minus residuals, minus advisories in unlinked code (the same
+// arithmetic ToResult counts with). Unvalidated bumps fall back to the IDs
+// recorded on the SecurityFixes (skipping the "security vulnerability"
+// placeholder used when no OSV ID was matched). Stdlib rebuild fixes are
+// always included.
+func epochFixedVulnIDs(gp *GoBumpProcessor) []string {
+	ids := make(map[string]struct{})
+	if gp.ActualChangesApplied && len(gp.SecurityFixes) > 0 {
+		if gp.Validated {
+			for id := range analysisSeverities(gp) {
+				ids[id] = struct{}{}
+			}
+			for _, residual := range gp.Residuals {
+				for _, id := range residual.VulnIDs {
+					delete(ids, id)
+				}
+			}
+			for _, id := range gp.UnreachableVulnIDs {
+				delete(ids, id)
+			}
+		} else {
+			for _, fix := range gp.SecurityFixes {
+				for _, id := range strings.Split(fix.Vulnerability, ",") {
+					id = strings.TrimSpace(id)
+					if id == "" || strings.ContainsRune(id, ' ') {
+						continue // free-text placeholder, not an advisory ID
+					}
+					ids[id] = struct{}{}
+				}
+			}
+		}
+	}
+	for _, bump := range gp.StdlibBumps {
+		for _, id := range bump.VulnIDs {
+			ids[id] = struct{}{}
+		}
+	}
+	return slices.Collect(maps.Keys(ids))
+}
+
+// analysisSeverities maps every advisory ID the analysis scan found to its
+// most critical observed severity.
+func analysisSeverities(gp *GoBumpProcessor) map[string]string {
+	severities := make(map[string]string)
+	if gp.VulnerabilityAnalysis == nil {
+		return severities
+	}
+	for _, lang := range gp.VulnerabilityAnalysis.ByLanguage {
+		for _, modroot := range lang.ByModroot {
+			if modroot.ScanResult == nil {
+				continue
+			}
+			for _, vuln := range modroot.ScanResult.Vulnerabilities {
+				if existing, ok := severities[vuln.ID]; !ok || scan.SeverityRank(vuln.Severity) < scan.SeverityRank(existing) {
+					severities[vuln.ID] = vuln.Severity
+				}
+			}
+		}
+	}
+	return severities
+}
+
+// renderFixList renders advisory IDs most-critical-first (alphabetical
+// within a severity tier; IDs without a known severity - including stdlib
+// GO-* records, which carry none - rank last), truncated to
+// epochCommentMaxIDs with a "+N more" tail.
+func renderFixList(ids []string, severities map[string]string) string {
+	if len(ids) == 0 {
+		return ""
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		ri, rj := scan.SeverityRank(severities[ids[i]]), scan.SeverityRank(severities[ids[j]])
+		if ri != rj {
+			return ri < rj
+		}
+		return ids[i] < ids[j]
+	})
+	if len(ids) > epochCommentMaxIDs {
+		return fmt.Sprintf("%s, +%d more",
+			strings.Join(ids[:epochCommentMaxIDs], ", "), len(ids)-epochCommentMaxIDs)
+	}
+	return strings.Join(ids, ", ")
 }
 
 // checkVulnerabilities performs real vulnerability analysis across every

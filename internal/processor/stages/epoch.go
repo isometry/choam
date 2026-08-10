@@ -30,9 +30,29 @@ func (r *ResetOnVersionChangeStrategy) GetReason() string {
 	return "version changed"
 }
 
+// epochCommenter is an optional extension of EpochStrategy: a strategy that
+// can state WHY the epoch changes gets its text written as an inline comment
+// on the epoch line. GetReason cannot serve this purpose - it is a constant
+// per strategy, not derived from what actually happened.
+type epochCommenter interface {
+	EpochComment(p processor.Processor) string
+}
+
 // BumpOnSecurityFixStrategy bumps epoch by 1 for security fixes
 type BumpOnSecurityFixStrategy struct {
 	CheckFunc func(p processor.Processor) bool
+	// CommentFunc, when set, composes the inline intent comment written on
+	// the epoch line (e.g. "updated bumps; fixes: ..."). Empty result or nil
+	// func leaves the epoch line comment-free.
+	CommentFunc func(p processor.Processor) string
+}
+
+// EpochComment implements epochCommenter.
+func (b *BumpOnSecurityFixStrategy) EpochComment(p processor.Processor) string {
+	if b.CommentFunc == nil {
+		return ""
+	}
+	return b.CommentFunc(p)
 }
 
 func (b *BumpOnSecurityFixStrategy) ShouldUpdateEpoch(p processor.Processor) bool {
@@ -145,9 +165,14 @@ func (e *EpochStage) Apply(ctx context.Context, p processor.Processor) error {
 		return nil
 	}
 
-	// Actually update the YAML
+	// Actually update the YAML, with an inline intent comment when the
+	// strategy can compose one.
+	var comment string
+	if commenter, ok := e.Strategy.(epochCommenter); ok {
+		comment = commenter.EpochComment(p)
+	}
 	loader := melangeConfig.NewLoader()
-	updatedYAML, err := loader.SetEpoch(p.GetCurrentYAML(), newEpoch)
+	updatedYAML, err := loader.SetEpochWithComment(p.GetCurrentYAML(), newEpoch, comment)
 	if err != nil {
 		return fmt.Errorf("setting epoch: %w", err)
 	}
