@@ -7,12 +7,14 @@ import (
 	"io"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 
 	"chainguard.dev/melange/pkg/config"
 	"github.com/goccy/go-yaml"
 	"github.com/goccy/go-yaml/ast"
 	"github.com/goccy/go-yaml/parser"
+	"github.com/goccy/go-yaml/token"
 )
 
 // Loader handles loading and saving melange configurations while preserving YAML structure
@@ -106,6 +108,42 @@ func (l *Loader) SetEpoch(yamlContent []byte, newEpoch int64) ([]byte, error) {
 	return l.UpdateIntField(yamlContent, "$.package.epoch", newEpoch)
 }
 
+// SetEpochWithComment sets the epoch field and attaches an inline intent
+// comment on the same line (`epoch: 2 # <comment>`), replacing any existing
+// inline comment there. The value write goes through the same
+// ReplaceWithReader path as SetEpoch - which discards the old value node and
+// its inline comment - so the comment is attached to the freshly written
+// value node afterwards, within the same parse/render cycle. An empty
+// comment behaves exactly like SetEpoch.
+func (l *Loader) SetEpochWithComment(yamlContent []byte, newEpoch int64, comment string) ([]byte, error) {
+	if comment == "" {
+		return l.SetEpoch(yamlContent, newEpoch)
+	}
+
+	yamlPath, err := yaml.PathString("$.package.epoch")
+	if err != nil {
+		return nil, fmt.Errorf("creating YAML path: %w", err)
+	}
+	file, err := parser.ParseBytes(yamlContent, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parsing YAML: %w", err)
+	}
+	if err := yamlPath.ReplaceWithReader(file, strings.NewReader(fmt.Sprintf("%d", newEpoch))); err != nil {
+		return nil, fmt.Errorf("updating epoch: %w", err)
+	}
+
+	valueNode, err := yamlPath.FilterFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("locating epoch value: %w", err)
+	}
+	commentToken := token.Comment(" "+comment, "# "+comment, valueNode.GetToken().Position)
+	if err := valueNode.SetComment(ast.CommentGroup([]*token.Token{commentToken})); err != nil {
+		return nil, fmt.Errorf("attaching epoch comment: %w", err)
+	}
+
+	return []byte(file.String()), nil
+}
+
 // UpdatePipelineField updates a field within a specific pipeline
 func (l *Loader) UpdatePipelineField(yamlContent []byte, pipelineIndex int, field, newValue string) ([]byte, error) {
 	path := fmt.Sprintf("$.pipeline[%d].with.%s", pipelineIndex, field)
@@ -133,30 +171,127 @@ func (l *Loader) FindPipelinesByUse(yamlContent []byte, useType string) ([]int, 
 	return indices, nil
 }
 
-// GetPipelineWithField gets the with field map for a specific pipeline
+// GetPipelineWithField gets the with field map for a specific pipeline.
+//
+// It reads the with block off the comment-preserving AST (rather than via
+// yaml.Unmarshal) so that non-string scalars surface their raw token text
+// instead of being dropped or coerced. An UNQUOTED "go-version: 1.30" parses
+// as a YAML float; unmarshalling would either drop it (map[string]string only
+// keeps string values) or, worse, coerce it through float64 to "1.3" - a
+// 27-minor corruption of a pinned toolchain. Reading the AST token keeps the
+// text exactly as written ("1.30"). Values with no meaningful scalar text
+// (null, sequences, nested mappings) are skipped, matching the prior reader.
 func (l *Loader) GetPipelineWithField(yamlContent []byte, pipelineIndex int) (map[string]string, error) {
-	var parsed map[string]any
-	if err := yaml.Unmarshal(yamlContent, &parsed); err != nil {
+	withPath, err := yaml.PathString(fmt.Sprintf("$.pipeline[%d].with", pipelineIndex))
+	if err != nil {
+		return nil, fmt.Errorf("creating with path: %w", err)
+	}
+
+	file, err := parser.ParseBytes(yamlContent, parser.ParseComments)
+	if err != nil {
 		return nil, fmt.Errorf("parsing YAML to get pipeline with field: %w", err)
 	}
 
-	if pipeline, ok := parsed["pipeline"].([]any); ok {
-		if pipelineIndex < len(pipeline) {
-			if stepMap, ok := pipeline[pipelineIndex].(map[string]any); ok {
-				if withField, ok := stepMap["with"].(map[string]any); ok {
-					result := make(map[string]string)
-					for k, v := range withField {
-						if str, ok := v.(string); ok {
-							result[k] = str
-						}
-					}
-					return result, nil
-				}
-			}
-		}
+	node, err := withPath.FilterFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline at index %d not found or has no with field", pipelineIndex)
 	}
 
-	return nil, fmt.Errorf("pipeline at index %d not found or has no with field", pipelineIndex)
+	values, ok := mappingValues(node)
+	if !ok {
+		return nil, fmt.Errorf("pipeline at index %d not found or has no with field", pipelineIndex)
+	}
+
+	result := make(map[string]string)
+	for _, mv := range values {
+		if text, ok := scalarText(mv.Value); ok {
+			result[mv.Key.GetToken().Value] = text
+		}
+	}
+	return result, nil
+}
+
+// mappingValues normalises the node a "$....with" path resolves to into a
+// slice of key/value entries. goccy represents a multi-entry mapping as
+// *ast.MappingNode but a single-entry one as a bare *ast.MappingValueNode, so
+// both shapes must be handled to avoid silently ignoring a single-key with
+// block.
+func mappingValues(node ast.Node) ([]*ast.MappingValueNode, bool) {
+	switch n := node.(type) {
+	case *ast.MappingNode:
+		return n.Values, true
+	case *ast.MappingValueNode:
+		return []*ast.MappingValueNode{n}, true
+	default:
+		return nil, false
+	}
+}
+
+// scalarText extracts the string content of a with-field value node. String
+// scalars yield their interpreted value (quotes stripped); block/literal
+// scalars yield their interpreted body; integer/float/bool scalars yield their
+// raw token text exactly as written (so "1.30" never becomes float64(1.3)).
+// Null, sequence and mapping values have no meaningful scalar text and return
+// false so the caller skips them.
+func scalarText(n ast.Node) (string, bool) {
+	switch v := n.(type) {
+	case *ast.StringNode:
+		return v.Value, true
+	case *ast.LiteralNode:
+		// Interpreted block-scalar content (e.g. a "deps: |-" body).
+		return v.Value.Value, true
+	case *ast.IntegerNode, *ast.FloatNode, *ast.BoolNode:
+		// Raw token text as written - never coerced through the parsed
+		// numeric/bool value.
+		return v.GetToken().Value, true
+	default:
+		return "", false
+	}
+}
+
+// RemovePipelineWithField removes a single field from a pipeline step's with
+// map, preserving the rest of the step and surrounding formatting.
+func (l *Loader) RemovePipelineWithField(yamlContent []byte, pipelineIndex int, field string) ([]byte, error) {
+	withPath, err := yaml.PathString(fmt.Sprintf("$.pipeline[%d].with", pipelineIndex))
+	if err != nil {
+		return nil, fmt.Errorf("creating with path: %w", err)
+	}
+
+	file, err := parser.ParseBytes(yamlContent, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parsing YAML: %w", err)
+	}
+
+	node, err := withPath.FilterFile(file)
+	if err != nil {
+		// No with field - nothing to remove.
+		return yamlContent, nil
+	}
+
+	// Only *ast.MappingNode is handled here - a single-entry with-block
+	// (bare *ast.MappingValueNode, see mappingValues above) silently no-ops
+	// instead of removing the field. This is a known pre-existing gap;
+	// mappingValues exists to normalise both shapes if this ever needs
+	// closing.
+	mapping, ok := node.(*ast.MappingNode)
+	if !ok {
+		return yamlContent, nil
+	}
+
+	filtered := make([]*ast.MappingValueNode, 0, len(mapping.Values))
+	for _, mv := range mapping.Values {
+		if mv.Key.GetToken().Value == field {
+			continue
+		}
+		filtered = append(filtered, mv)
+	}
+	if len(filtered) == len(mapping.Values) {
+		// Field not present - nothing to remove.
+		return yamlContent, nil
+	}
+	mapping.Values = filtered
+
+	return []byte(file.String()), nil
 }
 
 // SaveWithBackup saves the updated YAML content to file with backup
@@ -255,7 +390,25 @@ func (l *Loader) GetPackageInfo(yamlContent []byte) (name, version string, epoch
 	return name, version, epoch, nil
 }
 
-// GetGoBumpDeps extracts the deps field from a go/bump pipeline
+// whitespaceRegex splits block-scalar or space-separated pipeline field values
+// (deps, modroot) into their individual entries.
+var whitespaceRegex = regexp.MustCompile(`\s+`)
+
+// splitWhitespaceList splits a string on any whitespace (spaces, tabs, newlines),
+// discarding empty entries.
+func splitWhitespaceList(value string) []string {
+	parts := whitespaceRegex.Split(value, -1)
+	var result []string
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			result = append(result, part)
+		}
+	}
+	return result
+}
+
+// GetGoBumpDeps extracts the deps field from a bump or go/bump pipeline
 func (l *Loader) GetGoBumpDeps(yamlContent []byte, pipelineIndex int) ([]string, error) {
 	withFields, err := l.GetPipelineWithField(yamlContent, pipelineIndex)
 	if err != nil {
@@ -267,33 +420,256 @@ func (l *Loader) GetGoBumpDeps(yamlContent []byte, pipelineIndex int) ([]string,
 		return []string{}, nil // No deps field
 	}
 
-	// Split deps by any whitespace (spaces, tabs, newlines)
-	whitespaceRegex := regexp.MustCompile(`\s+`)
-	parts := whitespaceRegex.Split(deps, -1)
+	return splitWhitespaceList(deps), nil
+}
 
-	var result []string
-	for _, part := range parts {
-		part = strings.TrimSpace(part)
-		if part != "" {
-			result = append(result, part)
+// GetBumpReplaces extracts the replaces field ("old=new@version" entries) from
+// a bump or go/bump pipeline step.
+func (l *Loader) GetBumpReplaces(yamlContent []byte, pipelineIndex int) ([]string, error) {
+	withFields, err := l.GetPipelineWithField(yamlContent, pipelineIndex)
+	if err != nil {
+		return nil, fmt.Errorf("getting pipeline with fields: %w", err)
+	}
+
+	replaces, ok := withFields["replaces"]
+	if !ok {
+		return []string{}, nil // No replaces field
+	}
+
+	return splitWhitespaceList(replaces), nil
+}
+
+// bumpActions are the pipeline "uses" values that perform Go dependency bumps.
+// "bump" is the modern, language-agnostic omnibump wrapper (supports a
+// multi-valued modroot); "go/bump" is the legacy, single-modroot wrapper.
+var bumpActions = []string{"bump", "go/bump"}
+
+// BumpStep describes a bump or go/bump pipeline step and its parsed with-fields.
+type BumpStep struct {
+	Index     int      // pipeline index
+	Action    string   // "bump" or "go/bump"
+	Language  string   // parsed with.language entry ("" when absent)
+	GoVersion string   // parsed with.go-version entry ("" when absent)
+	Modroots  []string // parsed with.modroot entries; defaults to ["."] when absent
+	Deps      []string // parsed with.deps entries ("module@version")
+	Replaces  []string // parsed with.replaces entries ("old=new@version")
+}
+
+// FindBumpSteps finds all bump and go/bump pipeline steps, in pipeline order,
+// with their modroot and deps fields parsed.
+func (l *Loader) FindBumpSteps(yamlContent []byte) ([]BumpStep, error) {
+	var steps []BumpStep
+
+	for _, action := range bumpActions {
+		indices, err := l.FindPipelinesByUse(yamlContent, action)
+		if err != nil {
+			return nil, fmt.Errorf("finding %s pipelines: %w", action, err)
+		}
+
+		for _, idx := range indices {
+			modroots, err := l.GetBumpModroots(yamlContent, idx)
+			if err != nil {
+				return nil, fmt.Errorf("getting modroot for pipeline[%d]: %w", idx, err)
+			}
+
+			deps, err := l.GetGoBumpDeps(yamlContent, idx)
+			if err != nil {
+				return nil, fmt.Errorf("getting deps for pipeline[%d]: %w", idx, err)
+			}
+
+			replaces, err := l.GetBumpReplaces(yamlContent, idx)
+			if err != nil {
+				return nil, fmt.Errorf("getting replaces for pipeline[%d]: %w", idx, err)
+			}
+
+			var language, goVersion string
+			if withFields, err := l.GetPipelineWithField(yamlContent, idx); err == nil {
+				language = withFields["language"]
+				goVersion = withFields["go-version"]
+			}
+
+			steps = append(steps, BumpStep{
+				Index:     idx,
+				Action:    action,
+				Language:  language,
+				GoVersion: goVersion,
+				Modroots:  modroots,
+				Deps:      deps,
+				Replaces:  replaces,
+			})
 		}
 	}
 
-	return result, nil
+	sort.Slice(steps, func(i, j int) bool { return steps[i].Index < steps[j].Index })
+
+	return steps, nil
+}
+
+// GetBumpModroots extracts the modroot field from a bump/go-bump pipeline step.
+// When the field is absent, it defaults to ["."], matching the pipeline's own
+// default (the current directory).
+func (l *Loader) GetBumpModroots(yamlContent []byte, pipelineIndex int) ([]string, error) {
+	withFields, err := l.GetPipelineWithField(yamlContent, pipelineIndex)
+	if err != nil {
+		return nil, fmt.Errorf("getting pipeline with fields: %w", err)
+	}
+
+	modroot, ok := withFields["modroot"]
+	if !ok || strings.TrimSpace(modroot) == "" {
+		return []string{"."}, nil
+	}
+
+	return splitWhitespaceList(modroot), nil
 }
 
 // UpdateGoBumpDeps updates the deps field in a go/bump pipeline
 func (l *Loader) UpdateGoBumpDeps(yamlContent []byte, pipelineIndex int, newDeps []string) ([]byte, error) {
-	if len(newDeps) == 0 {
-		// Empty deps - remove the entire go/bump pipeline step
-		return l.RemovePipelineStep(yamlContent, pipelineIndex)
-	} else {
-		// Use block scalar format with |- for any deps (even single dep)
-		path := fmt.Sprintf("$.pipeline[%d].with.deps", pipelineIndex)
-		depsString := strings.Join(newDeps, "\n")
+	return l.UpdateGoBumpStep(yamlContent, pipelineIndex, newDeps, nil, "")
+}
 
-		// Use the block scalar update function
-		return l.UpdateFieldWithBlockScalar(yamlContent, path, depsString)
+// UpdateGoBumpStep updates a bump/go-bump step's deps, replaces and
+// go-version fields in place. Both deps and replaces empty removes the whole
+// step; deps empty with replaces present keeps the step (gobump accepts a
+// replaces-only invocation) and removes just the deps field; an empty
+// replaces list removes just that field. goVersion == "" leaves any existing
+// go-version field untouched (it is never removed by this call); a non-empty
+// goVersion upserts go-version as a quoted scalar so it can never round-trip
+// as a YAML float.
+func (l *Loader) UpdateGoBumpStep(yamlContent []byte, pipelineIndex int, deps, replaces []string, goVersion string) ([]byte, error) {
+	if len(deps) == 0 && len(replaces) == 0 {
+		return l.RemovePipelineStep(yamlContent, pipelineIndex)
+	}
+
+	var err error
+	if len(deps) == 0 {
+		yamlContent, err = l.RemovePipelineWithField(yamlContent, pipelineIndex, "deps")
+	} else {
+		path := fmt.Sprintf("$.pipeline[%d].with.deps", pipelineIndex)
+		yamlContent, err = l.UpdateFieldWithBlockScalar(yamlContent, path, strings.Join(deps, "\n"))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("updating deps for pipeline[%d]: %w", pipelineIndex, err)
+	}
+
+	if len(replaces) == 0 {
+		yamlContent, err = l.RemovePipelineWithField(yamlContent, pipelineIndex, "replaces")
+	} else {
+		yamlContent, err = l.UpsertPipelineWithBlockScalar(yamlContent, pipelineIndex, "replaces", strings.Join(replaces, "\n"))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("updating replaces for pipeline[%d]: %w", pipelineIndex, err)
+	}
+
+	if goVersion != "" {
+		yamlContent, err = l.UpsertPipelineWithQuotedString(yamlContent, pipelineIndex, "go-version", goVersion)
+		if err != nil {
+			return nil, fmt.Errorf("updating go-version for pipeline[%d]: %w", pipelineIndex, err)
+		}
+	}
+
+	return yamlContent, nil
+}
+
+// goPackagePinActions are the pipeline "uses" values that accept a
+// with.go-package pin (the go toolchain version a build/install step
+// compiles with).
+var goPackagePinActions = map[string]bool{"go/build": true, "go/install": true}
+
+// GoPackagePin locates one go/build|go/install step's with.go-package value.
+type GoPackagePin struct {
+	Path       string // goccy yaml path, e.g. "$.pipeline[3].with.go-package" or "$.subpackages[2].pipeline[0].with.go-package"
+	Subpackage string // subpackage name for messages; "" for top-level
+	Value      string // raw string value (possibly templated)
+	Uses       string // the step's uses: value ("go/build" or "go/install")
+	Modroot    string // raw with.modroot (possibly templated); "." when absent - go/build only, go/install has none
+}
+
+// FindGoPackagePins walks the top-level pipeline and every subpackage's
+// pipeline for go/build and go/install steps carrying a string
+// with.go-package pin, returning one GoPackagePin per pin found - in
+// top-level-then-subpackage, then pipeline order. Steps without a go-package
+// field are not returned; there's nothing to edit. Each pin's Path is a
+// goccy yaml path directly usable with UpdateField to rewrite it in place.
+func (l *Loader) FindGoPackagePins(yamlContent []byte) ([]GoPackagePin, error) {
+	var parsed map[string]any
+	if err := yaml.Unmarshal(yamlContent, &parsed); err != nil {
+		return nil, fmt.Errorf("parsing YAML to find go-package pins: %w", err)
+	}
+
+	var pins []GoPackagePin
+	collectGoPackagePins(&pins, parsed["pipeline"], "$", "")
+
+	if subpackages, ok := parsed["subpackages"].([]any); ok {
+		for i, sp := range subpackages {
+			spMap, ok := sp.(map[string]any)
+			if !ok {
+				continue
+			}
+			name, _ := spMap["name"].(string)
+			collectGoPackagePins(&pins, spMap["pipeline"], fmt.Sprintf("$.subpackages[%d]", i), name)
+		}
+	}
+
+	return pins, nil
+}
+
+// collectGoPackagePins appends a GoPackagePin for every go/build|go/install
+// step in pipeline (the raw, unmarshalled `pipeline:` sequence value) that
+// carries a string with.go-package, using pathPrefix (e.g. "$" or
+// "$.subpackages[2]") to build each pin's editable yaml path.
+func collectGoPackagePins(pins *[]GoPackagePin, pipeline any, pathPrefix, subpackage string) {
+	steps, ok := pipeline.([]any)
+	if !ok {
+		return
+	}
+	for i, step := range steps {
+		stepMap, ok := step.(map[string]any)
+		if !ok {
+			continue
+		}
+		uses, _ := stepMap["uses"].(string)
+		if !goPackagePinActions[uses] {
+			continue
+		}
+		withField, ok := stepMap["with"].(map[string]any)
+		if !ok {
+			continue
+		}
+		value, ok := withField["go-package"].(string)
+		if !ok {
+			continue
+		}
+		// with.modroot associates a go/build pin with its module root (the
+		// pin's own floor is keyed by it); default "." matches the pipeline's
+		// own default. go/install has no modroot. Usually a string, but an
+		// unquoted numeric-looking value ("modroot: 2024") unmarshals as a
+		// non-string scalar, so fall back to its printed form - matching
+		// melange's own map[string]string coercion on the discovery side,
+		// which keys the floors map - rather than mis-defaulting to ".".
+		// Null and non-scalar (sequence/mapping) values carry no usable
+		// modroot and keep the default.
+		modroot := "."
+		if raw, exists := withField["modroot"]; exists && raw != nil {
+			mr, ok := raw.(string)
+			if !ok {
+				switch raw.(type) {
+				case map[string]any, []any:
+					// Not a scalar - no usable modroot.
+				default:
+					mr = fmt.Sprint(raw)
+				}
+			}
+			if strings.TrimSpace(mr) != "" {
+				modroot = mr
+			}
+		}
+		*pins = append(*pins, GoPackagePin{
+			Path:       fmt.Sprintf("%s.pipeline[%d].with.go-package", pathPrefix, i),
+			Subpackage: subpackage,
+			Value:      value,
+			Uses:       uses,
+			Modroot:    modroot,
+		})
 	}
 }
 
@@ -327,14 +703,8 @@ func (l *Loader) RemovePipelineStep(yamlContent []byte, pipelineIndex int) ([]by
 		return yamlContent, nil // Invalid index, return unchanged
 	}
 
-	// Remove the pipeline step by creating new slice without the item at pipelineIndex
-	newValues := make([]ast.Node, 0, len(seqNode.Values)-1)
-	for i, value := range seqNode.Values {
-		if i != pipelineIndex {
-			newValues = append(newValues, value)
-		}
-	}
-	seqNode.Values = newValues
+	// Remove the pipeline step, keeping any comments on the remaining steps intact
+	removeSequenceValue(seqNode, pipelineIndex)
 
 	// Return the AST string representation with formatting preserved
 	return []byte(file.String()), nil
@@ -384,20 +754,8 @@ func (l *Loader) InsertPipelineStep(yamlContent []byte, pipelineIndex int, pipel
 		return nil, fmt.Errorf("invalid pipeline step structure")
 	}
 
-	// Insert the new step at the specified index
-	if pipelineIndex < 0 {
-		pipelineIndex = 0
-	}
-	if pipelineIndex > len(seqNode.Values) {
-		pipelineIndex = len(seqNode.Values)
-	}
-
-	// Create new slice with the inserted item
-	newValues := make([]ast.Node, 0, len(seqNode.Values)+1)
-	newValues = append(newValues, seqNode.Values[:pipelineIndex]...)
-	newValues = append(newValues, stepASTNode)
-	newValues = append(newValues, seqNode.Values[pipelineIndex:]...)
-	seqNode.Values = newValues
+	// Insert the new step, keeping any comments on the surrounding steps intact
+	insertSequenceValue(seqNode, pipelineIndex, stepASTNode)
 
 	// Return the AST string representation with formatting preserved
 	return []byte(file.String()), nil

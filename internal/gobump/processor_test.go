@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/isometry/choam/internal/processor"
+	"github.com/isometry/choam/internal/simulate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -312,8 +313,8 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 				proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 					VulnerabilitiesFound: 3,
 					BumpActions: []BumpAction{
-						{Action: "update", PipelineIdx: 0, Dependencies: []string{"dep1@v1.0.0"}},
-						{Action: "insert", PipelineIdx: -1, Dependencies: []string{"dep2@v2.0.0"}},
+						{Action: "update", Modroots: []string{"."}, Dependencies: []string{"dep1@v1.0.0"}},
+						{Action: "insert", Modroots: []string{"cmd/foo"}, Dependencies: []string{"dep2@v2.0.0"}},
 					},
 				}
 				proc.AddSecurityFix(SecurityFix{
@@ -353,7 +354,7 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 				proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 					VulnerabilitiesFound: 1,
 					BumpActions: []BumpAction{
-						{Action: "update", PipelineIdx: 0},
+						{Action: "update", Modroots: []string{"."}},
 					},
 				}
 				proc.AddSecurityFix(SecurityFix{
@@ -408,8 +409,8 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 				proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 					VulnerabilitiesFound: 2,
 					BumpActions: []BumpAction{
-						{Action: "keep", PipelineIdx: 0},
-						{Action: "keep", PipelineIdx: 1},
+						{Action: "keep", Modroots: []string{"."}},
+						{Action: "keep", Modroots: []string{"cmd/foo"}},
 					},
 				}
 				// No changes to YAML, no ActualChangesApplied flag
@@ -493,6 +494,28 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 	}
 }
 
+// Validated-path advisory accounting: residual IDs are deduplicated across
+// entries, and residuals the bump itself INTRODUCED (advisories absent from
+// the baseline scan) must not subtract from the baseline found count.
+func TestGoBumpProcessor_ToResult_IntroducedResidualAccounting(t *testing.T) {
+	proc := NewGoBumpProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
+	proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{VulnerabilitiesFound: 4}
+	proc.Validated = true
+	proc.AddResiduals([]simulate.Residual{
+		{Module: "example.com/old", VulnIDs: []string{"GO-1", "GO-2"}, Reason: "no released fix"},
+		{Module: "example.com/dup", VulnIDs: []string{"GO-2"}, Reason: "no released fix"},
+		{Module: "example.com/new", VulnIDs: []string{"GO-9"}, Introduced: true,
+			Reason: "introduced by bump to v2.0.0; not present at baseline; no released fix"},
+	})
+
+	result := proc.ToResult()
+
+	assert.Equal(t, 4, result.VulnerabilitiesFound)
+	assert.Equal(t, 3, result.VulnerabilitiesResidual, "deduplicated across residual entries")
+	assert.Equal(t, 2, result.VulnerabilitiesFixed,
+		"found(4) - baseline residual IDs(2); introduced GO-9 must not subtract")
+}
+
 func TestGoBumpProcessor_Integration(t *testing.T) {
 	tests := []struct {
 		name           string
@@ -510,13 +533,13 @@ func TestGoBumpProcessor_Integration(t *testing.T) {
 					BumpActions: []BumpAction{
 						{
 							Action:       "update",
-							PipelineIdx:  0,
+							Modroots:     []string{"."},
 							Dependencies: []string{"golang.org/x/crypto@v0.14.0"},
 							Reason:       "security fix for CVE-2023-1234",
 						},
 						{
 							Action:       "insert",
-							PipelineIdx:  -1,
+							Modroots:     []string{"cmd/foo"},
 							Dependencies: []string{"github.com/gin-gonic/gin@v1.9.1"},
 							Reason:       "security fix for GHSA-xxxx-yyyy",
 						},

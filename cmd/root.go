@@ -21,6 +21,11 @@ var (
 	// Update-specific flags
 	updateShared bool
 	backupSuffix string
+
+	// Bump-specific flags
+	noValidate        bool
+	simulationTimeout time.Duration
+	noStdlib          bool
 )
 
 // NewRootCmd creates the root command
@@ -40,7 +45,7 @@ and release-monitoring.org.`,
 
 	cmd.AddCommand(NewCheckCmd())
 	cmd.AddCommand(NewUpdateCmd())
-	cmd.AddCommand(NewGoBumpCmd())
+	cmd.AddCommand(NewBumpCmd())
 
 	return cmd
 }

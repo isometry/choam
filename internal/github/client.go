@@ -7,7 +7,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/google/go-github/v75/github"
+	"github.com/google/go-github/v81/github"
 	"github.com/isometry/choam/internal/types"
 	"golang.org/x/oauth2"
 )
@@ -233,7 +233,7 @@ func (c *Client) GetReleasesPage(ctx context.Context, owner, repo string, page, 
 }
 
 // GetFirstValidTag finds the first tag that passes all filtering criteria
-func (c *Client) GetFirstValidTag(ctx context.Context, owner, repo string, tagPrefix string, filter types.VersionFilterFunc) (string, error) {
+func (c *Client) GetFirstValidTag(ctx context.Context, owner, repo string, tagPrefix, tagContains string, filter types.VersionFilterFunc) (string, error) {
 	const maxPages = 10 // Limit search to 1000 tags (100 per page)
 	opts := &github.ListOptions{
 		Page:    1,
@@ -258,6 +258,11 @@ func (c *Client) GetFirstValidTag(ctx context.Context, owner, repo string, tagPr
 				continue
 			}
 
+			// Apply substring filter if specified
+			if tagContains != "" && !strings.Contains(*tag.Name, tagContains) {
+				continue
+			}
+
 			// Apply the unified filter function
 			if filter(*tag.Name) {
 				return *tag.Name, nil // Found first valid version, return immediately
@@ -274,7 +279,7 @@ func (c *Client) GetFirstValidTag(ctx context.Context, owner, repo string, tagPr
 }
 
 // GetFirstValidRelease finds the first release that passes all filtering criteria
-func (c *Client) GetFirstValidRelease(ctx context.Context, owner, repo string, tagPrefix string, filter types.VersionFilterFunc) (string, error) {
+func (c *Client) GetFirstValidRelease(ctx context.Context, owner, repo string, tagPrefix, tagContains string, filter types.VersionFilterFunc) (string, error) {
 	const maxPages = 5 // Limit search to 500 releases (100 per page)
 	opts := &github.ListOptions{
 		Page:    1,
@@ -296,6 +301,11 @@ func (c *Client) GetFirstValidRelease(ctx context.Context, owner, repo string, t
 
 			// Apply prefix filter at API level if specified for efficiency
 			if tagPrefix != "" && !strings.HasPrefix(*release.TagName, tagPrefix) {
+				continue
+			}
+
+			// Apply substring filter if specified
+			if tagContains != "" && !strings.Contains(*release.TagName, tagContains) {
 				continue
 			}
 

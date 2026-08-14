@@ -37,7 +37,7 @@ func ProcessFile(ctx context.Context, filePath string, opts ProcessorOptions, an
 	})
 
 	// Create and execute the pipeline
-	pipeline := NewGoBumpPipeline(analyzer)
+	pipeline := NewGoBumpPipeline(analyzer, opts)
 
 	if err := pipeline.Execute(ctx, goBumpProcessor); err != nil {
 		goBumpProcessor.AddError(err)

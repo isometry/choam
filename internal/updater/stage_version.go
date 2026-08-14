@@ -1,9 +1,11 @@
 package updater
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	melange "chainguard.dev/melange/pkg/config"
 	githubClient "github.com/isometry/choam/internal/github"
@@ -140,6 +142,9 @@ func (vc *VersionChecker) getLatestValidGitHubVersion(ctx context.Context, cfg *
 		"repository", monitor.Identifier,
 		"use_tags", monitor.UseTags)
 
+	// The deprecated tag-filter key has prefix semantics; tag-filter-prefix wins when both are set.
+	tagPrefix := cmp.Or(monitor.TagFilterPrefix, monitor.TagFilter) //nolint:staticcheck // deprecated tag-filter kept for compat
+
 	// Get the first valid version using the filter
 	var validVersion string
 	if monitor.UseTags {
@@ -147,7 +152,8 @@ func (vc *VersionChecker) getLatestValidGitHubVersion(ctx context.Context, cfg *
 			ctx,
 			repo.Owner,
 			repo.Name,
-			monitor.TagFilterPrefix,
+			tagPrefix,
+			monitor.TagFilterContains,
 			filterFunc,
 		)
 	} else {
@@ -155,7 +161,8 @@ func (vc *VersionChecker) getLatestValidGitHubVersion(ctx context.Context, cfg *
 			ctx,
 			repo.Owner,
 			repo.Name,
-			monitor.TagFilterPrefix,
+			tagPrefix,
+			monitor.TagFilterContains,
 			filterFunc,
 		)
 	}
@@ -180,6 +187,10 @@ func (vc *VersionChecker) getLatestValidReleaseMonitorVersion(ctx context.Contex
 	version, err := anityaClient.GetLatestVersion(ctx, monitor.Identifier)
 	if err != nil {
 		return "", "release-monitor", fmt.Errorf("getting version from release-monitoring.org: %w", err)
+	}
+
+	if !matchesTagFilters(version, monitor.VersionFilterPrefix, monitor.VersionFilterContains) {
+		return "", "release-monitor", fmt.Errorf("version %s filtered out by version-filter rules", version)
 	}
 
 	// Process it through validation pipeline
@@ -213,6 +224,12 @@ func (vc *VersionChecker) getLatestValidGitVersion(ctx context.Context, cfg *mel
 	// Get Git client
 	_, _, gitClient, _ := orchestrator.GetServiceClients()
 
+	// Apply the monitor's tag filters to raw tags before version processing
+	inner := filterFunc
+	filterFunc = func(tag string) bool {
+		return matchesTagFilters(tag, monitor.TagFilterPrefix, monitor.TagFilterContains) && inner(tag)
+	}
+
 	// Get the first valid version using the filter
 	validVersion, err := gitClient.GetFirstValidTag(ctx, repoURL, filterFunc)
 	if err != nil {
@@ -223,6 +240,19 @@ func (vc *VersionChecker) getLatestValidGitVersion(ctx context.Context, cfg *mel
 	processed, _, _ := versionFilter.ProcessVersion(validVersion, &cfg.Update)
 
 	return processed, "git", nil
+}
+
+// matchesTagFilters reports whether a raw tag/version passes the monitor's
+// prefix and substring filters. Empty filters match everything; when both are
+// set, both must match (mirroring upstream wolfictl behaviour).
+func matchesTagFilters(value, prefix, contains string) bool {
+	if prefix != "" && !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	if contains != "" && !strings.Contains(value, contains) {
+		return false
+	}
+	return true
 }
 
 // createVersionFilter creates a unified filter function with logging context

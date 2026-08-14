@@ -1,40 +1,27 @@
-package gobump
+package golang
 
 import (
 	"fmt"
 	"log/slog"
-	"net/http"
 	"slices"
 	"strings"
 
-	"github.com/isometry/choam/internal/scan"
 	"github.com/isometry/choam/internal/utils"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
 )
 
-// Analyzer handles vulnerability analysis and bump logic for Go dependencies
-type Analyzer struct {
-	fetcher              *Fetcher
-	parser               *Parser
-	vulnerabilityScanner *scan.VulnerabilityScanner
+// analyzer applies Go-specific bump decisioning: version comparison,
+// v2+ module path normalization, and replace-directive resolution.
+type analyzer struct{}
+
+func newAnalyzer() *analyzer {
+	return &analyzer{}
 }
 
-// NewAnalyzer creates a new analyzer with the provided HTTP client
-func NewAnalyzer(httpClient *http.Client) *Analyzer {
-	if httpClient == nil {
-		httpClient = &http.Client{}
-	}
-	return &Analyzer{
-		fetcher:              NewFetcher(httpClient),
-		parser:               NewParser(),
-		vulnerabilityScanner: scan.NewVulnerabilityScanner(httpClient),
-	}
-}
-
-// AnalyzeBumps analyzes each bump and determines whether to keep or remove it
-func (a *Analyzer) AnalyzeBumps(deps []string, goModInfo *GoModInfo) ([]BumpAnalysis, []string) {
-	var analysis []BumpAnalysis
+// analyzeBumps analyzes each candidate bump and determines whether to keep or remove it.
+func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnalysis, []string) {
+	var analysis []bumpAnalysis
 
 	slog.Debug("analyzing bumps",
 		"input_count", len(deps),
@@ -112,7 +99,7 @@ func (a *Analyzer) AnalyzeBumps(deps []string, goModInfo *GoModInfo) ([]BumpAnal
 		if bumpVersion == "" {
 			// Malformed dep, keep it as is
 			filteredDeps = append(filteredDeps, module)
-			analysis = append(analysis, BumpAnalysis{
+			analysis = append(analysis, bumpAnalysis{
 				Module:       module,
 				BumpVersion:  "",
 				GoModVersion: "",
@@ -130,7 +117,7 @@ func (a *Analyzer) AnalyzeBumps(deps []string, goModInfo *GoModInfo) ([]BumpAnal
 		normalizedModule, exists := a.normalizeModulePath(module, bumpVersion, goModInfo)
 		if !exists {
 			// Module not found even with path correction
-			analysis = append(analysis, BumpAnalysis{
+			analysis = append(analysis, bumpAnalysis{
 				Module:       module,
 				BumpVersion:  bumpVersion,
 				GoModVersion: "(missing)",
@@ -176,7 +163,7 @@ func (a *Analyzer) AnalyzeBumps(deps []string, goModInfo *GoModInfo) ([]BumpAnal
 			// Use normalized module path in output
 			dep := fmt.Sprintf("%s@%s", normalizedModule, bumpVersion)
 			filteredDeps = append(filteredDeps, dep)
-			analysis = append(analysis, BumpAnalysis{
+			analysis = append(analysis, bumpAnalysis{
 				Module:       normalizedModule,
 				BumpVersion:  bumpVersion,
 				GoModVersion: effectiveVersion,
@@ -189,7 +176,7 @@ func (a *Analyzer) AnalyzeBumps(deps []string, goModInfo *GoModInfo) ([]BumpAnal
 				"reason", "bump version is newer")
 		} else if comparison == 0 {
 			// Versions are equal - remove as no-op
-			analysis = append(analysis, BumpAnalysis{
+			analysis = append(analysis, bumpAnalysis{
 				Module:       normalizedModule,
 				BumpVersion:  bumpVersion,
 				GoModVersion: effectiveVersion,
@@ -202,7 +189,7 @@ func (a *Analyzer) AnalyzeBumps(deps []string, goModInfo *GoModInfo) ([]BumpAnal
 				"reason", "versions match")
 		} else {
 			// Bump version is behind go.mod version - remove as downgrade
-			analysis = append(analysis, BumpAnalysis{
+			analysis = append(analysis, bumpAnalysis{
 				Module:       normalizedModule,
 				BumpVersion:  bumpVersion,
 				GoModVersion: effectiveVersion,
@@ -311,7 +298,7 @@ func (a *Analyzer) AnalyzeBumps(deps []string, goModInfo *GoModInfo) ([]BumpAnal
 // Go modules v2+ require /vN suffix in import path (e.g., github.com/foo/bar/v2).
 // OSV often returns paths without this suffix, so we need to correct them against go.mod.
 // Returns the normalized module path and whether it was found in go.mod with compatible major version.
-func (a *Analyzer) normalizeModulePath(module, version string, goModInfo *GoModInfo) (string, bool) {
+func (a *analyzer) normalizeModulePath(module, version string, goModInfo *GoModInfo) (string, bool) {
 	// Extract major version from the bump version
 	bumpMajor := semver.Major(version)
 
@@ -460,7 +447,7 @@ func (a *Analyzer) normalizeModulePath(module, version string, goModInfo *GoModI
 }
 
 // getEffectiveVersion returns the effective version considering replace directives
-func (a *Analyzer) getEffectiveVersion(module, originalVersion string, replacements map[string]*modfile.Replace) string {
+func (a *analyzer) getEffectiveVersion(module, originalVersion string, replacements map[string]*modfile.Replace) string {
 	slog.Debug("checking effective version",
 		"module", module,
 		"original_version", originalVersion)
@@ -509,40 +496,4 @@ func (a *Analyzer) getEffectiveVersion(module, originalVersion string, replaceme
 		"module", module,
 		"effective_version", originalVersion)
 	return originalVersion
-}
-
-// HaveDepsChanged compares two dependency lists to determine if they're different
-func (a *Analyzer) HaveDepsChanged(existing, merged []string) bool {
-	// Normalize both slices for comparison
-	normalizeDepList := func(deps []string) []string {
-		var normalized []string
-		for _, dep := range deps {
-			dep = strings.TrimSpace(dep)
-			if dep != "" {
-				normalized = append(normalized, dep)
-			}
-		}
-		slices.Sort(normalized)
-		return normalized
-	}
-
-	normalizedExisting := normalizeDepList(existing)
-	normalizedMerged := normalizeDepList(merged)
-
-	return !slices.Equal(normalizedExisting, normalizedMerged)
-}
-
-// GetVulnerabilityScanner returns the vulnerability scanner for external use
-func (a *Analyzer) GetVulnerabilityScanner() *scan.VulnerabilityScanner {
-	return a.vulnerabilityScanner
-}
-
-// GetFetcher returns the fetcher for external use
-func (a *Analyzer) GetFetcher() *Fetcher {
-	return a.fetcher
-}
-
-// GetParser returns the parser for external use
-func (a *Analyzer) GetParser() *Parser {
-	return a.parser
 }
