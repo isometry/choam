@@ -1,6 +1,25 @@
 version: "2"
 
-# Linters: intentionally unset — keeps golangci-lint's standard default set.
+# Linters: default set left unset (kept implicit) — enable only adds
+# forbidigo on top of golangci-lint's standard default set (errcheck, govet,
+# ineffassign, staticcheck, unused).
+linters:
+  enable:
+    - forbidigo
+  settings:
+    forbidigo:
+      forbid:
+        - pattern: '^slog\.(Debug|Info|Warn|Error)$'
+          msg: >-
+            bare slog calls lose per-file attribution - use
+            logging.From(ctx), a Processor's GetLogger(), or a struct
+            logger field instead (see internal/logging).
+  exclusions:
+    rules:
+      - path: '(cmd/logger\.go|internal/logging/)'
+        linters: [forbidigo]
+      - path: '_test\.go'
+        linters: [forbidigo]
 
 formatters:
   enable:

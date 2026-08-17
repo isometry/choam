@@ -54,7 +54,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	slog.Info("found melange files to update", "count", len(files))
+	slog.Info("found melange files to update", "count", len(files)) //nolint:forbidigo // pre-per-file: no processor/ctx attribution exists yet
 
 	// Configure processor options (note: no more SecurityScan - always enabled)
 	opts := updater.ProcessorOptions{
