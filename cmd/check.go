@@ -46,7 +46,7 @@ func runCheck(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	slog.Info("found melange files to check", "count", len(files))
+	slog.Info("found melange files to check", "count", len(files)) //nolint:forbidigo // pre-per-file: no processor/ctx attribution exists yet
 
 	if dryRun {
 		fmt.Println("Dry run mode - would check the following files:")
@@ -65,7 +65,7 @@ func runCheck(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("checking updates: %w", err)
 	}
 
-	slog.Info("processed melange files", "count", len(processors))
+	slog.Info("processed melange files", "count", len(processors)) //nolint:forbidigo // run-level summary, not attributable to any one file
 
 	// Convert processors to results for output
 	results := make([]*updater.UpdateResult, 0, len(processors))

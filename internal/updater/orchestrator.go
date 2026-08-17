@@ -158,7 +158,7 @@ func (o *UpdateOrchestrator) ProcessMultipleChecks(ctx context.Context, filePath
 			return processors, err
 		}
 
-		slog.Info("processing melange file", "file", filePath, "index", i+1, "total", len(filePaths))
+		slog.Info("processing melange file", "file", filePath, "index", i+1, "total", len(filePaths)) //nolint:forbidigo // this IS the file attribution - the per-file processor logger is seeded just below
 
 		processor, err := o.ProcessPackageCheck(ctx, filePath)
 		if err != nil {
@@ -185,7 +185,7 @@ func (o *UpdateOrchestrator) ProcessMultipleApplies(ctx context.Context, filePat
 			return processors, err
 		}
 
-		slog.Info("processing melange file", "file", filePath, "index", i+1, "total", len(filePaths))
+		slog.Info("processing melange file", "file", filePath, "index", i+1, "total", len(filePaths)) //nolint:forbidigo // this IS the file attribution - the per-file processor logger is seeded just below
 
 		processor, err := o.ProcessPackageApply(ctx, filePath, options)
 		if err != nil {

@@ -57,7 +57,7 @@ func runBump(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	slog.Info("found melange files to check for vulnerabilities", "count", len(files))
+	slog.Info("found melange files to check for vulnerabilities", "count", len(files)) //nolint:forbidigo // pre-per-file: no processor/ctx attribution exists yet
 
 	// Configure processor options
 	opts := buildBumpProcessorOptions()
@@ -77,12 +77,12 @@ func runBump(cmd *cobra.Command, args []string) error {
 			return fmt.Errorf("bump cancelled: %w", err)
 		}
 
-		slog.Info("processing melange file", "file", file, "index", i+1, "total", len(files))
+		slog.Info("processing melange file", "file", file, "index", i+1, "total", len(files)) //nolint:forbidigo // this IS the file attribution - the per-file ctx is seeded inside ProcessFile
 
 		result, err := gobump.ProcessFile(ctx, file, opts, analyzer)
 
 		if err != nil {
-			slog.Error("processing melange file failed", "file", file, "error", err)
+			slog.Error("processing melange file failed", "file", file, "error", err) //nolint:forbidigo // ProcessFile failed before/without seeding a ctx logger
 			// Create error result
 			result = &gobump.GoBumpResult{
 				PackageName: extractPackageNameFromPath(file),
