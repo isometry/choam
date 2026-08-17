@@ -5,13 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/isometry/choam/internal/gorelease"
 	"github.com/isometry/choam/internal/goversion"
+	"github.com/isometry/choam/internal/logging"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 )
@@ -64,7 +64,7 @@ func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBa
 	for _, candidate := range candidates {
 		if skip != nil && skip(candidate.module) {
 			skippedPrivate++
-			slog.Debug("go-version fallback: private module - skipping probe",
+			logging.From(ctx).Debug("go-version fallback: private module - skipping probe",
 				"modroot", m.Modroot, "module", candidate.module, "version", candidate.version)
 			continue
 		}
@@ -73,7 +73,7 @@ func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBa
 			if cerr := parentCtx.Err(); cerr != nil {
 				return "", cerr
 			}
-			slog.Debug("go-version fallback: could not fetch candidate go.mod - skipping",
+			logging.From(ctx).Debug("go-version fallback: could not fetch candidate go.mod - skipping",
 				"modroot", m.Modroot, "module", candidate.module, "version", candidate.version, "error", err)
 			continue
 		}

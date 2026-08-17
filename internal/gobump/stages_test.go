@@ -112,7 +112,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		steps, err := loader.FindBumpSteps([]byte(certManagerLikeYAML))
 		require.NoError(t, err)
 
-		units := discoverAnalysisUnits(&melange.Configuration{}, steps)
+		units := discoverAnalysisUnits(t.Context(), &melange.Configuration{}, steps)
 		require.Contains(t, units, "go")
 		assert.ElementsMatch(t, []string{"cmd/a", "cmd/b", ".", "test/e2e"}, roots(units["go"]))
 	})
@@ -124,7 +124,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "go/build", With: map[string]string{"modroot": "cmd/foo"}},
 			},
 		}
-		units := discoverAnalysisUnits(cfg, nil)
+		units := discoverAnalysisUnits(t.Context(), cfg, nil)
 		assert.Equal(t, []string{"cmd/foo"}, roots(units["go"]))
 	})
 
@@ -132,7 +132,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		cfg := &melange.Configuration{
 			Pipeline: []melange.Pipeline{{Uses: "go/build"}},
 		}
-		units := discoverAnalysisUnits(cfg, nil)
+		units := discoverAnalysisUnits(t.Context(), cfg, nil)
 		assert.Equal(t, []string{"."}, roots(units["go"]))
 	})
 
@@ -140,7 +140,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		cfg := &melange.Configuration{
 			Pipeline: []melange.Pipeline{{Uses: "cargo/build", With: map[string]string{"modroot": "."}}},
 		}
-		units := discoverAnalysisUnits(cfg, nil)
+		units := discoverAnalysisUnits(t.Context(), cfg, nil)
 		assert.Equal(t, []string{"."}, roots(units["rust"]))
 	})
 
@@ -153,7 +153,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				}},
 			},
 		}
-		units := discoverAnalysisUnits(cfg, nil)
+		units := discoverAnalysisUnits(t.Context(), cfg, nil)
 		assert.Equal(t, []string{"cmd/sub"}, roots(units["go"]))
 	})
 
@@ -168,7 +168,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				}},
 			},
 		}
-		units := discoverAnalysisUnits(cfg, nil)
+		units := discoverAnalysisUnits(t.Context(), cfg, nil)
 		assert.ElementsMatch(t, []string{"cmd/a", "cmd/b"}, roots(units["go"]))
 	})
 
@@ -178,7 +178,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				"choam/bump-rust": "cmd/foo, cmd/bar",
 			}},
 		}
-		units := discoverAnalysisUnits(cfg, nil)
+		units := discoverAnalysisUnits(t.Context(), cfg, nil)
 		assert.ElementsMatch(t, []string{"cmd/foo", "cmd/bar"}, roots(units["rust"]))
 	})
 
@@ -186,7 +186,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		cfg := &melange.Configuration{
 			Package: melange.Package{Annotations: map[string]string{"choam/bump-java": ""}},
 		}
-		units := discoverAnalysisUnits(cfg, nil)
+		units := discoverAnalysisUnits(t.Context(), cfg, nil)
 		assert.Equal(t, []string{"."}, roots(units["java"]))
 	})
 
@@ -198,7 +198,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				"choam/bump-go": "cmd/annotated",
 			}},
 		}
-		units := discoverAnalysisUnits(cfg, bumpSteps)
+		units := discoverAnalysisUnits(t.Context(), cfg, bumpSteps)
 		assert.ElementsMatch(t, []string{"cmd/existing", "cmd/build", "cmd/annotated"}, roots(units["go"]))
 	})
 
@@ -209,7 +209,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "cargo/build", With: map[string]string{"modroot": "cli"}},
 			},
 		}
-		units := discoverAnalysisUnits(cfg, nil)
+		units := discoverAnalysisUnits(t.Context(), cfg, nil)
 		assert.Equal(t, []string{"."}, roots(units["go"]))
 		assert.Equal(t, []string{"cli"}, roots(units["rust"]))
 	})
@@ -218,7 +218,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		cfg := &melange.Configuration{
 			Pipeline: []melange.Pipeline{{Uses: "git-checkout"}, {Runs: "make build"}},
 		}
-		units := discoverAnalysisUnits(cfg, nil)
+		units := discoverAnalysisUnits(t.Context(), cfg, nil)
 		assert.Empty(t, units)
 	})
 
@@ -226,11 +226,11 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		cfg := &melange.Configuration{
 			Pipeline: []melange.Pipeline{{Uses: "maven/pombump"}}, // not a build step with modroot
 		}
-		units := discoverAnalysisUnits(cfg, nil)
+		units := discoverAnalysisUnits(t.Context(), cfg, nil)
 		assert.NotContains(t, units, "java")
 
 		cfg.Package.Annotations = map[string]string{"choam/bump-java": "."}
-		units = discoverAnalysisUnits(cfg, nil)
+		units = discoverAnalysisUnits(t.Context(), cfg, nil)
 		assert.Equal(t, []string{"."}, roots(units["java"]))
 	})
 
@@ -240,7 +240,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "go/build", With: map[string]string{"modroot": ".", "packages": "./cmd/terraform ."}},
 			},
 		}
-		units := discoverAnalysisUnits(cfg, nil)
+		units := discoverAnalysisUnits(t.Context(), cfg, nil)
 		require.Len(t, units["go"], 1)
 		assert.Equal(t, ".", units["go"][0].Modroot)
 		assert.ElementsMatch(t, []string{".", "./cmd/terraform"}, units["go"][0].Packages)
@@ -253,7 +253,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "go/build", With: map[string]string{"packages": "./cmd/b ./cmd/a"}},
 			},
 		}
-		units := discoverAnalysisUnits(cfg, nil)
+		units := discoverAnalysisUnits(t.Context(), cfg, nil)
 		require.Len(t, units["go"], 1)
 		assert.Equal(t, []string{"./cmd/a", "./cmd/b"}, units["go"][0].Packages)
 	})
@@ -265,14 +265,14 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "go/build", With: map[string]string{"packages": "./cmd/${{package.name}}"}},
 			},
 		}
-		units := discoverAnalysisUnits(cfg, nil)
+		units := discoverAnalysisUnits(t.Context(), cfg, nil)
 		require.Len(t, units["go"], 1)
 		assert.Equal(t, []string{"./cmd/example"}, units["go"][0].Packages)
 	})
 
 	t.Run("bump-step-only modroot has empty packages", func(t *testing.T) {
 		bumpSteps := []config.BumpStep{{Language: "go", Modroots: []string{"cmd/only"}}}
-		units := discoverAnalysisUnits(&melange.Configuration{}, bumpSteps)
+		units := discoverAnalysisUnits(t.Context(), &melange.Configuration{}, bumpSteps)
 		require.Len(t, units["go"], 1)
 		assert.Empty(t, units["go"][0].Packages)
 	})
@@ -338,7 +338,7 @@ func TestReconcileBumpSteps_JavaGrammar(t *testing.T) {
 		BumpActions: []BumpAction{{Action: "needs_bump", Language: "java", Modroots: []string{"."}}},
 	}
 
-	err := applier.reconcileBumpSteps(gp, analysis, loader)
+	err := applier.reconcileBumpSteps(t.Context(), gp, analysis, loader)
 	require.NoError(t, err)
 
 	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
@@ -542,7 +542,7 @@ func TestReconcileBumpSteps_FastPathUpdatesInPlace(t *testing.T) {
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"."}}},
 	}
 
-	err := applier.reconcileBumpSteps(gp, analysis, loader)
+	err := applier.reconcileBumpSteps(t.Context(), gp, analysis, loader)
 	require.NoError(t, err)
 	assert.True(t, gp.ActualChangesApplied)
 
@@ -584,7 +584,7 @@ func TestReconcileBumpSteps_CoUpdateNotCreditedAsSecurityFix(t *testing.T) {
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"."}}},
 	}
 
-	err := applier.reconcileBumpSteps(gp, analysis, loader)
+	err := applier.reconcileBumpSteps(t.Context(), gp, analysis, loader)
 	require.NoError(t, err)
 
 	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
@@ -627,7 +627,7 @@ func TestReconcileBumpSteps_GeneralPathCoalescesDivergentRoots(t *testing.T) {
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"cmd/a"}}}, // non-empty is all that matters here
 	}
 
-	err := applier.reconcileBumpSteps(gp, analysis, loader)
+	err := applier.reconcileBumpSteps(t.Context(), gp, analysis, loader)
 	require.NoError(t, err)
 	assert.True(t, gp.ActualChangesApplied)
 
@@ -674,7 +674,7 @@ func TestReconcileBumpSteps_InsertsWhenNoStepExists(t *testing.T) {
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"."}}},
 	}
 
-	err := applier.reconcileBumpSteps(gp, analysis, loader)
+	err := applier.reconcileBumpSteps(t.Context(), gp, analysis, loader)
 	require.NoError(t, err)
 	assert.True(t, gp.ActualChangesApplied)
 
@@ -733,7 +733,7 @@ pipeline:
 		},
 	}
 
-	err := applier.reconcileBumpSteps(gp, analysis, loader)
+	err := applier.reconcileBumpSteps(t.Context(), gp, analysis, loader)
 	require.NoError(t, err)
 
 	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
@@ -774,7 +774,7 @@ func TestReconcileBumpSteps_FastPathWritesReplaces(t *testing.T) {
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"."}}},
 	}
 
-	err := applier.reconcileBumpSteps(gp, analysis, loader)
+	err := applier.reconcileBumpSteps(t.Context(), gp, analysis, loader)
 	require.NoError(t, err)
 
 	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
@@ -817,7 +817,7 @@ func TestReconcileBumpSteps_GeneralPathCoalescesByReplaces(t *testing.T) {
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"cmd/a", "cmd/b"}}},
 	}
 
-	err := applier.reconcileBumpSteps(gp, analysis, loader)
+	err := applier.reconcileBumpSteps(t.Context(), gp, analysis, loader)
 	require.NoError(t, err)
 
 	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
@@ -860,7 +860,7 @@ func TestReconcileBumpSteps_PreservesBlankLineConvention(t *testing.T) {
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"cmd/a", "cmd/b", "test/e2e"}}},
 	}
 
-	err := applier.reconcileBumpSteps(gp, analysis, loader)
+	err := applier.reconcileBumpSteps(t.Context(), gp, analysis, loader)
 	require.NoError(t, err)
 
 	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
@@ -955,7 +955,7 @@ func TestReconcileBumpSteps_FastPathEmitsGoVersion(t *testing.T) {
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"."}}},
 	}
 
-	require.NoError(t, applier.reconcileBumpSteps(gp, analysis, loader))
+	require.NoError(t, applier.reconcileBumpSteps(t.Context(), gp, analysis, loader))
 
 	firstPass := string(gp.GetCurrentYAML())
 	assert.Contains(t, firstPass, `go-version: "1.26"`)
@@ -985,7 +985,7 @@ func TestReconcileBumpSteps_FastPathEmitsGoVersion(t *testing.T) {
 		}},
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"."}}},
 	}
-	require.NoError(t, applier.reconcileBumpSteps(gp, secondAnalysis, loader))
+	require.NoError(t, applier.reconcileBumpSteps(t.Context(), gp, secondAnalysis, loader))
 	assert.Equal(t, firstPass, string(gp.GetCurrentYAML()), "double-running the applier must be byte-stable")
 }
 
@@ -1029,7 +1029,7 @@ pipeline:
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"."}}},
 	}
 
-	require.NoError(t, applier.reconcileBumpSteps(gp, analysis, loader))
+	require.NoError(t, applier.reconcileBumpSteps(t.Context(), gp, analysis, loader))
 
 	content := string(gp.GetCurrentYAML())
 	assert.Contains(t, content, `go-version: "1.26"`)
@@ -1093,7 +1093,7 @@ pipeline:
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{".", "cmd/a"}}},
 	}
 
-	require.NoError(t, applier.reconcileBumpSteps(gp, analysis, loader))
+	require.NoError(t, applier.reconcileBumpSteps(t.Context(), gp, analysis, loader))
 
 	firstPass := string(gp.GetCurrentYAML())
 	assert.Contains(t, firstPass, `go-version: "1.26"`, "single step must satisfy the most demanding root")
@@ -1131,7 +1131,7 @@ pipeline:
 		}},
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{".", "cmd/a"}}},
 	}
-	require.NoError(t, applier.reconcileBumpSteps(gp, secondAnalysis, loader))
+	require.NoError(t, applier.reconcileBumpSteps(t.Context(), gp, secondAnalysis, loader))
 	assert.Equal(t, firstPass, string(gp.GetCurrentYAML()), "re-running the fast path on divergent-go-version roots must be byte-stable")
 }
 
@@ -1186,7 +1186,7 @@ pipeline:
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{".", "cmd/a"}}},
 	}
 
-	require.NoError(t, applier.reconcileBumpSteps(gp, analysis, loader))
+	require.NoError(t, applier.reconcileBumpSteps(t.Context(), gp, analysis, loader))
 
 	content := string(gp.GetCurrentYAML())
 	assert.Contains(t, content, `go-version: "1.27"`)
@@ -1238,7 +1238,7 @@ pipeline:
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"."}}},
 	}
 
-	require.NoError(t, applier.reconcileBumpSteps(gp, analysis, loader))
+	require.NoError(t, applier.reconcileBumpSteps(t.Context(), gp, analysis, loader))
 
 	content := string(gp.GetCurrentYAML())
 	assert.Contains(t, content, "go-version: ${{vars.go-version}}", "templated value must survive untouched")
@@ -1302,7 +1302,7 @@ pipeline:
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"cmd/a", "cmd/b"}}},
 	}
 
-	require.NoError(t, applier.reconcileBumpSteps(gp, analysis, loader))
+	require.NoError(t, applier.reconcileBumpSteps(t.Context(), gp, analysis, loader))
 
 	content := string(gp.GetCurrentYAML())
 	assert.NotContains(t, content, "go-version", "the templated go-version cannot be re-emitted through the rebuild")
@@ -1341,7 +1341,7 @@ func TestReconcileBumpSteps_GeneralPathSplitsByGoVersion(t *testing.T) {
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"cmd/a", "cmd/b"}}},
 	}
 
-	require.NoError(t, applier.reconcileBumpSteps(gp, analysis, loader))
+	require.NoError(t, applier.reconcileBumpSteps(t.Context(), gp, analysis, loader))
 
 	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
 	require.NoError(t, err)
@@ -1381,7 +1381,7 @@ func TestReconcileBumpSteps_GeneralPathSplitsByGoVersion(t *testing.T) {
 		}},
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"cmd/a", "cmd/b"}}},
 	}
-	require.NoError(t, applier.reconcileBumpSteps(gp, secondAnalysis, loader))
+	require.NoError(t, applier.reconcileBumpSteps(t.Context(), gp, secondAnalysis, loader))
 	assert.Equal(t, firstPass, string(gp.GetCurrentYAML()), "re-running the general path must be byte-stable")
 }
 
@@ -1490,7 +1490,7 @@ pipeline:
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"cmd/a", "cmd/b"}}},
 	}
 
-	err := applier.reconcileBumpSteps(gp, analysis, loader)
+	err := applier.reconcileBumpSteps(t.Context(), gp, analysis, loader)
 	require.NoError(t, err)
 
 	content := string(gp.GetCurrentYAML())

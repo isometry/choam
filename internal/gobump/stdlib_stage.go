@@ -4,12 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/isometry/choam/internal/git"
+	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/processor"
 	"github.com/isometry/choam/internal/simulate"
 )
@@ -70,7 +70,7 @@ func NewStdlibStage(analyzer *Analyzer, opts ProcessorOptions) *StdlibStage {
 // each stage's ShouldRun on its own, so this stage runs even when every
 // earlier stage was skipped (a package with no dependency changes can still
 // need a stdlib rebuild).
-func (s *StdlibStage) ShouldRun(_ context.Context, p processor.Processor) (bool, error) {
+func (s *StdlibStage) ShouldRun(ctx context.Context, p processor.Processor) (bool, error) {
 	gp, ok := p.(*GoBumpProcessor)
 	if !ok {
 		return false, fmt.Errorf("expected GoBumpProcessor, got %T", p)
@@ -78,7 +78,7 @@ func (s *StdlibStage) ShouldRun(_ context.Context, p processor.Processor) (bool,
 	if !s.Options.StdlibCheck || gp.Config == nil {
 		return false, nil
 	}
-	return len(unitsFromBuildSteps(gp.Config)["go"]) > 0, nil
+	return len(unitsFromBuildSteps(ctx, gp.Config)["go"]) > 0, nil
 }
 
 // Apply runs the staleness check. EVERY failure path degrades to a
@@ -90,7 +90,7 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 	}
 
 	if s.index == nil || s.scanner == nil {
-		s.skipWarn(gp, "stdlib: release index/scanner unavailable - skipping stdlib staleness check")
+		s.skipWarn(ctx, gp, "stdlib: release index/scanner unavailable - skipping stdlib staleness check")
 		return nil
 	}
 
@@ -106,7 +106,7 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
-		s.skipWarn(gp, fmt.Sprintf("stdlib: could not determine the melange file's last commit (%v) - skipping stdlib staleness check", err))
+		s.skipWarn(ctx, gp, fmt.Sprintf("stdlib: could not determine the melange file's last commit (%v) - skipping stdlib staleness check", err))
 		return nil
 	}
 	if info.Dirty {
@@ -117,15 +117,15 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 		return nil
 	}
 	if info.Shallow {
-		slog.Warn("melange repository history is shallow - stdlib staleness estimate may assume a newer toolchain than reality",
-			"file", gp.GetFilePath(), "commit_time", info.Time)
+		logging.From(ctx).Warn("melange repository history is shallow - stdlib staleness estimate may assume a newer toolchain than reality",
+			"commit_time", info.Time)
 		gp.AddMessage("stdlib: repository history is shallow - the assumed build toolchain may be newer than reality")
 	}
 
 	// Constraints come from the pristine config (the historical truth the
 	// assumed side needs); the rebuild side additionally reflects go-package
 	// pins this same run raised (the applier runs before this stage).
-	constraints := distinctMinorConstraints(goToolchainPins(gp.Config))
+	constraints := distinctMinorConstraints(goToolchainPins(ctx, gp.Config))
 	in := stdlibInput{
 		CommitTime:         info.Time,
 		Constraints:        constraints,
@@ -140,7 +140,7 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr
 		}
-		s.skipWarn(gp, fmt.Sprintf("stdlib: staleness check unavailable (%v) - skipping", err))
+		s.skipWarn(ctx, gp, fmt.Sprintf("stdlib: staleness check unavailable (%v) - skipping", err))
 		return nil
 	}
 
@@ -155,7 +155,7 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 			if cerr := ctx.Err(); cerr != nil {
 				return cerr
 			}
-			slog.Warn("could not determine linked stdlib packages - stdlib findings remain unfiltered", "error", err)
+			logging.From(ctx).Warn("could not determine linked stdlib packages - stdlib findings remain unfiltered", "error", err)
 			gp.AddMessage(fmt.Sprintf("stdlib: could not determine linked stdlib packages (%v) - findings not filtered by artifact reachability", err))
 		} else if linked != nil {
 			in.Linked, in.Validated = linked, true
@@ -164,7 +164,7 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 				if cerr := ctx.Err(); cerr != nil {
 					return cerr
 				}
-				slog.Warn("linked-import stdlib re-evaluation failed - stdlib findings remain unfiltered", "error", err)
+				logging.From(ctx).Warn("linked-import stdlib re-evaluation failed - stdlib findings remain unfiltered", "error", err)
 				gp.AddMessage(fmt.Sprintf("stdlib: linked-import re-evaluation failed (%v) - findings not filtered by artifact reachability", err))
 			} else {
 				bumps, messages = filteredBumps, filteredMessages
@@ -178,7 +178,7 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 		gp.AddMessage(msg)
 	}
 	if len(bumps) == 0 && len(messages) == 0 {
-		slog.Debug("stdlib staleness check found nothing to fix", "file", gp.GetFilePath())
+		logging.From(ctx).Debug("stdlib staleness check found nothing to fix")
 	}
 	return nil
 }
@@ -208,27 +208,27 @@ func (s *StdlibStage) checkoutLinkedStd(ctx context.Context, gp *GoBumpProcessor
 	}
 	defer func() {
 		if err := os.RemoveAll(cloneDir); err != nil {
-			slog.Debug("could not remove stdlib checkout directory", "dir", cloneDir, "error", err)
+			logging.From(ctx).Debug("could not remove stdlib checkout directory", "dir", cloneDir, "error", err)
 		}
 	}()
 
 	gitClient := git.New()
-	slog.Debug("cloning source for stdlib reachability", "repository", analysis.RepoURL, "tag", analysis.Tag, "dir", cloneDir)
+	logging.From(ctx).Debug("cloning source for stdlib reachability", "repository", analysis.RepoURL, "tag", analysis.Tag, "dir", cloneDir)
 	if err := gitClient.CloneAtTag(ctx, analysis.RepoURL, analysis.Tag, cloneDir); err != nil {
 		return nil, fmt.Errorf("cloning %s at %s: %w", analysis.RepoURL, analysis.Tag, err)
 	}
 	if analysis.ExpectedCommit != "" {
 		// Warn-only, mirroring the simulator: melange enforces it at build time.
 		if head, err := gitClient.HeadCommit(ctx, cloneDir); err != nil {
-			slog.Warn("could not verify expected commit for stdlib checkout", "error", err)
+			logging.From(ctx).Warn("could not verify expected commit for stdlib checkout", "error", err)
 		} else if head != analysis.ExpectedCommit {
-			slog.Warn("stdlib checkout does not match expected-commit; using the tag's actual state",
+			logging.From(ctx).Warn("stdlib checkout does not match expected-commit; using the tag's actual state",
 				"tag", analysis.Tag, "expected", analysis.ExpectedCommit, "actual", head)
 		}
 	}
 
 	union := make(map[string]struct{})
-	for _, unit := range unitsFromBuildSteps(gp.Config)["go"] {
+	for _, unit := range unitsFromBuildSteps(ctx, gp.Config)["go"] {
 		dir := cloneDir
 		if unit.Modroot != "" && unit.Modroot != "." {
 			dir = filepath.Join(cloneDir, filepath.FromSlash(unit.Modroot))
@@ -251,7 +251,7 @@ func (s *StdlibStage) checkoutLinkedStd(ctx context.Context, gp *GoBumpProcessor
 
 // skipWarn records a degrade-to-skip both in the log and the per-package
 // messages (this stage never fails the run).
-func (s *StdlibStage) skipWarn(gp *GoBumpProcessor, msg string) {
-	slog.Warn(msg, "file", gp.GetFilePath())
+func (s *StdlibStage) skipWarn(ctx context.Context, gp *GoBumpProcessor, msg string) {
+	logging.From(ctx).Warn(msg)
 	gp.AddMessage(msg)
 }
