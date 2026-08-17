@@ -109,6 +109,9 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 
 	sim, err := s.newSimulator(s.Options, s.Analyzer)
 	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
 		s.degrade(gp, err)
 		return nil
 	}
@@ -134,6 +137,9 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 
 		results, err := sim.Simulate(ctx, analysis.RepoURL, analysis.Tag, analysis.ExpectedCommit, reqs)
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			s.degrade(gp, err)
 			return nil
 		}
@@ -375,7 +381,9 @@ func (s *SimulationStage) safeDetectCoUpdates(ctx context.Context, packagesToUpd
 
 // degrade falls back to the unvalidated pre-simulation candidate set,
 // loudly: the written deps list has not been proven to resolve or to cover
-// every advisory.
+// every advisory. Callers must check ctx.Err() before calling this - a
+// cancelled run must propagate that cancellation, not degrade and write an
+// unvalidated result as if simulation had merely failed.
 func (s *SimulationStage) degrade(gp *GoBumpProcessor, err error) {
 	gp.Validated = false
 	slog.Warn("bump simulation unavailable - proceeding with UNVALIDATED deps", "error", err)

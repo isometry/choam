@@ -50,6 +50,11 @@ func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBa
 		return "", nil
 	}
 
+	// parentCtx is checked (not the budget-bounded ctx below) so that this
+	// function's own best-effort timeout expiring keeps failing open as
+	// designed - only a REAL cancellation of the caller's ctx short-circuits
+	// the probe.
+	parentCtx := ctx
 	ctx, cancel := context.WithTimeout(ctx, fallbackGoVersionBudget)
 	defer cancel()
 
@@ -65,6 +70,9 @@ func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBa
 		}
 		goDirective, err := fetchModGoDirective(ctx, client, proxyBaseURL, candidate.module, candidate.version)
 		if err != nil {
+			if cerr := parentCtx.Err(); cerr != nil {
+				return "", cerr
+			}
 			slog.Debug("go-version fallback: could not fetch candidate go.mod - skipping",
 				"modroot", m.Modroot, "module", candidate.module, "version", candidate.version, "error", err)
 			continue

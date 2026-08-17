@@ -103,6 +103,9 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 		gp.AddMessage("stdlib: melange file has no commit history - skipping stdlib staleness check")
 		return nil
 	case err != nil:
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
 		s.skipWarn(gp, fmt.Sprintf("stdlib: could not determine the melange file's last commit (%v) - skipping stdlib staleness check", err))
 		return nil
 	}
@@ -134,6 +137,9 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 
 	bumps, messages, err := evaluateStdlibStaleness(ctx, s.index, s.scanner, in)
 	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
 		s.skipWarn(gp, fmt.Sprintf("stdlib: staleness check unavailable (%v) - skipping", err))
 		return nil
 	}
@@ -141,16 +147,23 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 	// Fallback checkout: only worth a clone when the preliminary unfiltered
 	// evaluation actually found fixable advisories to validate against the
 	// artifact's linked stdlib set. Any failure fails OPEN: the unfiltered
-	// (Validated=false) findings stand.
+	// (Validated=false) findings stand. A cancellation is the one failure
+	// that must NOT fail open - it means stop, not "proceed unfiltered".
 	if len(bumps) > 0 && in.Linked == nil && s.Options.Validate {
 		linked, err := s.linkStd(ctx, gp)
 		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			slog.Warn("could not determine linked stdlib packages - stdlib findings remain unfiltered", "error", err)
 			gp.AddMessage(fmt.Sprintf("stdlib: could not determine linked stdlib packages (%v) - findings not filtered by artifact reachability", err))
 		} else if linked != nil {
 			in.Linked, in.Validated = linked, true
 			filteredBumps, filteredMessages, err := evaluateStdlibStaleness(ctx, s.index, s.scanner, in)
 			if err != nil {
+				if cerr := ctx.Err(); cerr != nil {
+					return cerr
+				}
 				slog.Warn("linked-import stdlib re-evaluation failed - stdlib findings remain unfiltered", "error", err)
 				gp.AddMessage(fmt.Sprintf("stdlib: linked-import re-evaluation failed (%v) - findings not filtered by artifact reachability", err))
 			} else {
