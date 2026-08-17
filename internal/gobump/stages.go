@@ -3,7 +3,6 @@ package gobump
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"maps"
 	"net/http"
 	"os"
@@ -17,6 +16,7 @@ import (
 	"github.com/isometry/choam/internal/goproxy"
 	"github.com/isometry/choam/internal/gorelease"
 	"github.com/isometry/choam/internal/goversion"
+	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/processor"
 	"github.com/isometry/choam/internal/processor/stages"
 	"github.com/isometry/choam/internal/scan"
@@ -414,7 +414,7 @@ func renderFixList(ids []string, severities map[string]string) string {
 // language and module root discovered for this package (see
 // discoverAnalysisUnits) - a package may have more than one language.
 func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoBumpProcessor) (*VulnerabilityAnalysis, error) {
-	slog.Debug("checking vulnerabilities", "file", gp.GetFilePath())
+	logging.From(ctx).Debug("checking vulnerabilities")
 
 	loader := newMelangeLoader()
 
@@ -423,16 +423,16 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoB
 		return nil, fmt.Errorf("finding bump pipelines: %w", err)
 	}
 
-	units := discoverAnalysisUnits(gp.Config, bumpSteps)
+	units := discoverAnalysisUnits(ctx, gp.Config, bumpSteps)
 	if len(units) == 0 {
-		slog.Debug("not a bumpable project", "file", gp.GetFilePath())
+		logging.From(ctx).Debug("not a bumpable project")
 		gp.AddMessage("Not a bumpable project - skipping dependency analysis")
 		return &VulnerabilityAnalysis{}, nil
 	}
 
 	repoURL, tag, expectedCommit, err := extractRepositoryFromYAML(gp.GetCurrentYAML(), gp.Config, gp.GetCurrentVersion())
 	if err != nil {
-		slog.Debug("could not extract repository info", "file", gp.GetFilePath(), "error", err)
+		logging.From(ctx).Debug("could not extract repository info", "error", err)
 		gp.AddMessage(fmt.Sprintf("Could not extract repository info - skipping: %v", err))
 		return &VulnerabilityAnalysis{}, nil
 	}
@@ -457,6 +457,11 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoB
 	var rawBumpsSeen []string
 
 	for _, language := range languages {
+		// Shadowed for the rest of this iteration: every log emitted while
+		// analyzing this language - including deep inside performAnalysis -
+		// now carries it.
+		ctx := logging.With(ctx, "language", language)
+
 		langUnits := units[language] // already sorted by modroot
 		modroots := unitRoots(langUnits)
 
@@ -468,7 +473,7 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoB
 			continue
 		}
 
-		slog.Debug("analyzing language", "language", language, "repository", repoURL, "tag", tag, "modroots", modroots)
+		logging.From(ctx).Debug("analyzing language", "repository", repoURL, "tag", tag, "modroots", modroots)
 		gp.AddMessage(fmt.Sprintf("Analyzing %s dependencies from %s @ %s (modroots: %s)", language, repoURL, tag, strings.Join(modroots, ", ")))
 
 		result, err := v.performAnalysis(ctx, eco, language, repoURL, tag, langUnits, bumpSteps, gp)
@@ -549,11 +554,15 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 
 	for _, unit := range langUnits {
 		root := unit.Modroot
+		// Shadowed for the rest of this iteration - see the language-level
+		// shadow above.
+		ctx := logging.With(ctx, "modroot", root)
+
 		files := make(map[string][]byte, len(manifestFiles))
 		for _, name := range manifestFiles {
 			content, err := fetcher.FetchFile(ctx, repoURL, tag, modrootPath(root, name))
 			if err != nil {
-				slog.Debug("could not fetch manifest file", "modroot", root, "file", name, "error", err)
+				logging.From(ctx).Debug("could not fetch manifest file", "manifest", name, "error", err)
 				continue
 			}
 			files[name] = content
@@ -561,7 +570,7 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 
 		deps, err := eco.Analyze(ctx, files)
 		if err != nil {
-			slog.Debug("could not analyze modroot", "modroot", root, "error", err)
+			logging.From(ctx).Debug("could not analyze modroot", "error", err)
 			gp.AddMessage(fmt.Sprintf("modroot %s: could not analyze dependencies (%v) - skipping", root, err))
 			continue
 		}
@@ -768,7 +777,7 @@ func dedupeSorted(items []string) []string {
 // with the desired per-modroot dependency sets computed during the check phase.
 func (g *GoBumpApplier) applyGoBumpChanges(ctx context.Context, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis) error {
 	if len(analysis.BumpActions) == 0 {
-		slog.Debug("skipping apply - no actions to apply")
+		logging.From(ctx).Debug("skipping apply - no actions to apply")
 		return nil
 	}
 
@@ -779,7 +788,7 @@ func (g *GoBumpApplier) applyGoBumpChanges(ctx context.Context, gp *GoBumpProces
 
 	loader := newMelangeLoader()
 
-	if err := g.reconcileBumpSteps(gp, analysis, loader); err != nil {
+	if err := g.reconcileBumpSteps(ctx, gp, analysis, loader); err != nil {
 		return fmt.Errorf("reconciling bump steps: %w", err)
 	}
 
@@ -813,13 +822,13 @@ func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProces
 				continue
 			}
 			if g.probeDisabled {
-				slog.Debug("go-version fallback: probe disabled (GOPROXY=off) - skipping", "modroot", m.Modroot)
+				logging.From(ctx).Debug("go-version fallback: probe disabled (GOPROXY=off) - skipping", "modroot", m.Modroot)
 				gp.AddMessage(fmt.Sprintf("modroot %s: GOPROXY=off - skipping best-effort Go version probe", m.Modroot))
 				continue
 			}
 			required, err := fallbackRequiredGoVersion(ctx, g.httpClient(), g.goProxyURL, m, g.skipPrivateModule)
 			if err != nil {
-				slog.Warn("could not determine required Go version (best-effort probe failed)",
+				logging.From(ctx).Warn("could not determine required Go version (best-effort probe failed)",
 					"modroot", m.Modroot, "error", err)
 				gp.AddMessage(fmt.Sprintf("modroot %s: could not determine required Go version (best-effort probe failed): %v", m.Modroot, err))
 				continue
@@ -834,13 +843,13 @@ func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProces
 			// floor - confirm it names a real Go release.
 			valid, offlineErr := validateGoVersionFloor(ctx, g.releaseIndex(), goversion.Minor(required))
 			if offlineErr != nil {
-				slog.Warn("could not validate required Go version against known releases (index unavailable) - proceeding",
+				logging.From(ctx).Warn("could not validate required Go version against known releases (index unavailable) - proceeding",
 					"modroot", m.Modroot, "version", required, "error", offlineErr)
 				gp.AddMessage(fmt.Sprintf("modroot %s: could not validate required Go %s against known releases (index unavailable) - proceeding without validation: %v",
 					m.Modroot, required, offlineErr))
 			}
 			if !valid {
-				slog.Warn("candidate dependencies claim to require an unknown Go release - ignoring",
+				logging.From(ctx).Warn("candidate dependencies claim to require an unknown Go release - ignoring",
 					"modroot", m.Modroot, "version", required)
 				gp.AddMessage(fmt.Sprintf("modroot %s: candidate dependencies claim to require Go %s, which is not a known Go release — ignoring (check the dependency's go.mod)",
 					m.Modroot, required))
@@ -868,12 +877,12 @@ func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProces
 // explicit with.language. This is what produces cert-manager-style
 // multi-step output when modroots genuinely diverge, while collapsing to a
 // single step when they agree.
-func (g *GoBumpApplier) reconcileBumpSteps(gp *GoBumpProcessor, analysis *VulnerabilityAnalysis, loader *config.Loader) error {
+func (g *GoBumpApplier) reconcileBumpSteps(ctx context.Context, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis, loader *config.Loader) error {
 	for _, langAnalysis := range analysis.ByLanguage {
 		if len(langAnalysis.ByModroot) == 0 {
 			continue
 		}
-		if err := g.reconcileLanguageBumpSteps(gp, langAnalysis, loader); err != nil {
+		if err := g.reconcileLanguageBumpSteps(ctx, gp, langAnalysis, loader); err != nil {
 			return fmt.Errorf("reconciling %s bump steps: %w", langAnalysis.Language, err)
 		}
 	}
@@ -904,7 +913,7 @@ func (g *GoBumpApplier) reconcileBumpSteps(gp *GoBumpProcessor, analysis *Vulner
 // with.language. This is what produces cert-manager-style multi-step output
 // when modroots genuinely diverge, while collapsing to a single step when
 // they agree.
-func (g *GoBumpApplier) reconcileLanguageBumpSteps(gp *GoBumpProcessor, langAnalysis LanguageAnalysis, loader *config.Loader) error {
+func (g *GoBumpApplier) reconcileLanguageBumpSteps(ctx context.Context, gp *GoBumpProcessor, langAnalysis LanguageAnalysis, loader *config.Loader) error {
 	allSteps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
 	if err != nil {
 		return fmt.Errorf("finding existing bump steps: %w", err)
@@ -953,7 +962,7 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(gp *GoBumpProcessor, langAnal
 			msg := fmt.Sprintf("%s pipeline[%d] go-version %q is not a plain version (templated?) and could not be preserved across the bump pipeline rebuild (modroots: %s) - reapply it manually",
 				step.Action, step.Index, step.GoVersion, strings.Join(step.Modroots, ", "))
 			gp.AddMessage(msg)
-			slog.Warn("go-version could not be preserved across bump pipeline rebuild",
+			logging.From(ctx).Warn("go-version could not be preserved across bump pipeline rebuild",
 				"action", step.Action, "index", step.Index, "go_version", step.GoVersion, "modroots", step.Modroots)
 		}
 	}

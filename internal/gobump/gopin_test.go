@@ -61,7 +61,7 @@ func TestGoToolchainPins(t *testing.T) {
 			},
 		}
 
-		pins := goToolchainPins(cfg)
+		pins := goToolchainPins(t.Context(), cfg)
 		require.Len(t, pins, 3)
 		assert.Equal(t, GoToolchainPin{Package: "go-1.24", Minor: "1.24"}, pins[0])
 		assert.Equal(t, GoToolchainPin{Package: "", Minor: ""}, pins[1])
@@ -76,7 +76,7 @@ func TestGoToolchainPins(t *testing.T) {
 			},
 		}
 
-		pins := goToolchainPins(cfg)
+		pins := goToolchainPins(t.Context(), cfg)
 		require.Len(t, pins, 1)
 		assert.Equal(t, GoToolchainPin{Package: "go-1.24", Minor: "1.24"}, pins[0])
 	})
@@ -88,7 +88,7 @@ func TestGoToolchainPins(t *testing.T) {
 			},
 		}
 
-		pins := goToolchainPins(cfg)
+		pins := goToolchainPins(t.Context(), cfg)
 		require.Len(t, pins, 1)
 		assert.Equal(t, "${{vars.missing}}", pins[0].Package)
 		assert.Equal(t, "", pins[0].Minor)
@@ -98,7 +98,7 @@ func TestGoToolchainPins(t *testing.T) {
 		cfg := &melange.Configuration{
 			Pipeline: []melange.Pipeline{{Uses: "git-checkout"}, {Uses: "cargo/build"}},
 		}
-		assert.Empty(t, goToolchainPins(cfg))
+		assert.Empty(t, goToolchainPins(t.Context(), cfg))
 	})
 }
 
