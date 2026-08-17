@@ -243,6 +243,44 @@ make fmt && make lint && make test
 - Minimal fix strategy to reduce update impact
 - Epoch management tied to actual fixes
 
+**Logging (`internal/logging`):**
+- `ctx context.Context` is the first parameter on every function that logs,
+  does I/O, runs a subprocess, or makes a network call - no bare
+  `slog.Debug/Info/Warn/Error` calls; `make lint` enforces this (forbidigo in
+  `.golangci.yml`, with narrow `//nolint:forbidigo` exemptions at the handful
+  of genuinely pre-per-file sites, e.g. `cmd/bump.go`'s "found N files"
+  announcement before any file's processor exists).
+- The per-file logger rides on `ctx`, not a separate parameter: call
+  `logging.From(ctx)` to log, `logging.Into(ctx, logger)` to seed a fresh
+  logger (replaces whatever ctx carried - never call it to add attributes),
+  and `logging.With(ctx, "key", val, ...)` to layer attributes as ctx
+  descends a call chain (the safe way to extend, since it reads the current
+  logger before replacing). `logging.ForFile(path)` covers the moment before
+  a `processor.Processor` exists (e.g. a read/parse failure).
+- `processor.Pipeline.Execute` seeds ctx once with the processor's logger,
+  then layers `stage`/`stage_index` per stage before calling any stage
+  method - a stage should never re-derive `stage` itself (duplicates the
+  key; `internal/updater/orchestrator_test.go`'s
+  `TestProcessPackageCheck_LogsCarryFileAttributionNoDuplicateKeys` guards
+  against regressing this).
+- Attribute vocabulary: `file` = melange spec path (always, never a
+  manifest/build-file name - see `manifest` below), `package` = melange
+  package name, `pipeline` = the `processor.Pipeline` name, `stage`/
+  `stage_index` = current pipeline stage, `modroot`/`language` = current
+  bump-analysis modroot/language, `manifest` = ecosystem manifest basename
+  (go.mod/go.sum/Cargo.lock/pom.xml).
+- Two independent, intentionally separate channels: `slog` via ctx is the
+  chronological operational stream (stderr, gated by `-v`/`-vv`);
+  `processor.Processor.AddMessage` is the per-package user-facing report
+  (stdout, grouped after the results table, shown at `-v`). Don't try to
+  unify them - some sites intentionally log and message the same fact for
+  different audiences.
+- Ctrl+C actually cancels a run (`main.go` wires `signal.NotifyContext` into
+  `cmd.ExecuteContext`). Check `ctx.Err()` before falling back to a
+  best-effort degrade (see `SimulationStage.degrade`,
+  `StdlibStage.skipWarn`) - a cancellation must propagate, not be
+  misreported as an ordinary tool failure.
+
 ## Important Reminders
 
 - **Edit over create**: Always prefer editing existing files over creating new ones
