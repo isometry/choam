@@ -49,6 +49,10 @@ func (p *Pipeline) Execute(ctx context.Context, processor Processor) error {
 	logger.Info("Starting pipeline execution", "stages", len(p.Stages))
 
 	for i, stage := range p.Stages {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		stageLogger := logger.With("stage", stage.Name(), "stage_index", i)
 
 		// Check if stage should run

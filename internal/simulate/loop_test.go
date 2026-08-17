@@ -373,6 +373,31 @@ func (h *countingHandler) count(msg string) int {
 	return h.counts[msg]
 }
 
+// TestRunLoop_CancelledContext confirms apply's attempt loop checks ctx at
+// the top of every attempt: without this, a cancellation mid-loop could burn
+// several more attempts (restore/getSatisfied succeed regardless of ctx) and
+// then report a misleading "module graph did not stabilize" instead of the
+// real cancellation.
+func TestRunLoop_CancelledContext(t *testing.T) {
+	tc := &fakeToolchain{base: map[string]string{"example.com/mod": "v0.40.0"}}
+	sc := &fakeScanner{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := RunLoop(ctx, tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/mod", Version: "v0.45.0", FromCVE: true, VulnIDs: []string{"GO-1"}},
+		},
+	}, Options{})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.NotContains(t, err.Error(), "did not stabilize",
+		"a cancellation must not be reported as attempt-budget exhaustion")
+}
+
 func TestRunLoop_RaisesToFixpoint(t *testing.T) {
 	// The seed fixes GO-0001, but the rescan of the raised graph reveals
 	// GO-0002 (introduced after the original version), requiring a second

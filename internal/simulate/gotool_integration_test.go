@@ -25,7 +25,7 @@ func TestRunLoop_RealToolchain(t *testing.T) {
 		t.Skip("set CHOAM_NETWORK_TESTS=1 to run network integration tests")
 	}
 
-	toolchain, err := NewToolchain(2 * time.Minute)
+	toolchain, err := NewToolchain(t.Context(), 2*time.Minute)
 	if err != nil {
 		t.Skipf("go toolchain unavailable: %v", err)
 	}
@@ -77,7 +77,7 @@ func TestRunLoop_RealToolchain(t *testing.T) {
 // TestGoToolchain_ReplaceRoundTrip exercises Replace/Replaces against the
 // real go tool (no network needed - pure go.mod edits).
 func TestGoToolchain_ReplaceRoundTrip(t *testing.T) {
-	toolchain, err := NewToolchain(time.Minute)
+	toolchain, err := NewToolchain(t.Context(), time.Minute)
 	if err != nil {
 		t.Skipf("go toolchain unavailable: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestGoToolchain_LinkedModules(t *testing.T) {
 		t.Skip("set CHOAM_NETWORK_TESTS=1 to run network integration tests")
 	}
 
-	toolchain, err := NewToolchain(2 * time.Minute)
+	toolchain, err := NewToolchain(t.Context(), 2*time.Minute)
 	if err != nil {
 		t.Skipf("go toolchain unavailable: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestGoToolchain_LinkedModules(t *testing.T) {
 // no go.sum, no network: `go list -m -json all` reports only the (skipped)
 // main module, and `go list -deps` walks the standard library only.
 func TestGoToolchain_DepGoVersionsAndLinkedStd(t *testing.T) {
-	toolchain, err := NewToolchain(time.Minute)
+	toolchain, err := NewToolchain(t.Context(), time.Minute)
 	if err != nil {
 		t.Skipf("go toolchain unavailable: %v", err)
 	}

@@ -13,7 +13,7 @@ import (
 // Cloner is the source-checkout seam; *git.Client satisfies it.
 type Cloner interface {
 	CloneAtTag(ctx context.Context, repoURL, tag, destDir string) error
-	HeadCommit(dir string) (string, error)
+	HeadCommit(ctx context.Context, dir string) (string, error)
 }
 
 // Simulator validates per-modroot bump candidate sets against a real
@@ -65,7 +65,7 @@ func (s *Simulator) Simulate(ctx context.Context, repoURL, tag, expectedCommit s
 	}
 
 	if expectedCommit != "" {
-		if head, err := s.git.HeadCommit(cloneDir); err != nil {
+		if head, err := s.git.HeadCommit(ctx, cloneDir); err != nil {
 			slog.Warn("could not verify expected commit", "error", err)
 		} else if head != expectedCommit {
 			slog.Warn("checkout does not match expected-commit; simulating against the tag's actual state",

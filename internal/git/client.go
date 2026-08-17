@@ -419,8 +419,10 @@ func (c *Client) CloneAtTag(ctx context.Context, repoURL, tag, destDir string) e
 	return nil
 }
 
-// HeadCommit returns the commit SHA the checkout at dir points to.
-func (c *Client) HeadCommit(dir string) (string, error) {
+// HeadCommit returns the commit SHA the checkout at dir points to. ctx is
+// accepted for interface consistency with the client's other methods; the
+// underlying go-git read is local-disk-only and doesn't support cancellation.
+func (c *Client) HeadCommit(_ context.Context, dir string) (string, error) {
 	repo, err := git.PlainOpen(dir)
 	if err != nil {
 		return "", fmt.Errorf("opening repository at %s: %w", dir, err)

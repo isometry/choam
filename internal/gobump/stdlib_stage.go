@@ -34,7 +34,7 @@ type StdlibStage struct {
 
 	// Test seams, mirroring SimulationStage's style: overridable functions
 	// and narrow interfaces defaulting to the real implementations.
-	lastCommit func(filePath string) (*git.FileCommitInfo, error)
+	lastCommit func(ctx context.Context, filePath string) (*git.FileCommitInfo, error)
 	index      goReleaseIndex
 	scanner    stdlibScanner
 
@@ -94,7 +94,7 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 		return nil
 	}
 
-	info, err := s.lastCommit(gp.GetFilePath())
+	info, err := s.lastCommit(ctx, gp.GetFilePath())
 	switch {
 	case errors.Is(err, git.ErrNotInRepository):
 		gp.AddMessage("stdlib: melange file is not in a git repository - skipping stdlib staleness check")
@@ -194,7 +194,7 @@ func (s *StdlibStage) checkoutLinkedStd(ctx context.Context, gp *GoBumpProcessor
 	}
 
 	simOpts := simulate.Options{Budget: s.Options.SimulationTimeout}.WithDefaults()
-	toolchain, err := simulate.NewToolchain(simOpts.CommandTimeout)
+	toolchain, err := simulate.NewToolchain(ctx, simOpts.CommandTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -219,7 +219,7 @@ func (s *StdlibStage) checkoutLinkedStd(ctx context.Context, gp *GoBumpProcessor
 	}
 	if analysis.ExpectedCommit != "" {
 		// Warn-only, mirroring the simulator: melange enforces it at build time.
-		if head, err := gitClient.HeadCommit(cloneDir); err != nil {
+		if head, err := gitClient.HeadCommit(ctx, cloneDir); err != nil {
 			slog.Warn("could not verify expected commit for stdlib checkout", "error", err)
 		} else if head != analysis.ExpectedCommit {
 			slog.Warn("stdlib checkout does not match expected-commit; using the tag's actual state",

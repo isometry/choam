@@ -153,6 +153,10 @@ func (o *UpdateOrchestrator) ProcessMultipleChecks(ctx context.Context, filePath
 	processors := make([]*UpdaterProcessor, 0, len(filePaths))
 
 	for _, filePath := range filePaths {
+		if err := ctx.Err(); err != nil {
+			return processors, err
+		}
+
 		processor, err := o.ProcessPackageCheck(ctx, filePath)
 		if err != nil {
 			// Create error processor to maintain consistent results
@@ -174,6 +178,10 @@ func (o *UpdateOrchestrator) ProcessMultipleApplies(ctx context.Context, filePat
 	processors := make([]*UpdaterProcessor, 0, len(filePaths))
 
 	for _, filePath := range filePaths {
+		if err := ctx.Err(); err != nil {
+			return processors, err
+		}
+
 		processor, err := o.ProcessPackageApply(ctx, filePath, options)
 		if err != nil {
 			// Error is already recorded in processor, continue with other packages
