@@ -74,6 +74,10 @@ func runBump(cmd *cobra.Command, args []string) error {
 	// Process all files using shared processor architecture
 	results := make([]*gobump.GoBumpResult, 0, len(files))
 	for _, file := range files {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("bump cancelled: %w", err)
+		}
+
 		result, err := gobump.ProcessFile(ctx, file, opts, analyzer)
 
 		if err != nil {

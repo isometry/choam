@@ -41,7 +41,7 @@ type SimulationStage struct {
 	// newSimulator constructs the simulator lazily so a missing go toolchain
 	// degrades at Apply time (with a message) instead of failing pipeline
 	// construction; tests override it.
-	newSimulator func(opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error)
+	newSimulator func(ctx context.Context, opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error)
 
 	// detectCoUpdates reproduces melange gobump's build-time co-update
 	// advisory (see declareCoUpdates); a func field so tests can inject a
@@ -71,9 +71,9 @@ func defaultDetectCoUpdates(ctx context.Context, packagesToUpdate map[string]str
 	return missing
 }
 
-func defaultSimulator(opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error) {
+func defaultSimulator(ctx context.Context, opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error) {
 	simOpts := simulate.Options{Budget: opts.SimulationTimeout}.WithDefaults()
-	toolchain, err := simulate.NewToolchain(simOpts.CommandTimeout)
+	toolchain, err := simulate.NewToolchain(ctx, simOpts.CommandTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +107,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 	}
 	analysis := gp.VulnerabilityAnalysis
 
-	sim, err := s.newSimulator(s.Options, s.Analyzer)
+	sim, err := s.newSimulator(ctx, s.Options, s.Analyzer)
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			return cerr

@@ -45,7 +45,7 @@ func (e *Ecosystem) Analyze(ctx context.Context, files map[string][]byte) (*ecos
 		return nil, errCargoLockNotFound
 	}
 
-	dir, cleanup, err := ecosystem.WriteTempFiles(map[string][]byte{"Cargo.lock": lockContent})
+	dir, cleanup, err := ecosystem.WriteTempFiles(ctx, map[string][]byte{"Cargo.lock": lockContent})
 	if err != nil {
 		return nil, err
 	}

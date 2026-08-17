@@ -52,7 +52,7 @@ func newStdlibTestStage(opts ProcessorOptions, index *fakeReleaseIndex, scanner 
 	stage := NewStdlibStage(nil, opts)
 	stage.index = index
 	stage.scanner = scanner
-	stage.lastCommit = func(string) (*git.FileCommitInfo, error) {
+	stage.lastCommit = func(context.Context, string) (*git.FileCommitInfo, error) {
 		return &git.FileCommitInfo{Time: stdlibCommitTime, Hash: "abc123"}, nil
 	}
 	stage.linkStd = func(context.Context, *GoBumpProcessor) (map[string]struct{}, error) {
@@ -194,7 +194,7 @@ func TestStdlibStage_SkipGates(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			index, scanner := staleIndex(), fixableScanner()
 			stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true}, index, scanner)
-			stage.lastCommit = func(string) (*git.FileCommitInfo, error) {
+			stage.lastCommit = func(context.Context, string) (*git.FileCommitInfo, error) {
 				return tt.commitInfo, tt.commitErr
 			}
 			gp := newStdlibTestProcessor()
@@ -211,7 +211,7 @@ func TestStdlibStage_SkipGates(t *testing.T) {
 func TestStdlibStage_ShallowWarnsAndContinues(t *testing.T) {
 	index, scanner := staleIndex(), fixableScanner()
 	stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true}, index, scanner)
-	stage.lastCommit = func(string) (*git.FileCommitInfo, error) {
+	stage.lastCommit = func(context.Context, string) (*git.FileCommitInfo, error) {
 		return &git.FileCommitInfo{Time: stdlibCommitTime, Shallow: true}, nil
 	}
 	gp := newStdlibTestProcessor()
@@ -235,7 +235,7 @@ func TestStdlibStage_IndexFailureDegradesToSkip(t *testing.T) {
 
 func TestStdlibStage_NilIndexDegradesToSkip(t *testing.T) {
 	stage := NewStdlibStage(nil, ProcessorOptions{StdlibCheck: true})
-	stage.lastCommit = func(string) (*git.FileCommitInfo, error) {
+	stage.lastCommit = func(context.Context, string) (*git.FileCommitInfo, error) {
 		t.Fatal("lastCommit must not be called without an index")
 		return nil, nil
 	}
@@ -433,7 +433,7 @@ func buildStdlibPipeline(t *testing.T, yamlContent string, opts ProcessorOptions
 		if stdlibStage, ok := stage.(*StdlibStage); ok {
 			stdlibStage.index = staleIndex()
 			stdlibStage.scanner = fixableScanner()
-			stdlibStage.lastCommit = func(string) (*git.FileCommitInfo, error) {
+			stdlibStage.lastCommit = func(context.Context, string) (*git.FileCommitInfo, error) {
 				return &git.FileCommitInfo{Time: stdlibCommitTime, Hash: "abc123"}, nil
 			}
 			stdlibStage.linkStd = func(context.Context, *GoBumpProcessor) (map[string]struct{}, error) {

@@ -125,7 +125,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	if len(l.buildPatterns) == 0 {
 		l.buildPatterns = []string{"./..."}
 	}
-	if err := l.savePristine(); err != nil {
+	if err := l.savePristine(ctx); err != nil {
 		return nil, err
 	}
 	pristineReplaces, err := tc.Replaces(ctx, dir)
@@ -383,8 +383,10 @@ func (l *loop) activeCandidates() []*candState {
 }
 
 // savePristine snapshots go.mod/go.sum so each apply attempt starts from the
-// tagged state - only these two files change under -mod=mod.
-func (l *loop) savePristine() error {
+// tagged state - only these two files change under -mod=mod. ctx is accepted
+// for consistency with the rest of the loop's methods; the reads themselves
+// are local disk I/O and not currently cancellable.
+func (l *loop) savePristine(_ context.Context) error {
 	l.pristine = make(map[string][]byte, 2)
 	for _, name := range []string{"go.mod", "go.sum"} {
 		content, err := os.ReadFile(filepath.Join(l.dir, name))
@@ -402,7 +404,12 @@ func (l *loop) savePristine() error {
 	return nil
 }
 
-func (l *loop) restore() error {
+// restore reverts go.mod/go.sum to the pristine snapshot savePristine took.
+// ctx is accepted for consistency with the rest of the loop's methods (and
+// is checked at the top of every call site that runs this on each apply
+// attempt); the writes themselves are local disk I/O and not currently
+// cancellable.
+func (l *loop) restore(_ context.Context) error {
 	for _, name := range []string{"go.mod", "go.sum"} {
 		path := filepath.Join(l.dir, name)
 		content, ok := l.pristine[name]
@@ -426,7 +433,15 @@ func (l *loop) restore() error {
 // bounded by the candidate count (a repair happens at most once per module).
 func (l *loop) apply(ctx context.Context) error {
 	for attempt := 0; attempt < 3*len(l.cands)+8; attempt++ {
-		if err := l.restore(); err != nil {
+		if err := ctx.Err(); err != nil {
+			// Without this, a cancellation mid-loop can still burn several
+			// more attempts (restore/getSatisfied succeed regardless of
+			// ctx), and exhausting the attempt budget afterward would report
+			// a misleading "module graph did not stabilize" instead of the
+			// real cancellation.
+			return err
+		}
+		if err := l.restore(ctx); err != nil {
 			return err
 		}
 		for _, c := range l.cands {
@@ -1238,7 +1253,7 @@ type trialResult struct {
 // spuriously reject the trial. Callers snapshot l.linked/l.linkedPackages
 // beforehand and restore them when rejecting.
 func (l *loop) trialApply(ctx context.Context, keep []*candState) (*trialResult, error) {
-	if err := l.restore(); err != nil {
+	if err := l.restore(ctx); err != nil {
 		return nil, err
 	}
 	if err := l.tc.ModTidy(ctx, l.dir); err != nil {

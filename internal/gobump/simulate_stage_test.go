@@ -73,7 +73,7 @@ func newSimulationProcessor() *GoBumpProcessor {
 
 func newStageWithFake(fake *fakeBumpSimulator) *SimulationStage {
 	stage := NewSimulationStage(nil, ProcessorOptions{Validate: true})
-	stage.newSimulator = func(ProcessorOptions, *Analyzer) (bumpSimulator, error) {
+	stage.newSimulator = func(context.Context, ProcessorOptions, *Analyzer) (bumpSimulator, error) {
 		return fake, nil
 	}
 	return stage
@@ -153,7 +153,7 @@ func TestSimulationStage_DegradesOnSimulatorError(t *testing.T) {
 
 func TestSimulationStage_DegradesWhenToolchainMissing(t *testing.T) {
 	stage := NewSimulationStage(nil, ProcessorOptions{Validate: true})
-	stage.newSimulator = func(ProcessorOptions, *Analyzer) (bumpSimulator, error) {
+	stage.newSimulator = func(context.Context, ProcessorOptions, *Analyzer) (bumpSimulator, error) {
 		return nil, errors.New("go toolchain not found in PATH")
 	}
 	gp := newSimulationProcessor()
