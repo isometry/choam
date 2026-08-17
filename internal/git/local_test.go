@@ -82,7 +82,7 @@ func TestLastCommitInfo_Committed(t *testing.T) {
 	requireGit(t)
 	dir, committedAt, headSHA := newLocalFixtureRepo(t)
 
-	info, err := LastCommitInfo(filepath.Join(dir, "melange.yaml"))
+	info, err := LastCommitInfo(t.Context(), filepath.Join(dir, "melange.yaml"))
 	require.NoError(t, err)
 	assert.True(t, committedAt.Equal(info.Time), "want %v, got %v", committedAt, info.Time)
 	assert.Equal(t, headSHA, info.Hash)
@@ -96,7 +96,7 @@ func TestLastCommitInfo_Dirty(t *testing.T) {
 
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "melange.yaml"), []byte("package:\n  name: fixture-modified\n"), 0o644))
 
-	info, err := LastCommitInfo(filepath.Join(dir, "melange.yaml"))
+	info, err := LastCommitInfo(t.Context(), filepath.Join(dir, "melange.yaml"))
 	require.NoError(t, err)
 	assert.True(t, committedAt.Equal(info.Time), "commit time should be unaffected by dirty content")
 	assert.Equal(t, headSHA, info.Hash)
@@ -110,7 +110,7 @@ func TestLastCommitInfo_Untracked(t *testing.T) {
 
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "untracked.yaml"), []byte("package:\n  name: untracked\n"), 0o644))
 
-	_, err := LastCommitInfo(filepath.Join(dir, "untracked.yaml"))
+	_, err := LastCommitInfo(t.Context(), filepath.Join(dir, "untracked.yaml"))
 	assert.ErrorIs(t, err, ErrUntracked)
 }
 
@@ -119,7 +119,7 @@ func TestLastCommitInfo_NotInRepository(t *testing.T) {
 	filePath := filepath.Join(dir, "file.yaml")
 	require.NoError(t, os.WriteFile(filePath, []byte("package:\n"), 0o644))
 
-	_, err := LastCommitInfo(filePath)
+	_, err := LastCommitInfo(t.Context(), filePath)
 	assert.ErrorIs(t, err, ErrNotInRepository)
 }
 
@@ -138,7 +138,7 @@ func TestLastCommitInfo_Subdirectory(t *testing.T) {
 	runGitWithEnv(t, dir, commitEnv(committedAt), "commit", "-q", "-m", "add foo")
 	headSHA := runGit(t, dir, "rev-parse", "HEAD")
 
-	info, err := LastCommitInfo(filePath)
+	info, err := LastCommitInfo(t.Context(), filePath)
 	require.NoError(t, err)
 	assert.Equal(t, headSHA, info.Hash)
 	assert.True(t, committedAt.Equal(info.Time))
@@ -153,7 +153,7 @@ func TestLastCommitInfo_Shallow(t *testing.T) {
 	dstRepo := filepath.Join(parent, "clone")
 	runGit(t, parent, "clone", "-q", "--depth", "1", "file://"+src, dstRepo)
 
-	info, err := LastCommitInfo(filepath.Join(dstRepo, "melange.yaml"))
+	info, err := LastCommitInfo(t.Context(), filepath.Join(dstRepo, "melange.yaml"))
 	require.NoError(t, err)
 	assert.True(t, info.Shallow)
 	assert.False(t, info.Dirty)
@@ -201,7 +201,7 @@ func TestLastCommitInfo_Rename(t *testing.T) {
 	runGitWithEnv(t, dir, commitEnv(renamedAt), "commit", "-q", "-m", "rename melange.yaml")
 	renameSHA := runGit(t, dir, "rev-parse", "HEAD")
 
-	info, err := LastCommitInfo(filepath.Join(dir, "renamed.yaml"))
+	info, err := LastCommitInfo(t.Context(), filepath.Join(dir, "renamed.yaml"))
 	require.NoError(t, err)
 	assert.Equal(t, renameSHA, info.Hash)
 	assert.True(t, renamedAt.Equal(info.Time))
@@ -215,7 +215,7 @@ func TestRunGitStatus(t *testing.T) {
 	dir, _, _ := newLocalFixtureRepo(t)
 
 	t.Run("clean", func(t *testing.T) {
-		dirty, invoked, err := runGitStatus(dir, "melange.yaml")
+		dirty, invoked, err := runGitStatus(t.Context(), dir, "melange.yaml")
 		require.NoError(t, err)
 		assert.True(t, invoked)
 		assert.False(t, dirty)
@@ -224,7 +224,7 @@ func TestRunGitStatus(t *testing.T) {
 	t.Run("modified", func(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, "melange.yaml"), []byte("package:\n  name: fixture-modified\n"), 0o644))
 
-		dirty, invoked, err := runGitStatus(dir, "melange.yaml")
+		dirty, invoked, err := runGitStatus(t.Context(), dir, "melange.yaml")
 		require.NoError(t, err)
 		assert.True(t, invoked)
 		assert.True(t, dirty)
@@ -239,7 +239,7 @@ func TestRunGitStatus_NotInvoked(t *testing.T) {
 	requireGit(t)
 
 	t.Run("command failure", func(t *testing.T) {
-		dirty, invoked, err := runGitStatus(filepath.Join(t.TempDir(), "does-not-exist"), "melange.yaml")
+		dirty, invoked, err := runGitStatus(t.Context(), filepath.Join(t.TempDir(), "does-not-exist"), "melange.yaml")
 		require.NoError(t, err)
 		assert.False(t, invoked)
 		assert.False(t, dirty)
@@ -247,7 +247,7 @@ func TestRunGitStatus_NotInvoked(t *testing.T) {
 
 	t.Run("missing binary", func(t *testing.T) {
 		t.Setenv("PATH", t.TempDir()) // empty dir: exec.LookPath("git") fails
-		dirty, invoked, err := runGitStatus(t.TempDir(), "melange.yaml")
+		dirty, invoked, err := runGitStatus(t.Context(), t.TempDir(), "melange.yaml")
 		require.NoError(t, err)
 		assert.False(t, invoked)
 		assert.False(t, dirty)
@@ -268,13 +268,13 @@ func TestFileDirty_FallsBackToIsDirty(t *testing.T) {
 	badRoot := filepath.Join(t.TempDir(), "does-not-exist")
 	filePath := filepath.Join(dir, "melange.yaml")
 
-	dirty, err := fileDirty(repo, badRoot, filePath, "melange.yaml")
+	dirty, err := fileDirty(t.Context(), repo, badRoot, filePath, "melange.yaml")
 	require.NoError(t, err)
 	assert.False(t, dirty, "clean fixture should read clean via the isDirty fallback")
 
 	require.NoError(t, os.WriteFile(filePath, []byte("package:\n  name: fixture-modified\n"), 0o644))
 
-	dirty, err = fileDirty(repo, badRoot, filePath, "melange.yaml")
+	dirty, err = fileDirty(t.Context(), repo, badRoot, filePath, "melange.yaml")
 	require.NoError(t, err)
 	assert.True(t, dirty, "modified fixture should read dirty via the isDirty fallback")
 }
@@ -302,7 +302,7 @@ func TestLastCommitInfo_ContentFilteredClean(t *testing.T) {
 
 	filePath := filepath.Join(dir, "melange.yaml")
 
-	info, err := LastCommitInfo(filePath)
+	info, err := LastCommitInfo(t.Context(), filePath)
 	require.NoError(t, err)
 	assert.False(t, info.Dirty, "content-filtered CRLF file should read clean via git status")
 

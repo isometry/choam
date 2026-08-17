@@ -3,13 +3,13 @@ package simulate
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 
 	"github.com/isometry/choam/internal/goversion"
+	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/scan"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
@@ -125,7 +125,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	if len(l.buildPatterns) == 0 {
 		l.buildPatterns = []string{"./..."}
 	}
-	if err := l.savePristine(); err != nil {
+	if err := l.savePristine(ctx); err != nil {
 		return nil, err
 	}
 	pristineReplaces, err := tc.Replaces(ctx, dir)
@@ -179,7 +179,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 			l.tidiedModern = l.tidiedGoModern()
 			if l.tidiedModern && l.linked == nil && !l.degradedNoted {
 				l.degradedNoted = true
-				slog.Info("artifact reachability degraded: using tidied go.mod require membership as module-level reachability",
+				logging.From(ctx).Info("artifact reachability degraded: using tidied go.mod require membership as module-level reachability",
 					"modroot", l.req.Modroot)
 			}
 			l.replaces, err = l.tc.Replaces(ctx, l.dir)
@@ -200,7 +200,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 			return nil, err
 		}
 
-		raises := l.processScan(scanResult, resolved)
+		raises := l.processScan(ctx, scanResult, resolved)
 		if len(raises) == 0 {
 			result.Converged = true
 			break
@@ -278,7 +278,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 			result.Residuals[i].ResolvedVersion = resolved[result.Residuals[i].Module]
 		}
 	}
-	l.classifyIntroduced(result.Residuals)
+	l.classifyIntroduced(ctx, result.Residuals)
 	sort.Slice(result.Residuals, func(i, j int) bool { return result.Residuals[i].Module < result.Residuals[j].Module })
 	result.RemainingVulnIDs = remainingVulnIDs(result.Residuals)
 
@@ -383,8 +383,10 @@ func (l *loop) activeCandidates() []*candState {
 }
 
 // savePristine snapshots go.mod/go.sum so each apply attempt starts from the
-// tagged state - only these two files change under -mod=mod.
-func (l *loop) savePristine() error {
+// tagged state - only these two files change under -mod=mod. ctx is accepted
+// for consistency with the rest of the loop's methods; the reads themselves
+// are local disk I/O and not currently cancellable.
+func (l *loop) savePristine(_ context.Context) error {
 	l.pristine = make(map[string][]byte, 2)
 	for _, name := range []string{"go.mod", "go.sum"} {
 		content, err := os.ReadFile(filepath.Join(l.dir, name))
@@ -402,7 +404,12 @@ func (l *loop) savePristine() error {
 	return nil
 }
 
-func (l *loop) restore() error {
+// restore reverts go.mod/go.sum to the pristine snapshot savePristine took.
+// ctx is accepted for consistency with the rest of the loop's methods (and
+// is checked at the top of every call site that runs this on each apply
+// attempt); the writes themselves are local disk I/O and not currently
+// cancellable.
+func (l *loop) restore(_ context.Context) error {
 	for _, name := range []string{"go.mod", "go.sum"} {
 		path := filepath.Join(l.dir, name)
 		content, ok := l.pristine[name]
@@ -426,7 +433,15 @@ func (l *loop) restore() error {
 // bounded by the candidate count (a repair happens at most once per module).
 func (l *loop) apply(ctx context.Context) error {
 	for attempt := 0; attempt < 3*len(l.cands)+8; attempt++ {
-		if err := l.restore(); err != nil {
+		if err := ctx.Err(); err != nil {
+			// Without this, a cancellation mid-loop can still burn several
+			// more attempts (restore/getSatisfied succeed regardless of
+			// ctx), and exhausting the attempt budget afterward would report
+			// a misleading "module graph did not stabilize" instead of the
+			// real cancellation.
+			return err
+		}
+		if err := l.restore(ctx); err != nil {
 			return err
 		}
 		for _, c := range l.cands {
@@ -458,7 +473,7 @@ func (l *loop) apply(ctx context.Context) error {
 				// version. Running the get anyway would be a DOWNGRADE that
 				// can drag an earlier candidate's module back below its fix.
 				c.satisfiedTransitively = true
-				slog.Debug("skipping go get: require already exceeds target",
+				logging.From(ctx).Debug("skipping go get: require already exceeds target",
 					"modroot", l.req.Modroot, "module", c.Module, "target", c.Version)
 				continue
 			}
@@ -678,7 +693,7 @@ func (l *loop) getSatisfied(ctx context.Context, c *candState) bool {
 	}
 	requirements, err := l.tc.Requirements(ctx, l.dir)
 	if err != nil {
-		slog.Debug("go.mod requirements unavailable during apply - not skipping",
+		logging.From(ctx).Debug("go.mod requirements unavailable during apply - not skipping",
 			"modroot", l.req.Modroot, "module", c.Module, "error", err)
 		return false
 	}
@@ -768,7 +783,7 @@ func (l *loop) refreshLinked(ctx context.Context) {
 	linked, linkedPackages, err := l.tc.Linked(ctx, l.dir, l.buildPatterns)
 	if err != nil {
 		if !l.linkedWarned {
-			slog.Warn("artifact reachability unavailable - not filtering",
+			logging.From(ctx).Warn("artifact reachability unavailable - not filtering",
 				"modroot", l.req.Modroot, "packages", strings.Join(l.buildPatterns, " "), "error", err)
 			l.linkedWarned = true
 		}
@@ -784,7 +799,7 @@ func (l *loop) refreshLinked(ctx context.Context) {
 func (l *loop) maxDepGoVersion(ctx context.Context) string {
 	versions, err := l.tc.DepGoVersions(ctx, l.dir)
 	if err != nil {
-		slog.Warn("dependency go directive lookup unavailable", "modroot", l.req.Modroot, "error", err)
+		logging.From(ctx).Warn("dependency go directive lookup unavailable", "modroot", l.req.Modroot, "error", err)
 		return ""
 	}
 	vs := make([]string, 0, len(versions))
@@ -800,7 +815,7 @@ func (l *loop) linkedStdPackages(ctx context.Context) map[string]struct{} {
 	std, err := l.tc.LinkedStd(ctx, l.dir, l.buildPatterns)
 	if err != nil {
 		if !l.linkedStdWarned {
-			slog.Warn("linked stdlib package lookup unavailable",
+			logging.From(ctx).Warn("linked stdlib package lookup unavailable",
 				"modroot", l.req.Modroot, "packages", strings.Join(l.buildPatterns, " "), "error", err)
 			l.linkedStdWarned = true
 		}
@@ -1074,7 +1089,7 @@ func (l *loop) checkReplaceCandidate(c *candState) bool {
 
 // processScan converts a rescan of the resolved graph into raised candidates
 // and recomputed scan residuals. It returns the raises applied this round.
-func (l *loop) processScan(scanResult *scan.ScanResult, resolved map[string]string) []raise {
+func (l *loop) processScan(ctx context.Context, scanResult *scan.ScanResult, resolved map[string]string) []raise {
 	raises, residuals := l.scanFindings(scanResult, resolved)
 	l.scanResiduals = residuals
 
@@ -1089,7 +1104,7 @@ func (l *loop) processScan(scanResult *scan.ScanResult, resolved map[string]stri
 						// policy: the module cannot be linked, so the
 						// advisory affects nothing that ships (the
 						// orchestrator reports it separately, as info).
-						slog.Info("advisory persists only in a module not required by the tidied go.mod - cannot be linked; not residual",
+						logging.From(ctx).Info("advisory persists only in a module not required by the tidied go.mod - cannot be linked; not residual",
 							"modroot", l.req.Modroot, "module", r.module, "vulns", strings.Join(r.vulnIDs, ","))
 						continue
 					}
@@ -1238,7 +1253,7 @@ type trialResult struct {
 // spuriously reject the trial. Callers snapshot l.linked/l.linkedPackages
 // beforehand and restore them when rejecting.
 func (l *loop) trialApply(ctx context.Context, keep []*candState) (*trialResult, error) {
-	if err := l.restore(); err != nil {
+	if err := l.restore(ctx); err != nil {
 		return nil, err
 	}
 	if err := l.tc.ModTidy(ctx, l.dir); err != nil {
@@ -1595,7 +1610,7 @@ func ambiguousImportModules(errText string) []string {
 // fixpoint loop; what reaches here is genuinely unavoidable, but must be
 // reported distinctly and must not deflate the baseline fixed count. No-op
 // when the caller provided no baseline (fail open).
-func (l *loop) classifyIntroduced(residuals []Residual) {
+func (l *loop) classifyIntroduced(ctx context.Context, residuals []Residual) {
 	if l.req.BaselineVulnIDs == nil {
 		return
 	}
@@ -1617,7 +1632,7 @@ func (l *loop) classifyIntroduced(residuals []Residual) {
 		r.Introduced = true
 		r.Reason = fmt.Sprintf("introduced by bump to %s; not present at baseline; %s",
 			r.ResolvedVersion, r.Reason)
-		slog.Warn("bump introduces new advisory",
+		logging.From(ctx).Warn("bump introduces new advisory",
 			"modroot", l.req.Modroot, "module", r.Module, "resolved", r.ResolvedVersion,
 			"vulns", strings.Join(r.VulnIDs, ","))
 	}

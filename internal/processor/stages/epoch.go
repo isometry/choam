@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	melangeConfig "github.com/isometry/choam/internal/config"
+	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/processor"
 )
 
@@ -150,7 +151,7 @@ func (e *EpochStage) ShouldRun(ctx context.Context, p processor.Processor) (bool
 }
 
 func (e *EpochStage) Apply(ctx context.Context, p processor.Processor) error {
-	logger := p.GetLogger().With("stage", e.Name())
+	logger := logging.From(ctx)
 
 	newEpoch := e.Strategy.CalculateNewEpoch(p)
 	oldEpoch := p.GetCurrentEpoch()

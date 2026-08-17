@@ -1,6 +1,7 @@
 package simulate
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -11,6 +12,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/scan"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -371,6 +373,31 @@ func (h *countingHandler) count(msg string) int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.counts[msg]
+}
+
+// TestRunLoop_CancelledContext confirms apply's attempt loop checks ctx at
+// the top of every attempt: without this, a cancellation mid-loop could burn
+// several more attempts (restore/getSatisfied succeed regardless of ctx) and
+// then report a misleading "module graph did not stabilize" instead of the
+// real cancellation.
+func TestRunLoop_CancelledContext(t *testing.T) {
+	tc := &fakeToolchain{base: map[string]string{"example.com/mod": "v0.40.0"}}
+	sc := &fakeScanner{}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err := RunLoop(ctx, tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/mod", Version: "v0.45.0", FromCVE: true, VulnIDs: []string{"GO-1"}},
+		},
+	}, Options{})
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.NotContains(t, err.Error(), "did not stabilize",
+		"a cancellation must not be reported as attempt-budget exhaustion")
 }
 
 func TestRunLoop_RaisesToFixpoint(t *testing.T) {
@@ -2016,6 +2043,36 @@ func TestRunLoop_DegradedReachability_PrecisePathUnaffected(t *testing.T) {
 	assert.Nil(t, result.UnrequiredModules, "precise reachability must disable the degraded signal")
 	require.Len(t, result.Residuals, 1)
 	assert.Contains(t, result.Residuals[0].Reason, "fix abandoned")
+}
+
+// TestRunLoop_CtxLoggerAttributesRecords confirms RunLoop's log records
+// carry whatever logger the caller stashed on ctx (see internal/logging),
+// not just slog.Default() - the mechanism the per-file bump run relies on to
+// attribute this loop's warnings back to a melange spec file.
+func TestRunLoop_CtxLoggerAttributesRecords(t *testing.T) {
+	tc := &fakeToolchain{
+		base:      map[string]string{"example.com/mod": "v1.0.0"},
+		linkedErr: errors.New("go list: build constraints exclude all Go files"),
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/mod", id: "GO-9003", fixed: "v1.2.0"},
+	}}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil)).With("file", "x.yaml")
+	ctx := logging.Into(t.Context(), logger)
+
+	_, err := RunLoop(ctx, tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot:  ".",
+		Baseline: map[string]string{"example.com/mod": "v1.0.0"},
+	}, Options{})
+	require.NoError(t, err)
+
+	out := buf.String()
+	require.NotEmpty(t, out, "the failed-reachability fixture must produce log output")
+	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+		assert.Contains(t, line, "file=x.yaml", "every record must carry the ctx-supplied attribute")
+	}
 }
 
 // TestRunLoop_DegradedReachability_LinkedStdWarnOnce: the linked-stdlib

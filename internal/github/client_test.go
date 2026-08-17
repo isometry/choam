@@ -7,9 +7,50 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/go-github/v81/github"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/oauth2"
 )
+
+// TestNew_PreservesConfiguredTimeoutWhenAuthenticated is a regression test:
+// New used to hand the caller's *http.Client wholesale to oauth2.NewClient,
+// which built a fresh client with Timeout: 0, silently discarding
+// --http-timeout for every authenticated GitHub call. New must instead wrap
+// the caller's transport (and keep its Timeout) with oauth2's
+// token-injecting RoundTripper.
+func TestNew_PreservesConfiguredTimeoutWhenAuthenticated(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "test-token")
+
+	customTransport := &http.Transport{}
+	configured := &http.Client{Timeout: 7 * time.Second, Transport: customTransport}
+	client := New(configured)
+
+	got := client.client.Client()
+	require.NotNil(t, got)
+	assert.Equal(t, 7*time.Second, got.Timeout,
+		"the configured --http-timeout must survive oauth2 wrapping")
+
+	transport, ok := got.Transport.(*oauth2.Transport)
+	require.True(t, ok, "transport must be wrapped with oauth2.Transport, got %T", got.Transport)
+	assert.Same(t, customTransport, transport.Base,
+		"the caller's original transport must be preserved as the oauth2 wrapper's base, not discarded")
+}
+
+// TestNew_NoTokenLeavesClientUntouched confirms New is a no-op (beyond
+// go-github's own defaulting) when GITHUB_TOKEN is unset.
+func TestNew_NoTokenLeavesClientUntouched(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "")
+
+	configured := &http.Client{Timeout: 3 * time.Second}
+	client := New(configured)
+
+	got := client.client.Client()
+	require.NotNil(t, got)
+	assert.Equal(t, 3*time.Second, got.Timeout)
+}
 
 func TestParseRepository(t *testing.T) {
 	tests := []struct {

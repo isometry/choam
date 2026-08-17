@@ -3,7 +3,6 @@ package gobump
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"regexp"
 	"sort"
 	"strings"
@@ -11,6 +10,7 @@ import (
 	melange "chainguard.dev/melange/pkg/config"
 	"github.com/isometry/choam/internal/config"
 	"github.com/isometry/choam/internal/goversion"
+	"github.com/isometry/choam/internal/logging"
 )
 
 // GoToolchainPin describes one go/build|go/install step's toolchain selection.
@@ -57,12 +57,12 @@ func parseGoPackagePin(value string) (base, minor string, ok bool) {
 // value that fails to render is kept raw. A rendered value that isn't a go
 // toolchain package name (parseGoPackagePin ok=false) is also treated as
 // unpinned, but its Package string is preserved so callers can warn about it.
-func goToolchainPins(cfg *melange.Configuration) []GoToolchainPin {
+func goToolchainPins(ctx context.Context, cfg *melange.Configuration) []GoToolchainPin {
 	var pins []GoToolchainPin
 
 	renderer, err := config.NewRenderer(cfg)
 	if err != nil {
-		slog.Debug("could not build template renderer for go-toolchain-pin discovery", "error", err)
+		logging.From(ctx).Debug("could not build template renderer for go-toolchain-pin discovery", "error", err)
 		renderer = nil
 	}
 	render := func(value string) string {
@@ -71,7 +71,7 @@ func goToolchainPins(cfg *melange.Configuration) []GoToolchainPin {
 		}
 		rendered, err := renderer.RenderString(value)
 		if err != nil {
-			slog.Debug("could not render go-package field", "value", value, "error", err)
+			logging.From(ctx).Debug("could not render go-package field", "value", value, "error", err)
 			return value
 		}
 		return rendered
@@ -155,8 +155,8 @@ func goPinFloors(analysis *VulnerabilityAnalysis) map[string]string {
 // already float to the latest toolchain and are left alone. Empty floors
 // (nothing demands anything) make this a no-op.
 //
-// The context parameter is threaded for release-existence validation added in
-// a follow-up task; this implementation does not yet consult it.
+// ctx is consulted for release-existence validation (see validateFloor below)
+// and carries this file's logger (internal/logging).
 //
 // Scope note: this only runs when the applier runs at all
 // (GoBumpApplier.ShouldRun gates on bump actions), so a package whose pins
@@ -188,7 +188,7 @@ func (g *GoBumpApplier) reconcileGoPackagePins(ctx context.Context, gp *GoBumpPr
 	if gp.Config != nil {
 		renderer, err = config.NewRenderer(gp.Config)
 		if err != nil {
-			slog.Debug("could not build template renderer for go-package pin reconciliation", "error", err)
+			logging.From(ctx).Debug("could not build template renderer for go-package pin reconciliation", "error", err)
 			renderer = nil
 		}
 	}
@@ -198,7 +198,7 @@ func (g *GoBumpApplier) reconcileGoPackagePins(ctx context.Context, gp *GoBumpPr
 		}
 		r, err := renderer.RenderString(value)
 		if err != nil {
-			slog.Debug("could not render templated value during pin reconciliation", "value", value, "error", err)
+			logging.From(ctx).Debug("could not render templated value during pin reconciliation", "value", value, "error", err)
 			return value
 		}
 		return r
@@ -214,7 +214,7 @@ func (g *GoBumpApplier) reconcileGoPackagePins(ctx context.Context, gp *GoBumpPr
 		modroot := render(pin.Modroot)
 		floor, ok := floors[modroot]
 		if !ok {
-			slog.Debug("go-package pin modroot not in analysis - no floor, leaving untouched",
+			logging.From(ctx).Debug("go-package pin modroot not in analysis - no floor, leaving untouched",
 				"modroot", modroot, "value", pin.Value)
 		}
 		return floor
@@ -270,7 +270,7 @@ func (g *GoBumpApplier) reconcileGoPackagePins(ctx context.Context, gp *GoBumpPr
 		if minor == "" {
 			// Unversioned toolchain package ("go", "go-fips"): tracks the
 			// latest release already, nothing to raise.
-			slog.Debug("go-package pin is unversioned - leaving untouched", "value", pin.Value, "where", where)
+			logging.From(ctx).Debug("go-package pin is unversioned - leaving untouched", "value", pin.Value, "where", where)
 			continue
 		}
 		if floorMinor == "" || goversion.Compare(minor, floorMinor) >= 0 {

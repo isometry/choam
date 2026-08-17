@@ -3,17 +3,17 @@ package simulate
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"os"
 	"path/filepath"
 
 	"github.com/isometry/choam/internal/git"
+	"github.com/isometry/choam/internal/logging"
 )
 
 // Cloner is the source-checkout seam; *git.Client satisfies it.
 type Cloner interface {
 	CloneAtTag(ctx context.Context, repoURL, tag, destDir string) error
-	HeadCommit(dir string) (string, error)
+	HeadCommit(ctx context.Context, dir string) (string, error)
 }
 
 // Simulator validates per-modroot bump candidate sets against a real
@@ -55,20 +55,20 @@ func (s *Simulator) Simulate(ctx context.Context, repoURL, tag, expectedCommit s
 	}
 	defer func() {
 		if err := os.RemoveAll(cloneDir); err != nil {
-			slog.Debug("could not remove simulation directory", "dir", cloneDir, "error", err)
+			logging.From(ctx).Debug("could not remove simulation directory", "dir", cloneDir, "error", err)
 		}
 	}()
 
-	slog.Debug("cloning source for bump simulation", "repository", repoURL, "tag", tag, "dir", cloneDir)
+	logging.From(ctx).Debug("cloning source for bump simulation", "repository", repoURL, "tag", tag, "dir", cloneDir)
 	if err := s.git.CloneAtTag(ctx, repoURL, tag, cloneDir); err != nil {
 		return nil, fmt.Errorf("cloning %s at %s: %w", repoURL, tag, err)
 	}
 
 	if expectedCommit != "" {
-		if head, err := s.git.HeadCommit(cloneDir); err != nil {
-			slog.Warn("could not verify expected commit", "error", err)
+		if head, err := s.git.HeadCommit(ctx, cloneDir); err != nil {
+			logging.From(ctx).Warn("could not verify expected commit", "error", err)
 		} else if head != expectedCommit {
-			slog.Warn("checkout does not match expected-commit; simulating against the tag's actual state",
+			logging.From(ctx).Warn("checkout does not match expected-commit; simulating against the tag's actual state",
 				"tag", tag, "expected", expectedCommit, "actual", head)
 		}
 	}
@@ -84,7 +84,7 @@ func (s *Simulator) Simulate(ctx context.Context, repoURL, tag, expectedCommit s
 		if err != nil {
 			return nil, fmt.Errorf("simulating modroot %s: %w", req.Modroot, err)
 		}
-		slog.Debug("modroot simulation complete",
+		logging.From(ctx).Debug("modroot simulation complete",
 			"modroot", req.Modroot,
 			"iterations", result.Iterations,
 			"converged", result.Converged,

@@ -27,13 +27,13 @@ func TestEcosystem_BumpCoords(t *testing.T) {
 
 	t.Run("v2+ module named without suffix by OSV normalizes to go.mod path", func(t *testing.T) {
 		bump := scan.SecurityBump{Name: "github.com/cli/go-gh", FixedVersion: "v2.11.1", VulnIDs: []string{"GO-2024-0001"}}
-		coords := eco.BumpCoords([]scan.SecurityBump{bump}, deps)
+		coords := eco.BumpCoords(t.Context(), []scan.SecurityBump{bump}, deps)
 		require.Len(t, coords, 1)
 		assert.Equal(t, bump, coords["github.com/cli/go-gh/v2"])
 	})
 
 	t.Run("plain module maps identity", func(t *testing.T) {
-		coords := eco.BumpCoords([]scan.SecurityBump{
+		coords := eco.BumpCoords(t.Context(), []scan.SecurityBump{
 			{Name: "github.com/stretchr/testify", FixedVersion: "v1.9.0"},
 		}, deps)
 		require.Len(t, coords, 1)
@@ -41,7 +41,7 @@ func TestEcosystem_BumpCoords(t *testing.T) {
 	})
 
 	t.Run("module absent from go.mod still yields a key", func(t *testing.T) {
-		coords := eco.BumpCoords([]scan.SecurityBump{
+		coords := eco.BumpCoords(t.Context(), []scan.SecurityBump{
 			{Name: "github.com/unknown/module", FixedVersion: "v1.0.0"},
 		}, deps)
 		require.Len(t, coords, 1)
@@ -49,7 +49,7 @@ func TestEcosystem_BumpCoords(t *testing.T) {
 	})
 
 	t.Run("nil Raw returns nil", func(t *testing.T) {
-		coords := eco.BumpCoords([]scan.SecurityBump{
+		coords := eco.BumpCoords(t.Context(), []scan.SecurityBump{
 			{Name: "github.com/any/module", FixedVersion: "v1.0.0"},
 		}, &ecosystem.ModuleDeps{})
 		assert.Nil(t, coords)
@@ -109,7 +109,7 @@ github.com/indirect/dep v0.9.0/go.mod h1:hash=
 	assert.True(t, indirect.Indirect)
 	assert.Equal(t, "v0.9.0", indirect.Version, "go.sum duplicate versions - highest wins")
 
-	pkgs := eco.ScanPackages(deps)
+	pkgs := eco.ScanPackages(t.Context(), deps)
 	byPkg := make(map[string]scan.Package, len(pkgs))
 	for _, pkg := range pkgs {
 		byPkg[pkg.Name] = pkg
@@ -162,7 +162,7 @@ func TestEcosystem_ScanPackages_VersionlessReplaceFallsBackToOriginal(t *testing
 		},
 	}
 
-	pkgs := New().ScanPackages(&ecosystem.ModuleDeps{Raw: info})
+	pkgs := New().ScanPackages(t.Context(), &ecosystem.ModuleDeps{Raw: info})
 	require.Len(t, pkgs, 1)
 	assert.Equal(t, "github.com/fork/dep", pkgs[0].Name)
 	assert.Equal(t, "v1.4.0", pkgs[0].Version, "version-less replacement falls back to the original version")
@@ -196,7 +196,7 @@ github.com/graph/only v4.0.0/go.mod h1:hash=
 		assert.NotEqual(t, "github.com/graph/only", dep.Name, "go.sum-only module must not be analyzed for go>=1.17")
 	}
 
-	for _, pkg := range eco.ScanPackages(deps) {
+	for _, pkg := range eco.ScanPackages(t.Context(), deps) {
 		assert.NotEqual(t, "github.com/graph/only", pkg.Name, "go.sum-only module must not be scanned for go>=1.17")
 	}
 }

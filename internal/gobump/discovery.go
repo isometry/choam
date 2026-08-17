@@ -1,13 +1,14 @@
 package gobump
 
 import (
-	"log/slog"
+	"context"
 	"sort"
 	"strings"
 
 	melange "chainguard.dev/melange/pkg/config"
 	"github.com/isometry/choam/internal/config"
 	"github.com/isometry/choam/internal/ecosystem"
+	"github.com/isometry/choam/internal/logging"
 )
 
 // buildStepSignals maps a melange build-pipeline "uses:" name to the
@@ -49,7 +50,7 @@ type analysisUnit struct {
 // with.packages build patterns), and (3) package.annotations explicit
 // opt-ins. Returns language -> units sorted by modroot; a language absent
 // from the result had no modroots from any source.
-func discoverAnalysisUnits(cfg *melange.Configuration, bumpSteps []config.BumpStep) map[string][]analysisUnit {
+func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bumpSteps []config.BumpStep) map[string][]analysisUnit {
 	// language -> modroot -> set of build package patterns
 	units := make(map[string]map[string]map[string]struct{})
 
@@ -80,7 +81,7 @@ func discoverAnalysisUnits(cfg *melange.Configuration, bumpSteps []config.BumpSt
 	}
 
 	if cfg != nil {
-		for language, buildUnits := range unitsFromBuildSteps(cfg) {
+		for language, buildUnits := range unitsFromBuildSteps(ctx, cfg) {
 			for _, unit := range buildUnits {
 				add(language, []string{unit.Modroot}, unit.Packages)
 			}
@@ -128,12 +129,12 @@ func unitRoots(units []analysisUnit) []string {
 // same renderer git-checkout fields get; a value that fails to render is
 // kept raw (a broken pattern later makes reachability fail OPEN - no
 // filtering - which is the safe direction).
-func unitsFromBuildSteps(cfg *melange.Configuration) map[string][]analysisUnit {
+func unitsFromBuildSteps(ctx context.Context, cfg *melange.Configuration) map[string][]analysisUnit {
 	result := make(map[string][]analysisUnit)
 
 	renderer, err := config.NewRenderer(cfg)
 	if err != nil {
-		slog.Debug("could not build template renderer for build-step discovery", "error", err)
+		logging.From(ctx).Debug("could not build template renderer for build-step discovery", "error", err)
 		renderer = nil
 	}
 	render := func(value string) string {
@@ -142,7 +143,7 @@ func unitsFromBuildSteps(cfg *melange.Configuration) map[string][]analysisUnit {
 		}
 		rendered, err := renderer.RenderString(value)
 		if err != nil {
-			slog.Debug("could not render build-step field", "value", value, "error", err)
+			logging.From(ctx).Debug("could not render build-step field", "value", value, "error", err)
 			return value
 		}
 		return rendered

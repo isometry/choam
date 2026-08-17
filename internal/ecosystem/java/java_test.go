@@ -87,7 +87,7 @@ func TestEcosystem_ScanPackages(t *testing.T) {
 		},
 	}
 
-	pkgs := eco.ScanPackages(deps)
+	pkgs := eco.ScanPackages(t.Context(), deps)
 	require.Len(t, pkgs, 1)
 	assert.Equal(t, "io.netty:netty-codec-http", pkgs[0].Name)
 	assert.Equal(t, "Maven", pkgs[0].Ecosystem)
@@ -131,13 +131,13 @@ func TestEcosystem_BumpCoords(t *testing.T) {
 
 	t.Run("colon OSV name maps to rendered groupId@artifactId via pom entry", func(t *testing.T) {
 		bump := scan.SecurityBump{Name: "io.netty:netty-codec-http", FixedVersion: "4.1.94.Final", VulnIDs: []string{"GHSA-xxxx"}}
-		coords := eco.BumpCoords([]scan.SecurityBump{bump}, deps)
+		coords := eco.BumpCoords(t.Context(), []scan.SecurityBump{bump}, deps)
 		require.Len(t, coords, 1)
 		assert.Equal(t, bump, coords["io.netty@netty-codec-http"])
 	})
 
 	t.Run("coordinate absent from pom falls back to colon substitution", func(t *testing.T) {
-		coords := eco.BumpCoords([]scan.SecurityBump{
+		coords := eco.BumpCoords(t.Context(), []scan.SecurityBump{
 			{Name: "com.example:not-present", FixedVersion: "1.0.0"},
 		}, deps)
 		require.Len(t, coords, 1)

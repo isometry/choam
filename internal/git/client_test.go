@@ -49,7 +49,7 @@ func TestCloneAtTag(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, string(content), "module example.com/fixture")
 
-	head, err := client.HeadCommit(dest)
+	head, err := client.HeadCommit(t.Context(), dest)
 	require.NoError(t, err)
 	assert.Equal(t, commitSHA, head)
 }

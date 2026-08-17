@@ -1,10 +1,7 @@
 package updater
 
 import (
-	"context"
 	"fmt"
-	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -140,8 +137,6 @@ func TestGetLatestValidGitHubVersion_TagFilters(t *testing.T) {
 		},
 	}
 
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			orchestrator := NewOrchestrator()
@@ -156,7 +151,7 @@ func TestGetLatestValidGitHubVersion_TagFilters(t *testing.T) {
 			cfg.Update.GitHubMonitor = &tt.monitor
 
 			vc := NewVersionChecker(orchestrator)
-			gotVersion, gotSource, err := vc.getLatestValidGitHubVersion(context.Background(), cfg, cfg.Update.GitHubMonitor, orchestrator, logger)
+			gotVersion, gotSource, err := vc.getLatestValidGitHubVersion(t.Context(), cfg, cfg.Update.GitHubMonitor, orchestrator)
 			if err != nil {
 				t.Fatalf("getLatestValidGitHubVersion() error = %v", err)
 			}

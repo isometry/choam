@@ -101,7 +101,7 @@ func isMelangeConfig(filePath string) bool {
 		if err := file.Close(); err != nil {
 			// Log the error but don't fail the function
 			// since this is just a cleanup operation
-			slog.Debug("Failed to close file", "error", err, "file", filePath)
+			slog.Debug("Failed to close file", "error", err, "file", filePath) //nolint:forbidigo // reachable only from GetSharedDependencies/UpdateSharedDependencies, which have no live callers
 		}
 	}()
 
@@ -202,7 +202,7 @@ func substituteVariablesWithConfig(template, version string, cfg *melange.Config
 	if err != nil {
 		// Fallback to original template if substitution fails
 		// This maintains backward compatibility
-		slog.Debug("Variable substitution failed", "template", template, "error", err)
+		slog.Debug("Variable substitution failed", "template", template, "error", err) //nolint:forbidigo // no ctx reaches this helper; rare fallback path, not worth threading
 		return template
 	}
 	return result

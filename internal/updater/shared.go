@@ -39,7 +39,7 @@ func (su *SharedUpdater) UpdateSharedDependencies(ctx context.Context, updatedFi
 			continue
 		}
 
-		updated, err := su.updateDependentPackage(filePath, updatedPackageName, opts)
+		updated, err := su.updateDependentPackage(ctx, filePath, updatedPackageName, opts)
 		if err != nil {
 			results = append(results, fmt.Sprintf("Error updating %s: %v", filepath.Base(filePath), err))
 			continue
@@ -54,11 +54,11 @@ func (su *SharedUpdater) UpdateSharedDependencies(ctx context.Context, updatedFi
 }
 
 // updateDependentPackage checks if a package depends on the updated package and updates it
-func (su *SharedUpdater) updateDependentPackage(filePath, updatedPackageName string, opts *ProcessorOptions) (bool, error) {
+func (su *SharedUpdater) updateDependentPackage(ctx context.Context, filePath, updatedPackageName string, opts *ProcessorOptions) (bool, error) {
 	loader := melangeConfig.NewLoader()
 
 	// Load the file to check for dependencies
-	_, originalContent, err := loader.LoadWithPreservation(filePath)
+	_, originalContent, err := loader.LoadWithPreservation(ctx, filePath)
 	if err != nil {
 		return false, fmt.Errorf("loading file %s: %w", filePath, err)
 	}

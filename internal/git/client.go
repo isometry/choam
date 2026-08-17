@@ -54,7 +54,7 @@ func (c *Client) GetTagsWithFilter(ctx context.Context, repoURL, filterPrefix, f
 	})
 
 	// List all references
-	refs, err := rem.List(&git.ListOptions{})
+	refs, err := rem.ListContext(ctx, &git.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("listing references from %s: %w", repoURL, err)
 	}
@@ -98,7 +98,7 @@ func (c *Client) GetFirstValidTag(ctx context.Context, repoURL string, filter ty
 	})
 
 	// List all references
-	refs, err := rem.List(&git.ListOptions{})
+	refs, err := rem.ListContext(ctx, &git.ListOptions{})
 	if err != nil {
 		return "", fmt.Errorf("listing references from %s: %w", repoURL, err)
 	}
@@ -139,7 +139,7 @@ func (c *Client) GetTags(ctx context.Context, repoURL string) ([]string, error) 
 	})
 
 	// List all references
-	refs, err := rem.List(&git.ListOptions{})
+	refs, err := rem.ListContext(ctx, &git.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("listing references from %s: %w", repoURL, err)
 	}
@@ -226,7 +226,7 @@ func (c *Client) GetCommitSHAForTag(ctx context.Context, repoURL, tag string) (s
 	})
 
 	// List all references
-	refs, err := rem.List(&git.ListOptions{})
+	refs, err := rem.ListContext(ctx, &git.ListOptions{})
 	if err != nil {
 		return "", fmt.Errorf("listing references from %s: %w", repoURL, err)
 	}
@@ -273,7 +273,7 @@ func (c *Client) VerifyCommitExists(ctx context.Context, repoURL, commitSHA stri
 	})
 
 	// List all references
-	refs, err := rem.List(&git.ListOptions{})
+	refs, err := rem.ListContext(ctx, &git.ListOptions{})
 	if err != nil {
 		return false, fmt.Errorf("listing references from %s: %w", repoURL, err)
 	}
@@ -297,7 +297,7 @@ func (c *Client) GetTagInfo(ctx context.Context, repoURL, tagName string) (*TagI
 	})
 
 	// List all references
-	refs, err := rem.List(&git.ListOptions{})
+	refs, err := rem.ListContext(ctx, &git.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("listing references from %s: %w", repoURL, err)
 	}
@@ -325,7 +325,7 @@ func (c *Client) ListBranches(ctx context.Context, repoURL string) ([]string, er
 	})
 
 	// List all references
-	refs, err := rem.List(&git.ListOptions{})
+	refs, err := rem.ListContext(ctx, &git.ListOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("listing references from %s: %w", repoURL, err)
 	}
@@ -351,7 +351,7 @@ func (c *Client) GetDefaultBranch(ctx context.Context, repoURL string) (string, 
 	})
 
 	// List all references
-	refs, err := rem.List(&git.ListOptions{})
+	refs, err := rem.ListContext(ctx, &git.ListOptions{})
 	if err != nil {
 		return "", fmt.Errorf("listing references from %s: %w", repoURL, err)
 	}
@@ -383,7 +383,7 @@ func (c *Client) GetDefaultBranch(ctx context.Context, repoURL string) (string, 
 // CloneRepository clones a repository to memory for more advanced operations
 func (c *Client) CloneRepository(ctx context.Context, repoURL string) (*git.Repository, error) {
 	// Clone to memory storage (doesn't create files on disk)
-	repo, err := git.Clone(memory.NewStorage(), nil, &git.CloneOptions{
+	repo, err := git.CloneContext(ctx, memory.NewStorage(), nil, &git.CloneOptions{
 		URL: repoURL,
 	})
 	if err != nil {
@@ -419,8 +419,10 @@ func (c *Client) CloneAtTag(ctx context.Context, repoURL, tag, destDir string) e
 	return nil
 }
 
-// HeadCommit returns the commit SHA the checkout at dir points to.
-func (c *Client) HeadCommit(dir string) (string, error) {
+// HeadCommit returns the commit SHA the checkout at dir points to. ctx is
+// accepted for interface consistency with the client's other methods; the
+// underlying go-git read is local-disk-only and doesn't support cancellation.
+func (c *Client) HeadCommit(_ context.Context, dir string) (string, error) {
 	repo, err := git.PlainOpen(dir)
 	if err != nil {
 		return "", fmt.Errorf("opening repository at %s: %w", dir, err)

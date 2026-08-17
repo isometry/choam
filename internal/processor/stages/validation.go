@@ -6,6 +6,7 @@ import (
 	"os"
 
 	melange "chainguard.dev/melange/pkg/config"
+	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/processor"
 )
 
@@ -34,10 +35,10 @@ func (v *ValidationStage) ShouldRun(ctx context.Context, p processor.Processor) 
 }
 
 func (v *ValidationStage) Apply(ctx context.Context, p processor.Processor) error {
-	logger := p.GetLogger().With("stage", v.Name())
+	logger := logging.From(ctx)
 
 	if v.ValidateOriginal {
-		if err := v.validateYAML(p.GetOriginalYAML(), "original"); err != nil {
+		if err := v.validateYAML(ctx, p.GetOriginalYAML(), "original"); err != nil {
 			logger.Error("Original YAML validation failed", "error", err)
 			return fmt.Errorf("original YAML validation failed: %w", err)
 		}
@@ -45,7 +46,7 @@ func (v *ValidationStage) Apply(ctx context.Context, p processor.Processor) erro
 	}
 
 	if v.ValidateCurrent {
-		if err := v.validateYAML(p.GetCurrentYAML(), "current"); err != nil {
+		if err := v.validateYAML(ctx, p.GetCurrentYAML(), "current"); err != nil {
 			logger.Error("Current YAML validation failed", "error", err)
 			return fmt.Errorf("current YAML validation failed: %w", err)
 		}
@@ -56,7 +57,7 @@ func (v *ValidationStage) Apply(ctx context.Context, p processor.Processor) erro
 	return nil
 }
 
-func (v *ValidationStage) validateYAML(yamlContent []byte, label string) error {
+func (v *ValidationStage) validateYAML(ctx context.Context, yamlContent []byte, label string) error {
 	if len(yamlContent) == 0 {
 		return fmt.Errorf("%s YAML is empty", label)
 	}
@@ -72,7 +73,7 @@ func (v *ValidationStage) validateYAML(yamlContent []byte, label string) error {
 		return fmt.Errorf("writing temp file: %w", err)
 	}
 
-	_, err = melange.ParseConfiguration(context.Background(), tempFile.Name())
+	_, err = melange.ParseConfiguration(ctx, tempFile.Name())
 	if err != nil {
 		return fmt.Errorf("parsing melange configuration: %w", err)
 	}

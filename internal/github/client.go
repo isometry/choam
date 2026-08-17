@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/google/go-github/v81/github"
 	"github.com/isometry/choam/internal/types"
@@ -19,16 +20,32 @@ type Client struct {
 
 // New creates a new GitHub client with optional authentication
 // If httpClient is nil, a default HTTP client will be used
-// If authentication is configured via GITHUB_TOKEN, the client will be wrapped with oauth2
+// If authentication is configured via GITHUB_TOKEN, the client's transport is
+// wrapped with oauth2's token-injecting RoundTripper.
 func New(httpClient *http.Client) *Client {
 	// Check for GitHub token in environment for authentication
 	if token := os.Getenv("GITHUB_TOKEN"); token != "" {
-		ctx := context.Background()
 		ts := oauth2.StaticTokenSource(
 			&oauth2.Token{AccessToken: token},
 		)
-		// Wrap the provided HTTP client (or nil) with oauth2
-		httpClient = oauth2.NewClient(ctx, ts)
+
+		// Preserve the caller's transport (connection pooling, TLS config)
+		// and timeout by wrapping them, rather than handing the whole
+		// client to oauth2.NewClient - which builds a fresh client with
+		// Timeout: 0, silently discarding --http-timeout for every
+		// authenticated GitHub call.
+		base := http.DefaultTransport
+		var timeout time.Duration
+		if httpClient != nil {
+			timeout = httpClient.Timeout
+			if httpClient.Transport != nil {
+				base = httpClient.Transport
+			}
+		}
+		httpClient = &http.Client{
+			Transport: &oauth2.Transport{Source: ts, Base: base},
+			Timeout:   timeout,
+		}
 	}
 
 	return &Client{
