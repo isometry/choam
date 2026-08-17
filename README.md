@@ -262,7 +262,8 @@ go              1.21.0     1.21.5     YES        0→1      OK
 
 - `GITHUB_TOKEN`: GitHub personal access token for API authentication
 - `ANITYA_TOKEN`: Release monitoring API token
-- `LOG_LEVEL`: Log level override (debug, info, warn, error)
+
+Log verbosity is controlled by the `-v`/`-vv` flags (see [Global Flags](#global-flags)), not an environment variable.
 
 ## Requirements
 
