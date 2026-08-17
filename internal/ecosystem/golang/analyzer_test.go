@@ -1,8 +1,12 @@
 package golang
 
 import (
+	"bytes"
+	"log/slog"
+	"strings"
 	"testing"
 
+	"github.com/isometry/choam/internal/logging"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 )
@@ -224,7 +228,7 @@ func TestAnalyzer_AnalyzeBumps(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			a := newAnalyzer()
-			analysis, filteredDeps := a.analyzeBumps(tt.deps, tt.goModInfo)
+			analysis, filteredDeps := a.analyzeBumps(t.Context(), tt.deps, tt.goModInfo)
 
 			if len(filteredDeps) != len(tt.wantKeep) {
 				t.Errorf("filteredDeps count = %d, want %d", len(filteredDeps), len(tt.wantKeep))
@@ -417,7 +421,7 @@ func TestAnalyzer_GetEffectiveVersion(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			a := newAnalyzer()
-			result := a.getEffectiveVersion(tt.module, tt.originalVersion, tt.replacements)
+			result := a.getEffectiveVersion(t.Context(), tt.module, tt.originalVersion, tt.replacements)
 			if result != tt.expected {
 				t.Errorf("getEffectiveVersion() = %q, want %q", result, tt.expected)
 			}
@@ -446,7 +450,7 @@ func TestAnalyzer_AnalyzeBumps_SortingStability(t *testing.T) {
 	}
 
 	a := newAnalyzer()
-	_, filteredDeps := a.analyzeBumps(deps, goModInfo)
+	_, filteredDeps := a.analyzeBumps(t.Context(), deps, goModInfo)
 
 	expected := []string{
 		"github.com/m-package/middle@v1.0.0",
@@ -552,7 +556,7 @@ func TestAnalyzer_AnalyzeBumps_DependencyOrdering(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			a := newAnalyzer()
-			_, filteredDeps := a.analyzeBumps(tt.deps, tt.goModInfo)
+			_, filteredDeps := a.analyzeBumps(t.Context(), tt.deps, tt.goModInfo)
 
 			if len(filteredDeps) != len(tt.wantOrdered) {
 				t.Fatalf("got %d deps, want %d\nGot: %v\nWant: %v", len(filteredDeps), len(tt.wantOrdered), filteredDeps, tt.wantOrdered)
@@ -618,7 +622,7 @@ func TestAnalyzer_AnalyzeBumps_PreReleaseVersions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			a := newAnalyzer()
-			_, filteredDeps := a.analyzeBumps(tt.deps, tt.goModInfo)
+			_, filteredDeps := a.analyzeBumps(t.Context(), tt.deps, tt.goModInfo)
 
 			if len(filteredDeps) != len(tt.wantKeep) {
 				t.Fatalf("got %d deps, want %d", len(filteredDeps), len(tt.wantKeep))
@@ -751,7 +755,7 @@ func TestAnalyzer_NormalizeModulePath(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			a := newAnalyzer()
-			gotNormalized, gotFound := a.normalizeModulePath(tt.module, tt.version, tt.goModInfo)
+			gotNormalized, gotFound := a.normalizeModulePath(t.Context(), tt.module, tt.version, tt.goModInfo)
 
 			if gotNormalized != tt.wantNormalized {
 				t.Errorf("normalizeModulePath() normalized = %q, want %q", gotNormalized, tt.wantNormalized)
@@ -760,6 +764,39 @@ func TestAnalyzer_NormalizeModulePath(t *testing.T) {
 				t.Errorf("normalizeModulePath() found = %v, want %v", gotFound, tt.wantFound)
 			}
 		})
+	}
+}
+
+// TestAnalyzer_LogsCarryCtxAttribution is the acceptance test for threading
+// ctx through analyzeBumps/normalizeModulePath/getEffectiveVersion: every
+// slog.Debug record this package emits must reach the logger stashed on ctx
+// (see internal/logging), so a per-file run can attribute its debug output.
+func TestAnalyzer_LogsCarryCtxAttribution(t *testing.T) {
+	var buf bytes.Buffer
+	handler := slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})
+	logger := slog.New(handler).With("file", "example.yaml")
+	ctx := logging.Into(t.Context(), logger)
+
+	a := newAnalyzer()
+	goModInfo := &GoModInfo{
+		Requirements:    map[string]string{"example.com/mod": "v1.0.0"},
+		AllRequirements: map[string]string{"example.com/mod": "v1.0.0"},
+		Replacements:    map[string]*modfile.Replace{},
+	}
+	a.analyzeBumps(ctx, []string{"example.com/mod@v1.1.0"}, goModInfo)
+
+	out := buf.String()
+	if !strings.Contains(out, "file=example.yaml") {
+		t.Fatalf("expected debug output to carry file=example.yaml, got:\n%s", out)
+	}
+	lines := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	if len(lines) == 0 {
+		t.Fatal("expected at least one debug record")
+	}
+	for _, line := range lines {
+		if !strings.Contains(line, "file=example.yaml") {
+			t.Errorf("record missing file attribution: %s", line)
+		}
 	}
 }
 
