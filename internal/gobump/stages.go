@@ -566,7 +566,7 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 			continue
 		}
 
-		pkgs := eco.ScanPackages(deps)
+		pkgs := eco.ScanPackages(ctx, deps)
 		scanResult, err := scanner.ScanPackages(ctx, pkgs)
 		if err != nil {
 			return nil, fmt.Errorf("modroot %s: scanning dependencies for vulnerabilities: %w", root, err)
@@ -590,7 +590,7 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 		// Coordinates in this modroot's rendered dep grammar (not OSV's own
 		// naming - see Ecosystem.BumpCoords), so they compare directly
 		// against splitCoordVersion output downstream.
-		bumpCoords := eco.BumpCoords(scanResult.SecurityBumps, deps)
+		bumpCoords := eco.BumpCoords(ctx, scanResult.SecurityBumps, deps)
 		securityBumpModules := make([]string, 0, len(bumpCoords))
 		for coord := range bumpCoords {
 			securityBumpModules = append(securityBumpModules, coord)

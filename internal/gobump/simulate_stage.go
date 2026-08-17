@@ -128,7 +128,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			reqs = append(reqs, simulate.ModrootRequest{
 				Modroot:         m.Modroot,
 				Seeds:           seedCandidates(m),
-				Baseline:        goEco.EffectiveVersions(m.Deps),
+				Baseline:        goEco.EffectiveVersions(ctx, m.Deps),
 				Packages:        m.BuildPackages,
 				VulnImports:     vulnImportPaths(m.ScanResult),
 				BaselineVulnIDs: baselineVulnIDs(m.ScanResult),

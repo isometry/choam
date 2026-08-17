@@ -61,7 +61,7 @@ func TestEcosystem_ScanPackages(t *testing.T) {
 		},
 	}
 
-	pkgs := eco.ScanPackages(deps)
+	pkgs := eco.ScanPackages(t.Context(), deps)
 	require.Len(t, pkgs, 2)
 	for _, pkg := range pkgs {
 		assert.Equal(t, "crates.io", pkg.Ecosystem)
@@ -108,7 +108,7 @@ func TestEcosystem_BumpCoords_Identity(t *testing.T) {
 	eco := New()
 	bump := scan.SecurityBump{Name: "serde", FixedVersion: "1.0.200", VulnIDs: []string{"RUSTSEC-0000"}}
 
-	coords := eco.BumpCoords([]scan.SecurityBump{bump}, &ecosystem.ModuleDeps{})
+	coords := eco.BumpCoords(t.Context(), []scan.SecurityBump{bump}, &ecosystem.ModuleDeps{})
 	require.Len(t, coords, 1)
 	assert.Equal(t, bump, coords["serde"])
 }

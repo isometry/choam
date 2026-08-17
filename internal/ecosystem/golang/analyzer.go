@@ -1,11 +1,12 @@
 package golang
 
 import (
+	"context"
 	"fmt"
-	"log/slog"
 	"slices"
 	"strings"
 
+	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/utils"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
@@ -20,17 +21,17 @@ func newAnalyzer() *analyzer {
 }
 
 // analyzeBumps analyzes each candidate bump and determines whether to keep or remove it.
-func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnalysis, []string) {
+func (a *analyzer) analyzeBumps(ctx context.Context, deps []string, goModInfo *GoModInfo) ([]bumpAnalysis, []string) {
 	var analysis []bumpAnalysis
 
-	slog.Debug("analyzing bumps",
+	logging.From(ctx).Debug("analyzing bumps",
 		"input_count", len(deps),
 		"deps", deps)
 
 	// First, deduplicate and keep only the latest version per module
 	latestVersions := make(map[string]string)
 
-	slog.Debug("deduplication phase started", "raw_deps", len(deps))
+	logging.From(ctx).Debug("deduplication phase started", "raw_deps", len(deps))
 
 	for _, dep := range deps {
 		dep = strings.TrimSpace(dep)
@@ -44,7 +45,7 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 			// Malformed dep, keep it as is (but still dedupe)
 			if _, exists := latestVersions[dep]; !exists {
 				latestVersions[dep] = ""
-				slog.Debug("malformed dependency detected",
+				logging.From(ctx).Debug("malformed dependency detected",
 					"dep", dep,
 					"reason", "missing @ separator")
 			}
@@ -59,19 +60,19 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 			if existing == "" {
 				// Previous was malformed, this one is valid
 				latestVersions[module] = bumpVersion
-				slog.Debug("duplicate module - replacing malformed with valid",
+				logging.From(ctx).Debug("duplicate module - replacing malformed with valid",
 					"module", module,
 					"new_version", bumpVersion)
 			} else if semver.Compare(bumpVersion, existing) > 0 {
 				// This version is newer
-				slog.Debug("duplicate module detected - keeping newer",
+				logging.From(ctx).Debug("duplicate module detected - keeping newer",
 					"module", module,
 					"old_version", existing,
 					"new_version", bumpVersion,
 					"comparison", "newer")
 				latestVersions[module] = bumpVersion
 			} else {
-				slog.Debug("duplicate module detected - keeping existing",
+				logging.From(ctx).Debug("duplicate module detected - keeping existing",
 					"module", module,
 					"existing_version", existing,
 					"rejected_version", bumpVersion,
@@ -83,16 +84,16 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 		}
 	}
 
-	slog.Debug("deduplication phase complete",
+	logging.From(ctx).Debug("deduplication phase complete",
 		"unique_modules", len(latestVersions))
 
 	// Now analyze the deduplicated dependencies
 	var filteredDeps []string
 
-	slog.Debug("analysis phase started", "modules_to_analyze", len(latestVersions))
+	logging.From(ctx).Debug("analysis phase started", "modules_to_analyze", len(latestVersions))
 
 	for module, bumpVersion := range latestVersions {
-		slog.Debug("analyzing module",
+		logging.From(ctx).Debug("analyzing module",
 			"module", module,
 			"bump_version", bumpVersion)
 
@@ -106,7 +107,7 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 				Action:       "keep",
 				Reason:       "malformed dependency, keeping as-is",
 			})
-			slog.Debug("analysis decision",
+			logging.From(ctx).Debug("analysis decision",
 				"module", module,
 				"action", "keep",
 				"reason", "malformed dependency")
@@ -114,7 +115,7 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 		}
 
 		// Normalize module path for v2+ modules (adds /vN suffix if needed)
-		normalizedModule, exists := a.normalizeModulePath(module, bumpVersion, goModInfo)
+		normalizedModule, exists := a.normalizeModulePath(ctx, module, bumpVersion, goModInfo)
 		if !exists {
 			// Module not found even with path correction
 			analysis = append(analysis, bumpAnalysis{
@@ -124,7 +125,7 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 				Action:       "remove-missing",
 				Reason:       "module not found in go.mod/go.sum",
 			})
-			slog.Debug("analysis decision",
+			logging.From(ctx).Debug("analysis decision",
 				"module", module,
 				"bump_version", bumpVersion,
 				"action", "remove-missing",
@@ -135,17 +136,17 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 		// Get the version from go.mod using normalized path
 		goModVersion := goModInfo.AllRequirements[normalizedModule]
 
-		slog.Debug("go.mod lookup",
+		logging.From(ctx).Debug("go.mod lookup",
 			"normalized_module", normalizedModule,
 			"current_version", goModVersion)
 
 		// Check for replace directives that affect this module
-		effectiveVersion := a.getEffectiveVersion(normalizedModule, goModVersion, goModInfo.Replacements)
+		effectiveVersion := a.getEffectiveVersion(ctx, normalizedModule, goModVersion, goModInfo.Replacements)
 
 		// Compare versions using semantic versioning
 		comparison := semver.Compare(bumpVersion, effectiveVersion)
 
-		slog.Debug("version comparison",
+		logging.From(ctx).Debug("version comparison",
 			"module", normalizedModule,
 			"bump_version", bumpVersion,
 			"effective_version", effectiveVersion,
@@ -170,7 +171,7 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 				Action:       "keep",
 				Reason:       "bump version is newer than effective version",
 			})
-			slog.Debug("analysis decision",
+			logging.From(ctx).Debug("analysis decision",
 				"module", normalizedModule,
 				"action", "keep",
 				"reason", "bump version is newer")
@@ -183,7 +184,7 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 				Action:       "remove-noop",
 				Reason:       "bump version matches effective version",
 			})
-			slog.Debug("analysis decision",
+			logging.From(ctx).Debug("analysis decision",
 				"module", normalizedModule,
 				"action", "remove-noop",
 				"reason", "versions match")
@@ -196,7 +197,7 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 				Action:       "remove-downgrade",
 				Reason:       "bump version is older than effective version",
 			})
-			slog.Debug("analysis decision",
+			logging.From(ctx).Debug("analysis decision",
 				"module", normalizedModule,
 				"action", "remove-downgrade",
 				"reason", "bump would downgrade")
@@ -209,7 +210,7 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 	directDeps := make([]string, 0)
 	newDeps := make([]string, 0)
 
-	slog.Debug("classifying dependencies for smart ordering",
+	logging.From(ctx).Debug("classifying dependencies for smart ordering",
 		"total_deps", len(filteredDeps))
 
 	for _, dep := range filteredDeps {
@@ -218,7 +219,7 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 		if len(parts) != 2 {
 			// Malformed, put in new deps
 			newDeps = append(newDeps, dep)
-			slog.Debug("malformed dep - classifying as new",
+			logging.From(ctx).Debug("malformed dep - classifying as new",
 				"dep", dep)
 			continue
 		}
@@ -228,19 +229,19 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 		if _, isRequired := goModInfo.Requirements[module]; isRequired {
 			// Direct dependency (explicitly in project's go.mod)
 			directDeps = append(directDeps, dep)
-			slog.Debug("classified as direct dependency",
+			logging.From(ctx).Debug("classified as direct dependency",
 				"module", module,
 				"reason", "found in Requirements")
 		} else if _, isTransitive := goModInfo.AllRequirements[module]; isTransitive {
 			// Indirect dependency (transitive, not directly required)
 			indirectDeps = append(indirectDeps, dep)
-			slog.Debug("classified as indirect dependency",
+			logging.From(ctx).Debug("classified as indirect dependency",
 				"module", module,
 				"reason", "found in AllRequirements but not Requirements")
 		} else {
 			// New dependency (not currently in go.mod at all)
 			newDeps = append(newDeps, dep)
-			slog.Debug("classified as new dependency",
+			logging.From(ctx).Debug("classified as new dependency",
 				"module", module,
 				"reason", "not found in go.mod")
 		}
@@ -251,7 +252,7 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 	slices.Sort(directDeps)
 	slices.Sort(newDeps)
 
-	slog.Debug("dependency groups sorted alphabetically",
+	logging.From(ctx).Debug("dependency groups sorted alphabetically",
 		"indirect_count", len(indirectDeps),
 		"direct_count", len(directDeps),
 		"new_count", len(newDeps))
@@ -264,7 +265,7 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 	filteredDeps = append(filteredDeps, directDeps...)
 	filteredDeps = append(filteredDeps, newDeps...)
 
-	slog.Debug("smart ordering applied",
+	logging.From(ctx).Debug("smart ordering applied",
 		"order", "indirect→direct→new",
 		"final_list", filteredDeps)
 
@@ -283,7 +284,7 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 		}
 	}
 
-	slog.Debug("analysis phase complete",
+	logging.From(ctx).Debug("analysis phase complete",
 		"total_analyzed", len(analysis),
 		"kept", kept,
 		"removed_missing", removedMissing,
@@ -298,25 +299,25 @@ func (a *analyzer) analyzeBumps(deps []string, goModInfo *GoModInfo) ([]bumpAnal
 // Go modules v2+ require /vN suffix in import path (e.g., github.com/foo/bar/v2).
 // OSV often returns paths without this suffix, so we need to correct them against go.mod.
 // Returns the normalized module path and whether it was found in go.mod with compatible major version.
-func (a *analyzer) normalizeModulePath(module, version string, goModInfo *GoModInfo) (string, bool) {
+func (a *analyzer) normalizeModulePath(ctx context.Context, module, version string, goModInfo *GoModInfo) (string, bool) {
 	// Extract major version from the bump version
 	bumpMajor := semver.Major(version)
 
-	slog.Debug("normalizing module path",
+	logging.From(ctx).Debug("normalizing module path",
 		"module", module,
 		"version", version,
 		"bump_major", bumpMajor)
 
 	// Try module as-is first
 	if existingVersion, exists := goModInfo.AllRequirements[module]; exists {
-		slog.Debug("module found as-is",
+		logging.From(ctx).Debug("module found as-is",
 			"module", module,
 			"existing_version", existingVersion)
 
 		// Check if major versions are compatible
 		existingMajor := semver.Major(existingVersion)
 
-		slog.Debug("checking major version compatibility",
+		logging.From(ctx).Debug("checking major version compatibility",
 			"bump_major", bumpMajor,
 			"existing_major", existingMajor)
 
@@ -324,7 +325,7 @@ func (a *analyzer) normalizeModulePath(module, version string, goModInfo *GoModI
 		// v2+ requires /vN suffix and major version must match exactly
 		if bumpMajor == existingMajor {
 			// Major versions match exactly
-			slog.Debug("major versions match - compatible",
+			logging.From(ctx).Debug("major versions match - compatible",
 				"module", module,
 				"major_version", bumpMajor,
 				"result", "found")
@@ -332,7 +333,7 @@ func (a *analyzer) normalizeModulePath(module, version string, goModInfo *GoModI
 		}
 		if (bumpMajor == "v0" || bumpMajor == "v1") && (existingMajor == "v0" || existingMajor == "v1") {
 			// v0↔v1 transitions don't require path changes
-			slog.Debug("v0↔v1 transition - compatible",
+			logging.From(ctx).Debug("v0↔v1 transition - compatible",
 				"module", module,
 				"bump_major", bumpMajor,
 				"existing_major", existingMajor,
@@ -341,7 +342,7 @@ func (a *analyzer) normalizeModulePath(module, version string, goModInfo *GoModI
 		}
 		// Major versions don't match and require import path changes (/v2, /v3, etc.)
 		// This is not compatible with simple go/bump updates
-		slog.Debug("major version incompatibility detected",
+		logging.From(ctx).Debug("major version incompatibility detected",
 			"module", module,
 			"bump_major", bumpMajor,
 			"existing_major", existingMajor,
@@ -350,13 +351,13 @@ func (a *analyzer) normalizeModulePath(module, version string, goModInfo *GoModI
 		return module, false
 	}
 
-	slog.Debug("module not found as-is, trying with suffix",
+	logging.From(ctx).Debug("module not found as-is, trying with suffix",
 		"module", module)
 
 	// If not found, try with version suffix for v2+
 	if bumpMajor == "" || bumpMajor == "v0" || bumpMajor == "v1" {
 		// v0 and v1 modules don't use version suffix, and we already checked above
-		slog.Debug("v0/v1 module not found",
+		logging.From(ctx).Debug("v0/v1 module not found",
 			"module", module,
 			"reason", "v0/v1 modules don't use version suffix",
 			"result", "not_found")
@@ -366,7 +367,7 @@ func (a *analyzer) normalizeModulePath(module, version string, goModInfo *GoModI
 	// Check if path already has the suffix
 	suffix := "/" + bumpMajor
 	if strings.HasSuffix(module, suffix) {
-		slog.Debug("module already has version suffix",
+		logging.From(ctx).Debug("module already has version suffix",
 			"module", module,
 			"suffix", suffix)
 
@@ -374,30 +375,30 @@ func (a *analyzer) normalizeModulePath(module, version string, goModInfo *GoModI
 		if existingVersion, exists := goModInfo.AllRequirements[module]; exists {
 			existingMajor := semver.Major(existingVersion)
 
-			slog.Debug("module with suffix found",
+			logging.From(ctx).Debug("module with suffix found",
 				"module", module,
 				"existing_version", existingVersion,
 				"existing_major", existingMajor)
 
 			if bumpMajor == existingMajor {
-				slog.Debug("major versions match with suffix",
+				logging.From(ctx).Debug("major versions match with suffix",
 					"module", module,
 					"result", "found")
 				return module, true
 			}
 			// v0 and v1 are compatible
 			if (bumpMajor == "v0" || bumpMajor == "v1") && (existingMajor == "v0" || existingMajor == "v1") {
-				slog.Debug("v0↔v1 transition with suffix",
+				logging.From(ctx).Debug("v0↔v1 transition with suffix",
 					"module", module,
 					"result", "found")
 				return module, true
 			}
-			slog.Debug("major version mismatch with suffix",
+			logging.From(ctx).Debug("major version mismatch with suffix",
 				"module", module,
 				"result", "not_found")
 			return module, false
 		}
-		slog.Debug("module with suffix not found in go.mod",
+		logging.From(ctx).Debug("module with suffix not found in go.mod",
 			"module", module,
 			"result", "not_found")
 		return module, false
@@ -405,12 +406,12 @@ func (a *analyzer) normalizeModulePath(module, version string, goModInfo *GoModI
 
 	// Try with version suffix (e.g., github.com/cli/go-gh -> github.com/cli/go-gh/v2)
 	correctedPath := module + suffix
-	slog.Debug("trying with corrected path",
+	logging.From(ctx).Debug("trying with corrected path",
 		"original", module,
 		"corrected", correctedPath)
 
 	if existingVersion, exists := goModInfo.AllRequirements[correctedPath]; exists {
-		slog.Debug("corrected path found",
+		logging.From(ctx).Debug("corrected path found",
 			"corrected_path", correctedPath,
 			"existing_version", existingVersion)
 
@@ -418,19 +419,19 @@ func (a *analyzer) normalizeModulePath(module, version string, goModInfo *GoModI
 		existingMajor := semver.Major(existingVersion)
 
 		if bumpMajor == existingMajor {
-			slog.Debug("major versions match with corrected path",
+			logging.From(ctx).Debug("major versions match with corrected path",
 				"corrected_path", correctedPath,
 				"result", "found")
 			return correctedPath, true
 		}
 		// v0 and v1 are compatible
 		if (bumpMajor == "v0" || bumpMajor == "v1") && (existingMajor == "v0" || existingMajor == "v1") {
-			slog.Debug("v0↔v1 transition with corrected path",
+			logging.From(ctx).Debug("v0↔v1 transition with corrected path",
 				"corrected_path", correctedPath,
 				"result", "found")
 			return correctedPath, true
 		}
-		slog.Debug("major version mismatch with corrected path",
+		logging.From(ctx).Debug("major version mismatch with corrected path",
 			"corrected_path", correctedPath,
 			"bump_major", bumpMajor,
 			"existing_major", existingMajor,
@@ -439,7 +440,7 @@ func (a *analyzer) normalizeModulePath(module, version string, goModInfo *GoModI
 	}
 
 	// Not found even with correction
-	slog.Debug("module not found even with path correction",
+	logging.From(ctx).Debug("module not found even with path correction",
 		"original", module,
 		"corrected", correctedPath,
 		"result", "not_found")
@@ -447,8 +448,8 @@ func (a *analyzer) normalizeModulePath(module, version string, goModInfo *GoModI
 }
 
 // getEffectiveVersion returns the effective version considering replace directives
-func (a *analyzer) getEffectiveVersion(module, originalVersion string, replacements map[string]*modfile.Replace) string {
-	slog.Debug("checking effective version",
+func (a *analyzer) getEffectiveVersion(ctx context.Context, module, originalVersion string, replacements map[string]*modfile.Replace) string {
+	logging.From(ctx).Debug("checking effective version",
 		"module", module,
 		"original_version", originalVersion)
 
@@ -457,14 +458,14 @@ func (a *analyzer) getEffectiveVersion(module, originalVersion string, replaceme
 	if replace, ok := replacements[exactKey]; ok {
 		if utils.IsLocalPath(replace.New.Path) {
 			// Local replacement - treat as effectively very new version
-			slog.Debug("exact version replacement with local path",
+			logging.From(ctx).Debug("exact version replacement with local path",
 				"module", module,
 				"local_path", replace.New.Path,
 				"effective_version", "v999.999.999")
 			return "v999.999.999" // This ensures bumps are considered downgrades
 		}
 		if replace.New.Version != "" {
-			slog.Debug("exact version replacement",
+			logging.From(ctx).Debug("exact version replacement",
 				"module", module,
 				"original_version", originalVersion,
 				"effective_version", replace.New.Version)
@@ -476,14 +477,14 @@ func (a *analyzer) getEffectiveVersion(module, originalVersion string, replaceme
 	if replace, ok := replacements[module]; ok {
 		if utils.IsLocalPath(replace.New.Path) {
 			// Local replacement - treat as effectively very new version
-			slog.Debug("module-level replacement with local path",
+			logging.From(ctx).Debug("module-level replacement with local path",
 				"module", module,
 				"local_path", replace.New.Path,
 				"effective_version", "v999.999.999")
 			return "v999.999.999" // This ensures bumps are considered downgrades
 		}
 		if replace.New.Version != "" {
-			slog.Debug("module-level replacement",
+			logging.From(ctx).Debug("module-level replacement",
 				"module", module,
 				"original_version", originalVersion,
 				"effective_version", replace.New.Version)
@@ -492,7 +493,7 @@ func (a *analyzer) getEffectiveVersion(module, originalVersion string, replaceme
 	}
 
 	// No replacement, use original version
-	slog.Debug("no replacement directive",
+	logging.From(ctx).Debug("no replacement directive",
 		"module", module,
 		"effective_version", originalVersion)
 	return originalVersion
