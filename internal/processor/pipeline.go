@@ -3,6 +3,8 @@ package processor
 import (
 	"context"
 	"fmt"
+
+	"github.com/isometry/choam/internal/logging"
 )
 
 // Pipeline represents a sequence of stages that operate on a processor
@@ -48,11 +50,19 @@ func (p *Pipeline) Execute(ctx context.Context, processor Processor) error {
 	logger := processor.GetLogger().With("pipeline", p.Name)
 	logger.Info("Starting pipeline execution", "stages", len(p.Stages))
 
+	// Seed ctx with the same attribution logger carries, so stages that
+	// have no Processor handy (only ctx) can still reach it via
+	// logging.From(ctx) - see internal/logging.
+	ctx = logging.Into(ctx, logger)
+
 	for i, stage := range p.Stages {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 
+		// Shadowed for this stage only - layers onto the pipeline-level
+		// logger just seeded above.
+		ctx := logging.With(ctx, "stage", stage.Name(), "stage_index", i)
 		stageLogger := logger.With("stage", stage.Name(), "stage_index", i)
 
 		// Check if stage should run

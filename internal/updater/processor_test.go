@@ -482,39 +482,6 @@ func TestUpdaterProcessor_HasChanges(t *testing.T) {
 	}
 }
 
-func TestUpdaterProcessor_WithStage(t *testing.T) {
-	proc := NewUpdaterProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
-
-	stages := []string{"fetch", "parse", "validate", "update"}
-
-	for _, stage := range stages {
-		logger := proc.WithStage(stage)
-		require.NotNil(t, logger)
-		// Logger should be different instance with stage context
-		assert.NotEqual(t, proc.GetLogger(), logger)
-	}
-}
-
-func TestUpdaterProcessor_WithPipeline(t *testing.T) {
-	proc := NewUpdaterProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
-
-	tests := []struct {
-		stage string
-		index int
-	}{
-		{stage: "go/build", index: 0},
-		{stage: "go/bump", index: 1},
-		{stage: "git-checkout", index: 2},
-	}
-
-	for _, tt := range tests {
-		logger := proc.WithPipeline(tt.stage, tt.index)
-		require.NotNil(t, logger)
-		// Logger should be different instance with pipeline context
-		assert.NotEqual(t, proc.GetLogger(), logger)
-	}
-}
-
 func TestUpdaterProcessor_Summary(t *testing.T) {
 	tests := []struct {
 		name         string

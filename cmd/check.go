@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 
@@ -45,9 +46,7 @@ func runCheck(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	if verbosity > 0 {
-		fmt.Fprintf(os.Stderr, "Found %d melange files to check\n", len(files))
-	}
+	slog.Info("found melange files to check", "count", len(files))
 
 	if dryRun {
 		fmt.Println("Dry run mode - would check the following files:")
@@ -66,9 +65,7 @@ func runCheck(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("checking updates: %w", err)
 	}
 
-	if verbosity > 0 {
-		fmt.Fprintf(os.Stderr, "Processed %d files\n", len(processors))
-	}
+	slog.Info("processed melange files", "count", len(processors))
 
 	// Convert processors to results for output
 	results := make([]*updater.UpdateResult, 0, len(processors))

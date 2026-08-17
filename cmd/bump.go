@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"time"
@@ -56,9 +57,7 @@ func runBump(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	if verbosity > 0 {
-		fmt.Fprintf(os.Stderr, "Found %d melange files to check for vulnerabilities\n", len(files))
-	}
+	slog.Info("found melange files to check for vulnerabilities", "count", len(files))
 
 	// Configure processor options
 	opts := buildBumpProcessorOptions()
@@ -73,17 +72,17 @@ func runBump(cmd *cobra.Command, args []string) error {
 
 	// Process all files using shared processor architecture
 	results := make([]*gobump.GoBumpResult, 0, len(files))
-	for _, file := range files {
+	for i, file := range files {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("bump cancelled: %w", err)
 		}
 
+		slog.Info("processing melange file", "file", file, "index", i+1, "total", len(files))
+
 		result, err := gobump.ProcessFile(ctx, file, opts, analyzer)
 
 		if err != nil {
-			if verbosity > 0 {
-				fmt.Fprintf(os.Stderr, "Error processing %s: %v\n", file, err)
-			}
+			slog.Error("processing melange file failed", "file", file, "error", err)
 			// Create error result
 			result = &gobump.GoBumpResult{
 				PackageName: extractPackageNameFromPath(file),
