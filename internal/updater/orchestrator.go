@@ -3,6 +3,7 @@ package updater
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -68,7 +69,7 @@ func (o *UpdateOrchestrator) processPackageCheckWithConfig(ctx context.Context, 
 	if cfg == nil {
 		loader := newMelangeLoader()
 		var err error
-		cfg, originalContent, err = loader.LoadWithPreservation(filePath)
+		cfg, originalContent, err = loader.LoadWithPreservation(ctx, filePath)
 		if err != nil {
 			return nil, fmt.Errorf("loading configuration %s: %w", filePath, err)
 		}
@@ -152,10 +153,12 @@ func (o *UpdateOrchestrator) ProcessPackageApply(ctx context.Context, filePath s
 func (o *UpdateOrchestrator) ProcessMultipleChecks(ctx context.Context, filePaths []string) ([]*UpdaterProcessor, error) {
 	processors := make([]*UpdaterProcessor, 0, len(filePaths))
 
-	for _, filePath := range filePaths {
+	for i, filePath := range filePaths {
 		if err := ctx.Err(); err != nil {
 			return processors, err
 		}
+
+		slog.Info("processing melange file", "file", filePath, "index", i+1, "total", len(filePaths))
 
 		processor, err := o.ProcessPackageCheck(ctx, filePath)
 		if err != nil {
@@ -177,10 +180,12 @@ func (o *UpdateOrchestrator) ProcessMultipleChecks(ctx context.Context, filePath
 func (o *UpdateOrchestrator) ProcessMultipleApplies(ctx context.Context, filePaths []string, options ProcessorOptions) ([]*UpdaterProcessor, error) {
 	processors := make([]*UpdaterProcessor, 0, len(filePaths))
 
-	for _, filePath := range filePaths {
+	for i, filePath := range filePaths {
 		if err := ctx.Err(); err != nil {
 			return processors, err
 		}
+
+		slog.Info("processing melange file", "file", filePath, "index", i+1, "total", len(filePaths))
 
 		processor, err := o.ProcessPackageApply(ctx, filePath, options)
 		if err != nil {

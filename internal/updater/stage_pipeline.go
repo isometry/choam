@@ -3,13 +3,13 @@ package updater
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"net/http"
 	"strings"
 
 	melangeConfig "github.com/isometry/choam/internal/config"
 	"github.com/isometry/choam/internal/git"
 	githubClient "github.com/isometry/choam/internal/github"
+	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/processor"
 )
 
@@ -45,15 +45,16 @@ func (pp *PipelineProcessor) Apply(ctx context.Context, p processor.Processor) e
 		return fmt.Errorf("expected UpdaterProcessor, got %T", p)
 	}
 
-	logger := up.WithStage(pp.Name())
+	// ctx already carries "stage"/"stage_index" - processor.Pipeline.Execute
+	// seeds them before calling any stage method.
 
 	// Skip if no version update (pipelines only change with version updates)
 	if !up.VersionChanged && !up.GetOptions().Force {
-		logger.Debug("No version change - skipping pipeline updates")
+		logging.From(ctx).Debug("No version change - skipping pipeline updates")
 		return nil
 	}
 
-	logger.Info("Starting pipeline updates")
+	logging.From(ctx).Info("Starting pipeline updates")
 
 	// Get service clients
 	_, githubClient, gitClient, httpClient := pp.orchestrator.GetServiceClients()
@@ -61,34 +62,38 @@ func (pp *PipelineProcessor) Apply(ctx context.Context, p processor.Processor) e
 	loader := newMelangeLoader()
 
 	// Process git-checkout pipelines
-	if err := pp.processGitCheckoutPipelines(ctx, up, loader, githubClient, gitClient, logger); err != nil {
+	if err := pp.processGitCheckoutPipelines(ctx, up, loader, githubClient, gitClient); err != nil {
 		return fmt.Errorf("processing git-checkout pipelines: %w", err)
 	}
 
 	// Process fetch pipelines
-	if err := pp.processFetchPipelines(ctx, up, loader, httpClient, logger); err != nil {
+	if err := pp.processFetchPipelines(ctx, up, loader, httpClient); err != nil {
 		return fmt.Errorf("processing fetch pipelines: %w", err)
 	}
 
-	logger.Info("Pipeline updates completed", "changes", len(up.PipelineChanges))
+	logging.From(ctx).Info("Pipeline updates completed", "changes", len(up.PipelineChanges))
 	return nil
 }
 
 // processGitCheckoutPipelines updates git-checkout pipelines with new expected-commit
-func (pp *PipelineProcessor) processGitCheckoutPipelines(ctx context.Context, processor *UpdaterProcessor, loader *melangeConfig.Loader, githubClient *githubClient.Client, gitClient *git.Client, logger *slog.Logger) error {
+func (pp *PipelineProcessor) processGitCheckoutPipelines(ctx context.Context, processor *UpdaterProcessor, loader *melangeConfig.Loader, githubClient *githubClient.Client, gitClient *git.Client) error {
 	// Find git-checkout pipelines
 	gitCheckoutIndices, err := loader.FindPipelinesByUse(processor.GetCurrentYAML(), "git-checkout")
 	if err != nil {
 		return fmt.Errorf("finding git-checkout pipelines: %w", err)
 	}
 
-	logger.Debug("Processing git-checkout pipelines", "count", len(gitCheckoutIndices))
+	logging.From(ctx).Debug("Processing git-checkout pipelines", "count", len(gitCheckoutIndices))
 
 	for _, index := range gitCheckoutIndices {
-		pipelineLogger := processor.WithPipeline("git-checkout", index)
-		pipelineLogger.Debug("Examining git-checkout pipeline", "index", index)
+		// Shadowed for this iteration - "pipeline_step" names the melange
+		// pipeline step kind (git-checkout/fetch), distinct from ctx's
+		// existing "pipeline" (the processor.Pipeline this stage runs in)
+		// and "stage" (this stage's own name) attributes.
+		ctx := logging.With(ctx, "pipeline_step", "git-checkout", "pipeline_index", index)
+		logging.From(ctx).Debug("Examining git-checkout pipeline")
 
-		if err := pp.updateGitCheckoutPipeline(ctx, processor, index, loader, githubClient, gitClient, pipelineLogger); err != nil {
+		if err := pp.updateGitCheckoutPipeline(ctx, processor, index, loader, githubClient, gitClient); err != nil {
 			return fmt.Errorf("updating git-checkout[%d]: %w", index, err)
 		}
 	}
@@ -97,7 +102,7 @@ func (pp *PipelineProcessor) processGitCheckoutPipelines(ctx context.Context, pr
 }
 
 // updateGitCheckoutPipeline updates a single git-checkout pipeline
-func (pp *PipelineProcessor) updateGitCheckoutPipeline(ctx context.Context, processor *UpdaterProcessor, pipelineIndex int, loader *melangeConfig.Loader, githubClient *githubClient.Client, gitClient *git.Client, logger *slog.Logger) error {
+func (pp *PipelineProcessor) updateGitCheckoutPipeline(ctx context.Context, processor *UpdaterProcessor, pipelineIndex int, loader *melangeConfig.Loader, githubClient *githubClient.Client, gitClient *git.Client) error {
 	// Get current pipeline configuration
 	withFields, err := loader.GetPipelineWithField(processor.GetCurrentYAML(), pipelineIndex)
 	if err != nil {
@@ -107,7 +112,7 @@ func (pp *PipelineProcessor) updateGitCheckoutPipeline(ctx context.Context, proc
 	// Check if this pipeline has expected-commit
 	currentCommit, hasExpectedCommit := withFields["expected-commit"]
 	if !hasExpectedCommit {
-		logger.Debug("Pipeline has no expected-commit field - skipping")
+		logging.From(ctx).Debug("Pipeline has no expected-commit field - skipping")
 		return nil
 	}
 
@@ -125,7 +130,7 @@ func (pp *PipelineProcessor) updateGitCheckoutPipeline(ctx context.Context, proc
 
 	// Skip if commit hasn't changed
 	if currentCommit == newCommit {
-		logger.Debug("Commit unchanged - skipping pipeline update", "commit", newCommit[:12])
+		logging.From(ctx).Debug("Commit unchanged - skipping pipeline update", "commit", newCommit[:12])
 		return nil
 	}
 
@@ -148,25 +153,26 @@ func (pp *PipelineProcessor) updateGitCheckoutPipeline(ctx context.Context, proc
 	}
 	processor.AddPipelineChange(change)
 
-	logger.Info("Git checkout pipeline updated", "old_commit", currentCommit[:12], "new_commit", newCommit[:12])
+	logging.From(ctx).Info("Git checkout pipeline updated", "old_commit", currentCommit[:12], "new_commit", newCommit[:12])
 	return nil
 }
 
 // processFetchPipelines updates fetch pipelines with new expected-sha256 if URL changed
-func (pp *PipelineProcessor) processFetchPipelines(ctx context.Context, processor *UpdaterProcessor, loader *melangeConfig.Loader, httpClient *http.Client, logger *slog.Logger) error {
+func (pp *PipelineProcessor) processFetchPipelines(ctx context.Context, processor *UpdaterProcessor, loader *melangeConfig.Loader, httpClient *http.Client) error {
 	// Find fetch pipelines
 	fetchIndices, err := loader.FindPipelinesByUse(processor.GetCurrentYAML(), "fetch")
 	if err != nil {
 		return fmt.Errorf("finding fetch pipelines: %w", err)
 	}
 
-	logger.Debug("Processing fetch pipelines", "count", len(fetchIndices))
+	logging.From(ctx).Debug("Processing fetch pipelines", "count", len(fetchIndices))
 
 	for _, index := range fetchIndices {
-		pipelineLogger := processor.WithPipeline("fetch", index)
-		pipelineLogger.Debug("Examining fetch pipeline", "index", index)
+		// Shadowed for this iteration - see processGitCheckoutPipelines.
+		ctx := logging.With(ctx, "pipeline_step", "fetch", "pipeline_index", index)
+		logging.From(ctx).Debug("Examining fetch pipeline")
 
-		if err := pp.updateFetchPipeline(ctx, processor, index, loader, httpClient, pipelineLogger); err != nil {
+		if err := pp.updateFetchPipeline(ctx, processor, index, loader, httpClient); err != nil {
 			return fmt.Errorf("updating fetch[%d]: %w", index, err)
 		}
 	}
@@ -175,7 +181,7 @@ func (pp *PipelineProcessor) processFetchPipelines(ctx context.Context, processo
 }
 
 // updateFetchPipeline updates a single fetch pipeline
-func (pp *PipelineProcessor) updateFetchPipeline(ctx context.Context, processor *UpdaterProcessor, pipelineIndex int, loader *melangeConfig.Loader, httpClient *http.Client, logger *slog.Logger) error {
+func (pp *PipelineProcessor) updateFetchPipeline(ctx context.Context, processor *UpdaterProcessor, pipelineIndex int, loader *melangeConfig.Loader, httpClient *http.Client) error {
 	// Get current pipeline configuration
 	withFields, err := loader.GetPipelineWithField(processor.GetCurrentYAML(), pipelineIndex)
 	if err != nil {
@@ -187,13 +193,13 @@ func (pp *PipelineProcessor) updateFetchPipeline(ctx context.Context, processor 
 	currentSHA, hasSHA := withFields["expected-sha256"]
 
 	if !hasURI || !hasSHA {
-		logger.Debug("Pipeline missing uri or expected-sha256 - skipping")
+		logging.From(ctx).Debug("Pipeline missing uri or expected-sha256 - skipping")
 		return nil
 	}
 
 	// Check if URI contains version variable
 	if !pp.uriContainsVersionVariable(uri) {
-		logger.Debug("URI does not contain version variable - skipping")
+		logging.From(ctx).Debug("URI does not contain version variable - skipping")
 		return nil
 	}
 
@@ -202,7 +208,7 @@ func (pp *PipelineProcessor) updateFetchPipeline(ctx context.Context, processor 
 
 	// Skip if URI hasn't changed
 	if uri == newURI {
-		logger.Debug("URI unchanged - skipping fetch pipeline update")
+		logging.From(ctx).Debug("URI unchanged - skipping fetch pipeline update")
 		return nil
 	}
 
@@ -241,7 +247,7 @@ func (pp *PipelineProcessor) updateFetchPipeline(ctx context.Context, processor 
 	}
 	processor.AddPipelineChange(change)
 
-	logger.Info("Fetch pipeline updated", "new_uri", newURI, "new_sha256", newSHA256[:12]+"...")
+	logging.From(ctx).Info("Fetch pipeline updated", "new_uri", newURI, "new_sha256", newSHA256[:12]+"...")
 	return nil
 }
 

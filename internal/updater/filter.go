@@ -1,10 +1,11 @@
 package updater
 
 import (
+	"context"
 	"fmt"
-	"log/slog"
 
 	melange "chainguard.dev/melange/pkg/config"
+	"github.com/isometry/choam/internal/logging"
 )
 
 // VersionFilter handles version filtering logic based on update configuration
@@ -24,13 +25,11 @@ func (vf *VersionFilter) isValidVersion(version string, allowPreRelease bool) bo
 	return vf.comparator.IsValidVersion(version, allowPreRelease)
 }
 
-// ProcessVersion processes a single version through all the update configuration rules
-func (vf *VersionFilter) ProcessVersion(version string, updateConfig *melange.Update) (string, bool, error) {
-	return vf.ProcessVersionWithLogger(version, updateConfig, slog.Default())
-}
-
-// ProcessVersionWithLogger processes a single version with a specific logger for context
-func (vf *VersionFilter) ProcessVersionWithLogger(version string, updateConfig *melange.Update, logger *slog.Logger) (string, bool, error) {
+// ProcessVersion processes a single version through all the update
+// configuration rules, logging intermediate decisions against the logger
+// carried on ctx (see internal/logging) so they carry the caller's
+// file/package/stage attribution.
+func (vf *VersionFilter) ProcessVersion(ctx context.Context, version string, updateConfig *melange.Update) (string, bool, error) {
 	if updateConfig == nil {
 		return version, true, nil
 	}
@@ -43,7 +42,7 @@ func (vf *VersionFilter) ProcessVersionWithLogger(version string, updateConfig *
 	beforeStrip := processed
 	processed = vf.applyStripRules(processed, updateConfig)
 	if processed != beforeStrip {
-		logger.Debug("After stripping", "before", beforeStrip, "after", processed)
+		logging.From(ctx).Debug("After stripping", "before", beforeStrip, "after", processed)
 	}
 
 	// 1b. Apply regex transformations
@@ -57,7 +56,7 @@ func (vf *VersionFilter) ProcessVersionWithLogger(version string, updateConfig *
 			}
 		}
 		if processed != beforeTransform {
-			logger.Debug("After transforms", "before", beforeTransform, "after", processed)
+			logging.From(ctx).Debug("After transforms", "before", beforeTransform, "after", processed)
 		}
 	}
 
@@ -70,18 +69,18 @@ func (vf *VersionFilter) ProcessVersionWithLogger(version string, updateConfig *
 			return "", false, fmt.Errorf("checking ignore patterns: %w", err)
 		}
 		if ignored {
-			logger.Debug("Version ignored by pattern", "version", processed)
+			logging.From(ctx).Debug("Version ignored by pattern", "version", processed)
 			return "", false, nil
 		}
 	}
 
 	// 2b. Validate semver format and filter pre-releases
 	if !vf.isValidVersion(processed, updateConfig.EnablePreReleaseTags) {
-		logger.Debug("Version failed validity check", "version", processed)
+		logging.From(ctx).Debug("Version failed validity check", "version", processed)
 		return "", false, nil // Invalid semver or unwanted pre-release
 	}
 
-	logger.Debug("Version accepted", "original", version, "processed", processed)
+	logging.From(ctx).Debug("Version accepted", "original", version, "processed", processed)
 	return processed, true, nil
 }
 

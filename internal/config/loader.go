@@ -26,7 +26,7 @@ func NewLoader() *Loader {
 }
 
 // LoadWithPreservation loads a melange config while preserving YAML structure and comments
-func (l *Loader) LoadWithPreservation(path string) (*config.Configuration, []byte, error) {
+func (l *Loader) LoadWithPreservation(ctx context.Context, path string) (*config.Configuration, []byte, error) {
 	// Read the original YAML content
 	originalContent, err := os.ReadFile(path)
 	if err != nil {
@@ -34,7 +34,7 @@ func (l *Loader) LoadWithPreservation(path string) (*config.Configuration, []byt
 	}
 
 	// Parse the configuration using melange's parser for validation
-	cfg, err := config.ParseConfiguration(context.Background(), path)
+	cfg, err := config.ParseConfiguration(ctx, path)
 	if err != nil {
 		return nil, nil, fmt.Errorf("parsing melange configuration %s: %w", path, err)
 	}
