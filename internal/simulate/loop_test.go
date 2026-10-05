@@ -16,6 +16,7 @@ import (
 	"github.com/isometry/choam/internal/scan"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
 )
 
@@ -2219,4 +2220,282 @@ func TestRunLoop_DegradedReachability_SelfReplaceKeyFailsOpen(t *testing.T) {
 	require.NotNil(t, result.UnrequiredModules)
 	assert.NotContains(t, result.UnrequiredModules, "example.com/selfpin",
 		"a module present as a replace KEY must fail open, not be classified unrequired")
+}
+
+// fakeCompiler adds the optional Compiler seam to fakeToolchain, enabling
+// the compile gate: compileFn derives the report from the module graph the
+// current apply produced; versions/requires model `go list -m -versions`
+// and per-version go.mod require blocks ("module@version" keys).
+type fakeCompiler struct {
+	*fakeToolchain
+	compileFn func(resolved map[string]string) *CompileReport
+	versions  map[string][]string
+	requires  map[string]map[string]string
+	compiles  int
+}
+
+func (f *fakeCompiler) Compile(ctx context.Context, dir string, _, _ []string) (*CompileReport, error) {
+	f.compiles++
+	lastCall := f.lastCall
+	resolved, err := f.ListModules(ctx, dir)
+	f.lastCall = lastCall
+	if err != nil {
+		return nil, err
+	}
+	if f.compileFn == nil {
+		return &CompileReport{}, nil
+	}
+	return f.compileFn(resolved), nil
+}
+
+func (f *fakeCompiler) ModuleVersions(_ context.Context, _, module string) ([]string, error) {
+	return f.versions[module], nil
+}
+
+func (f *fakeCompiler) ModuleRequires(_ context.Context, _, module, version string) (map[string]string, error) {
+	requires, ok := f.requires[module+"@"+version]
+	if !ok {
+		return nil, errors.New("unknown module version")
+	}
+	return requires, nil
+}
+
+// otelLikeCompiler models the opentofu break: example.com/exporter (an
+// otlploghttp stand-in) compiles only against an example.com/api (otel/log)
+// at or below what its own go.mod requires - raising api to v0.21.0 removes
+// API exporter < v0.21.0 uses, while MVS happily resolves the graph.
+func otelLikeCompiler(tc *fakeToolchain, exporterVersions []string) *fakeCompiler {
+	requires := map[string]map[string]string{"example.com/api@v0.21.0": {}}
+	for _, v := range []string{"v0.18.0", "v0.19.0", "v0.20.0", "v0.21.0", "v0.22.0"} {
+		requires["example.com/exporter@"+v] = map[string]string{"example.com/api": v}
+	}
+	requires["example.com/exporter@v0.18.0"] = map[string]string{"example.com/api": "v0.19.0"}
+	return &fakeCompiler{
+		fakeToolchain: tc,
+		versions:      map[string][]string{"example.com/exporter": exporterVersions},
+		requires:      requires,
+		compileFn: func(resolved map[string]string) *CompileReport {
+			report := &CompileReport{
+				Failed: map[string][]string{},
+				Modules: map[string]string{
+					"example.com/test":          "",
+					"example.com/exporter/otlp": "example.com/exporter",
+					"example.com/api/log":       "example.com/api",
+				},
+				Imports: map[string][]string{"example.com/exporter/otlp": {"example.com/api/log"}},
+			}
+			if semver.Compare(resolved["example.com/api"], "v0.21.0") >= 0 &&
+				semver.Compare(resolved["example.com/exporter"], "v0.21.0") < 0 {
+				report.Failed["example.com/exporter/otlp"] = []string{
+					"/modcache/example.com/exporter@" + resolved["example.com/exporter"] + "/log.go:5:17: undefined: api.KeyValue",
+				}
+			}
+			return report
+		},
+	}
+}
+
+func TestCompileGate_FullSetPasses(t *testing.T) {
+	tc := &fakeCompiler{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot:  ".",
+		Seeds:    []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
+		Baseline: map[string]string{"example.com/x": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/x@v1.1.0"}, result.FinalDeps)
+	assert.Empty(t, result.Residuals)
+	assert.Equal(t, 2, tc.compiles, "one baseline compile plus one full-set compile")
+}
+
+func TestCompileGate_NoCompileSkipsGate(t *testing.T) {
+	tc := &fakeCompiler{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds:   []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
+	}, Options{NoCompile: true})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/x@v1.1.0"}, result.FinalDeps)
+	assert.Zero(t, tc.compiles)
+}
+
+func TestCompileGate_BaselineFailuresExcluded(t *testing.T) {
+	// A package already broken in the pristine checkout (host noise, e.g.
+	// a missing C library) must not count against the bump.
+	tc := &fakeCompiler{
+		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}},
+		compileFn: func(map[string]string) *CompileReport {
+			return &CompileReport{
+				Failed:  map[string][]string{"example.com/test/cgo": {"cgo.go:3:8: could not import C"}},
+				Modules: map[string]string{"example.com/test/cgo": "", "example.com/x": "example.com/x"},
+				Imports: map[string][]string{"example.com/test/cgo": {"example.com/x"}},
+			}
+		},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot:  ".",
+		Seeds:    []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
+		Baseline: map[string]string{"example.com/x": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/x@v1.1.0"}, result.FinalDeps)
+	assert.Empty(t, result.Residuals)
+	assert.Empty(t, result.Dropped)
+	assert.Equal(t, 2, tc.compiles, "baseline failure excluded: the full set passes first time")
+}
+
+func TestCompileGate_CoherenceRemedy(t *testing.T) {
+	// The opentofu reference failure: the api fix tidies cleanly but breaks
+	// the lagging exporter; the gate raises exporter to the MINIMAL version
+	// whose go.mod requires the raised api (v0.21.0, not v0.22.0).
+	tc := otelLikeCompiler(&fakeToolchain{base: map[string]string{
+		"example.com/api":      "v0.19.0",
+		"example.com/exporter": "v0.19.0",
+	}}, []string{"v0.19.0", "v0.20.0", "v0.21.0", "v0.22.0"})
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/api", id: "GO-1", fixed: "v0.21.0"}}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/api", Version: "v0.21.0", FromCVE: true, VulnIDs: []string{"GO-1"}, Severity: "HIGH"},
+		},
+		Baseline: map[string]string{"example.com/api": "v0.19.0", "example.com/exporter": "v0.19.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/api@v0.21.0", "example.com/exporter@v0.21.0"}, result.FinalDeps)
+	assert.Equal(t, []string{"example.com/api"}, result.CVEBackedModules, "a coherence raise is not a security fix")
+	assert.Empty(t, result.Residuals)
+	assert.Equal(t, "v0.21.0", result.Resolved["example.com/exporter"])
+	assert.Equal(t, 3, tc.compiles, "baseline, failing full set, coherent set")
+}
+
+func TestCompileGate_ExistingEntryIsAFloor(t *testing.T) {
+	// An existing deps entry (exporter@v0.19.0, itself a fix) must be
+	// raisable by coherence, in place - never frozen, never duplicated.
+	tc := otelLikeCompiler(&fakeToolchain{base: map[string]string{
+		"example.com/api":      "v0.19.0",
+		"example.com/exporter": "v0.18.0",
+	}}, []string{"v0.18.0", "v0.19.0", "v0.20.0", "v0.21.0"})
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/api", id: "GO-1", fixed: "v0.21.0"},
+		{module: "example.com/exporter", id: "GO-2", fixed: "v0.19.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/exporter", Version: "v0.19.0", FromCVE: true, VulnIDs: []string{"GO-2"}},
+			{Module: "example.com/api", Version: "v0.21.0", FromCVE: true, VulnIDs: []string{"GO-1"}},
+		},
+		Baseline: map[string]string{"example.com/api": "v0.19.0", "example.com/exporter": "v0.18.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/exporter@v0.21.0", "example.com/api@v0.21.0"}, result.FinalDeps)
+	assert.ElementsMatch(t, []string{"example.com/exporter", "example.com/api"}, result.CVEBackedModules)
+	assert.Empty(t, result.Residuals)
+}
+
+func TestCompileGate_CoUpdateFallback(t *testing.T) {
+	// No released exporter version the walk can see is built against the
+	// raised api; omnibump's co-update recommendation supplies the target.
+	tc := otelLikeCompiler(&fakeToolchain{base: map[string]string{
+		"example.com/api":      "v0.19.0",
+		"example.com/exporter": "v0.19.0",
+	}}, []string{"v0.19.0", "v0.20.0"})
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/api", id: "GO-1", fixed: "v0.21.0"}}}
+	var coUpdateCalls int
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot:  ".",
+		Seeds:    []Candidate{{Module: "example.com/api", Version: "v0.21.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
+		Baseline: map[string]string{"example.com/api": "v0.19.0", "example.com/exporter": "v0.19.0"},
+	}, Options{CoUpdates: func(_ context.Context, updates map[string]string, _ *modfile.File) map[string]string {
+		coUpdateCalls++
+		assert.Equal(t, map[string]string{"example.com/api": "v0.21.0"}, updates)
+		return map[string]string{"example.com/exporter": "v0.21.0"}
+	}})
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, coUpdateCalls)
+	assert.Equal(t, []string{"example.com/api@v0.21.0", "example.com/exporter@v0.21.0"}, result.FinalDeps)
+	assert.Empty(t, result.Residuals)
+}
+
+func TestCompileGate_GreedySeverityOrderAndResidualReason(t *testing.T) {
+	// a and b each compile alone but not together, and no coherence raise
+	// can help (the conflict is in main-module code). The CRITICAL fix wins
+	// even though the LOW one was seeded first; the loser is reported as a
+	// "breaks compile" residual.
+	tc := &fakeCompiler{
+		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"}},
+		requires:      map[string]map[string]string{},
+		compileFn: func(resolved map[string]string) *CompileReport {
+			report := &CompileReport{
+				Failed:  map[string][]string{},
+				Modules: map[string]string{"example.com/test": "", "example.com/a": "example.com/a", "example.com/b": "example.com/b"},
+				Imports: map[string][]string{"example.com/test": {"example.com/a", "example.com/b"}},
+			}
+			if resolved["example.com/a"] == "v1.1.0" && resolved["example.com/b"] == "v1.1.0" {
+				report.Failed["example.com/test"] = []string{"/src/test/main.go:7:2: a.X and b.X conflict"}
+			}
+			return report
+		},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/a", id: "GO-A", fixed: "v1.1.0"},
+		{module: "example.com/b", id: "GO-B", fixed: "v1.1.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/a", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-A"}, Severity: "LOW"},
+			{Module: "example.com/b", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-B"}, Severity: "CRITICAL"},
+		},
+		Baseline: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/b@v1.1.0"}, result.FinalDeps)
+	require.Len(t, result.Residuals, 1)
+	residual := result.Residuals[0]
+	assert.Equal(t, "example.com/a", residual.Module)
+	assert.Equal(t, "v1.0.0", residual.ResolvedVersion)
+	assert.Equal(t, "v1.1.0", residual.FixedVersion)
+	assert.Equal(t, []string{"GO-A"}, residual.VulnIDs)
+	assert.Equal(t, "breaks compile: example.com/test: main.go:7:2: a.X and b.X conflict", residual.Reason)
+	assert.Contains(t, result.Dropped, DroppedCandidate{
+		Module: "example.com/a", Version: "v1.1.0",
+		Reason: "breaks compile: example.com/test: main.go:7:2: a.X and b.X conflict",
+	})
+}
+
+func TestCompileGate_CancellationPropagates(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	tc := &fakeCompiler{
+		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}},
+		compileFn: func(map[string]string) *CompileReport {
+			cancel()
+			return &CompileReport{}
+		},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
+
+	_, err := RunLoop(ctx, tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds:   []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
+	}, Options{})
+
+	require.ErrorIs(t, err, context.Canceled)
 }

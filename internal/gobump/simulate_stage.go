@@ -62,6 +62,27 @@ func NewSimulationStage(analyzer *Analyzer, opts ProcessorOptions) *SimulationSt
 	}
 }
 
+// compileGateCoUpdates adapts omnibump's DetectCoUpdates (the analysis behind
+// the build's "REQUIRED CO-UPDATES" advisory) for the simulation's compile
+// gate: module -> recommended minimum version. Bounded and panic-guarded
+// like declareCoUpdates' use; any failure yields no recommendations.
+func compileGateCoUpdates(ctx context.Context, packagesToUpdate map[string]string, modFile *modfile.File) (recommended map[string]string) {
+	defer func() {
+		if r := recover(); r != nil {
+			logging.From(ctx).Debug("compile-gate co-update analysis panicked - skipping", "recover", r)
+			recommended = nil
+		}
+	}()
+	ctx, cancel := context.WithTimeout(ctx, coUpdateBudget)
+	defer cancel()
+	missing, _ := omnibumpgolang.DetectCoUpdates(ctx, packagesToUpdate, modFile)
+	recommended = make(map[string]string, len(missing))
+	for module, dep := range missing {
+		recommended[module] = dep.RequiredVersion
+	}
+	return recommended
+}
+
 // defaultDetectCoUpdates wraps omnibump's DetectCoUpdates - the exact
 // function melange's bump pipeline runs at build time - discarding its
 // API-compat alert map (a heuristic "verify manually" tier, not actionable
@@ -72,7 +93,11 @@ func defaultDetectCoUpdates(ctx context.Context, packagesToUpdate map[string]str
 }
 
 func defaultSimulator(ctx context.Context, opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error) {
-	simOpts := simulate.Options{Budget: opts.SimulationTimeout}.WithDefaults()
+	simOpts := simulate.Options{
+		Budget:    opts.SimulationTimeout,
+		NoCompile: !opts.Compile,
+		CoUpdates: compileGateCoUpdates,
+	}.WithDefaults()
 	toolchain, err := simulate.NewToolchain(ctx, simOpts.CommandTimeout)
 	if err != nil {
 		return nil, err
@@ -133,6 +158,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 				Seeds:           seedCandidates(m),
 				Baseline:        goEco.EffectiveVersions(ctx, m.Deps),
 				Packages:        m.BuildPackages,
+				Tags:            m.BuildTags,
 				VulnImports:     vulnImportPaths(m.ScanResult),
 				BaselineVulnIDs: baselineVulnIDs(m.ScanResult),
 			})
@@ -406,7 +432,7 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 	bumpByModule := make(map[string]*simulateBumpInfo)
 	if m.ScanResult != nil {
 		for _, bump := range m.ScanResult.SecurityBumps {
-			bumpByModule[bump.Name] = &simulateBumpInfo{vulnIDs: bump.VulnIDs}
+			bumpByModule[bump.Name] = &simulateBumpInfo{vulnIDs: bump.VulnIDs, severity: bump.Severity}
 		}
 	}
 	infoFor := func(module string) *simulateBumpInfo {
@@ -436,6 +462,7 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 		if info := infoFor(newPath); info != nil {
 			candidate.FromCVE = true
 			candidate.VulnIDs = info.vulnIDs
+			candidate.Severity = info.severity
 		}
 		seeds = append(seeds, candidate)
 	}
@@ -449,6 +476,7 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 		if info := infoFor(module); info != nil {
 			candidate.FromCVE = true
 			candidate.VulnIDs = info.vulnIDs
+			candidate.Severity = info.severity
 		}
 		seeds = append(seeds, candidate)
 	}
@@ -456,7 +484,8 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 }
 
 type simulateBumpInfo struct {
-	vulnIDs []string
+	vulnIDs  []string
+	severity string
 }
 
 // rebuildLanguageActions recomputes one language's bump actions from its

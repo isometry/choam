@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/isometry/choam/internal/scan"
+	"golang.org/x/mod/modfile"
 )
 
 // Toolchain abstracts the go tool operations the simulation needs. The real
@@ -55,6 +56,38 @@ type Toolchain interface {
 	LinkedStd(ctx context.Context, dir string, patterns []string) (map[string]struct{}, error)
 }
 
+// Compiler is the optional compile-gate seam: a Toolchain that also
+// implements it enables the post-convergence compile gate (see
+// loop.compileGate), unless Options.NoCompile is set. *GoToolchain
+// implements it.
+type Compiler interface {
+	// Compile compiles (without linking) the transitive non-test import
+	// graph of patterns (empty means ./...) with the given build tags for
+	// GOOS=linux, reporting per-package failures. An error return means the
+	// go tool itself could not run, not that packages failed to compile.
+	Compile(ctx context.Context, dir string, patterns, tags []string) (*CompileReport, error)
+	// ModuleVersions lists module's released versions, ascending.
+	ModuleVersions(ctx context.Context, dir, module string) ([]string, error)
+	// ModuleRequires returns the require entries of module@version's own
+	// go.mod.
+	ModuleRequires(ctx context.Context, dir, module, version string) (map[string]string, error)
+}
+
+// CompileReport is the outcome of one Compiler.Compile.
+type CompileReport struct {
+	// Failed maps each package that failed to compile to its first error
+	// lines ("# pkg" header stripped).
+	Failed map[string][]string
+	// Modules maps every non-standard package in the graph to its module
+	// path (replacement applied); "" for main-module packages.
+	Modules map[string]string
+	// Imports holds the direct imports of each failed package, for blame.
+	Imports map[string][]string
+	// FileModules maps module-cache file paths named in error lines
+	// (<GOMODCACHE>/<mod>@<ver>/...) back to "module@version".
+	FileModules map[string]string
+}
+
 // ReplaceTarget is the right-hand side of a go.mod replace directive.
 type ReplaceTarget struct {
 	Path    string
@@ -77,6 +110,10 @@ type Candidate struct {
 	Version string
 	FromCVE bool
 	VulnIDs []string
+	// Severity is the most severe advisory level the candidate addresses
+	// (scan.SeverityRank vocabulary; empty when unknown). The compile gate
+	// re-admits blamed candidates most-severe-first.
+	Severity string
 
 	// Replace marks a candidate applied as a go.mod replace directive
 	// (survives `go mod tidy`, unlike a plain require pin) rather than a
@@ -208,6 +245,10 @@ type ModrootRequest struct {
 	// import graphs define artifact reachability; empty falls back to ./...
 	// (over-approximate, never narrower than the artifact).
 	Packages []string
+	// Tags are the go/build steps' build tags (toolchaintags plus tags),
+	// applied by the compile gate so it type-checks the files the build
+	// will compile.
+	Tags []string
 	// VulnImports maps each seed advisory ID to the import paths its
 	// vulnerable code lives in (from the analysis scan's OSV metadata; see
 	// scan.Vulnerability.VulnerableImports). Seed candidates whose
@@ -230,6 +271,13 @@ type Options struct {
 	CommandTimeout time.Duration
 	// Budget bounds the whole per-package simulation (default 10m).
 	Budget time.Duration
+	// NoCompile disables the compile gate (see Compiler).
+	NoCompile bool
+	// CoUpdates, when set, returns omnibump's required co-update
+	// recommendations (module -> minimum version) for the given update set
+	// against the pristine go.mod. The compile gate uses them as a fallback
+	// coherence source for a failing module the version walk cannot repair.
+	CoUpdates func(ctx context.Context, packagesToUpdate map[string]string, modFile *modfile.File) map[string]string
 }
 
 // WithDefaults fills unset options.

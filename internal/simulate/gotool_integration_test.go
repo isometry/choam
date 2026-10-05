@@ -2,16 +2,21 @@ package simulate
 
 import (
 	"context"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/isometry/choam/internal/scan"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/mod/module"
+	modzip "golang.org/x/mod/zip"
 )
 
 // TestRunLoop_RealToolchain exercises the loop end-to-end with the real go
@@ -172,4 +177,160 @@ func TestGoToolchain_DepGoVersionsAndLinkedStd(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, std, "fmt")
 	assert.Contains(t, std, "os")
+}
+
+// writeFileProxy builds a file:// GOPROXY serving the given module versions
+// (module@version -> file name -> content; go.mod is required), so a real go
+// toolchain can resolve and compile against them with no network access.
+func writeFileProxy(t *testing.T, modules map[string]map[string]string) string {
+	t.Helper()
+	proxy := t.TempDir()
+	src := t.TempDir()
+	lists := make(map[string][]string)
+	for coord, files := range modules {
+		modPath, version, ok := strings.Cut(coord, "@")
+		require.True(t, ok, coord)
+		dir := filepath.Join(src, filepath.FromSlash(modPath)+"@"+version)
+		require.NoError(t, os.MkdirAll(dir, 0o755))
+		for name, content := range files {
+			require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644))
+		}
+
+		escaped, err := module.EscapePath(modPath)
+		require.NoError(t, err)
+		versionDir := filepath.Join(proxy, filepath.FromSlash(escaped), "@v")
+		require.NoError(t, os.MkdirAll(versionDir, 0o755))
+		require.NoError(t, os.WriteFile(filepath.Join(versionDir, version+".mod"), []byte(files["go.mod"]), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(versionDir, version+".info"),
+			[]byte(`{"Version":"`+version+`","Time":"2024-01-01T00:00:00Z"}`), 0o644))
+		zipFile, err := os.Create(filepath.Join(versionDir, version+".zip"))
+		require.NoError(t, err)
+		require.NoError(t, modzip.CreateFromDir(zipFile, module.Version{Path: modPath, Version: version}, dir))
+		require.NoError(t, zipFile.Close())
+		lists[versionDir] = append(lists[versionDir], version)
+	}
+	for versionDir, versions := range lists {
+		require.NoError(t, os.WriteFile(filepath.Join(versionDir, "list"), []byte(strings.Join(versions, "\n")+"\n"), 0o644))
+	}
+	return proxy
+}
+
+// otelLikeFixture reproduces the opentofu otel-log break with real modules:
+// example.com/api v0.21.0 drops the KeyValue type example.com/exporter
+// v0.19.0/v0.20.0 compile against; exporter v0.21.0 is the first release
+// whose go.mod requires (and code uses) the new api. The main module links
+// exporter; raising api alone resolves and tidies cleanly but no longer
+// compiles.
+func otelLikeFixture(t *testing.T) (toolchain *GoToolchain, dir string) {
+	t.Helper()
+	if testing.Short() {
+		t.Skip("skipping go toolchain integration test in -short mode")
+	}
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skipf("go toolchain unavailable: %v", err)
+	}
+
+	exporter := func(apiVersion, apiType string) map[string]string {
+		return map[string]string{
+			"go.mod":  "module example.com/exporter\n\ngo 1.21\n\nrequire example.com/api " + apiVersion + "\n",
+			"otlp.go": "package exporter\n\nimport \"example.com/api\"\n\nfunc Record() api." + apiType + " { return api." + apiType + "{} }\n",
+		}
+	}
+	proxy := writeFileProxy(t, map[string]map[string]string{
+		"example.com/api@v0.19.0": {
+			"go.mod": "module example.com/api\n\ngo 1.21\n",
+			"api.go": "package api\n\ntype KeyValue struct{ Key, Value string }\n",
+		},
+		"example.com/api@v0.21.0": {
+			"go.mod": "module example.com/api\n\ngo 1.21\n",
+			"api.go": "package api\n\ntype Attr struct{ Key, Value string }\n",
+		},
+		"example.com/exporter@v0.19.0": exporter("v0.19.0", "KeyValue"),
+		"example.com/exporter@v0.20.0": exporter("v0.19.0", "KeyValue"),
+		"example.com/exporter@v0.21.0": exporter("v0.21.0", "Attr"),
+	})
+
+	modCache := t.TempDir()
+	t.Setenv("GOPROXY", "file://"+filepath.ToSlash(proxy))
+	t.Setenv("GOSUMDB", "off")
+	t.Setenv("GOMODCACHE", modCache)
+	t.Setenv("GONOSUMDB", "")
+	t.Setenv("GOPRIVATE", "")
+	t.Cleanup(func() {
+		// The module cache is read-only; clean it before TempDir removal.
+		cmd := exec.Command("go", "clean", "-modcache")
+		cmd.Env = os.Environ()
+		_ = cmd.Run()
+	})
+
+	dir = t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte(
+		"module example.com/app\n\ngo 1.21\n\nrequire example.com/exporter v0.19.0\n"), 0o644))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte(
+		"package main\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/exporter\"\n)\n\nfunc main() { fmt.Println(exporter.Record()) }\n"), 0o644))
+	cmd := exec.Command("go", "mod", "tidy")
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GOWORK=off", "GOFLAGS=-mod=mod")
+	out, err := cmd.CombinedOutput()
+	require.NoError(t, err, string(out))
+
+	toolchain, err = NewToolchain(t.Context(), 2*time.Minute)
+	require.NoError(t, err)
+	return toolchain, dir
+}
+
+// TestGoToolchain_CompileReportsLockstepBreak: the compile primitive must
+// see what resolution cannot - per-package errors located in the mod-cache
+// copy of the lagging module - while a clean graph reports nothing.
+func TestGoToolchain_CompileReportsLockstepBreak(t *testing.T) {
+	toolchain, dir := otelLikeFixture(t)
+	ctx := t.Context()
+
+	report, err := toolchain.Compile(ctx, dir, nil, []string{"netgo", "osusergo"})
+	require.NoError(t, err)
+	assert.Empty(t, report.Failed, "pristine fixture compiles")
+	assert.Equal(t, "", report.Modules["example.com/app"], "main-module package maps to the empty module")
+	assert.Equal(t, "example.com/exporter", report.Modules["example.com/exporter"])
+
+	require.NoError(t, toolchain.Get(ctx, dir, "example.com/api@v0.21.0"))
+	require.NoError(t, toolchain.ModTidy(ctx, dir), "MVS has no upper bounds: the raise tidies cleanly")
+
+	report, err = toolchain.Compile(ctx, dir, nil, nil)
+	require.NoError(t, err)
+	require.Contains(t, report.Failed, "example.com/exporter")
+	assert.Contains(t, strings.Join(report.Failed["example.com/exporter"], "\n"), "undefined: api.KeyValue")
+	assert.NotContains(t, report.Failed, "example.com/app", "dependents of a broken package are not compiled")
+	assert.Contains(t, report.Imports["example.com/exporter"], "example.com/api")
+	assert.Contains(t, slices.Collect(maps.Values(report.FileModules)), "example.com/exporter@v0.19.0",
+		"mod-cache error paths map back to module@version")
+
+	versions, err := toolchain.ModuleVersions(ctx, dir, "example.com/exporter")
+	require.NoError(t, err)
+	assert.Equal(t, []string{"v0.19.0", "v0.20.0", "v0.21.0"}, versions)
+	requires, err := toolchain.ModuleRequires(ctx, dir, "example.com/exporter", "v0.21.0")
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"example.com/api": "v0.21.0"}, requires)
+}
+
+// TestRunLoop_CompileGateRepairsLockstepBreak drives the whole loop with the
+// real toolchain: the api fix alone would ship a build that does not
+// compile; the gate must add the minimal coherent exporter (v0.21.0 - not
+// v0.20.0, whose go.mod still requires the old api).
+func TestRunLoop_CompileGateRepairsLockstepBreak(t *testing.T) {
+	toolchain, dir := otelLikeFixture(t)
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/api", id: "GO-API", fixed: "v0.21.0"}}}
+
+	result, err := RunLoop(t.Context(), toolchain, sc, dir, ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/api", Version: "v0.21.0", FromCVE: true, VulnIDs: []string{"GO-API"}, Severity: "HIGH"},
+		},
+		Baseline: map[string]string{"example.com/api": "v0.19.0", "example.com/exporter": "v0.19.0"},
+		Tags:     []string{"netgo", "osusergo"},
+	}, Options{})
+	require.NoError(t, err)
+
+	assert.ElementsMatch(t, []string{"example.com/api@v0.21.0", "example.com/exporter@v0.21.0"}, result.FinalDeps)
+	assert.Empty(t, result.Residuals)
+	assert.Equal(t, "v0.21.0", result.Resolved["example.com/exporter"])
 }

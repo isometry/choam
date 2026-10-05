@@ -34,6 +34,7 @@ Path can be a single file or a directory containing .yaml files.`,
 	cmd.Flags().StringVar(&backupSuffix, "backup-suffix", "", "Suffix for backup files (empty = no backup)")
 	cmd.Flags().BoolVar(&noValidate, "no-validate", false, "Skip bump simulation (writes deps lists without proving they resolve or cover all advisories, and skips artifact-reachability filtering; go.sum narrowing still applies); requires a go toolchain otherwise")
 	cmd.Flags().DurationVar(&simulationTimeout, "simulation-timeout", 10*time.Minute, "Per-package budget for bump simulation")
+	cmd.Flags().BoolVar(&noCompile, "no-compile", false, "Skip the simulation's compile gate (validated deps are then only proven to resolve, not to compile the go/build packages); implied by --no-validate")
 	cmd.Flags().BoolVar(&noStdlib, "no-stdlib", false, "Skip the Go stdlib staleness check (no epoch bump for toolchain-fixed vulnerabilities). The check is also skipped automatically for files with uncommitted changes.")
 
 	return cmd
@@ -108,6 +109,7 @@ func buildBumpProcessorOptions() gobump.ProcessorOptions {
 		TempDir:           os.TempDir(),
 		Validate:          !noValidate,
 		SimulationTimeout: simulationTimeout,
+		Compile:           !noValidate && !noCompile,
 		StdlibCheck:       !noStdlib,
 	}
 }

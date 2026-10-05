@@ -275,6 +275,30 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		units := discoverAnalysisUnits(t.Context(), &melange.Configuration{}, bumpSteps)
 		require.Len(t, units["go"], 1)
 		assert.Empty(t, units["go"][0].Packages)
+		assert.Empty(t, units["go"][0].Tags)
+	})
+
+	t.Run("go/build tags: toolchaintags default plus tags, unioned", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{
+				{Uses: "go/build", With: map[string]string{"tags": "foo, bar"}},
+				{Uses: "go/build", With: map[string]string{"toolchaintags": "netgo", "tags": "baz"}},
+			},
+		}
+		units := discoverAnalysisUnits(t.Context(), cfg, nil)
+		require.Len(t, units["go"], 1)
+		assert.Equal(t, []string{"bar", "baz", "foo", "netgo", "osusergo"}, units["go"][0].Tags)
+	})
+
+	t.Run("go/build empty toolchaintags override drops the default", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{
+				{Uses: "go/build", With: map[string]string{"toolchaintags": ""}},
+			},
+		}
+		units := discoverAnalysisUnits(t.Context(), cfg, nil)
+		require.Len(t, units["go"], 1)
+		assert.Empty(t, units["go"][0].Tags)
 	})
 }
 

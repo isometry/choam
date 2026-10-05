@@ -102,6 +102,11 @@ type ModrootAnalysis struct {
 	// roots); the simulation then over-approximates with ./....
 	BuildPackages []string `json:"build_packages,omitempty" yaml:"build_packages,omitempty"`
 
+	// BuildTags are this modroot's go/build steps' build tags (each step's
+	// toolchaintags - default netgo,osusergo - plus its tags), unioned, for
+	// the simulation's compile gate. Empty when no go/build step covers it.
+	BuildTags []string `json:"build_tags,omitempty" yaml:"build_tags,omitempty"`
+
 	Deps         *ecosystem.ModuleDeps `json:"-" yaml:"-"` // ecosystem-internal, not serialized
 	ScanResult   *scan.ScanResult      `json:"scan_result" yaml:"scan_result"`
 	ExistingDeps []string              `json:"existing_deps" yaml:"existing_deps"` // deps currently declared for this root
@@ -197,6 +202,12 @@ type ProcessorOptions struct {
 
 	// SimulationTimeout bounds each package's bump simulation (default 10m).
 	SimulationTimeout time.Duration `json:"simulation_timeout" yaml:"simulation_timeout"`
+
+	// Compile enables the simulation's compile gate (default true at the
+	// CLI; --no-compile disables it): the validated deps set must also
+	// compile the go/build packages without new failures (see
+	// simulate.Compiler). Moot when Validate is false.
+	Compile bool `json:"compile" yaml:"compile"`
 
 	// StdlibCheck enables the Go stdlib staleness check (see StdlibStage):
 	// estimate the toolchain the package was last built with and bump the

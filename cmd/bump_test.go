@@ -66,6 +66,22 @@ func TestBuildBumpProcessorOptions_StdlibCheck(t *testing.T) {
 	assert.False(t, buildBumpProcessorOptions().StdlibCheck, "--no-stdlib disables StdlibCheck")
 }
 
+// TestBuildBumpProcessorOptions_Compile verifies --no-compile (and
+// --no-validate, which skips simulation entirely) disable the compile gate.
+func TestBuildBumpProcessorOptions_Compile(t *testing.T) {
+	origCompile, origValidate := noCompile, noValidate
+	t.Cleanup(func() { noCompile, noValidate = origCompile, origValidate })
+
+	noCompile, noValidate = false, false
+	assert.True(t, buildBumpProcessorOptions().Compile, "compile gate defaults on")
+
+	noCompile = true
+	assert.False(t, buildBumpProcessorOptions().Compile, "--no-compile disables the gate")
+
+	noCompile, noValidate = false, true
+	assert.False(t, buildBumpProcessorOptions().Compile, "--no-validate implies no compile gate")
+}
+
 func TestBumpRowStatus(t *testing.T) {
 	tests := []struct {
 		name        string

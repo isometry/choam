@@ -9,10 +9,15 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/module"
+	"golang.org/x/mod/semver"
 )
 
 // GoToolchain runs the local go binary. The environment passes through the
@@ -22,9 +27,18 @@ import (
 // directory doesn't mask resolution, and GOWORK=off so a stray go.work can't
 // leak into the analysis.
 type GoToolchain struct {
-	goBin     string
-	goVersion string // bare version ("1.26.4"), for gobump-parity `go mod tidy -go=`
-	timeout   time.Duration
+	goBin      string
+	goVersion  string // bare version ("1.26.4"), for gobump-parity `go mod tidy -go=`
+	goModCache string // GOMODCACHE, for mapping compile-error paths back to module@version
+	timeout    time.Duration
+
+	// compileTimeout bounds a Compile invocation, which type-checks the
+	// whole import graph and can take far longer than a resolution command
+	// on a cold build cache (the simulation budget still bounds it).
+	compileTimeout time.Duration
+
+	modRequiresMu sync.Mutex
+	modRequires   map[string]map[string]string // "module@version" -> its go.mod requires
 }
 
 // NewToolchain locates the go binary; the error return lets callers degrade
@@ -37,7 +51,12 @@ func NewToolchain(ctx context.Context, commandTimeout time.Duration) (*GoToolcha
 	if commandTimeout <= 0 {
 		commandTimeout = 2 * time.Minute
 	}
-	t := &GoToolchain{goBin: goBin, timeout: commandTimeout}
+	t := &GoToolchain{
+		goBin:          goBin,
+		timeout:        commandTimeout,
+		compileTimeout: max(commandTimeout, 10*time.Minute),
+		modRequires:    make(map[string]map[string]string),
+	}
 
 	// melange's gobump tidies with `-go=<its local go version>`, switching
 	// old modules to modern requirement-recording semantics; parity demands
@@ -45,9 +64,13 @@ func NewToolchain(ctx context.Context, commandTimeout time.Duration) (*GoToolcha
 	// documented residual risk).
 	probeCtx, cancel := context.WithTimeout(ctx, commandTimeout)
 	defer cancel()
-	version, err := exec.CommandContext(probeCtx, goBin, "env", "GOVERSION").Output()
+	env, err := exec.CommandContext(probeCtx, goBin, "env", "GOVERSION", "GOMODCACHE").Output()
 	if err == nil {
-		t.goVersion = strings.TrimPrefix(strings.TrimSpace(string(version)), "go")
+		lines := strings.Split(strings.TrimSpace(string(env)), "\n")
+		t.goVersion = strings.TrimPrefix(strings.TrimSpace(lines[0]), "go")
+		if len(lines) > 1 {
+			t.goModCache = strings.TrimSpace(lines[1])
+		}
 	}
 	return t, nil
 }
@@ -59,7 +82,15 @@ func (t *GoToolchain) run(ctx context.Context, dir string, args ...string) ([]by
 // runEnv is run with extra environment entries appended after the standard
 // parity settings (later entries win, so extraEnv can override).
 func (t *GoToolchain) runEnv(ctx context.Context, dir string, extraEnv []string, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, t.timeout)
+	return t.runEnvTimeout(ctx, dir, extraEnv, t.timeout, args...)
+}
+
+// runEnvTimeout is runEnv with an explicit per-command timeout. Only stdout
+// is returned: the go tool writes progress ("go: downloading ...") and
+// diagnostics to stderr, which would otherwise corrupt JSON decodes of
+// stdout. stderr (falling back to stdout) is folded into the error instead.
+func (t *GoToolchain) runEnvTimeout(ctx context.Context, dir string, extraEnv []string, timeout time.Duration, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, t.goBin, args...)
@@ -72,14 +103,18 @@ func (t *GoToolchain) runEnv(ctx context.Context, dir string, extraEnv []string,
 	)
 	cmd.Env = append(cmd.Env, extraEnv...)
 
-	var output bytes.Buffer
-	cmd.Stdout = &output
-	cmd.Stderr = &output
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("go %s: %w: %s", strings.Join(args, " "), err, condenseOutput(output.Bytes()))
+		diagnostics := stderr.Bytes()
+		if len(bytes.TrimSpace(diagnostics)) == 0 {
+			diagnostics = stdout.Bytes()
+		}
+		return nil, fmt.Errorf("go %s: %w: %s", strings.Join(args, " "), err, condenseOutput(diagnostics))
 	}
-	return output.Bytes(), nil
+	return stdout.Bytes(), nil
 }
 
 func (t *GoToolchain) ModTidy(ctx context.Context, dir string) error {
@@ -246,6 +281,217 @@ func (t *GoToolchain) LinkedStd(ctx context.Context, dir string, patterns []stri
 		std[pkg] = struct{}{}
 	}
 	return std, nil
+}
+
+// compileTargetArch is the GOARCH the compile gate type-checks for. The
+// target arch of the melange build is not threaded through yet; amd64 is
+// the common denominator (arch-specific files rarely carry API breaks).
+const compileTargetArch = "amd64"
+
+// maxCompileErrorLines caps the error lines kept per failing package.
+const maxCompileErrorLines = 5
+
+// goListPackage is the subset of `go list -json` package output Compile
+// needs.
+type goListPackage struct {
+	ImportPath string
+	Standard   bool
+	Module     *goListModule
+	Imports    []string
+	Error      *struct {
+		Err string
+	}
+}
+
+// Compile type-checks and compiles (without linking) every non-test package
+// in the transitive import graph of patterns, for GOOS=linux, via
+// `go list -e -export -deps -json`: -export forces a real compile of each
+// package to export data, and -e records each package's own compile error
+// on its .Error instead of aborting the walk - structured, per-package, no
+// vet noise, no link step. A package whose dependency failed is not compiled
+// at all (only DepsErrors), so failures surface on the deepest broken
+// package - exactly the module that needs blaming. CGO is enabled only when
+// the host can build cgo for the target natively (no linux C toolchain is
+// assumed on other hosts: cross-cgo would fail runtime/cgo and mask every
+// package above it). The build cache is the user's GOCACHE, shared and
+// incremental across compiles and runs. An error return means the go tool
+// itself failed (not that packages failed to compile).
+func (t *GoToolchain) Compile(ctx context.Context, dir string, patterns, tags []string) (*CompileReport, error) {
+	if len(patterns) == 0 {
+		patterns = []string{"./..."}
+	}
+	args := []string{"list", "-e", "-export", "-deps", "-json=ImportPath,Standard,Module,Imports,Error"}
+	if len(tags) > 0 {
+		args = append(args, "-tags", strings.Join(tags, ","))
+	}
+	args = append(args, patterns...)
+
+	cgo := "0"
+	if runtime.GOOS == "linux" && runtime.GOARCH == compileTargetArch {
+		cgo = "1"
+	}
+	env := []string{"GOOS=linux", "GOARCH=" + compileTargetArch, "CGO_ENABLED=" + cgo}
+	output, err := t.runEnvTimeout(ctx, dir, env, t.compileTimeout, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	report := &CompileReport{
+		Failed:      make(map[string][]string),
+		Modules:     make(map[string]string),
+		Imports:     make(map[string][]string),
+		FileModules: make(map[string]string),
+	}
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	for {
+		var pkg goListPackage
+		if err := decoder.Decode(&pkg); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, fmt.Errorf("parsing go list -export -json output: %w", err)
+		}
+		if pkg.Standard {
+			continue
+		}
+		if pkg.Module != nil {
+			modulePath := pkg.Module.Path
+			if pkg.Module.Replace != nil && pkg.Module.Replace.Version != "" {
+				modulePath = pkg.Module.Replace.Path
+			}
+			if pkg.Module.Main {
+				modulePath = ""
+			}
+			report.Modules[pkg.ImportPath] = modulePath
+		}
+		if pkg.Error == nil {
+			continue
+		}
+		lines := compileErrorLines(pkg.Error.Err)
+		report.Failed[pkg.ImportPath] = lines
+		report.Imports[pkg.ImportPath] = pkg.Imports
+		for _, line := range lines {
+			if file, coord, ok := t.modCacheFile(dir, line); ok {
+				report.FileModules[file] = coord
+			}
+		}
+	}
+	return report, nil
+}
+
+// compileErrorLines extracts the first maxCompileErrorLines diagnostic lines
+// from a go list package error, dropping the "# pkg" header.
+func compileErrorLines(errText string) []string {
+	var lines []string
+	for line := range strings.SplitSeq(errText, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "# ") {
+			continue
+		}
+		lines = append(lines, line)
+		if len(lines) == maxCompileErrorLines {
+			break
+		}
+	}
+	if len(lines) == 0 {
+		lines = []string{strings.TrimSpace(errText)}
+	}
+	return lines
+}
+
+// modCacheFile maps a "file:line:col: msg" diagnostic whose file lives in the
+// module cache (<GOMODCACHE>/<escaped module>@<version>/...) back to its
+// absolute path and module@version.
+func (t *GoToolchain) modCacheFile(dir, line string) (file, coord string, ok bool) {
+	if t.goModCache == "" {
+		return "", "", false
+	}
+	idx := strings.Index(line, ".go:")
+	if idx < 0 {
+		return "", "", false
+	}
+	file = line[:idx+len(".go")]
+	if !filepath.IsAbs(file) {
+		file = filepath.Join(dir, file)
+	}
+	file = filepath.Clean(file)
+	rel, err := filepath.Rel(filepath.Clean(t.goModCache), file)
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return "", "", false
+	}
+	rel = filepath.ToSlash(rel)
+	at := strings.Index(rel, "@")
+	if at < 0 {
+		return "", "", false
+	}
+	version, _, _ := strings.Cut(rel[at+1:], "/")
+	modulePath, err := module.UnescapePath(rel[:at])
+	if err != nil {
+		return "", "", false
+	}
+	version, err = module.UnescapeVersion(version)
+	if err != nil {
+		return "", "", false
+	}
+	return file, modulePath + "@" + version, true
+}
+
+// ModuleVersions lists the released versions of module (`go list -m
+// -versions`), in ascending semver order.
+func (t *GoToolchain) ModuleVersions(ctx context.Context, dir, modulePath string) ([]string, error) {
+	output, err := t.run(ctx, dir, "list", "-m", "-versions", modulePath)
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Fields(string(output))
+	if len(fields) == 0 {
+		return nil, nil
+	}
+	versions := fields[1:]
+	sort.Slice(versions, func(i, j int) bool { return semver.Compare(versions[i], versions[j]) < 0 })
+	return versions, nil
+}
+
+// ModuleRequires returns the require entries of module@version's own go.mod
+// (`go list -m -json` fetches only the .mod/.info, never the zip), memoized
+// per toolchain: module versions are immutable.
+func (t *GoToolchain) ModuleRequires(ctx context.Context, dir, modulePath, version string) (map[string]string, error) {
+	key := modulePath + "@" + version
+	t.modRequiresMu.Lock()
+	cached, ok := t.modRequires[key]
+	t.modRequiresMu.Unlock()
+	if ok {
+		return cached, nil
+	}
+
+	output, err := t.run(ctx, dir, "list", "-m", "-json", key)
+	if err != nil {
+		return nil, err
+	}
+	var info struct{ GoMod string }
+	if err := json.Unmarshal(output, &info); err != nil {
+		return nil, fmt.Errorf("parsing go list -m -json %s output: %w", key, err)
+	}
+	if info.GoMod == "" {
+		return nil, fmt.Errorf("no go.mod reported for %s", key)
+	}
+	content, err := os.ReadFile(info.GoMod)
+	if err != nil {
+		return nil, fmt.Errorf("reading go.mod of %s: %w", key, err)
+	}
+	modFile, err := modfile.ParseLax(info.GoMod, content, nil)
+	if err != nil {
+		return nil, fmt.Errorf("parsing go.mod of %s: %w", key, err)
+	}
+	requires := make(map[string]string, len(modFile.Require))
+	for _, require := range modFile.Require {
+		requires[require.Mod.Path] = require.Mod.Version
+	}
+
+	t.modRequiresMu.Lock()
+	t.modRequires[key] = requires
+	t.modRequiresMu.Unlock()
+	return requires, nil
 }
 
 // Replace applies a replace directive with gobump parity: dropreplace first

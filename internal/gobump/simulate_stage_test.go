@@ -1051,3 +1051,19 @@ func TestSimulationStage_DegradedUnreachableCrossModrootReachable(t *testing.T) 
 	assert.Equal(t, 0, result.VulnerabilitiesUnreachable)
 	assert.Equal(t, 1, result.VulnerabilitiesFixed)
 }
+
+// TestSeedCandidates_ThreadsSeverity: the analysis scan's per-bump severity
+// reaches simulate.Candidate (the compile gate re-admits most-severe-first).
+func TestSeedCandidates_ThreadsSeverity(t *testing.T) {
+	seeds := seedCandidates(ModrootAnalysis{
+		DesiredDeps: []string{"example.com/a@v1.1.0", "example.com/b@v1.2.0"},
+		ScanResult: &scan.ScanResult{SecurityBumps: []scan.SecurityBump{
+			{Name: "example.com/a", FixedVersion: "v1.1.0", VulnIDs: []string{"GO-A"}, Severity: "CRITICAL"},
+		}},
+	})
+	require.Len(t, seeds, 2)
+	assert.Equal(t, simulate.Candidate{
+		Module: "example.com/a", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-A"}, Severity: "CRITICAL",
+	}, seeds[0])
+	assert.Equal(t, simulate.Candidate{Module: "example.com/b", Version: "v1.2.0"}, seeds[1])
+}

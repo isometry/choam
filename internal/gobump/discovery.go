@@ -40,7 +40,13 @@ const annotationPrefix = "choam/bump-"
 type analysisUnit struct {
 	Modroot  string
 	Packages []string
+	// Tags are the build tags of the go/build steps sharing the modroot
+	// (toolchaintags, default netgo,osusergo, plus tags), unioned.
+	Tags []string
 }
+
+// defaultToolchainTags mirrors melange's go/build toolchaintags default.
+const defaultToolchainTags = "netgo,osusergo"
 
 // discoverAnalysisUnits determines, for every registered language, the set
 // of modroots to analyze - the union of three additive sources, checked
@@ -51,23 +57,27 @@ type analysisUnit struct {
 // opt-ins. Returns language -> units sorted by modroot; a language absent
 // from the result had no modroots from any source.
 func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bumpSteps []config.BumpStep) map[string][]analysisUnit {
-	// language -> modroot -> set of build package patterns
-	units := make(map[string]map[string]map[string]struct{})
+	// language -> modroot -> sets of build package patterns and tags
+	type unitSets struct{ patterns, tags map[string]struct{} }
+	units := make(map[string]map[string]*unitSets)
 
-	add := func(language string, modroots, packages []string) {
+	add := func(language string, modroots, packages, tags []string) {
 		byRoot, ok := units[language]
 		if !ok {
-			byRoot = make(map[string]map[string]struct{})
+			byRoot = make(map[string]*unitSets)
 			units[language] = byRoot
 		}
 		for _, root := range modroots {
-			patterns, ok := byRoot[root]
+			sets, ok := byRoot[root]
 			if !ok {
-				patterns = make(map[string]struct{})
-				byRoot[root] = patterns
+				sets = &unitSets{patterns: make(map[string]struct{}), tags: make(map[string]struct{})}
+				byRoot[root] = sets
 			}
 			for _, pattern := range packages {
-				patterns[pattern] = struct{}{}
+				sets.patterns[pattern] = struct{}{}
+			}
+			for _, tag := range tags {
+				sets.tags[tag] = struct{}{}
 			}
 		}
 	}
@@ -77,17 +87,17 @@ func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bump
 		if language == "" {
 			language = "go" // legacy go/bump and language-less bump steps default to go
 		}
-		add(language, step.Modroots, nil)
+		add(language, step.Modroots, nil, nil)
 	}
 
 	if cfg != nil {
 		for language, buildUnits := range unitsFromBuildSteps(ctx, cfg) {
 			for _, unit := range buildUnits {
-				add(language, []string{unit.Modroot}, unit.Packages)
+				add(language, []string{unit.Modroot}, unit.Packages, unit.Tags)
 			}
 		}
 		for language, modroots := range modrootsFromAnnotations(cfg) {
-			add(language, modroots, nil)
+			add(language, modroots, nil, nil)
 		}
 	}
 
@@ -97,12 +107,16 @@ func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bump
 			continue
 		}
 		langUnits := make([]analysisUnit, 0, len(byRoot))
-		for root, patterns := range byRoot {
+		for root, sets := range byRoot {
 			unit := analysisUnit{Modroot: root}
-			for pattern := range patterns {
+			for pattern := range sets.patterns {
 				unit.Packages = append(unit.Packages, pattern)
 			}
 			sort.Strings(unit.Packages)
+			for tag := range sets.tags {
+				unit.Tags = append(unit.Tags, tag)
+			}
+			sort.Strings(unit.Tags)
 			langUnits = append(langUnits, unit)
 		}
 		sort.Slice(langUnits, func(i, j int) bool { return langUnits[i].Modroot < langUnits[j].Modroot })
@@ -159,10 +173,18 @@ func unitsFromBuildSteps(ctx context.Context, cfg *melange.Configuration) map[st
 			if modroot == "" {
 				modroot = "."
 			}
-			result[language] = append(result[language], analysisUnit{
+			unit := analysisUnit{
 				Modroot:  modroot,
 				Packages: strings.Fields(render(step.With["packages"])),
-			})
+			}
+			if step.Uses == "go/build" {
+				toolchainTags, set := step.With["toolchaintags"]
+				if !set {
+					toolchainTags = defaultToolchainTags
+				}
+				unit.Tags = splitBuildTags(render(toolchainTags) + "," + render(step.With["tags"]))
+			}
+			result[language] = append(result[language], unit)
 		}
 	}
 
@@ -172,6 +194,12 @@ func unitsFromBuildSteps(ctx context.Context, cfg *melange.Configuration) map[st
 	}
 
 	return result
+}
+
+// splitBuildTags splits go/build's comma-separated tag lists (tolerating
+// whitespace), dropping empties.
+func splitBuildTags(value string) []string {
+	return strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' })
 }
 
 // modrootsFromAnnotations reads package.annotations["choam/bump-<language>"]

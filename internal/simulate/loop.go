@@ -3,8 +3,10 @@ package simulate
 import (
 	"context"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 
@@ -39,6 +41,18 @@ type candState struct {
 	residualized bool
 	// dropReason mirrors the DroppedCandidate reason, for backfill wording.
 	dropReason string
+
+	// Compile-gate coherence bookkeeping (see addCoherenceRemedies):
+	// coherence marks a candidate the gate created to keep a module
+	// compatible with a raised dependency; coherenceFrom is the
+	// pre-raise version of an EXISTING candidate the gate raised (existing
+	// entries are floors, not frozen pins); coherenceVersion is the raised
+	// target either way; coherenceFor lists the blamed candidates whose
+	// raises the coherence raise supports.
+	coherence        bool
+	coherenceFrom    string
+	coherenceVersion string
+	coherenceFor     map[string]struct{}
 }
 
 // drop marks the candidate dropped and records it with the given reason.
@@ -93,13 +107,28 @@ type loop struct {
 	tidiedModern    bool
 	linkedStdWarned bool
 	degradedNoted   bool
+
+	// Compile gate (see compileGate): compiler is nil when the gate is off
+	// (toolchain without Compiler support, or Options.NoCompile).
+	// baselineFailed are the packages already failing to compile in the
+	// pristine checkout (excluded from blame); baselineResolved is the
+	// pristine tidied module graph; gateResiduals are the residuals of
+	// CVE-backed candidates the gate rejected, kept only while the final
+	// rescan still wants their fix; coUpdates memoizes CoUpdates.
+	compiler         Compiler
+	baselineFailed   map[string]struct{}
+	baselineResolved map[string]string
+	gateResiduals    map[string]Residual
+	coUpdates        map[string]string
+	coUpdatesLoaded  bool
 }
 
 // raise is a rescan finding that requires moving a module further forward.
 type raise struct {
-	module  string
-	version string
-	vulnIDs []string
+	module   string
+	version  string
+	vulnIDs  []string
+	severity string
 }
 
 // RunLoop applies the seed candidates to the module at dir with the real go
@@ -125,6 +154,9 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	if len(l.buildPatterns) == 0 {
 		l.buildPatterns = []string{"./..."}
 	}
+	if compiler, ok := tc.(Compiler); ok && !opts.NoCompile {
+		l.compiler = compiler
+	}
 	if err := l.savePristine(ctx); err != nil {
 		return nil, err
 	}
@@ -144,6 +176,12 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	// graph and surface as a bogus "fix breaks module graph" residual.
 	l.refreshLinked(ctx)
 	l.dropUnreachable()
+
+	if l.compiler != nil {
+		if err := l.compileBaseline(ctx); err != nil {
+			return nil, err
+		}
+	}
 
 	result := &ModrootResult{Modroot: req.Modroot}
 
@@ -263,6 +301,18 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 		resolved = l.confirmMinimalSet(ctx, resolved, result)
 	}
 
+	// The compile gate runs last, against the final candidate set: the
+	// fixpoint only proves the graph resolves and tidies - MVS has no upper
+	// bounds, so a raised dependency can still remove API a lagging sibling
+	// compiles against (see compileGate).
+	if l.compiler != nil {
+		gated, err := l.compileGate(ctx, resolved, result)
+		if err != nil {
+			return nil, err
+		}
+		resolved = gated
+	}
+
 	result.Resolved = resolved
 	result.Linked = l.linked
 	result.LinkedPackages = l.linkedPackages
@@ -364,12 +414,21 @@ func (l *loop) addCandidate(c Candidate, seed bool) *candState {
 		}
 		existing.FromCVE = existing.FromCVE || c.FromCVE
 		existing.VulnIDs = mergeIDs(existing.VulnIDs, c.VulnIDs)
+		existing.Severity = mergeSeverity(existing.Severity, c.Severity)
 		return existing
 	}
 	state := &candState{Candidate: c, seed: seed}
 	l.cands = append(l.cands, state)
 	l.byModule[c.Module] = state
 	return state
+}
+
+// mergeSeverity keeps the more severe of two advisory levels.
+func mergeSeverity(a, b string) string {
+	if a == "" || (b != "" && scan.SeverityRank(b) < scan.SeverityRank(a)) {
+		return b
+	}
+	return a
 }
 
 func (l *loop) activeCandidates() []*candState {
@@ -1139,10 +1198,11 @@ func (l *loop) processScan(ctx context.Context, scanResult *scan.ScanResult, res
 			continue
 		}
 		candidate := Candidate{
-			Module:  r.module,
-			Version: r.version,
-			FromCVE: true,
-			VulnIDs: r.vulnIDs,
+			Module:   r.module,
+			Version:  r.version,
+			FromCVE:  true,
+			VulnIDs:  r.vulnIDs,
+			Severity: r.severity,
 		}
 		// A raise for a replace-pinned module must update the replace - a
 		// plain `go get` cannot out-vote the directive. (Local-path pins
@@ -1226,7 +1286,7 @@ func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]str
 			})
 			continue
 		}
-		raises = append(raises, raise{module: bump.Name, version: bump.FixedVersion, vulnIDs: bump.VulnIDs})
+		raises = append(raises, raise{module: bump.Name, version: bump.FixedVersion, vulnIDs: bump.VulnIDs, severity: bump.Severity})
 	}
 
 	sort.Slice(raises, func(i, j int) bool { return raises[i].module < raises[j].module })
@@ -1253,30 +1313,7 @@ type trialResult struct {
 // spuriously reject the trial. Callers snapshot l.linked/l.linkedPackages
 // beforehand and restore them when rejecting.
 func (l *loop) trialApply(ctx context.Context, keep []*candState) (*trialResult, error) {
-	if err := l.restore(ctx); err != nil {
-		return nil, err
-	}
-	if err := l.tc.ModTidy(ctx, l.dir); err != nil {
-		return nil, err
-	}
-	// gobump parity: replace directives before any get.
-	for _, c := range keep {
-		if !c.Replace {
-			continue
-		}
-		if err := l.tc.Replace(ctx, l.dir, c.OldPath(), c.Module, c.Version); err != nil {
-			return nil, err
-		}
-	}
-	for _, c := range keep {
-		if c.Replace || l.getSatisfied(ctx, c) {
-			continue
-		}
-		if err := l.tc.Get(ctx, l.dir, c.Module+"@"+c.Version); err != nil {
-			return nil, err
-		}
-	}
-	if err := l.tc.ModTidy(ctx, l.dir); err != nil {
+	if err := l.applyExact(ctx, keep); err != nil {
 		return nil, err
 	}
 
@@ -1299,6 +1336,36 @@ func (l *loop) trialApply(ctx context.Context, keep []*candState) (*trialResult,
 	}
 	tr.raises, tr.residuals = l.scanFindings(scanResult, tr.resolved)
 	return tr, nil
+}
+
+// applyExact re-applies exactly the keep set from the pristine snapshot
+// (tidy, replaces, skip-guarded gets, tidy - gobump parity throughout), in
+// keep's order. Single-shot: any failure is returned with no repair ladder.
+func (l *loop) applyExact(ctx context.Context, keep []*candState) error {
+	if err := l.restore(ctx); err != nil {
+		return err
+	}
+	if err := l.tc.ModTidy(ctx, l.dir); err != nil {
+		return err
+	}
+	// gobump parity: replace directives before any get.
+	for _, c := range keep {
+		if !c.Replace {
+			continue
+		}
+		if err := l.tc.Replace(ctx, l.dir, c.OldPath(), c.Module, c.Version); err != nil {
+			return err
+		}
+	}
+	for _, c := range keep {
+		if c.Replace || l.getSatisfied(ctx, c) {
+			continue
+		}
+		if err := l.tc.Get(ctx, l.dir, c.Module+"@"+c.Version); err != nil {
+			return err
+		}
+	}
+	return l.tc.ModTidy(ctx, l.dir)
 }
 
 // sustained verifies every keep candidate against the trial's tidied state:
@@ -1512,6 +1579,636 @@ func (l *loop) finalOutputs(resolved map[string]string) ([]string, []string, []s
 		}
 	}
 	return deps, replaces, cveModules
+}
+
+// Compile-gate bounds: coherence rounds (each repairs every newly failing
+// module at most once) and versions inspected per module walk.
+const (
+	maxCoherenceRounds = 3
+	maxCoherenceWalk   = 40
+)
+
+// gateState is the outcome of one compile-gate trial.
+type gateState struct {
+	report   *CompileReport
+	resolved map[string]string
+	failures map[string][]string // packages failing now but not at baseline
+}
+
+// compileBaseline compiles the pristine checkout once, after the initial
+// tidy: packages that already fail there (missing C libraries, generated
+// code, host-only noise) are excluded from every later verdict, so only
+// failures a bump introduces count.
+func (l *loop) compileBaseline(ctx context.Context) error {
+	if err := l.restore(ctx); err != nil {
+		return err
+	}
+	if err := l.tc.ModTidy(ctx, l.dir); err != nil {
+		return fmt.Errorf("initial go mod tidy: %w", err)
+	}
+	resolved, err := l.tc.ListModules(ctx, l.dir)
+	if err != nil {
+		return err
+	}
+	report, err := l.compiler.Compile(ctx, l.dir, l.buildPatterns, l.req.Tags)
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		return fmt.Errorf("compile gate baseline: %w", err)
+	}
+	l.baselineResolved = resolved
+	l.baselineFailed = make(map[string]struct{}, len(report.Failed))
+	for pkg := range report.Failed {
+		l.baselineFailed[pkg] = struct{}{}
+	}
+	if len(report.Failed) > 0 {
+		logging.From(ctx).Debug("compile gate baseline: packages already failing are excluded",
+			"modroot", l.req.Modroot, "count", len(report.Failed), "first", firstCompileError(report.Failed))
+	}
+	return nil
+}
+
+// compileGate proves the final candidate set compiles: it re-applies the
+// set and compiles the build patterns, counting only failures absent from
+// the baseline. On failure it blames candidates, first tries bounded
+// coherence raises of the failing modules (never escalation: the minimal
+// version of a failing module that is built against the raised dependency),
+// then falls back to re-admitting blamed candidates greedily, most severe
+// first, rejecting each that breaks the build as a "breaks compile"
+// residual. Returns the adopted resolved graph; an error means the gate
+// could not finish (the caller must not trust the candidate set).
+func (l *loop) compileGate(ctx context.Context, resolved map[string]string, result *ModrootResult) (map[string]string, error) {
+	active := l.activeCandidates()
+	if len(active) == 0 {
+		return resolved, nil
+	}
+	l.gateResiduals = make(map[string]Residual)
+
+	st, reject, err := l.gateTry(ctx, active)
+	if err != nil {
+		return nil, err
+	}
+	if reject != "" {
+		return nil, fmt.Errorf("compile gate: re-applying the converged set failed: %s", reject)
+	}
+	if len(st.failures) == 0 {
+		logging.From(ctx).Debug("compile gate passed", "modroot", l.req.Modroot, "candidates", len(active))
+		return resolved, nil
+	}
+	logging.From(ctx).Info("compile gate: converged bump set breaks the build",
+		"modroot", l.req.Modroot, "packages", len(st.failures), "first", firstCompileError(st.failures))
+
+	suspects := l.blame(ctx, st, active)
+	remedied := make(map[string]struct{})
+	for range maxCoherenceRounds {
+		added, err := l.addCoherenceRemedies(ctx, st, suspects, remedied)
+		if err != nil {
+			return nil, err
+		}
+		if !added {
+			break
+		}
+		st, reject, err = l.gateTry(ctx, l.activeCandidates())
+		if err != nil {
+			return nil, err
+		}
+		if reject != "" {
+			break
+		}
+		if len(st.failures) == 0 {
+			return l.gateFinish(ctx, l.activeCandidates(), result)
+		}
+		maps.Copy(suspects, l.blame(ctx, st, l.activeCandidates()))
+	}
+	return l.gateGreedy(ctx, suspects, result)
+}
+
+// gateTry applies exactly keep and compiles it. A non-empty reject reason
+// means keep itself would not resolve (a trial verdict, not an error); an
+// error means the gate cannot continue (cancellation, tool failure).
+func (l *loop) gateTry(ctx context.Context, keep []*candState) (*gateState, string, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, "", err
+	}
+	if err := l.applyExact(ctx, l.inApplyOrder(keep)); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, "", cerr
+		}
+		return nil, firstLine(err.Error()), nil
+	}
+	resolved, err := l.tc.ListModules(ctx, l.dir)
+	if err != nil {
+		return nil, "", err
+	}
+	report, err := l.compiler.Compile(ctx, l.dir, l.buildPatterns, l.req.Tags)
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, "", cerr
+		}
+		return nil, "", fmt.Errorf("compile gate: %w", err)
+	}
+	failures := make(map[string][]string)
+	for pkg, lines := range report.Failed {
+		if _, known := l.baselineFailed[pkg]; !known {
+			failures[pkg] = lines
+		}
+	}
+	return &gateState{report: report, resolved: resolved, failures: failures}, "", nil
+}
+
+// inApplyOrder orders a candidate subset like apply does: ambiguity
+// remedies first, then candidates in the order they were added.
+func (l *loop) inApplyOrder(keep []*candState) []*candState {
+	include := make(map[*candState]struct{}, len(keep))
+	for _, c := range keep {
+		include[c] = struct{}{}
+	}
+	ordered := make([]*candState, 0, len(keep))
+	for _, remedyPass := range []bool{true, false} {
+		for _, c := range l.cands {
+			if _, ok := include[c]; ok && c.remedy == remedyPass {
+				ordered = append(ordered, c)
+			}
+		}
+	}
+	return ordered
+}
+
+// blame returns the candidates (keyed by module) suspected of a trial's new
+// compile failures. For a failing package P in module F:
+//   - when P imports packages of dependencies D raised above both baseline
+//     and what F's own go.mod requires (see outgrownDeps), F is the victim
+//     of those raises (a coherence candidate, never a suspect): blame the
+//     candidates behind each D;
+//   - otherwise (a) a candidate that moved F itself is suspect, and (b) so
+//     is any candidate behind a moved module P imports.
+//
+// A candidate is "behind" a moved module M when it is M, or its own go.mod
+// requires M above baseline (the raise traces back to it). Remedies and
+// coherence raises are never suspects. When nothing can be attributed,
+// every other candidate is suspect (the greedy pass then sorts it out).
+func (l *loop) blame(ctx context.Context, st *gateState, active []*candState) map[string]*candState {
+	byModule := make(map[string]*candState)
+	for _, c := range active {
+		if !c.remedy && !c.coherence && c.coherenceVersion == "" {
+			byModule[c.Module] = c
+		}
+	}
+	suspects := make(map[string]*candState)
+	blameBehind := func(module string) {
+		if c, ok := byModule[module]; ok {
+			suspects[module] = c
+			return
+		}
+		for candidateModule, c := range byModule {
+			if l.candidateRaises(ctx, c, module) {
+				suspects[candidateModule] = c
+			}
+		}
+	}
+
+	for _, pkg := range sortedKeys(st.failures) {
+		owner, outgrown := l.outgrownDeps(ctx, st, pkg)
+		if len(outgrown) > 0 {
+			for _, dep := range sortedKeys(outgrown) {
+				blameBehind(dep)
+			}
+			continue
+		}
+		if c, ok := byModule[owner]; ok && l.moved(st, owner) {
+			suspects[owner] = c
+		}
+		for _, imp := range st.report.Imports[pkg] {
+			if dep, known := st.report.Modules[imp]; known && dep != owner && l.moved(st, dep) {
+				blameBehind(dep)
+			}
+		}
+	}
+	if len(suspects) == 0 {
+		maps.Copy(suspects, byModule)
+	}
+	return suspects
+}
+
+// moved reports whether module resolves differently than at baseline.
+func (l *loop) moved(st *gateState, module string) bool {
+	return module != "" && st.resolved[module] != "" && st.resolved[module] != l.baselineResolved[module]
+}
+
+// outgrownDeps returns failing package pkg's module F and the dependencies
+// F has been outgrown by: modules of packages pkg imports that were raised
+// above baseline AND above the version F's own go.mod (at its resolved
+// version) requires - the lockstep-family break MVS cannot see (no upper
+// bounds). Empty for main-module packages or when F's go.mod is unknown.
+func (l *loop) outgrownDeps(ctx context.Context, st *gateState, pkg string) (string, map[string]string) {
+	owner := st.report.Modules[pkg]
+	ownerVersion := st.resolved[owner]
+	if owner == "" || ownerVersion == "" {
+		return owner, nil
+	}
+	requires, err := l.compiler.ModuleRequires(ctx, l.dir, owner, ownerVersion)
+	if err != nil {
+		return owner, nil
+	}
+	outgrown := make(map[string]string)
+	for _, imp := range st.report.Imports[pkg] {
+		dep, known := st.report.Modules[imp]
+		if !known || dep == "" || dep == owner {
+			continue
+		}
+		base, current := l.baselineResolved[dep], st.resolved[dep]
+		if base == "" || semver.Compare(current, base) <= 0 {
+			continue
+		}
+		if required, ok := requires[dep]; ok && semver.Compare(required, current) < 0 {
+			outgrown[dep] = current
+		}
+	}
+	return owner, outgrown
+}
+
+// candidateRaises reports whether candidate c's own go.mod requires dep
+// above its baseline version (best-effort: lookup failures attribute
+// nothing).
+func (l *loop) candidateRaises(ctx context.Context, c *candState, dep string) bool {
+	requires, err := l.compiler.ModuleRequires(ctx, l.dir, c.Module, c.Version)
+	if err != nil {
+		return false
+	}
+	version, ok := requires[dep]
+	return ok && semver.Compare(version, l.baselineResolved[dep]) > 0
+}
+
+// addCoherenceRemedies raises each newly failing module F (at most once)
+// that raised dependencies have outgrown (see outgrownDeps) to the minimal
+// F version built against them (see minCoherentVersion), falling back to
+// omnibump's co-update recommendation. An existing candidate for F is
+// raised in place - deps entries are floors, not frozen pins - unless it is
+// a replace or an ambiguity remedy, or is itself blamed. Bounded and never
+// escalation: cross-major raises are not attempted. Returns whether
+// anything was raised.
+func (l *loop) addCoherenceRemedies(ctx context.Context, st *gateState, suspects map[string]*candState, remedied map[string]struct{}) (bool, error) {
+	added := false
+	for _, pkg := range sortedKeys(st.failures) {
+		owner, outgrown := l.outgrownDeps(ctx, st, pkg)
+		if len(outgrown) == 0 {
+			continue
+		}
+		if _, done := remedied[owner]; done {
+			continue
+		}
+		if _, blamed := suspects[owner]; blamed {
+			continue
+		}
+		if c, ok := l.byModule[owner]; ok && !c.dropped && (c.Replace || c.remedy) {
+			continue
+		}
+		remedied[owner] = struct{}{}
+		ownerVersion := st.resolved[owner]
+
+		version, err := l.minCoherentVersion(ctx, owner, ownerVersion, outgrown)
+		if err != nil {
+			return false, err
+		}
+		source := "version walk"
+		if version == "" {
+			version, source = l.coUpdateFor(ctx, owner, ownerVersion), "omnibump co-update"
+		}
+		if version == "" {
+			logging.From(ctx).Debug("compile gate: no coherent version for failing module",
+				"modroot", l.req.Modroot, "module", owner, "version", ownerVersion)
+			continue
+		}
+
+		var previous string
+		existing, exists := l.byModule[owner]
+		if exists && !existing.dropped {
+			previous = existing.Version
+		}
+		state := l.addCandidate(Candidate{Module: owner, Version: version}, false)
+		if previous != "" && state.Version == previous {
+			continue // already at or above the coherent version
+		}
+		if previous != "" {
+			if state.coherenceFrom == "" {
+				state.coherenceFrom = previous
+			}
+		} else {
+			state.coherence = true
+		}
+		state.coherenceVersion = state.Version
+		if state.coherenceFor == nil {
+			state.coherenceFor = make(map[string]struct{})
+		}
+		for module, c := range suspects {
+			if _, direct := outgrown[module]; direct {
+				state.coherenceFor[module] = struct{}{}
+				continue
+			}
+			for dep := range outgrown {
+				if l.candidateRaises(ctx, c, dep) {
+					state.coherenceFor[module] = struct{}{}
+					break
+				}
+			}
+		}
+		added = true
+		logging.From(ctx).Info("compile gate: coherence raise",
+			"modroot", l.req.Modroot, "module", owner, "from", ownerVersion, "to", state.Version, "source", source)
+	}
+	return added, nil
+}
+
+// minCoherentVersion walks module's released versions upward from `from`
+// (same major, no pre-releases unless already on one, bounded) and returns
+// the first whose go.mod requires every relevant raised dependency at or
+// above its raised version - relevant meaning required by module@from below
+// the raise. "" when there is nothing to repair or no such version exists;
+// an error only for cancellation.
+func (l *loop) minCoherentVersion(ctx context.Context, module, from string, raised map[string]string) (string, error) {
+	current, err := l.compiler.ModuleRequires(ctx, l.dir, module, from)
+	if err != nil {
+		return "", ctx.Err()
+	}
+	relevant := make(map[string]string)
+	for dep, version := range raised {
+		if required, ok := current[dep]; ok && semver.Compare(required, version) < 0 {
+			relevant[dep] = version
+		}
+	}
+	if len(relevant) == 0 {
+		return "", nil
+	}
+	versions, err := l.compiler.ModuleVersions(ctx, l.dir, module)
+	if err != nil {
+		return "", ctx.Err()
+	}
+	inspected := 0
+	for _, version := range versions {
+		if semver.Compare(version, from) <= 0 {
+			continue
+		}
+		if semver.Major(version) != semver.Major(from) {
+			break // cross-major: not expressible as a deps entry
+		}
+		if semver.Prerelease(version) != "" && semver.Prerelease(from) == "" {
+			continue
+		}
+		inspected++
+		if inspected > maxCoherenceWalk {
+			break
+		}
+		requires, err := l.compiler.ModuleRequires(ctx, l.dir, module, version)
+		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return "", cerr
+			}
+			continue
+		}
+		coherent := true
+		for dep, need := range relevant {
+			if required, ok := requires[dep]; !ok || semver.Compare(required, need) < 0 {
+				coherent = false
+				break
+			}
+		}
+		if coherent {
+			return version, nil
+		}
+	}
+	return "", nil
+}
+
+// coUpdateFor returns omnibump's required co-update version for module when
+// it is a same-major raise above from (the co-update analysis is computed
+// once per gate, for the full candidate set against the pristine go.mod).
+func (l *loop) coUpdateFor(ctx context.Context, module, from string) string {
+	if l.opts.CoUpdates == nil {
+		return ""
+	}
+	if !l.coUpdatesLoaded {
+		l.coUpdatesLoaded = true
+		modFile, err := modfile.ParseLax("go.mod", l.pristine["go.mod"], nil)
+		if err != nil {
+			return ""
+		}
+		updates := make(map[string]string)
+		for _, c := range l.activeCandidates() {
+			if !c.remedy && !c.coherence {
+				updates[c.Module] = c.Version
+			}
+		}
+		l.coUpdates = l.opts.CoUpdates(ctx, updates, modFile)
+	}
+	version := l.coUpdates[module]
+	if !semver.IsValid(version) || semver.Major(version) != semver.Major(from) || semver.Compare(version, from) <= 0 {
+		return ""
+	}
+	return version
+}
+
+// gateGreedy is the compile gate's fallback: keep every unblamed candidate,
+// then re-admit blamed ones most-severe-first (CVE fixes before coherence
+// pins at equal severity), each with the coherence raises supporting it,
+// keeping a candidate only when the build still has no new failures. A
+// rejected candidate is dropped with a "breaks compile" reason (and, when
+// CVE-backed, a residual).
+func (l *loop) gateGreedy(ctx context.Context, suspects map[string]*candState, result *ModrootResult) (map[string]string, error) {
+	// Coherence raises are re-admitted only alongside the candidate they
+	// support; existing entries they raised fall back to their own version.
+	for _, c := range l.activeCandidates() {
+		if c.coherenceFrom != "" {
+			c.Version = c.coherenceFrom
+		}
+	}
+	baseSet := func() []*candState {
+		var keep []*candState
+		for _, c := range l.activeCandidates() {
+			if _, blamed := suspects[c.Module]; !blamed && !c.coherence {
+				keep = append(keep, c)
+			}
+		}
+		return keep
+	}
+
+	keep := baseSet()
+	st, reject, err := l.gateTry(ctx, keep)
+	if err != nil {
+		return nil, err
+	}
+	if reject != "" || len(st.failures) > 0 {
+		// Blame was incomplete: widen it to every candidate except remedies
+		// and user-authored replaces, then retry from that base once.
+		for _, c := range keep {
+			if userReplace := c.Replace && c.seed; !c.remedy && !userReplace {
+				suspects[c.Module] = c
+			}
+		}
+		keep = baseSet()
+		if st, reject, err = l.gateTry(ctx, keep); err != nil {
+			return nil, err
+		}
+		if reject != "" {
+			return nil, fmt.Errorf("compile gate: the build does not resolve even without the blamed bumps: %s", reject)
+		}
+		if len(st.failures) > 0 {
+			return nil, fmt.Errorf("compile gate: the build fails even without the blamed bumps: %s", firstCompileError(st.failures))
+		}
+	}
+
+	index := make(map[*candState]int, len(l.cands))
+	for i, c := range l.cands {
+		index[c] = i
+	}
+	order := make([]*candState, 0, len(suspects))
+	for _, c := range suspects {
+		order = append(order, c)
+	}
+	sort.Slice(order, func(i, j int) bool {
+		ri, rj := scan.SeverityRank(order[i].Severity), scan.SeverityRank(order[j].Severity)
+		if ri != rj {
+			return ri < rj
+		}
+		if order[i].FromCVE != order[j].FromCVE {
+			return order[i].FromCVE
+		}
+		return index[order[i]] < index[order[j]]
+	})
+
+	accepted := make(map[*candState]struct{})
+	for _, suspect := range order {
+		trial := append([]*candState{}, keep...)
+		trial = append(trial, suspect)
+		var partners []*candState
+		for _, c := range l.activeCandidates() {
+			if _, supports := c.coherenceFor[suspect.Module]; !supports || c.coherenceVersion == "" {
+				continue
+			}
+			if _, done := accepted[c]; done {
+				continue
+			}
+			partners = append(partners, c)
+			c.Version = c.coherenceVersion
+			if !slices.Contains(trial, c) {
+				trial = append(trial, c)
+			}
+		}
+
+		st, reject, err := l.gateTry(ctx, trial)
+		if err != nil {
+			return nil, err
+		}
+		if reject == "" && len(st.failures) == 0 {
+			keep = trial
+			for _, c := range partners {
+				accepted[c] = struct{}{}
+			}
+			continue
+		}
+
+		for _, c := range partners {
+			if c.coherenceFrom != "" {
+				c.Version = c.coherenceFrom
+			}
+		}
+		reason := "breaks module graph: " + reject
+		if reject == "" {
+			reason = "breaks compile: " + firstCompileError(st.failures)
+		}
+		l.rejectForCompile(ctx, suspect, reason)
+	}
+
+	for _, c := range l.activeCandidates() {
+		if _, ok := accepted[c]; ok || !c.coherence {
+			continue
+		}
+		l.drop(c, "coherence raise not needed: the bump it supported was rejected by the compile gate")
+	}
+	return l.gateFinish(ctx, keep, result)
+}
+
+// rejectForCompile drops a candidate the compile gate could not admit,
+// recording a pending residual for a CVE-backed one (kept only if the final
+// rescan still wants its fix - see gateFinish).
+func (l *loop) rejectForCompile(ctx context.Context, c *candState, reason string) {
+	l.drop(c, reason)
+	logging.From(ctx).Warn("compile gate rejected bump", "modroot", l.req.Modroot,
+		"module", c.Module, "version", c.Version, "reason", reason)
+	if !c.FromCVE {
+		return
+	}
+	c.residualized = true
+	l.gateResiduals[c.Module] = Residual{
+		Module:       c.Module,
+		FixedVersion: c.Version,
+		VulnIDs:      c.VulnIDs,
+		Reason:       reason,
+	}
+}
+
+// gateFinish adopts the compile gate's accepted set: re-applies it,
+// rescans, and refreshes the loop's accepted state. A rejected fix's
+// residual stands only while the rescan still wants that fix; any other
+// fix the rescan wants is surfaced as a residual rather than raised (it was
+// never compile-validated).
+func (l *loop) gateFinish(ctx context.Context, keep []*candState, result *ModrootResult) (map[string]string, error) {
+	tr, err := l.trialApply(ctx, l.inApplyOrder(keep))
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, cerr
+		}
+		return nil, fmt.Errorf("compile gate: re-applying the accepted set: %w", err)
+	}
+	if !l.sustained(tr, keep) {
+		logging.From(ctx).Warn("compile gate: accepted set not fully sustained by the tidied go.mod",
+			"modroot", l.req.Modroot)
+	}
+	l.adoptTrial(ctx, tr, result)
+	for _, r := range tr.raises {
+		if residual, rejected := l.gateResiduals[r.module]; rejected {
+			residual.ResolvedVersion = tr.resolved[r.module]
+			l.persistentResiduals = append(l.persistentResiduals, residual)
+			continue
+		}
+		l.scanResiduals = append(l.scanResiduals, Residual{
+			Module:          r.module,
+			ResolvedVersion: tr.resolved[r.module],
+			FixedVersion:    r.version,
+			VulnIDs:         r.vulnIDs,
+			Reason:          "advisory surfaced after compile-gate adjustments; fix not validated",
+		})
+	}
+	return tr.resolved, nil
+}
+
+// firstCompileError renders the first (by package path) compile failure as
+// "pkg: file.go:line:col: message", trimming the file's directory.
+func firstCompileError(failures map[string][]string) string {
+	pkgs := sortedKeys(failures)
+	if len(pkgs) == 0 || len(failures[pkgs[0]]) == 0 {
+		return "unknown compile error"
+	}
+	line := failures[pkgs[0]][0]
+	if idx := strings.Index(line, ".go:"); idx >= 0 {
+		file := line[:idx+len(".go")]
+		line = filepath.Base(file) + line[idx+len(".go"):]
+	}
+	return pkgs[0] + ": " + line
+}
+
+func firstLine(text string) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(text), "\n")
+	return line
+}
+
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // packagesFor renders a resolved module graph as OSV scan queries, in stable order.

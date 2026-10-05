@@ -609,6 +609,7 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 		result.Analysis.ByModroot = append(result.Analysis.ByModroot, ModrootAnalysis{
 			Modroot:       root,
 			BuildPackages: unit.Packages,
+			BuildTags:     unit.Tags,
 			Deps:          deps,
 			ScanResult:    scanResult,
 			ExistingDeps:  existingDeps,
