@@ -5,13 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
 	"github.com/isometry/choam/internal/gorelease"
 	"github.com/isometry/choam/internal/goversion"
+	"github.com/isometry/choam/internal/logging"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 )
@@ -50,6 +50,11 @@ func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBa
 		return "", nil
 	}
 
+	// parentCtx is checked (not the budget-bounded ctx below) so that this
+	// function's own best-effort timeout expiring keeps failing open as
+	// designed - only a REAL cancellation of the caller's ctx short-circuits
+	// the probe.
+	parentCtx := ctx
 	ctx, cancel := context.WithTimeout(ctx, fallbackGoVersionBudget)
 	defer cancel()
 
@@ -59,13 +64,16 @@ func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBa
 	for _, candidate := range candidates {
 		if skip != nil && skip(candidate.module) {
 			skippedPrivate++
-			slog.Debug("go-version fallback: private module - skipping probe",
+			logging.From(ctx).Debug("go-version fallback: private module - skipping probe",
 				"modroot", m.Modroot, "module", candidate.module, "version", candidate.version)
 			continue
 		}
 		goDirective, err := fetchModGoDirective(ctx, client, proxyBaseURL, candidate.module, candidate.version)
 		if err != nil {
-			slog.Debug("go-version fallback: could not fetch candidate go.mod - skipping",
+			if cerr := parentCtx.Err(); cerr != nil {
+				return "", cerr
+			}
+			logging.From(ctx).Debug("go-version fallback: could not fetch candidate go.mod - skipping",
 				"modroot", m.Modroot, "module", candidate.module, "version", candidate.version, "error", err)
 			continue
 		}

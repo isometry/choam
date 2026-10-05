@@ -2,6 +2,7 @@ package git
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -46,7 +47,7 @@ type FileCommitInfo struct {
 //
 // It returns ErrNotInRepository if filePath is not inside a discoverable git
 // repository, and ErrUntracked if the file has no commit history.
-func LastCommitInfo(filePath string) (*FileCommitInfo, error) {
+func LastCommitInfo(ctx context.Context, filePath string) (*FileCommitInfo, error) {
 	absPath, err := filepath.Abs(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("resolving absolute path for %s: %w", filePath, err)
@@ -82,12 +83,12 @@ func LastCommitInfo(filePath string) (*FileCommitInfo, error) {
 	}
 	relPath = filepath.ToSlash(relPath)
 
-	hash, commitTime, err := lastCommitTouching(repo, root, relPath)
+	hash, commitTime, err := lastCommitTouching(ctx, repo, root, relPath)
 	if err != nil {
 		return nil, err
 	}
 
-	dirty, err := fileDirty(repo, root, absPath, relPath)
+	dirty, err := fileDirty(ctx, repo, root, absPath, relPath)
 	if err != nil {
 		return nil, err
 	}
@@ -110,8 +111,8 @@ func LastCommitInfo(filePath string) (*FileCommitInfo, error) {
 // walk is far cheaper than go-git's tree-diffing Log on large repositories)
 // and falls back to logViaGoGit when the binary is unavailable or fails to
 // execute.
-func lastCommitTouching(repo *gogit.Repository, root, relPath string) (plumbing.Hash, time.Time, error) {
-	hash, when, invoked, err := runGitLog(root, relPath)
+func lastCommitTouching(ctx context.Context, repo *gogit.Repository, root, relPath string) (plumbing.Hash, time.Time, error) {
+	hash, when, invoked, err := runGitLog(ctx, root, relPath)
 	if invoked {
 		return hash, when, err
 	}
@@ -122,12 +123,12 @@ func lastCommitTouching(repo *gogit.Repository, root, relPath string) (plumbing.
 // invoked reports whether the git binary was found and executed
 // successfully; callers should fall back to logViaGoGit when it is false,
 // regardless of the returned error (which will be nil in that case).
-func runGitLog(root, relPath string) (hash plumbing.Hash, when time.Time, invoked bool, err error) {
+func runGitLog(ctx context.Context, root, relPath string) (hash plumbing.Hash, when time.Time, invoked bool, err error) {
 	if _, lookErr := exec.LookPath("git"); lookErr != nil {
 		return plumbing.ZeroHash, time.Time{}, false, nil
 	}
 
-	cmd := exec.Command("git", "-C", root, "log", "-1", "--format=%H|%cI", "--", relPath)
+	cmd := exec.CommandContext(ctx, "git", "-C", root, "log", "-1", "--format=%H|%cI", "--", relPath)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	if runErr := cmd.Run(); runErr != nil {
@@ -185,8 +186,8 @@ func logViaGoGit(repo *gogit.Repository, relPath string) (plumbing.Hash, time.Ti
 // git itself does when populating the working tree, and falls back to the
 // isDirty raw byte-compare when the binary is unavailable or fails to
 // execute.
-func fileDirty(repo *gogit.Repository, root, absPath, relPath string) (bool, error) {
-	dirty, invoked, err := runGitStatus(root, relPath)
+func fileDirty(ctx context.Context, repo *gogit.Repository, root, absPath, relPath string) (bool, error) {
+	dirty, invoked, err := runGitStatus(ctx, root, relPath)
 	if invoked {
 		return dirty, err
 	}
@@ -199,12 +200,12 @@ func fileDirty(repo *gogit.Repository, root, absPath, relPath string) (bool, err
 // regardless of the returned error (which will be nil in that case).
 // err is currently always nil even when invoked is true; it is kept in the
 // signature for symmetry with runGitLog's fast-path/fallback contract.
-func runGitStatus(root, relPath string) (dirty bool, invoked bool, err error) {
+func runGitStatus(ctx context.Context, root, relPath string) (dirty bool, invoked bool, err error) {
 	if _, lookErr := exec.LookPath("git"); lookErr != nil {
 		return false, false, nil
 	}
 
-	cmd := exec.Command("git", "-C", root, "status", "--porcelain", "--", relPath)
+	cmd := exec.CommandContext(ctx, "git", "-C", root, "status", "--porcelain", "--", relPath)
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 	if runErr := cmd.Run(); runErr != nil {

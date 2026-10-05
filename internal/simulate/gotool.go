@@ -29,7 +29,7 @@ type GoToolchain struct {
 
 // NewToolchain locates the go binary; the error return lets callers degrade
 // gracefully (skip validation, report it) when no toolchain is available.
-func NewToolchain(commandTimeout time.Duration) (*GoToolchain, error) {
+func NewToolchain(ctx context.Context, commandTimeout time.Duration) (*GoToolchain, error) {
 	goBin, err := exec.LookPath("go")
 	if err != nil {
 		return nil, fmt.Errorf("go toolchain not found in PATH: %w", err)
@@ -43,7 +43,9 @@ func NewToolchain(commandTimeout time.Duration) (*GoToolchain, error) {
 	// old modules to modern requirement-recording semantics; parity demands
 	// the same (the build image's go version may still differ slightly -
 	// documented residual risk).
-	version, err := exec.Command(goBin, "env", "GOVERSION").Output()
+	probeCtx, cancel := context.WithTimeout(ctx, commandTimeout)
+	defer cancel()
+	version, err := exec.CommandContext(probeCtx, goBin, "env", "GOVERSION").Output()
 	if err == nil {
 		t.goVersion = strings.TrimPrefix(strings.TrimSpace(string(version)), "go")
 	}

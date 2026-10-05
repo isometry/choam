@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/processor"
 )
 
@@ -54,7 +55,7 @@ func (f *FileWriterStage) Validate(ctx context.Context, p processor.Processor) e
 }
 
 func (f *FileWriterStage) Apply(ctx context.Context, p processor.Processor) error {
-	logger := p.GetLogger().With("stage", f.Name())
+	logger := logging.From(ctx)
 	filePath := p.GetFilePath()
 
 	if p.GetOptions().DryRun {

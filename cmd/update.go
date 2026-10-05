@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -53,9 +54,7 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 
-	if verbosity > 0 {
-		fmt.Fprintf(os.Stderr, "Found %d melange files to update\n", len(files))
-	}
+	slog.Info("found melange files to update", "count", len(files)) //nolint:forbidigo // pre-per-file: no processor/ctx attribution exists yet
 
 	// Configure processor options (note: no more SecurityScan - always enabled)
 	opts := updater.ProcessorOptions{

@@ -1,6 +1,7 @@
 package gobump
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -114,6 +115,18 @@ func TestFallbackRequiredGoVersion(t *testing.T) {
 		m := &ModrootAnalysis{DesiredDeps: []string{"example.com/a@v1.2.0"}}
 		got, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, nil)
 		require.Error(t, err)
+		assert.Equal(t, "", got)
+	})
+
+	t.Run("cancelled ctx is returned as an error instead of the usual fail-open skip", func(t *testing.T) {
+		server := fakeGoProxy(t, nil) // 404s everything, same as the "every fetch failed" case
+		m := &ModrootAnalysis{DesiredDeps: []string{"example.com/a@v1.2.0"}}
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		got, err := fallbackRequiredGoVersion(ctx, server.Client(), server.URL, m, nil)
+
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.Canceled)
 		assert.Equal(t, "", got)
 	})
 

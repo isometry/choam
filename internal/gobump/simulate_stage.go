@@ -3,7 +3,6 @@ package gobump
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -12,6 +11,7 @@ import (
 	omnibumpgolang "github.com/chainguard-dev/omnibump/pkg/languages/golang"
 	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
 	"github.com/isometry/choam/internal/goversion"
+	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/processor"
 	"github.com/isometry/choam/internal/scan"
 	"github.com/isometry/choam/internal/simulate"
@@ -41,7 +41,7 @@ type SimulationStage struct {
 	// newSimulator constructs the simulator lazily so a missing go toolchain
 	// degrades at Apply time (with a message) instead of failing pipeline
 	// construction; tests override it.
-	newSimulator func(opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error)
+	newSimulator func(ctx context.Context, opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error)
 
 	// detectCoUpdates reproduces melange gobump's build-time co-update
 	// advisory (see declareCoUpdates); a func field so tests can inject a
@@ -71,9 +71,9 @@ func defaultDetectCoUpdates(ctx context.Context, packagesToUpdate map[string]str
 	return missing
 }
 
-func defaultSimulator(opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error) {
+func defaultSimulator(ctx context.Context, opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error) {
 	simOpts := simulate.Options{Budget: opts.SimulationTimeout}.WithDefaults()
-	toolchain, err := simulate.NewToolchain(simOpts.CommandTimeout)
+	toolchain, err := simulate.NewToolchain(ctx, simOpts.CommandTimeout)
 	if err != nil {
 		return nil, err
 	}
@@ -107,9 +107,12 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 	}
 	analysis := gp.VulnerabilityAnalysis
 
-	sim, err := s.newSimulator(s.Options, s.Analyzer)
+	sim, err := s.newSimulator(ctx, s.Options, s.Analyzer)
 	if err != nil {
-		s.degrade(gp, err)
+		if cerr := ctx.Err(); cerr != nil {
+			return cerr
+		}
+		s.degrade(ctx, gp, err)
 		return nil
 	}
 
@@ -118,6 +121,9 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 		if lang.Language != "go" || len(lang.ByModroot) == 0 {
 			continue
 		}
+		// Shadowed for the rest of this iteration: every log emitted while
+		// simulating this language carries it.
+		ctx := logging.With(ctx, "language", lang.Language)
 
 		goEco := ecogolang.New()
 		reqs := make([]simulate.ModrootRequest, 0, len(lang.ByModroot))
@@ -125,7 +131,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			reqs = append(reqs, simulate.ModrootRequest{
 				Modroot:         m.Modroot,
 				Seeds:           seedCandidates(m),
-				Baseline:        goEco.EffectiveVersions(m.Deps),
+				Baseline:        goEco.EffectiveVersions(ctx, m.Deps),
 				Packages:        m.BuildPackages,
 				VulnImports:     vulnImportPaths(m.ScanResult),
 				BaselineVulnIDs: baselineVulnIDs(m.ScanResult),
@@ -134,7 +140,10 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 
 		results, err := sim.Simulate(ctx, analysis.RepoURL, analysis.Tag, analysis.ExpectedCommit, reqs)
 		if err != nil {
-			s.degrade(gp, err)
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			s.degrade(ctx, gp, err)
 			return nil
 		}
 
@@ -148,6 +157,10 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 		stdComplete := true
 		for mi := range lang.ByModroot {
 			m := &lang.ByModroot[mi]
+			// Shadowed for the rest of this iteration - see the
+			// language-level shadow above.
+			ctx := logging.With(ctx, "modroot", m.Modroot)
+
 			result := results[m.Modroot]
 			if result == nil {
 				// Skipped/unsimulated modroot: everything it found counts as
@@ -200,12 +213,12 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 				m.Modroot, convergedWord(result.Converged), result.Iterations,
 				len(result.FinalDeps), len(result.FinalReplaces), len(result.Dropped), len(result.RemainingVulnIDs), unlinkedHere))
 			for _, dropped := range result.Dropped {
-				slog.Info("bump candidate dropped by simulation",
-					"modroot", m.Modroot, "module", dropped.Module, "version", dropped.Version, "reason", dropped.Reason)
+				logging.From(ctx).Info("bump candidate dropped by simulation",
+					"module", dropped.Module, "version", dropped.Version, "reason", dropped.Reason)
 			}
 			for _, residual := range result.Residuals {
-				slog.Warn("residual vulnerability after simulation",
-					"modroot", m.Modroot, "module", residual.Module,
+				logging.From(ctx).Warn("residual vulnerability after simulation",
+					"module", residual.Module,
 					"resolved", residual.ResolvedVersion, "fix", residual.FixedVersion,
 					"vulns", strings.Join(residual.VulnIDs, ","), "reason", residual.Reason)
 			}
@@ -219,8 +232,8 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 		if stdComplete && len(stdUnion) > 0 {
 			gp.LinkedStdPackages = stdUnion
 		} else if !stdComplete {
-			slog.Debug("discarding partial linked-stdlib union: not every go modroot contributed a validated stdlib package set",
-				"language", lang.Language, "modroot_count", len(lang.ByModroot))
+			logging.From(ctx).Debug("discarding partial linked-stdlib union: not every go modroot contributed a validated stdlib package set",
+				"modroot_count", len(lang.ByModroot))
 		}
 
 		// Advisories whose modules were unlinked in EVERY modroot that saw
@@ -248,7 +261,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 					module.name, strings.Join(module.vulnIDs, ", "))
 			}
 			gp.AddMessage(msg)
-			slog.Info("advisory in unlinked code - no bump proposed",
+			logging.From(ctx).Info("advisory in unlinked code - no bump proposed",
 				"module", module.name, "module_linked", module.moduleLinked, "degraded", module.degraded, "vulns", strings.Join(module.vulnIDs, ","))
 		}
 
@@ -334,14 +347,14 @@ func (s *SimulationStage) declareCoUpdates(ctx context.Context, gp *GoBumpProces
 			}
 			sustainedVersion, required := result.Requires[module]
 			if !required || semver.Compare(sustainedVersion, rec.RequiredVersion) < 0 {
-				slog.Debug("co-update recommendation not satisfied by the validated graph - skipping",
-					"modroot", m.Modroot, "module", module, "recommended", rec.RequiredVersion, "reason", rec.Reason)
+				logging.From(ctx).Debug("co-update recommendation not satisfied by the validated graph - skipping",
+					"module", module, "recommended", rec.RequiredVersion, "reason", rec.Reason)
 				continue
 			}
 			if result.Linked != nil {
 				if _, linked := result.Linked[module]; !linked {
-					slog.Debug("co-update recommendation for unlinked module - skipping",
-						"modroot", m.Modroot, "module", module, "recommended", rec.RequiredVersion)
+					logging.From(ctx).Debug("co-update recommendation for unlinked module - skipping",
+						"module", module, "recommended", rec.RequiredVersion)
 					continue
 				}
 			}
@@ -350,7 +363,7 @@ func (s *SimulationStage) declareCoUpdates(ctx context.Context, gp *GoBumpProces
 			m.DesiredDeps = append(m.DesiredDeps, entry)
 			appended = true
 			gp.AddMessage(fmt.Sprintf("declared co-update: %s (required alongside the validated bumps; already satisfied by the proven graph)", entry))
-			slog.Info("declared co-update", "modroot", m.Modroot, "module", module,
+			logging.From(ctx).Info("declared co-update", "module", module,
 				"version", sustainedVersion, "reason", rec.Reason)
 		}
 
@@ -366,7 +379,7 @@ func (s *SimulationStage) declareCoUpdates(ctx context.Context, gp *GoBumpProces
 func (s *SimulationStage) safeDetectCoUpdates(ctx context.Context, packagesToUpdate map[string]string, modFile *modfile.File) (missing map[string]omnibumpgolang.MissingDependency) {
 	defer func() {
 		if r := recover(); r != nil {
-			slog.Debug("co-update declaration panicked - skipping", "recover", r)
+			logging.From(ctx).Debug("co-update declaration panicked - skipping", "recover", r)
 			missing = nil
 		}
 	}()
@@ -375,10 +388,12 @@ func (s *SimulationStage) safeDetectCoUpdates(ctx context.Context, packagesToUpd
 
 // degrade falls back to the unvalidated pre-simulation candidate set,
 // loudly: the written deps list has not been proven to resolve or to cover
-// every advisory.
-func (s *SimulationStage) degrade(gp *GoBumpProcessor, err error) {
+// every advisory. Callers must check ctx.Err() before calling this - a
+// cancelled run must propagate that cancellation, not degrade and write an
+// unvalidated result as if simulation had merely failed.
+func (s *SimulationStage) degrade(ctx context.Context, gp *GoBumpProcessor, err error) {
 	gp.Validated = false
-	slog.Warn("bump simulation unavailable - proceeding with UNVALIDATED deps", "error", err)
+	logging.From(ctx).Warn("bump simulation unavailable - proceeding with UNVALIDATED deps", "error", err)
 	gp.AddMessage(fmt.Sprintf("WARNING: deps list NOT validated - simulation unavailable: %v", err))
 }
 

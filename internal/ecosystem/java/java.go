@@ -91,7 +91,7 @@ func (e *Ecosystem) Analyze(ctx context.Context, files map[string][]byte) (*ecos
 	return &ecosystem.ModuleDeps{Deps: deps, Raw: result}, nil
 }
 
-func (e *Ecosystem) ScanPackages(deps *ecosystem.ModuleDeps) []scan.Package {
+func (e *Ecosystem) ScanPackages(_ context.Context, deps *ecosystem.ModuleDeps) []scan.Package {
 	pkgs := make([]scan.Package, 0, len(deps.Deps))
 	for _, dep := range deps.Deps {
 		if dep.Version == "" {
@@ -108,7 +108,7 @@ func (e *Ecosystem) ScanPackages(deps *ecosystem.ModuleDeps) []scan.Package {
 // rendering exactly). A bump for a coordinate absent from the pom falls back
 // to a plain colon->at-sign substitution - FilterBumps drops such entries
 // anyway, so the unmatched key is harmless.
-func (e *Ecosystem) BumpCoords(bumps []scan.SecurityBump, deps *ecosystem.ModuleDeps) map[string]scan.SecurityBump {
+func (e *Ecosystem) BumpCoords(_ context.Context, bumps []scan.SecurityBump, deps *ecosystem.ModuleDeps) map[string]scan.SecurityBump {
 	byName := make(map[string]ecosystem.Dep, len(deps.Deps))
 	for _, dep := range deps.Deps {
 		byName[dep.Name] = dep

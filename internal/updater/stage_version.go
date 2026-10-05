@@ -4,11 +4,11 @@ import (
 	"cmp"
 	"context"
 	"fmt"
-	"log/slog"
 	"strings"
 
 	melange "chainguard.dev/melange/pkg/config"
 	githubClient "github.com/isometry/choam/internal/github"
+	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/processor"
 )
 
@@ -34,33 +34,34 @@ func (vc *VersionChecker) Check(ctx context.Context, p processor.Processor) erro
 		return fmt.Errorf("expected UpdaterProcessor, got %T", p)
 	}
 
-	logger := up.WithStage(vc.Name())
+	// ctx already carries "stage"/"stage_index" - processor.Pipeline.Execute
+	// seeds them before calling any stage method.
 	cfg := up.GetConfig()
 
-	logger.Debug("Starting version check")
+	logging.From(ctx).Debug("Starting version check")
 
 	// Check if updates are enabled
 	if !cfg.Update.Enabled {
-		logger.Debug("Updates disabled in configuration")
+		logging.From(ctx).Debug("Updates disabled in configuration")
 		return nil
 	}
 
 	// Check if update is excluded
 	if cfg.Update.ExcludeReason != "" {
-		logger.Debug("Updates excluded", "reason", cfg.Update.ExcludeReason)
+		logging.From(ctx).Debug("Updates excluded", "reason", cfg.Update.ExcludeReason)
 		up.AddError(fmt.Errorf("updates excluded: %s", cfg.Update.ExcludeReason))
 		return nil
 	}
 
 	// Get the latest valid version
-	latestValidVersion, source, err := vc.getLatestValidVersion(ctx, cfg, vc.orchestrator, logger)
+	latestValidVersion, source, err := vc.getLatestValidVersion(ctx, cfg, vc.orchestrator)
 	if err != nil {
 		up.AddError(fmt.Errorf("getting latest version: %w", err))
 		return err
 	}
 
 	if latestValidVersion == "" {
-		logger.Debug("No valid version found")
+		logging.From(ctx).Debug("No valid version found")
 		return nil
 	}
 
@@ -83,43 +84,43 @@ func (vc *VersionChecker) Check(ctx context.Context, p processor.Processor) erro
 			up.AddMessage(fmt.Sprintf("update available: %s -> %s (%s)",
 				up.GetCurrentVersion(), latestValidVersion, source))
 		}
-		logger.Info("Update available",
+		logging.From(ctx).Info("Update available",
 			"current_version", up.GetCurrentVersion(),
 			"latest_version", latestValidVersion,
 			"source", source,
 			"manual", cfg.Update.Manual)
 	} else {
 		up.AddMessage("package is up-to-date")
-		logger.Debug("Package is up-to-date")
+		logging.From(ctx).Debug("Package is up-to-date")
 	}
 
 	return nil
 }
 
 // getLatestValidVersion gets the latest valid version from the appropriate source
-func (vc *VersionChecker) getLatestValidVersion(ctx context.Context, cfg *melange.Configuration, orchestrator *UpdateOrchestrator, logger *slog.Logger) (string, string, error) {
+func (vc *VersionChecker) getLatestValidVersion(ctx context.Context, cfg *melange.Configuration, orchestrator *UpdateOrchestrator) (string, string, error) {
 	updateConfig := &cfg.Update
 
 	// Check GitHub monitor first (most common)
 	if updateConfig.GitHubMonitor != nil {
-		return vc.getLatestValidGitHubVersion(ctx, cfg, updateConfig.GitHubMonitor, orchestrator, logger)
+		return vc.getLatestValidGitHubVersion(ctx, cfg, updateConfig.GitHubMonitor, orchestrator)
 	}
 
 	// Check release monitor
 	if updateConfig.ReleaseMonitor != nil {
-		return vc.getLatestValidReleaseMonitorVersion(ctx, cfg, updateConfig.ReleaseMonitor, orchestrator, logger)
+		return vc.getLatestValidReleaseMonitorVersion(ctx, cfg, updateConfig.ReleaseMonitor, orchestrator)
 	}
 
 	// Check git monitor
 	if updateConfig.GitMonitor != nil {
-		return vc.getLatestValidGitVersion(ctx, cfg, updateConfig.GitMonitor, orchestrator, logger)
+		return vc.getLatestValidGitVersion(ctx, cfg, updateConfig.GitMonitor, orchestrator)
 	}
 
 	return "", "", fmt.Errorf("no supported update monitor configured")
 }
 
 // getLatestValidGitHubVersion gets the latest valid version from GitHub
-func (vc *VersionChecker) getLatestValidGitHubVersion(ctx context.Context, cfg *melange.Configuration, monitor *melange.GitHubMonitor, orchestrator *UpdateOrchestrator, logger *slog.Logger) (string, string, error) {
+func (vc *VersionChecker) getLatestValidGitHubVersion(ctx context.Context, cfg *melange.Configuration, monitor *melange.GitHubMonitor, orchestrator *UpdateOrchestrator) (string, string, error) {
 	repo, err := githubClient.ParseRepository(monitor.Identifier)
 	if err != nil {
 		return "", "github", fmt.Errorf("parsing repository identifier: %w", err)
@@ -127,7 +128,7 @@ func (vc *VersionChecker) getLatestValidGitHubVersion(ctx context.Context, cfg *
 
 	// Create version filter with package context
 	versionFilter, _ := orchestrator.GetVersionComponents()
-	filterFunc := vc.createVersionFilter(cfg, versionFilter, logger)
+	filterFunc := vc.createVersionFilter(ctx, cfg, versionFilter)
 
 	// Get GitHub client
 	_, githubClient, _, _ := orchestrator.GetServiceClients()
@@ -138,7 +139,7 @@ func (vc *VersionChecker) getLatestValidGitHubVersion(ctx context.Context, cfg *
 		source = "github-tags"
 	}
 
-	logger.Debug("Checking GitHub for updates",
+	logging.From(ctx).Debug("Checking GitHub for updates",
 		"repository", monitor.Identifier,
 		"use_tags", monitor.UseTags)
 
@@ -172,16 +173,16 @@ func (vc *VersionChecker) getLatestValidGitHubVersion(ctx context.Context, cfg *
 	}
 
 	// Process the valid version to get the final processed form
-	processed, _, _ := versionFilter.ProcessVersion(validVersion, &cfg.Update)
+	processed, _, _ := versionFilter.ProcessVersion(ctx, validVersion, &cfg.Update)
 
 	return processed, source, nil
 }
 
 // getLatestValidReleaseMonitorVersion gets the latest valid version from release-monitoring.org
-func (vc *VersionChecker) getLatestValidReleaseMonitorVersion(ctx context.Context, cfg *melange.Configuration, monitor *melange.ReleaseMonitor, orchestrator *UpdateOrchestrator, logger *slog.Logger) (string, string, error) {
+func (vc *VersionChecker) getLatestValidReleaseMonitorVersion(ctx context.Context, cfg *melange.Configuration, monitor *melange.ReleaseMonitor, orchestrator *UpdateOrchestrator) (string, string, error) {
 	anityaClient, _, _, _ := orchestrator.GetServiceClients()
 
-	logger.Debug("Checking release-monitoring.org for updates", "identifier", monitor.Identifier)
+	logging.From(ctx).Debug("Checking release-monitoring.org for updates", "identifier", monitor.Identifier)
 
 	// Get the single version from release monitor
 	version, err := anityaClient.GetLatestVersion(ctx, monitor.Identifier)
@@ -195,7 +196,7 @@ func (vc *VersionChecker) getLatestValidReleaseMonitorVersion(ctx context.Contex
 
 	// Process it through validation pipeline
 	versionFilter, _ := orchestrator.GetVersionComponents()
-	processed, valid, err := versionFilter.ProcessVersion(version, &cfg.Update)
+	processed, valid, err := versionFilter.ProcessVersion(ctx, version, &cfg.Update)
 	if err != nil {
 		return "", "release-monitor", fmt.Errorf("processing version: %w", err)
 	}
@@ -208,18 +209,18 @@ func (vc *VersionChecker) getLatestValidReleaseMonitorVersion(ctx context.Contex
 }
 
 // getLatestValidGitVersion gets the latest valid version from a Git repository
-func (vc *VersionChecker) getLatestValidGitVersion(ctx context.Context, cfg *melange.Configuration, monitor *melange.GitMonitor, orchestrator *UpdateOrchestrator, logger *slog.Logger) (string, string, error) {
+func (vc *VersionChecker) getLatestValidGitVersion(ctx context.Context, cfg *melange.Configuration, monitor *melange.GitMonitor, orchestrator *UpdateOrchestrator) (string, string, error) {
 	// Extract repository URL from the pipeline
 	repoURL, err := extractRepositoryFromConfig(cfg)
 	if err != nil {
 		return "", "git", fmt.Errorf("extracting repository from pipeline: %w", err)
 	}
 
-	logger.Debug("Checking Git repository for updates", "repository", repoURL)
+	logging.From(ctx).Debug("Checking Git repository for updates", "repository", repoURL)
 
 	// Create version filter
 	versionFilter, _ := orchestrator.GetVersionComponents()
-	filterFunc := vc.createVersionFilter(cfg, versionFilter, logger)
+	filterFunc := vc.createVersionFilter(ctx, cfg, versionFilter)
 
 	// Get Git client
 	_, _, gitClient, _ := orchestrator.GetServiceClients()
@@ -237,7 +238,7 @@ func (vc *VersionChecker) getLatestValidGitVersion(ctx context.Context, cfg *mel
 	}
 
 	// Process the valid version to get the final processed form
-	processed, _, _ := versionFilter.ProcessVersion(validVersion, &cfg.Update)
+	processed, _, _ := versionFilter.ProcessVersion(ctx, validVersion, &cfg.Update)
 
 	return processed, "git", nil
 }
@@ -256,22 +257,23 @@ func matchesTagFilters(value, prefix, contains string) bool {
 }
 
 // createVersionFilter creates a unified filter function with logging context
-func (vc *VersionChecker) createVersionFilter(cfg *melange.Configuration, filter *VersionFilter, logger *slog.Logger) func(string) bool {
+func (vc *VersionChecker) createVersionFilter(ctx context.Context, cfg *melange.Configuration, filter *VersionFilter) func(string) bool {
 	return func(rawVersion string) bool {
-		// Create a version-specific logger for this filtering operation
-		versionLogger := logger.With("checking_version", rawVersion)
+		// Extend for this filtering operation only - versionCtx is local to
+		// this call, never fed back into the outer ctx.
+		versionCtx := logging.With(ctx, "checking_version", rawVersion)
 
 		// Apply ALL filtering logic with logging context
-		processed, valid, err := filter.ProcessVersionWithLogger(rawVersion, &cfg.Update, versionLogger)
+		processed, valid, err := filter.ProcessVersion(versionCtx, rawVersion, &cfg.Update)
 		if err != nil {
-			versionLogger.Debug("Error processing version", "error", err)
+			logging.From(versionCtx).Debug("Error processing version", "error", err)
 			return false
 		}
 
 		if valid {
-			versionLogger.Debug("Version accepted", "original", rawVersion, "processed", processed)
+			logging.From(versionCtx).Debug("Version accepted", "original", rawVersion, "processed", processed)
 		} else {
-			versionLogger.Debug("Version rejected", "original", rawVersion)
+			logging.From(versionCtx).Debug("Version rejected", "original", rawVersion)
 		}
 
 		return valid
@@ -308,10 +310,11 @@ func (va *VersionApplier) Apply(ctx context.Context, p processor.Processor) erro
 		return fmt.Errorf("expected UpdaterProcessor, got %T", p)
 	}
 
-	logger := up.WithStage(va.Name())
+	// ctx already carries "stage"/"stage_index" - processor.Pipeline.Execute
+	// seeds them before calling any stage method.
 
 	if up.GetOptions().DryRun {
-		logger.Info("Dry run - would update version",
+		logging.From(ctx).Info("Dry run - would update version",
 			"old_version", up.GetCurrentVersion(),
 			"new_version", up.LatestVersion)
 		up.SetVersionUpdate(up.GetCurrentVersion(), up.LatestVersion)
@@ -331,7 +334,7 @@ func (va *VersionApplier) Apply(ctx context.Context, p processor.Processor) erro
 	up.SetCurrentYAML(updatedContent)
 	up.SetVersionUpdate(up.GetCurrentVersion(), up.LatestVersion)
 
-	logger.Info("Version updated",
+	logging.From(ctx).Info("Version updated",
 		"old_version", up.GetCurrentVersion(),
 		"new_version", up.LatestVersion)
 

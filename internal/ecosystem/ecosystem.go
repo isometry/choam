@@ -29,15 +29,18 @@ type Ecosystem interface {
 	// materializing files to a temporary directory internally.
 	Analyze(ctx context.Context, files map[string][]byte) (*ModuleDeps, error)
 
-	// ScanPackages maps the modroot's dependencies into OSV query inputs.
-	ScanPackages(deps *ModuleDeps) []scan.Package
+	// ScanPackages maps the modroot's dependencies into OSV query inputs. ctx
+	// carries this modroot's logger (see internal/logging); current
+	// implementations are pure and don't otherwise need it.
+	ScanPackages(ctx context.Context, deps *ModuleDeps) []scan.Package
 
 	// FilterBumps merges a modroot's existing declared melange deps with
 	// fresh OSV security bumps and returns the desired melange deps for
 	// that modroot, rendered in this language's grammar, deduplicated and
 	// with no-ops/downgrades/missing entries removed. ctx bounds any
-	// network access an implementation may need; current implementations
-	// are offline and ignore it.
+	// network access an implementation may need and carries this modroot's
+	// logger (see internal/logging); current implementations are offline
+	// and use ctx only for logging.
 	FilterBumps(ctx context.Context, existing []string, bumps []scan.SecurityBump, deps *ModuleDeps) []string
 
 	// BumpCoords maps each OSV security bump to the coordinate this
@@ -47,8 +50,10 @@ type Ecosystem interface {
 	// grammar is "groupId@artifactId@version", and OSV names v2+ Go modules
 	// without the /vN path suffix go.mod requires. Callers use the keys to
 	// recognize which rendered deps fix a flagged vulnerability, and the
-	// values to attribute advisory IDs / prior versions to them.
-	BumpCoords(bumps []scan.SecurityBump, deps *ModuleDeps) map[string]scan.SecurityBump
+	// values to attribute advisory IDs / prior versions to them. ctx
+	// carries this modroot's logger; current implementations are pure and
+	// don't otherwise need it.
+	BumpCoords(ctx context.Context, bumps []scan.SecurityBump, deps *ModuleDeps) map[string]scan.SecurityBump
 }
 
 // ModuleDeps is a normalized dependency view for one modroot.

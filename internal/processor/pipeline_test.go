@@ -604,6 +604,61 @@ func TestPipeline_Execute_ContextCancellation(t *testing.T) {
 	assert.Error(t, err)
 }
 
+// TestPipeline_Execute_CancelledBeforeAnyStage confirms Execute checks ctx at
+// the top of the stage loop, on every iteration - not just relying on
+// individual stages to notice cancellation themselves (see
+// TestPipeline_Execute_ContextCancellation for that case). A cancellation
+// caught here must stop before the next stage even runs.
+func TestPipeline_Execute_CancelledBeforeAnyStage(t *testing.T) {
+	pipeline := NewPipeline("test-pipeline")
+	stage := &mockExecutableStage{
+		BaseStage: BaseStage{StageName: "never-runs"},
+		shouldRun: true,
+	}
+	pipeline.AddStage(stage)
+	proc := createTestProcessor()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := pipeline.Execute(ctx, proc)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.False(t, stage.executeCalled, "a stage must not run once ctx is already cancelled")
+}
+
+// TestPipeline_Execute_CancelledBetweenStages confirms cancellation is
+// re-checked before each stage, not just once at entry.
+func TestPipeline_Execute_CancelledBetweenStages(t *testing.T) {
+	pipeline := NewPipeline("test-pipeline")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	first := &mockExecutableStage{
+		BaseStage: BaseStage{StageName: "first"},
+		shouldRun: true,
+	}
+	first.executeFunc = func(context.Context, Processor) error {
+		cancel() // cancel partway through the pipeline
+		return nil
+	}
+	second := &mockExecutableStage{
+		BaseStage: BaseStage{StageName: "second"},
+		shouldRun: true,
+	}
+
+	pipeline.AddStage(first)
+	pipeline.AddStage(second)
+	proc := createTestProcessor()
+
+	err := pipeline.Execute(ctx, proc)
+
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.True(t, first.executeCalled)
+	assert.False(t, second.executeCalled, "cancellation between stages must stop the pipeline before the next one runs")
+}
+
 func TestPipeline_Execute_ComplexScenario(t *testing.T) {
 	// Test a realistic pipeline with multiple stage types, validation, and error handling
 	pipeline := NewPipeline("complex-pipeline")

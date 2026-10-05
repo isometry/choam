@@ -73,7 +73,7 @@ func (e *Ecosystem) Analyze(_ context.Context, files map[string][]byte) (*ecosys
 // replace directives: a locally-replaced module is skipped entirely (no
 // meaningful version to query), and a module replaced with another module is
 // queried under its replacement's name/version.
-func (e *Ecosystem) ScanPackages(deps *ecosystem.ModuleDeps) []scan.Package {
+func (e *Ecosystem) ScanPackages(_ context.Context, deps *ecosystem.ModuleDeps) []scan.Package {
 	info, ok := deps.Raw.(*GoModInfo)
 	if !ok || info == nil {
 		return nil
@@ -132,7 +132,7 @@ func ModFileOf(deps *ecosystem.ModuleDeps) *modfile.File {
 // (a local-path replacement maps to the "never bump this" sentinel, see
 // getEffectiveVersion). Used as the baseline for bump simulation: an entry
 // that doesn't move a module beyond this baseline is a no-op.
-func (e *Ecosystem) EffectiveVersions(deps *ecosystem.ModuleDeps) map[string]string {
+func (e *Ecosystem) EffectiveVersions(ctx context.Context, deps *ecosystem.ModuleDeps) map[string]string {
 	if deps == nil {
 		return nil
 	}
@@ -142,7 +142,7 @@ func (e *Ecosystem) EffectiveVersions(deps *ecosystem.ModuleDeps) map[string]str
 	}
 	versions := make(map[string]string, len(info.AllRequirements))
 	for module, version := range info.AllRequirements {
-		versions[module] = e.analyzer.getEffectiveVersion(module, version, info.Replacements)
+		versions[module] = e.analyzer.getEffectiveVersion(ctx, module, version, info.Replacements)
 	}
 	return versions
 }
@@ -153,7 +153,7 @@ func (e *Ecosystem) EffectiveVersions(deps *ecosystem.ModuleDeps) map[string]str
 // normalizeModulePath resolves that against this modroot's requirements. The
 // normalized path is used even when the module isn't found in go.mod at all -
 // FilterBumps drops such entries anyway, so an unmatched key is harmless.
-func (e *Ecosystem) BumpCoords(bumps []scan.SecurityBump, deps *ecosystem.ModuleDeps) map[string]scan.SecurityBump {
+func (e *Ecosystem) BumpCoords(ctx context.Context, bumps []scan.SecurityBump, deps *ecosystem.ModuleDeps) map[string]scan.SecurityBump {
 	info, ok := deps.Raw.(*GoModInfo)
 	if !ok || info == nil {
 		return nil
@@ -161,7 +161,7 @@ func (e *Ecosystem) BumpCoords(bumps []scan.SecurityBump, deps *ecosystem.Module
 
 	coords := make(map[string]scan.SecurityBump, len(bumps))
 	for _, bump := range bumps {
-		coord, _ := e.analyzer.normalizeModulePath(bump.Name, bump.FixedVersion, info)
+		coord, _ := e.analyzer.normalizeModulePath(ctx, bump.Name, bump.FixedVersion, info)
 		coords[coord] = bump
 	}
 	return coords
@@ -174,7 +174,7 @@ func (e *Ecosystem) BumpCoords(bumps []scan.SecurityBump, deps *ecosystem.Module
 // in release-group siblings and transitive requirement gaps) is deliberately
 // NOT handled here - the bump simulation owns it with the real toolchain
 // (go get / go mod tidy / MVS; see internal/simulate).
-func (e *Ecosystem) FilterBumps(_ context.Context, existing []string, bumps []scan.SecurityBump, deps *ecosystem.ModuleDeps) []string {
+func (e *Ecosystem) FilterBumps(ctx context.Context, existing []string, bumps []scan.SecurityBump, deps *ecosystem.ModuleDeps) []string {
 	info, ok := deps.Raw.(*GoModInfo)
 	if !ok || info == nil {
 		return nil
@@ -186,6 +186,6 @@ func (e *Ecosystem) FilterBumps(_ context.Context, existing []string, bumps []sc
 		candidate = append(candidate, fmt.Sprintf("%s@%s", bump.Name, bump.FixedVersion))
 	}
 
-	_, filtered := e.analyzer.analyzeBumps(candidate, info)
+	_, filtered := e.analyzer.analyzeBumps(ctx, candidate, info)
 	return filtered
 }

@@ -2,7 +2,6 @@ package updater
 
 import (
 	"fmt"
-	"log/slog"
 
 	"github.com/isometry/choam/internal/processor"
 )
@@ -90,16 +89,6 @@ func (p *UpdaterProcessor) AddPipelineChange(change PipelineChange) {
 // HasChanges returns true if any changes were made to the package
 func (p *UpdaterProcessor) HasChanges() bool {
 	return p.VersionChanged || p.IsEpochChanged() || len(p.PipelineChanges) > 0
-}
-
-// WithStage creates a child logger for a specific processing stage
-func (p *UpdaterProcessor) WithStage(stage string) *slog.Logger {
-	return p.GetLogger().With("stage", stage)
-}
-
-// WithPipeline creates a child logger for a specific pipeline operation
-func (p *UpdaterProcessor) WithPipeline(stage string, index int) *slog.Logger {
-	return p.GetLogger().With("stage", stage, "pipeline_index", index)
 }
 
 // Summary returns a brief summary of the processing results
