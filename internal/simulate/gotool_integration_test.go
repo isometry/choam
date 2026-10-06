@@ -250,6 +250,22 @@ func otelLikeFixture(t *testing.T) (toolchain *GoToolchain, dir string) {
 		"example.com/exporter@v0.21.0": exporter("v0.21.0", "Attr"),
 	})
 
+	useFileProxy(t, proxy)
+	dir = newFixtureModule(t, map[string]string{
+		"go.mod":  "module example.com/app\n\ngo 1.21\n\nrequire example.com/exporter v0.19.0\n",
+		"main.go": "package main\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/exporter\"\n)\n\nfunc main() { fmt.Println(exporter.Record()) }\n",
+	})
+
+	toolchain, err := NewToolchain(t.Context(), 2*time.Minute)
+	require.NoError(t, err)
+	return toolchain, dir
+}
+
+// useFileProxy points the go tool at a file:// GOPROXY (see writeFileProxy)
+// with checksum verification off and a private module cache, for the rest
+// of the test.
+func useFileProxy(t *testing.T, proxy string) {
+	t.Helper()
 	modCache := t.TempDir()
 	t.Setenv("GOPROXY", "file://"+filepath.ToSlash(proxy))
 	t.Setenv("GOSUMDB", "off")
@@ -262,21 +278,23 @@ func otelLikeFixture(t *testing.T) (toolchain *GoToolchain, dir string) {
 		cmd.Env = os.Environ()
 		_ = cmd.Run()
 	})
+}
 
-	dir = t.TempDir()
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte(
-		"module example.com/app\n\ngo 1.21\n\nrequire example.com/exporter v0.19.0\n"), 0o644))
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte(
-		"package main\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/exporter\"\n)\n\nfunc main() { fmt.Println(exporter.Record()) }\n"), 0o644))
+// newFixtureModule writes a main module (file name -> content; go.mod
+// required) and tidies it so the pristine snapshot carries a complete
+// go.sum.
+func newFixtureModule(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for name, content := range files {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644))
+	}
 	cmd := exec.Command("go", "mod", "tidy")
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(), "GOWORK=off", "GOFLAGS=-mod=mod")
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
-
-	toolchain, err = NewToolchain(t.Context(), 2*time.Minute)
-	require.NoError(t, err)
-	return toolchain, dir
+	return dir
 }
 
 // TestGoToolchain_CompileReportsLockstepBreak: the compile primitive must

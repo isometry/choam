@@ -279,9 +279,11 @@ func (f *fakeToolchain) Requirements(_ context.Context, _ string) (map[string]st
 // fakeAdvisory affects versions in [introduced, fixed); empty introduced
 // means "always"; empty fixed means "no released fix". imports optionally
 // models the advisory's vulnerable-package metadata
-// (scan.Vulnerability.VulnerableImports).
+// (scan.Vulnerability.VulnerableImports); severity, when set, is carried
+// onto the vulnerability and (most severe wins) its module's bump.
 type fakeAdvisory struct {
 	module, id, introduced, fixed string
+	severity                      string
 	imports                       []scan.VulnerableImport
 }
 
@@ -308,7 +310,7 @@ func (f *fakeScanner) ScanPackages(_ context.Context, pkgs []scan.Package) (*sca
 			result.Vulnerabilities = append(result.Vulnerabilities, scan.Vulnerability{
 				ID: adv.id, Module: pkg.Name, Ecosystem: "Go",
 				CurrentVersion: pkg.Version, FixedVersion: adv.fixed,
-				VulnerableImports: adv.imports,
+				Severity: adv.severity, VulnerableImports: adv.imports,
 			})
 			if adv.fixed == "" {
 				continue
@@ -322,6 +324,7 @@ func (f *fakeScanner) ScanPackages(_ context.Context, pkgs []scan.Package) (*sca
 				bump.FixedVersion = adv.fixed
 			}
 			bump.VulnIDs = append(bump.VulnIDs, adv.id)
+			bump.Severity = mergeSeverity(bump.Severity, adv.severity)
 		}
 	}
 	for _, bump := range bumps {
@@ -2498,4 +2501,78 @@ func TestCompileGate_CancellationPropagates(t *testing.T) {
 	}, Options{})
 
 	require.ErrorIs(t, err, context.Canceled)
+}
+
+// TestLogTrial_RecordShape pins the trial/repair trace records: pins with
+// roles, a capped resolved diff against baseline, failing owners and the
+// first compile errors, repair decisions - and nothing at all (no
+// formatting) when Debug is disabled.
+func TestLogTrial_RecordShape(t *testing.T) {
+	baseline := map[string]string{"example.com/gone": "v1.0.0"}
+	resolved := map[string]string{}
+	for i := range maxTrialLogDiff + 5 {
+		module := "example.com/m" + string(rune('a'+i))
+		baseline[module] = "v1.0.0"
+		resolved[module] = "v1.1.0"
+	}
+	l := &loop{req: ModrootRequest{Modroot: "."}, baselineResolved: baseline}
+	pins := []*candState{
+		{Candidate: Candidate{Module: "example.com/cve", Version: "v1.1.0", FromCVE: true}, seed: true},
+		{Candidate: Candidate{Module: "example.com/seed", Version: "v1.0.0"}, seed: true},
+		{Candidate: Candidate{Module: "example.com/rem", Version: latestQuery}, remedy: true},
+		{Candidate: Candidate{Module: "example.com/coh", Version: "v0.2.0"}, coherence: true},
+		{Candidate: Candidate{Module: "example.com/new", Version: "v2.0.0", Replace: true, ReplaceOld: "example.com/old"}},
+	}
+	st := &gateState{
+		report:   &CompileReport{Modules: map[string]string{"example.com/x/p": "example.com/x", "example.com/app": ""}},
+		resolved: resolved,
+		failures: map[string][]string{
+			"example.com/x/p": {"/cache/example.com/x@v1/p.go:1:2: undefined: Foo"},
+			"example.com/app": {"/src/main.go:3:4: broken"},
+		},
+	}
+
+	trace := &traceCapture{}
+	ctx := logging.Into(t.Context(), slog.New(trace))
+	l.logTrial(ctx, trialLog{purpose: "gate: admit", subject: "example.com/cve", pins: pins, resolved: resolved, compiled: st})
+	l.logTrial(ctx, trialLog{purpose: "refine: minimal set", pins: pins[:1], reject: "go: boom\nmore"})
+	l.logTrial(ctx, trialLog{purpose: "refine: minimal set", pins: pins[:1], resolved: resolved, raises: []raise{{module: "example.com/r", version: "v1.2.0"}}, residuals: 2})
+	l.logRepair(ctx, repairLog{module: "example.com/s", from: "v0.1.0", to: "v0.2.0", source: "version walk",
+		outgrown: map[string]string{"example.com/api": "v0.2.0"}, supports: []string{"example.com/b"}})
+	l.logRepair(ctx, repairLog{module: "example.com/s", from: "v0.1.0", skip: "owner is itself a blamed candidate"})
+
+	require.Len(t, trace.records, 5)
+	gate := trace.records[0].attrs
+	assert.Equal(t, trialLogMsg, trace.records[0].msg)
+	assert.Equal(t, []string{
+		"example.com/cve@v1.1.0(cve)", "example.com/seed@v1.0.0(seed)", "example.com/rem@latest(remedy)",
+		"example.com/coh@v0.2.0(coherence)", "example.com/old=example.com/new@v2.0.0(raise)",
+	}, gate["pins"])
+	assert.Equal(t, "example.com/cve", gate["subject"])
+	diff := gate["resolved_diff"].([]string)
+	require.Len(t, diff, maxTrialLogDiff+1)
+	assert.Equal(t, "example.com/ma v1.0.0->v1.1.0", diff[0])
+	assert.Equal(t, "+6 more", diff[maxTrialLogDiff], "30 raised modules plus one removed, capped")
+	assert.Equal(t, "breaks compile", gate["outcome"])
+	assert.Equal(t, int64(2), gate["failing"])
+	assert.Equal(t, []string{"(main)", "example.com/x"}, gate["failing_owners"])
+	assert.Equal(t, []string{"example.com/app: main.go:3:4: broken", "example.com/x/p: p.go:1:2: undefined: Foo"}, gate["errors"])
+
+	assert.Equal(t, "rejected", trace.records[1].attrs["outcome"])
+	assert.Equal(t, "go: boom", trace.records[1].attrs["reject"])
+	assert.Equal(t, []string{"example.com/r@v1.2.0"}, trace.records[2].attrs["raises"])
+	assert.Equal(t, int64(2), trace.records[2].attrs["residuals"])
+
+	assert.Equal(t, repairLogMsg, trace.records[3].msg)
+	assert.Equal(t, "raise", trace.records[3].attrs["decision"])
+	assert.Equal(t, []string{"example.com/api@v0.2.0"}, trace.records[3].attrs["outgrown"])
+	assert.Equal(t, []string{"example.com/b"}, trace.records[3].attrs["supports"])
+	assert.Equal(t, "skip", trace.records[4].attrs["decision"])
+	assert.Equal(t, "owner is itself a blamed candidate", trace.records[4].attrs["reason"])
+
+	var buf bytes.Buffer
+	quiet := logging.Into(t.Context(), slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	l.logTrial(quiet, trialLog{purpose: "gate: admit", pins: pins, resolved: resolved, compiled: st})
+	l.logRepair(quiet, repairLog{module: "example.com/s", skip: "x"})
+	assert.Empty(t, buf.String(), "trace records are Debug-only")
 }

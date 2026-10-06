@@ -3,6 +3,7 @@ package simulate
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"maps"
 	"os"
 	"path/filepath"
@@ -1312,8 +1313,9 @@ type trialResult struct {
 // against an unfiltered candidate scan, see "new" unlinked advisories, and
 // spuriously reject the trial. Callers snapshot l.linked/l.linkedPackages
 // beforehand and restore them when rejecting.
-func (l *loop) trialApply(ctx context.Context, keep []*candState) (*trialResult, error) {
+func (l *loop) trialApply(ctx context.Context, purpose string, keep []*candState) (*trialResult, error) {
 	if err := l.applyExact(ctx, keep); err != nil {
+		l.logTrial(ctx, trialLog{purpose: purpose, pins: keep, reject: err.Error()})
 		return nil, err
 	}
 
@@ -1335,6 +1337,7 @@ func (l *loop) trialApply(ctx context.Context, keep []*candState) (*trialResult,
 		return nil, err
 	}
 	tr.raises, tr.residuals = l.scanFindings(scanResult, tr.resolved)
+	l.logTrial(ctx, trialLog{purpose: purpose, pins: keep, resolved: tr.resolved, raises: tr.raises, residuals: len(tr.residuals)})
 	return tr, nil
 }
 
@@ -1440,7 +1443,7 @@ func (l *loop) dropSuperseded(ctx context.Context, resolved map[string]string, r
 	}
 
 	convergedLinked, convergedPackages := l.linked, l.linkedPackages
-	tr, err := l.trialApply(ctx, keep)
+	tr, err := l.trialApply(ctx, "refine: drop superseded", keep)
 	if err != nil || len(tr.raises) > 0 ||
 		introducesNewVulns(tr.residuals, l.scanResiduals) || !l.sustained(tr, keep) {
 		l.linked, l.linkedPackages = convergedLinked, convergedPackages
@@ -1485,7 +1488,7 @@ func (l *loop) confirmMinimalSet(ctx context.Context, resolved map[string]string
 	}
 
 	convergedLinked, convergedPackages := l.linked, l.linkedPackages
-	tr, err := l.trialApply(ctx, essential)
+	tr, err := l.trialApply(ctx, "refine: minimal set", essential)
 	if err != nil || len(tr.raises) > 0 ||
 		introducesNewVulns(tr.residuals, l.scanResiduals) || !l.sustained(tr, essential) {
 		l.linked, l.linkedPackages = convergedLinked, convergedPackages
@@ -1645,7 +1648,7 @@ func (l *loop) compileGate(ctx context.Context, resolved map[string]string, resu
 	}
 	l.gateResiduals = make(map[string]Residual)
 
-	st, reject, err := l.gateTry(ctx, active)
+	st, reject, err := l.gateTry(ctx, "gate: converged set", "", active)
 	if err != nil {
 		return nil, err
 	}
@@ -1669,7 +1672,7 @@ func (l *loop) compileGate(ctx context.Context, resolved map[string]string, resu
 		if !added {
 			break
 		}
-		st, reject, err = l.gateTry(ctx, l.activeCandidates())
+		st, reject, err = l.gateTry(ctx, "gate: coherence round", "", l.activeCandidates())
 		if err != nil {
 			return nil, err
 		}
@@ -1687,15 +1690,19 @@ func (l *loop) compileGate(ctx context.Context, resolved map[string]string, resu
 // gateTry applies exactly keep and compiles it. A non-empty reject reason
 // means keep itself would not resolve (a trial verdict, not an error); an
 // error means the gate cannot continue (cancellation, tool failure).
-func (l *loop) gateTry(ctx context.Context, keep []*candState) (*gateState, string, error) {
+// purpose/subject only label the trial's debug record (see logTrial).
+func (l *loop) gateTry(ctx context.Context, purpose, subject string, keep []*candState) (*gateState, string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, "", err
 	}
-	if err := l.applyExact(ctx, l.inApplyOrder(keep)); err != nil {
+	ordered := l.inApplyOrder(keep)
+	if err := l.applyExact(ctx, ordered); err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, "", cerr
 		}
-		return nil, firstLine(err.Error()), nil
+		reject := firstLine(err.Error())
+		l.logTrial(ctx, trialLog{purpose: purpose, subject: subject, pins: ordered, reject: reject})
+		return nil, reject, nil
 	}
 	resolved, err := l.tc.ListModules(ctx, l.dir)
 	if err != nil {
@@ -1714,7 +1721,9 @@ func (l *loop) gateTry(ctx context.Context, keep []*candState) (*gateState, stri
 			failures[pkg] = lines
 		}
 	}
-	return &gateState{report: report, resolved: resolved, failures: failures}, "", nil
+	st := &gateState{report: report, resolved: resolved, failures: failures}
+	l.logTrial(ctx, trialLog{purpose: purpose, subject: subject, pins: ordered, resolved: resolved, compiled: st})
+	return st, "", nil
 }
 
 // inApplyOrder orders a candidate subset like apply does: ambiguity
@@ -1855,17 +1864,20 @@ func (l *loop) addCoherenceRemedies(ctx context.Context, st *gateState, suspects
 		if len(outgrown) == 0 {
 			continue
 		}
+		ownerVersion := st.resolved[owner]
 		if _, done := remedied[owner]; done {
+			l.logRepair(ctx, repairLog{module: owner, from: ownerVersion, outgrown: outgrown, skip: "already repaired in this gate"})
 			continue
 		}
 		if _, blamed := suspects[owner]; blamed {
+			l.logRepair(ctx, repairLog{module: owner, from: ownerVersion, outgrown: outgrown, skip: "owner is itself a blamed candidate"})
 			continue
 		}
 		if c, ok := l.byModule[owner]; ok && !c.dropped && (c.Replace || c.remedy) {
+			l.logRepair(ctx, repairLog{module: owner, from: ownerVersion, outgrown: outgrown, skip: "owner is a replace or ambiguity-remedy candidate"})
 			continue
 		}
 		remedied[owner] = struct{}{}
-		ownerVersion := st.resolved[owner]
 
 		version, err := l.minCoherentVersion(ctx, owner, ownerVersion, outgrown)
 		if err != nil {
@@ -1878,6 +1890,7 @@ func (l *loop) addCoherenceRemedies(ctx context.Context, st *gateState, suspects
 		if version == "" {
 			logging.From(ctx).Debug("compile gate: no coherent version for failing module",
 				"modroot", l.req.Modroot, "module", owner, "version", ownerVersion)
+			l.logRepair(ctx, repairLog{module: owner, from: ownerVersion, outgrown: outgrown, skip: "no coherent version (version walk and omnibump co-update both empty)"})
 			continue
 		}
 
@@ -1888,6 +1901,8 @@ func (l *loop) addCoherenceRemedies(ctx context.Context, st *gateState, suspects
 		}
 		state := l.addCandidate(Candidate{Module: owner, Version: version}, false)
 		if previous != "" && state.Version == previous {
+			l.logRepair(ctx, repairLog{module: owner, from: ownerVersion, to: version, source: source, outgrown: outgrown,
+				skip: "existing candidate already at or above " + previous})
 			continue // already at or above the coherent version
 		}
 		if previous != "" {
@@ -1916,6 +1931,8 @@ func (l *loop) addCoherenceRemedies(ctx context.Context, st *gateState, suspects
 		added = true
 		logging.From(ctx).Info("compile gate: coherence raise",
 			"modroot", l.req.Modroot, "module", owner, "from", ownerVersion, "to", state.Version, "source", source)
+		l.logRepair(ctx, repairLog{module: owner, from: ownerVersion, to: state.Version, source: source, outgrown: outgrown,
+			supports: sortedKeys(state.coherenceFor)})
 	}
 	return added, nil
 }
@@ -2033,7 +2050,7 @@ func (l *loop) gateGreedy(ctx context.Context, suspects map[string]*candState, r
 	}
 
 	keep := baseSet()
-	st, reject, err := l.gateTry(ctx, keep)
+	st, reject, err := l.gateTry(ctx, "gate: unblamed base", "", keep)
 	if err != nil {
 		return nil, err
 	}
@@ -2046,7 +2063,7 @@ func (l *loop) gateGreedy(ctx context.Context, suspects map[string]*candState, r
 			}
 		}
 		keep = baseSet()
-		if st, reject, err = l.gateTry(ctx, keep); err != nil {
+		if st, reject, err = l.gateTry(ctx, "gate: widened base", "", keep); err != nil {
 			return nil, err
 		}
 		if reject != "" {
@@ -2095,7 +2112,7 @@ func (l *loop) gateGreedy(ctx context.Context, suspects map[string]*candState, r
 			}
 		}
 
-		st, reject, err := l.gateTry(ctx, trial)
+		st, reject, err := l.gateTry(ctx, "gate: admit", suspect.Module, trial)
 		if err != nil {
 			return nil, err
 		}
@@ -2104,6 +2121,8 @@ func (l *loop) gateGreedy(ctx context.Context, suspects map[string]*candState, r
 			for _, c := range partners {
 				accepted[c] = struct{}{}
 			}
+			logging.From(ctx).Debug("compile gate: admitted bump", "modroot", l.req.Modroot,
+				"module", suspect.Module, "version", suspect.Version, "partners", len(partners))
 			continue
 		}
 
@@ -2153,7 +2172,7 @@ func (l *loop) rejectForCompile(ctx context.Context, c *candState, reason string
 // fix the rescan wants is surfaced as a residual rather than raised (it was
 // never compile-validated).
 func (l *loop) gateFinish(ctx context.Context, keep []*candState, result *ModrootResult) (map[string]string, error) {
-	tr, err := l.trialApply(ctx, l.inApplyOrder(keep))
+	tr, err := l.trialApply(ctx, "gate: adopt accepted set", l.inApplyOrder(keep))
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr
@@ -2180,6 +2199,197 @@ func (l *loop) gateFinish(ctx context.Context, keep []*candState, result *Modroo
 		})
 	}
 	return tr.resolved, nil
+}
+
+// Trial tracing (Debug level only; see logTrial/logRepair). The message
+// strings are stable: tests capture these records to assert what each trial
+// applied, so later stages that restructure the trials must keep emitting
+// them.
+const (
+	trialLogMsg  = "simulate: trial"
+	repairLogMsg = "simulate: repair decision"
+
+	maxTrialLogDiff   = 25 // changed modules listed per trial record
+	maxTrialLogErrors = 3  // compile error lines listed per trial record
+)
+
+// trialLog describes one trial for logTrial: the pins it applied (in apply
+// order), and whichever outcome applies - a resolve/tidy rejection, a
+// compile report (gate trials), or a rescan (refinement trials).
+type trialLog struct {
+	purpose   string
+	subject   string // module the trial is about, when it has one (gate admission)
+	pins      []*candState
+	reject    string
+	resolved  map[string]string
+	compiled  *gateState
+	raises    []raise
+	residuals int
+}
+
+// pinRole names the provenance a pin carries in the loop, for tracing:
+// remedy (ambiguous-import repair), coherence (compile-gate co-update),
+// cve (advisory-backed), seed (caller-provided, no advisory), raise.
+func pinRole(c *candState) string {
+	switch {
+	case c.remedy:
+		return "remedy"
+	case c.coherence || c.coherenceVersion != "":
+		return "coherence"
+	case c.FromCVE:
+		return "cve"
+	case c.seed:
+		return "seed"
+	default:
+		return "raise"
+	}
+}
+
+// trialPin renders a pin as "module@version(role)", replaces as
+// "old=module@version(role)".
+func trialPin(c *candState) string {
+	coord := c.Module + "@" + c.Version
+	if c.Replace {
+		coord = c.OldPath() + "=" + coord
+	}
+	return coord + "(" + pinRole(c) + ")"
+}
+
+// logTrial emits one structured Debug record per trial: the pins applied
+// with their roles, the resolved graph's changes against the pristine
+// baseline (capped), and the outcome. It returns immediately when Debug is
+// disabled, so the formatting costs nothing on normal runs.
+func (l *loop) logTrial(ctx context.Context, tl trialLog) {
+	logger := logging.From(ctx)
+	if !logger.Enabled(ctx, slog.LevelDebug) {
+		return
+	}
+	pins := make([]string, 0, len(tl.pins))
+	for _, c := range tl.pins {
+		pins = append(pins, trialPin(c))
+	}
+	attrs := []any{"modroot", l.req.Modroot, "purpose", tl.purpose, "pins", pins}
+	if tl.subject != "" {
+		attrs = append(attrs, "subject", tl.subject)
+	}
+	if tl.reject != "" {
+		attrs = append(attrs, "outcome", "rejected", "reject", firstLine(tl.reject))
+		logger.Debug(trialLogMsg, attrs...)
+		return
+	}
+	if tl.resolved != nil {
+		attrs = append(attrs, "resolved_diff", l.resolvedDiff(tl.resolved))
+	}
+	if st := tl.compiled; st != nil {
+		outcome := "compiles"
+		if len(st.failures) > 0 {
+			outcome = "breaks compile"
+		}
+		attrs = append(attrs, "outcome", outcome, "failing", len(st.failures))
+		if len(st.failures) > 0 {
+			attrs = append(attrs, "failing_owners", failingOwners(st), "errors", firstCompileErrors(st.failures, maxTrialLogErrors))
+		}
+	} else {
+		raises := make([]string, 0, len(tl.raises))
+		for _, r := range tl.raises {
+			raises = append(raises, r.module+"@"+r.version)
+		}
+		attrs = append(attrs, "outcome", "resolved", "raises", raises, "residuals", tl.residuals)
+	}
+	logger.Debug(trialLogMsg, attrs...)
+}
+
+// resolvedDiff lists the modules whose resolved version differs from the
+// pristine baseline graph ("module old->new"; "-" for absent), capped at
+// maxTrialLogDiff with a trailing "+N more". The baseline is the compile
+// gate's pristine tidied graph when known, else the caller's go.mod view.
+func (l *loop) resolvedDiff(resolved map[string]string) []string {
+	baseline := l.baselineResolved
+	if baseline == nil {
+		baseline = l.req.Baseline
+	}
+	orDash := func(v string) string {
+		if v == "" {
+			return "-"
+		}
+		return v
+	}
+	var changed []string
+	for _, module := range sortedKeys(resolved) {
+		if resolved[module] != baseline[module] {
+			changed = append(changed, module+" "+orDash(baseline[module])+"->"+resolved[module])
+		}
+	}
+	for _, module := range sortedKeys(baseline) {
+		if _, ok := resolved[module]; !ok {
+			changed = append(changed, module+" "+baseline[module]+"->-")
+		}
+	}
+	if len(changed) > maxTrialLogDiff {
+		more := len(changed) - maxTrialLogDiff
+		changed = append(changed[:maxTrialLogDiff], fmt.Sprintf("+%d more", more))
+	}
+	return changed
+}
+
+// failingOwners lists the distinct modules owning a trial's newly failing
+// packages ("(main)" for the main module), sorted.
+func failingOwners(st *gateState) []string {
+	owners := make(map[string]struct{})
+	for pkg := range st.failures {
+		owner := st.report.Modules[pkg]
+		if owner == "" {
+			owner = "(main)"
+		}
+		owners[owner] = struct{}{}
+	}
+	return sortedKeys(owners)
+}
+
+// firstCompileErrors renders up to n compile failures, one line each, in
+// package order (see firstCompileError for the line shape).
+func firstCompileErrors(failures map[string][]string, n int) []string {
+	var lines []string
+	for _, pkg := range sortedKeys(failures) {
+		if len(lines) == n {
+			break
+		}
+		lines = append(lines, firstCompileError(map[string][]string{pkg: failures[pkg]}))
+	}
+	return lines
+}
+
+// repairLog describes one compile-gate repair decision for logRepair: the
+// failing module, its version, the raised dependencies that outgrew it,
+// and either the chosen raise (to/source/supports) or the skip reason.
+type repairLog struct {
+	module, from, to, source string
+	outgrown                 map[string]string
+	supports                 []string
+	skip                     string
+}
+
+// logRepair emits one structured Debug record per repair decision (free
+// when Debug is disabled).
+func (l *loop) logRepair(ctx context.Context, rl repairLog) {
+	logger := logging.From(ctx)
+	if !logger.Enabled(ctx, slog.LevelDebug) {
+		return
+	}
+	outgrown := make([]string, 0, len(rl.outgrown))
+	for _, dep := range sortedKeys(rl.outgrown) {
+		outgrown = append(outgrown, dep+"@"+rl.outgrown[dep])
+	}
+	attrs := []any{"modroot", l.req.Modroot, "module", rl.module, "from", rl.from, "outgrown", outgrown}
+	if rl.skip != "" {
+		attrs = append(attrs, "decision", "skip", "reason", rl.skip)
+		if rl.to != "" {
+			attrs = append(attrs, "to", rl.to, "source", rl.source)
+		}
+	} else {
+		attrs = append(attrs, "decision", "raise", "to", rl.to, "source", rl.source, "supports", rl.supports)
+	}
+	logger.Debug(repairLogMsg, attrs...)
 }
 
 // firstCompileError renders the first (by package path) compile failure as
