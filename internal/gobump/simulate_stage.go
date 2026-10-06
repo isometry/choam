@@ -2,6 +2,7 @@ package gobump
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -62,27 +63,6 @@ func NewSimulationStage(analyzer *Analyzer, opts ProcessorOptions) *SimulationSt
 	}
 }
 
-// compileGateCoUpdates adapts omnibump's DetectCoUpdates (the analysis behind
-// the build's "REQUIRED CO-UPDATES" advisory) for the simulation's compile
-// gate: module -> recommended minimum version. Bounded and panic-guarded
-// like declareCoUpdates' use; any failure yields no recommendations.
-func compileGateCoUpdates(ctx context.Context, packagesToUpdate map[string]string, modFile *modfile.File) (recommended map[string]string) {
-	defer func() {
-		if r := recover(); r != nil {
-			logging.From(ctx).Debug("compile-gate co-update analysis panicked - skipping", "recover", r)
-			recommended = nil
-		}
-	}()
-	ctx, cancel := context.WithTimeout(ctx, coUpdateBudget)
-	defer cancel()
-	missing, _ := omnibumpgolang.DetectCoUpdates(ctx, packagesToUpdate, modFile)
-	recommended = make(map[string]string, len(missing))
-	for module, dep := range missing {
-		recommended[module] = dep.RequiredVersion
-	}
-	return recommended
-}
-
 // defaultDetectCoUpdates wraps omnibump's DetectCoUpdates - the exact
 // function melange's bump pipeline runs at build time - discarding its
 // API-compat alert map (a heuristic "verify manually" tier, not actionable
@@ -96,7 +76,6 @@ func defaultSimulator(ctx context.Context, opts ProcessorOptions, analyzer *Anal
 	simOpts := simulate.Options{
 		Budget:    opts.SimulationTimeout,
 		NoCompile: !opts.Compile,
-		CoUpdates: compileGateCoUpdates,
 	}.WithDefaults()
 	toolchain, err := simulate.NewToolchain(ctx, simOpts.CommandTimeout)
 	if err != nil {
@@ -168,6 +147,12 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
 				return cerr
+			}
+			if s.failClosed(err) {
+				// The compile gate could not prove the candidate set builds:
+				// writing it (or the raw pre-simulation set) could break the
+				// build, so fail the file and leave its deps untouched.
+				return fmt.Errorf("bump simulation could not validate the deps (file left unchanged): %w", err)
 			}
 			s.degrade(ctx, gp, err)
 			return nil
@@ -412,6 +397,14 @@ func (s *SimulationStage) safeDetectCoUpdates(ctx context.Context, packagesToUpd
 	return s.detectCoUpdates(ctx, packagesToUpdate, modFile)
 }
 
+// failClosed reports whether a simulation error must fail the file instead
+// of degrading to the unvalidated candidate set: a compile-gate failure, or
+// a timeout while the gate is enabled (the set was never proven to compile).
+func (s *SimulationStage) failClosed(err error) bool {
+	return errors.Is(err, simulate.ErrCompileGate) ||
+		(s.Options.Compile && errors.Is(err, context.DeadlineExceeded))
+}
+
 // degrade falls back to the unvalidated pre-simulation candidate set,
 // loudly: the written deps list has not been proven to resolve or to cover
 // every advisory. Callers must check ctx.Err() before calling this - a
@@ -430,9 +423,17 @@ func (s *SimulationStage) degrade(ctx context.Context, gp *GoBumpProcessor, err 
 // seed for an already-replace-claimed module into the replace channel.
 func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 	bumpByModule := make(map[string]*simulateBumpInfo)
+	var vulns []scan.Vulnerability
 	if m.ScanResult != nil {
+		vulns = m.ScanResult.Vulnerabilities
 		for _, bump := range m.ScanResult.SecurityBumps {
-			bumpByModule[bump.Name] = &simulateBumpInfo{vulnIDs: bump.VulnIDs, severity: bump.Severity}
+			bumpByModule[bump.Name] = &simulateBumpInfo{name: bump.Name, current: bump.CurrentVersion, vulnIDs: bump.VulnIDs, severity: bump.Severity}
+		}
+	}
+	existingVersions := make(map[string][]string)
+	for _, dep := range m.ExistingDeps {
+		if module, version, ok := splitCoordVersion(dep); ok {
+			existingVersions[module] = append(existingVersions[module], version)
 		}
 	}
 	infoFor := func(module string) *simulateBumpInfo {
@@ -477,6 +478,19 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 			candidate.FromCVE = true
 			candidate.VulnIDs = info.vulnIDs
 			candidate.Severity = info.severity
+			// The fix ladder keeps every advisory's own fix version and the
+			// existing YAML pin, which FilterBumps merged into one (the
+			// highest) version: the compile gate relaxes down these rungs.
+			// A single rung is implied by the candidate itself.
+			also := []string{version}
+			for _, existing := range existingVersions[module] {
+				if semver.Compare(existing, info.current) > 0 {
+					also = append(also, existing) // a pin at/below the vulnerable baseline is no rung
+				}
+			}
+			if rungs := simulate.FixRungs(vulns, info.name, info.vulnIDs, also...); len(rungs) > 1 {
+				candidate.Rungs = rungs
+			}
 		}
 		seeds = append(seeds, candidate)
 	}
@@ -484,6 +498,8 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 }
 
 type simulateBumpInfo struct {
+	name     string // OSV module name (no /vN suffix)
+	current  string // vulnerable version the analysis scanned
 	vulnIDs  []string
 	severity string
 }

@@ -16,7 +16,6 @@ import (
 	"github.com/isometry/choam/internal/scan"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
 )
 
@@ -2409,37 +2408,12 @@ func TestCompileGate_ExistingEntryIsAFloor(t *testing.T) {
 	assert.Empty(t, result.Residuals)
 }
 
-func TestCompileGate_CoUpdateFallback(t *testing.T) {
-	// No released exporter version the walk can see is built against the
-	// raised api; omnibump's co-update recommendation supplies the target.
-	tc := otelLikeCompiler(&fakeToolchain{base: map[string]string{
-		"example.com/api":      "v0.19.0",
-		"example.com/exporter": "v0.19.0",
-	}}, []string{"v0.19.0", "v0.20.0"})
-	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/api", id: "GO-1", fixed: "v0.21.0"}}}
-	var coUpdateCalls int
-
-	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
-		Modroot:  ".",
-		Seeds:    []Candidate{{Module: "example.com/api", Version: "v0.21.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
-		Baseline: map[string]string{"example.com/api": "v0.19.0", "example.com/exporter": "v0.19.0"},
-	}, Options{CoUpdates: func(_ context.Context, updates map[string]string, _ *modfile.File) map[string]string {
-		coUpdateCalls++
-		assert.Equal(t, map[string]string{"example.com/api": "v0.21.0"}, updates)
-		return map[string]string{"example.com/exporter": "v0.21.0"}
-	}})
-
-	require.NoError(t, err)
-	assert.Equal(t, 1, coUpdateCalls)
-	assert.Equal(t, []string{"example.com/api@v0.21.0", "example.com/exporter@v0.21.0"}, result.FinalDeps)
-	assert.Empty(t, result.Residuals)
-}
-
-func TestCompileGate_GreedySeverityOrderAndResidualReason(t *testing.T) {
-	// a and b each compile alone but not together, and no coherence raise
-	// can help (the conflict is in main-module code). The CRITICAL fix wins
-	// even though the LOW one was seeded first; the loser is reported as a
-	// "breaks compile" residual.
+func TestCompileGate_RelaxSeverityOrderAndResidualReason(t *testing.T) {
+	// a and b each compile alone but not together, and no repair can help
+	// (the conflict is in main-module code). Both are implicated; the LOW
+	// fix is relaxed (dropped: it has one rung) even though the CRITICAL
+	// one was seeded later; the loser is reported as a "breaks compile"
+	// residual.
 	tc := &fakeCompiler{
 		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"}},
 		requires:      map[string]map[string]string{},
@@ -2484,6 +2458,148 @@ func TestCompileGate_GreedySeverityOrderAndResidualReason(t *testing.T) {
 	})
 }
 
+// brokenAbove is a compileFn whose module's own package fails to compile
+// at or above version.
+func brokenAbove(module, version string) func(map[string]string) *CompileReport {
+	return func(resolved map[string]string) *CompileReport {
+		report := &CompileReport{Failed: map[string][]string{}, Modules: map[string]string{module: module}}
+		if semver.Compare(resolved[module], version) >= 0 {
+			report.Failed[module] = []string{"/modcache/" + module + "@" + resolved[module] + "/x.go:1:2: broken"}
+		}
+		return report
+	}
+}
+
+func TestCompileGate_StepsDownFixRungs(t *testing.T) {
+	// x has three fix rungs; v1.3.0 and v1.2.0 do not compile. The gate
+	// steps down one rung at a time to v1.1.0 (never to baseline), and only
+	// the advisories fixed solely above it remain, citing the rejection.
+	tc := &fakeCompiler{
+		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}},
+		compileFn:     brokenAbove("example.com/x", "v1.2.0"),
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/x", id: "GO-HIGH", fixed: "v1.1.0", severity: "HIGH"},
+		{module: "example.com/x", id: "GO-MED", fixed: "v1.2.0", severity: "MEDIUM"},
+		{module: "example.com/x", id: "GO-LOW", fixed: "v1.3.0", severity: "LOW"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{{
+			Module: "example.com/x", Version: "v1.3.0", FromCVE: true, VulnIDs: []string{"GO-HIGH", "GO-LOW", "GO-MED"}, Severity: "HIGH",
+			Rungs: FixRungs(sc.mustScan(t, "example.com/x", "v1.0.0"), "example.com/x", nil),
+		}},
+		Baseline: map[string]string{"example.com/x": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/x@v1.1.0"}, result.FinalDeps)
+	assert.Equal(t, "v1.1.0", result.Resolved["example.com/x"])
+	require.Len(t, result.Residuals, 1)
+	assert.ElementsMatch(t, []string{"GO-LOW", "GO-MED"}, result.Residuals[0].VulnIDs)
+	assert.Equal(t, "breaks compile: example.com/x: x.go:1:2: broken", result.Residuals[0].Reason)
+	assert.Empty(t, result.Dropped, "relaxed, not dropped")
+	assert.Equal(t, 4, tc.compiles, "baseline plus one trial per rung")
+}
+
+// mustScan returns the fake's findings for module@version.
+func (f *fakeScanner) mustScan(t *testing.T, module, version string) []scan.Vulnerability {
+	t.Helper()
+	result, err := f.ScanPackages(t.Context(), []scan.Package{{Name: module, Version: version, Ecosystem: "Go"}})
+	require.NoError(t, err)
+	f.scans--
+	return result.Vulnerabilities
+}
+
+func TestCompileGate_RelaxesImplicatedBeforeLessSevere(t *testing.T) {
+	// b's own package breaks at its fix; a (LOW, otherwise first to go) is
+	// not implicated and must survive. b has one rung, so it is dropped.
+	tc := &fakeCompiler{
+		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"}},
+		compileFn:     brokenAbove("example.com/b", "v1.1.0"),
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/a", id: "GO-A", fixed: "v1.1.0", severity: "LOW"},
+		{module: "example.com/b", id: "GO-B", fixed: "v1.1.0", severity: "CRITICAL"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/a", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-A"}, Severity: "LOW"},
+			{Module: "example.com/b", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-B"}, Severity: "CRITICAL"},
+		},
+		Baseline: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/a@v1.1.0"}, result.FinalDeps)
+	require.Len(t, result.Residuals, 1)
+	assert.Equal(t, "example.com/b", result.Residuals[0].Module)
+	assert.Equal(t, []string{"GO-B"}, result.Residuals[0].VulnIDs)
+}
+
+func TestCompileGate_RepairsVictimThatIsAlsoImplicated(t *testing.T) {
+	// The otlploghttp shape: the exporter is a CVE candidate whose own fix
+	// version requires api above baseline (so it is implicated in the api
+	// raise) AND the module that breaks. It must be repaired in place to the
+	// coherent version, not skipped or relaxed.
+	tc := otelLikeCompiler(&fakeToolchain{base: map[string]string{
+		"example.com/api":      "v0.18.0",
+		"example.com/exporter": "v0.18.0",
+	}}, []string{"v0.18.0", "v0.19.0", "v0.20.0", "v0.21.0", "v0.22.0"})
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/api", id: "GO-1", fixed: "v0.21.0"},
+		{module: "example.com/exporter", id: "GO-2", fixed: "v0.19.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/exporter", Version: "v0.19.0", FromCVE: true, VulnIDs: []string{"GO-2"}},
+			{Module: "example.com/api", Version: "v0.21.0", FromCVE: true, VulnIDs: []string{"GO-1"}},
+		},
+		Baseline: map[string]string{"example.com/api": "v0.18.0", "example.com/exporter": "v0.18.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/exporter@v0.21.0", "example.com/api@v0.21.0"}, result.FinalDeps)
+	assert.Empty(t, result.Residuals)
+	assert.Empty(t, result.Dropped)
+	assert.Equal(t, 3, tc.compiles, "baseline, failing set, repaired set")
+}
+
+func TestCompileGate_FailsClosed(t *testing.T) {
+	seeds := []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
+	for _, tt := range []struct {
+		name   string
+		failAt int // compile call that fails (1 = baseline)
+	}{{"baseline unavailable", 1}, {"trial tool failure", 2}} {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := &failingCompiler{fakeCompiler: &fakeCompiler{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}, failAt: tt.failAt}
+			_, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{Modroot: ".", Seeds: seeds}, Options{})
+			require.ErrorIs(t, err, ErrCompileGate)
+		})
+	}
+
+}
+
+// failingCompiler fails the failAt-th Compile call as a tool failure.
+type failingCompiler struct {
+	*fakeCompiler
+	failAt int
+}
+
+func (f *failingCompiler) Compile(ctx context.Context, dir string, patterns, tags []string) (*CompileReport, error) {
+	if f.compiles+1 == f.failAt {
+		f.compiles++
+		return nil, errors.New("go list: exit status 2")
+	}
+	return f.fakeCompiler.Compile(ctx, dir, patterns, tags)
+}
+
 func TestCompileGate_CancellationPropagates(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	tc := &fakeCompiler{
@@ -2520,10 +2636,10 @@ func TestLogTrial_RecordShape(t *testing.T) {
 		{Candidate: Candidate{Module: "example.com/cve", Version: "v1.1.0", FromCVE: true}, seed: true},
 		{Candidate: Candidate{Module: "example.com/seed", Version: "v1.0.0"}, seed: true},
 		{Candidate: Candidate{Module: "example.com/rem", Version: latestQuery}, remedy: true},
-		{Candidate: Candidate{Module: "example.com/coh", Version: "v0.2.0"}, coherence: true},
+		{Candidate: Candidate{Module: "example.com/coh", Version: "v0.2.0"}, repair: true},
 		{Candidate: Candidate{Module: "example.com/new", Version: "v2.0.0", Replace: true, ReplaceOld: "example.com/old"}},
 	}
-	st := &gateState{
+	st := &trialOutcome{
 		report:   &CompileReport{Modules: map[string]string{"example.com/x/p": "example.com/x", "example.com/app": ""}},
 		resolved: resolved,
 		failures: map[string][]string{
@@ -2534,12 +2650,12 @@ func TestLogTrial_RecordShape(t *testing.T) {
 
 	trace := &traceCapture{}
 	ctx := logging.Into(t.Context(), slog.New(trace))
-	l.logTrial(ctx, trialLog{purpose: "gate: admit", subject: "example.com/cve", pins: pins, resolved: resolved, compiled: st})
+	l.logTrial(ctx, trialLog{purpose: "gate: relaxed", subject: "example.com/cve", pins: pins, resolved: resolved, compiled: st})
 	l.logTrial(ctx, trialLog{purpose: "refine: minimal set", pins: pins[:1], reject: "go: boom\nmore"})
 	l.logTrial(ctx, trialLog{purpose: "refine: minimal set", pins: pins[:1], resolved: resolved, raises: []raise{{module: "example.com/r", version: "v1.2.0"}}, residuals: 2})
 	l.logRepair(ctx, repairLog{module: "example.com/s", from: "v0.1.0", to: "v0.2.0", source: "version walk",
-		outgrown: map[string]string{"example.com/api": "v0.2.0"}, supports: []string{"example.com/b"}})
-	l.logRepair(ctx, repairLog{module: "example.com/s", from: "v0.1.0", skip: "owner is itself a blamed candidate"})
+		outgrown: map[string]string{"example.com/api": "v0.2.0"}})
+	l.logRepair(ctx, repairLog{module: "example.com/s", from: "v0.1.0", skip: "no coherent version"})
 
 	require.Len(t, trace.records, 5)
 	gate := trace.records[0].attrs
@@ -2566,13 +2682,13 @@ func TestLogTrial_RecordShape(t *testing.T) {
 	assert.Equal(t, repairLogMsg, trace.records[3].msg)
 	assert.Equal(t, "raise", trace.records[3].attrs["decision"])
 	assert.Equal(t, []string{"example.com/api@v0.2.0"}, trace.records[3].attrs["outgrown"])
-	assert.Equal(t, []string{"example.com/b"}, trace.records[3].attrs["supports"])
+	assert.Equal(t, "v0.2.0", trace.records[3].attrs["to"])
 	assert.Equal(t, "skip", trace.records[4].attrs["decision"])
-	assert.Equal(t, "owner is itself a blamed candidate", trace.records[4].attrs["reason"])
+	assert.Equal(t, "no coherent version", trace.records[4].attrs["reason"])
 
 	var buf bytes.Buffer
 	quiet := logging.Into(t.Context(), slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-	l.logTrial(quiet, trialLog{purpose: "gate: admit", pins: pins, resolved: resolved, compiled: st})
+	l.logTrial(quiet, trialLog{purpose: "gate: relaxed", pins: pins, resolved: resolved, compiled: st})
 	l.logRepair(quiet, repairLog{module: "example.com/s", skip: "x"})
 	assert.Empty(t, buf.String(), "trace records are Debug-only")
 }

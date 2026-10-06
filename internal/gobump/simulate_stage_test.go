@@ -3,6 +3,7 @@ package gobump
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -149,6 +150,38 @@ func TestSimulationStage_DegradesOnSimulatorError(t *testing.T) {
 	assert.False(t, modroot.Simulated)
 	require.NotEmpty(t, gp.Messages)
 	assert.Contains(t, gp.Messages[len(gp.Messages)-1], "NOT validated")
+}
+
+// TestSimulationStage_FailsClosedOnCompileGate: a compile-gate failure (or a
+// timeout with the gate enabled) must fail the file, never fall through to
+// the raw pre-simulation candidates.
+func TestSimulationStage_FailsClosedOnCompileGate(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		err     error
+		compile bool
+	}{
+		{"gate error", fmt.Errorf("simulating modroot .: %w: baseline: boom", simulate.ErrCompileGate), false},
+		{"budget timeout with gate on", fmt.Errorf("simulating modroot .: %w", context.DeadlineExceeded), true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			stage := newStageWithFake(&fakeBumpSimulator{err: tt.err})
+			stage.Options.Compile = tt.compile
+			gp := newSimulationProcessor()
+
+			err := stage.Apply(t.Context(), gp)
+			require.ErrorIs(t, err, tt.err)
+			assert.Contains(t, err.Error(), "file left unchanged")
+			assert.False(t, gp.Validated)
+			for _, msg := range gp.Messages {
+				assert.NotContains(t, msg, "NOT validated", "must not degrade to the unvalidated set")
+			}
+		})
+	}
+
+	// Without the gate, a timeout still degrades (unchanged behaviour).
+	stage := newStageWithFake(&fakeBumpSimulator{err: context.DeadlineExceeded})
+	require.NoError(t, stage.Apply(t.Context(), newSimulationProcessor()))
 }
 
 func TestSimulationStage_DegradesWhenToolchainMissing(t *testing.T) {
@@ -1053,7 +1086,7 @@ func TestSimulationStage_DegradedUnreachableCrossModrootReachable(t *testing.T) 
 }
 
 // TestSeedCandidates_ThreadsSeverity: the analysis scan's per-bump severity
-// reaches simulate.Candidate (the compile gate re-admits most-severe-first).
+// reaches simulate.Candidate (the compile gate relaxes least-severe-first).
 func TestSeedCandidates_ThreadsSeverity(t *testing.T) {
 	seeds := seedCandidates(ModrootAnalysis{
 		DesiredDeps: []string{"example.com/a@v1.1.0", "example.com/b@v1.2.0"},

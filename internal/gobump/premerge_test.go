@@ -103,7 +103,7 @@ func TestSeedCandidates_PreLoopMergeKeepsFixRungs(t *testing.T) {
 	}
 	t.Logf("desired deps: %v; otel/sdk seeds: %+v", desired, sdkSeeds)
 
-	knownDefect(t, defectPreLoopMerge, func(t require.TestingT) {
+	assertFixed(t, defectPreLoopMerge, func(t require.TestingT) {
 		require.NotEmpty(t, sdkSeeds, "otel/sdk must be seeded")
 		rendered := fmt.Sprintf("%+v", sdkSeeds)
 		for _, rung := range []string{"v1.45.0", "v1.43.0"} {

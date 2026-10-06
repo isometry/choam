@@ -9,10 +9,11 @@ package simulate
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/isometry/choam/internal/scan"
-	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/semver"
 )
 
 // Toolchain abstracts the go tool operations the simulation needs. The real
@@ -81,7 +82,8 @@ type CompileReport struct {
 	// Modules maps every non-standard package in the graph to its module
 	// path (replacement applied); "" for main-module packages.
 	Modules map[string]string
-	// Imports holds the direct imports of each failed package, for blame.
+	// Imports holds the direct imports of each failed package, for repair
+	// and relaxation attribution.
 	Imports map[string][]string
 	// FileModules maps module-cache file paths named in error lines
 	// (<GOMODCACHE>/<mod>@<ver>/...) back to "module@version".
@@ -111,9 +113,15 @@ type Candidate struct {
 	FromCVE bool
 	VulnIDs []string
 	// Severity is the most severe advisory level the candidate addresses
-	// (scan.SeverityRank vocabulary; empty when unknown). The compile gate
-	// re-admits blamed candidates most-severe-first.
+	// (scan.SeverityRank vocabulary; empty when unknown).
 	Severity string
+
+	// Rungs is the candidate's fix ladder, highest first: one rung per
+	// distinct advisory fix version (plus an existing YAML version), each
+	// with the advisories it first fixes. The compile gate relaxes a
+	// candidate whose version breaks the build one rung down. Empty means
+	// the single rung {Version, VulnIDs, Severity}.
+	Rungs []Rung
 
 	// Replace marks a candidate applied as a go.mod replace directive
 	// (survives `go mod tidy`, unlike a plain require pin) rather than a
@@ -131,6 +139,63 @@ func (c Candidate) OldPath() string {
 		return c.ReplaceOld
 	}
 	return c.Module
+}
+
+// Rung is one step of a candidate's fix ladder: a target version and the
+// advisories (with their most severe level) first fixed at it.
+type Rung struct {
+	Version  string
+	VulnIDs  []string
+	Severity string
+}
+
+// fixRungs returns c's ladder, defaulting to its single implicit rung.
+func (c Candidate) fixRungs() []Rung {
+	if len(c.Rungs) > 0 {
+		return c.Rungs
+	}
+	return []Rung{{Version: c.Version, VulnIDs: c.VulnIDs, Severity: c.Severity}}
+}
+
+// FixRungs builds module's fix ladder from scan findings: one rung per
+// distinct fixed version among module's advisories (restricted to ids when
+// non-empty), plus a bare rung for each of also not already present
+// (existing pins), highest first.
+func FixRungs(vulns []scan.Vulnerability, module string, ids []string, also ...string) []Rung {
+	var rungs []Rung
+	for _, v := range vulns {
+		if v.Module != module || v.FixedVersion == "" || (len(ids) > 0 && !slices.Contains(ids, v.ID)) {
+			continue
+		}
+		rungs = mergeRungs(rungs, []Rung{{Version: v.FixedVersion, VulnIDs: []string{v.ID}, Severity: v.Severity}})
+	}
+	for _, version := range also {
+		rungs = mergeRungs(rungs, []Rung{{Version: version}})
+	}
+	return rungs
+}
+
+// mergeRungs unions two ladders by version (advisories merged, most severe
+// level kept), dropping non-semver versions (@latest), highest first.
+func mergeRungs(a, b []Rung) []Rung {
+	byVersion := make(map[string]*Rung)
+	var merged []Rung
+	for _, r := range append(append([]Rung{}, a...), b...) {
+		if !semver.IsValid(r.Version) {
+			continue
+		}
+		if existing, ok := byVersion[r.Version]; ok {
+			existing.VulnIDs = mergeIDs(existing.VulnIDs, r.VulnIDs)
+			existing.Severity = mergeSeverity(existing.Severity, r.Severity)
+			continue
+		}
+		byVersion[r.Version] = &Rung{Version: r.Version, VulnIDs: r.VulnIDs, Severity: r.Severity}
+	}
+	for _, r := range byVersion {
+		merged = append(merged, *r)
+	}
+	slices.SortFunc(merged, func(x, y Rung) int { return semver.Compare(y.Version, x.Version) })
+	return merged
 }
 
 // DroppedCandidate records a candidate removed during simulation and why.
@@ -273,11 +338,6 @@ type Options struct {
 	Budget time.Duration
 	// NoCompile disables the compile gate (see Compiler).
 	NoCompile bool
-	// CoUpdates, when set, returns omnibump's required co-update
-	// recommendations (module -> minimum version) for the given update set
-	// against the pristine go.mod. The compile gate uses them as a fallback
-	// coherence source for a failing module the version walk cannot repair.
-	CoUpdates func(ctx context.Context, packagesToUpdate map[string]string, modFile *modfile.File) map[string]string
 }
 
 // WithDefaults fills unset options.

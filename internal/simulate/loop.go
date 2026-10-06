@@ -2,6 +2,7 @@ package simulate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/isometry/choam/internal/goversion"
@@ -43,17 +45,9 @@ type candState struct {
 	// dropReason mirrors the DroppedCandidate reason, for backfill wording.
 	dropReason string
 
-	// Compile-gate coherence bookkeeping (see addCoherenceRemedies):
-	// coherence marks a candidate the gate created to keep a module
-	// compatible with a raised dependency; coherenceFrom is the
-	// pre-raise version of an EXISTING candidate the gate raised (existing
-	// entries are floors, not frozen pins); coherenceVersion is the raised
-	// target either way; coherenceFor lists the blamed candidates whose
-	// raises the coherence raise supports.
-	coherence        bool
-	coherenceFrom    string
-	coherenceVersion string
-	coherenceFor     map[string]struct{}
+	// repair marks a coherence-only pin the compile gate added to keep a
+	// module compatible with a raised dependency (see repairsFor).
+	repair bool
 }
 
 // drop marks the candidate dropped and records it with the given reason.
@@ -112,24 +106,21 @@ type loop struct {
 	// Compile gate (see compileGate): compiler is nil when the gate is off
 	// (toolchain without Compiler support, or Options.NoCompile).
 	// baselineFailed are the packages already failing to compile in the
-	// pristine checkout (excluded from blame); baselineResolved is the
-	// pristine tidied module graph; gateResiduals are the residuals of
-	// CVE-backed candidates the gate rejected, kept only while the final
-	// rescan still wants their fix; coUpdates memoizes CoUpdates.
+	// pristine checkout (excluded from every verdict); baselineResolved is
+	// the pristine tidied module graph.
 	compiler         Compiler
 	baselineFailed   map[string]struct{}
 	baselineResolved map[string]string
-	gateResiduals    map[string]Residual
-	coUpdates        map[string]string
-	coUpdatesLoaded  bool
 }
 
-// raise is a rescan finding that requires moving a module further forward.
+// raise is a rescan finding that requires moving a module further forward;
+// rungs are its per-advisory fix versions (see FixRungs).
 type raise struct {
 	module   string
 	version  string
 	vulnIDs  []string
 	severity string
+	rungs    []Rung
 }
 
 // RunLoop applies the seed candidates to the module at dir with the real go
@@ -410,6 +401,7 @@ func (l *loop) dropLocalReplacePinned(c Candidate, oldPath string) {
 
 func (l *loop) addCandidate(c Candidate, seed bool) *candState {
 	if existing, ok := l.byModule[c.Module]; ok && !existing.dropped {
+		existing.Rungs = mergeRungs(existing.fixRungs(), c.fixRungs())
 		if semver.Compare(c.Version, existing.Version) > 0 {
 			existing.Version = c.Version
 		}
@@ -1204,6 +1196,7 @@ func (l *loop) processScan(ctx context.Context, scanResult *scan.ScanResult, res
 			FromCVE:  true,
 			VulnIDs:  r.vulnIDs,
 			Severity: r.severity,
+			Rungs:    r.rungs,
 		}
 		// A raise for a replace-pinned module must update the replace - a
 		// plain `go get` cannot out-vote the directive. (Local-path pins
@@ -1287,7 +1280,8 @@ func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]str
 			})
 			continue
 		}
-		raises = append(raises, raise{module: bump.Name, version: bump.FixedVersion, vulnIDs: bump.VulnIDs, severity: bump.Severity})
+		raises = append(raises, raise{module: bump.Name, version: bump.FixedVersion, vulnIDs: bump.VulnIDs, severity: bump.Severity,
+			rungs: FixRungs(scanResult.Vulnerabilities, bump.Name, bump.VulnIDs)})
 	}
 
 	sort.Slice(raises, func(i, j int) bool { return raises[i].module < raises[j].module })
@@ -1584,18 +1578,46 @@ func (l *loop) finalOutputs(resolved map[string]string) ([]string, []string, []s
 	return deps, replaces, cveModules
 }
 
-// Compile-gate bounds: coherence rounds (each repairs every newly failing
-// module at most once) and versions inspected per module walk.
+// Compile-gate bounds: repair rounds per pin set (each repairs every newly
+// failing module at most once more) and versions inspected per module walk.
 const (
-	maxCoherenceRounds = 3
-	maxCoherenceWalk   = 40
+	maxRepairRounds  = 3
+	maxCoherenceWalk = 40
 )
 
-// gateState is the outcome of one compile-gate trial.
-type gateState struct {
+// ErrCompileGate marks a simulation the compile gate could not finish
+// (baseline unavailable, tool failure, budget exhausted, or a build that
+// fails with every bump relaxed). Callers must fail closed: the candidate
+// set was never proven to compile, so it must not be written.
+var ErrCompileGate = errors.New("compile gate failed")
+
+// gateErr wraps a compile-gate failure in ErrCompileGate, except that a
+// cancellation propagates as itself (it is not a gate verdict).
+func gateErr(ctx context.Context, err error) error {
+	if cerr := ctx.Err(); errors.Is(cerr, context.Canceled) {
+		return cerr
+	}
+	return fmt.Errorf("%w: %w", ErrCompileGate, err)
+}
+
+// trialOutcome is the outcome of one compile trial: a non-empty reject means
+// the pins did not resolve/tidy; otherwise failures are the packages failing
+// now but not at baseline.
+type trialOutcome struct {
+	reject   string
 	report   *CompileReport
 	resolved map[string]string
-	failures map[string][]string // packages failing now but not at baseline
+	failures map[string][]string
+}
+
+func (o *trialOutcome) passed() bool { return o.reject == "" && len(o.failures) == 0 }
+
+// why renders the outcome's failure as a drop/residual reason.
+func (o *trialOutcome) why() string {
+	if o.reject != "" {
+		return "breaks module graph: " + o.reject
+	}
+	return "breaks compile: " + firstCompileError(o.failures)
 }
 
 // compileBaseline compiles the pristine checkout once, after the initial
@@ -1607,18 +1629,15 @@ func (l *loop) compileBaseline(ctx context.Context) error {
 		return err
 	}
 	if err := l.tc.ModTidy(ctx, l.dir); err != nil {
-		return fmt.Errorf("initial go mod tidy: %w", err)
+		return gateErr(ctx, fmt.Errorf("baseline go mod tidy: %w", err))
 	}
 	resolved, err := l.tc.ListModules(ctx, l.dir)
 	if err != nil {
-		return err
+		return gateErr(ctx, err)
 	}
 	report, err := l.compiler.Compile(ctx, l.dir, l.buildPatterns, l.req.Tags)
 	if err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return cerr
-		}
-		return fmt.Errorf("compile gate baseline: %w", err)
+		return gateErr(ctx, fmt.Errorf("baseline: %w", err))
 	}
 	l.baselineResolved = resolved
 	l.baselineFailed = make(map[string]struct{}, len(report.Failed))
@@ -1632,98 +1651,194 @@ func (l *loop) compileBaseline(ctx context.Context) error {
 	return nil
 }
 
-// compileGate proves the final candidate set compiles: it re-applies the
-// set and compiles the build patterns, counting only failures absent from
-// the baseline. On failure it blames candidates, first tries bounded
-// coherence raises of the failing modules (never escalation: the minimal
-// version of a failing module that is built against the raised dependency),
-// then falls back to re-admitting blamed candidates greedily, most severe
-// first, rejecting each that breaks the build as a "breaks compile"
-// residual. Returns the adopted resolved graph; an error means the gate
-// could not finish (the caller must not trust the candidate set).
+// gateRun is the compile gate's search state: each candidate's fix ladder
+// (see ladder) and the index of its active rung. Candidates themselves are
+// never mutated until the accepted set is adopted.
+type gateRun struct {
+	ladders map[*candState][]Rung
+	at      map[*candState]int
+}
+
+func (g *gateRun) rung(c *candState) Rung { return g.ladders[c][g.at[c]] }
+
+// compileGate proves the final candidate set compiles, as a repair fixpoint
+// with relaxation: trial every candidate at its active rung; on failure,
+// add co-update repairs derived from that trial's failures and re-trial
+// (see repairFixpoint); if it still fails, step the implicated candidate
+// down one fix rung (see relaxTarget) - dropping it below its lowest rung -
+// and start over with repairs recomputed from scratch. Each relaxation
+// strictly lowers the pin set, so this terminates. The accepted set (pins
+// plus the repairs of the passing trial) is adopted and rescanned; any
+// advisory left unfixed by a relaxation becomes a residual carrying the
+// rejected rung's failure. Errors are ErrCompileGate (or a cancellation):
+// the caller must not trust the candidate set.
 func (l *loop) compileGate(ctx context.Context, resolved map[string]string, result *ModrootResult) (map[string]string, error) {
-	active := l.activeCandidates()
+	active := l.inApplyOrder(l.activeCandidates())
 	if len(active) == 0 {
 		return resolved, nil
 	}
-	l.gateResiduals = make(map[string]Residual)
+	g := &gateRun{ladders: make(map[*candState][]Rung, len(active)), at: make(map[*candState]int, len(active))}
+	for _, c := range active {
+		g.ladders[c] = l.ladder(c)
+	}
+	rejected := make(map[string]string) // module -> why its higher rung was rejected
 
-	st, reject, err := l.gateTry(ctx, "gate: converged set", "", active)
-	if err != nil {
-		return nil, err
-	}
-	if reject != "" {
-		return nil, fmt.Errorf("compile gate: re-applying the converged set failed: %s", reject)
-	}
-	if len(st.failures) == 0 {
-		logging.From(ctx).Debug("compile gate passed", "modroot", l.req.Modroot, "candidates", len(active))
-		return resolved, nil
-	}
-	logging.From(ctx).Info("compile gate: converged bump set breaks the build",
-		"modroot", l.req.Modroot, "packages", len(st.failures), "first", firstCompileError(st.failures))
-
-	suspects := l.blame(ctx, st, active)
-	remedied := make(map[string]struct{})
-	for range maxCoherenceRounds {
-		added, err := l.addCoherenceRemedies(ctx, st, suspects, remedied)
+	purpose, subject := "gate: converged set", ""
+	for {
+		live := slices.DeleteFunc(slices.Clone(active), func(c *candState) bool { return c.dropped })
+		out, repairs, err := l.repairFixpoint(ctx, g, purpose, subject, live)
 		if err != nil {
 			return nil, err
+		}
+		if out.passed() {
+			if len(rejected) == 0 && len(repairs) == 0 {
+				logging.From(ctx).Debug("compile gate passed", "modroot", l.req.Modroot, "candidates", len(live))
+				return resolved, nil
+			}
+			return l.gateAdopt(ctx, g, live, repairs, rejected, result)
+		}
+		if purpose == "gate: converged set" {
+			logging.From(ctx).Info("compile gate: converged bump set breaks the build",
+				"modroot", l.req.Modroot, "first", firstLine(out.why()))
+		}
+
+		victim := l.relaxTarget(ctx, g, out, live)
+		if victim == nil {
+			return nil, gateErr(ctx, fmt.Errorf("the build fails with every bump relaxed: %s", out.why()))
+		}
+		reason := out.why()
+		rejected[victim.Module] = reason
+		from := g.rung(victim).Version
+		if g.at[victim]+1 < len(g.ladders[victim]) {
+			g.at[victim]++
+			logging.From(ctx).Info("compile gate: relaxed bump one fix rung", "modroot", l.req.Modroot,
+				"module", victim.Module, "from", from, "to", g.rung(victim).Version, "reason", reason)
+		} else {
+			victim.Version = from
+			l.drop(victim, reason)
+			logging.From(ctx).Warn("compile gate rejected bump", "modroot", l.req.Modroot,
+				"module", victim.Module, "version", from, "reason", reason)
+		}
+		purpose, subject = "gate: relaxed", victim.Module
+	}
+}
+
+// ladder returns candidate c's target versions, highest first: its current
+// version, then every lower fix rung still above the baseline-resolved
+// version. Each rung carries the advisories first fixed there - what
+// relaxing below it gives up. @latest fallbacks and ambiguity remedies have
+// a single rung.
+func (l *loop) ladder(c *candState) []Rung {
+	top := Rung{Version: c.Version}
+	if c.Version == latestQuery || c.remedy {
+		return []Rung{top}
+	}
+	var lower []Rung
+	for _, r := range c.fixRungs() {
+		switch cmp := semver.Compare(r.Version, c.Version); {
+		case cmp == 0:
+			top = r
+		case cmp < 0 && semver.Compare(r.Version, l.baselineResolved[c.Module]) > 0:
+			lower = append(lower, r)
+		}
+	}
+	return append([]Rung{top}, lower...)
+}
+
+// repairFixpoint trials live at their active rungs and, while the trial
+// fails to compile, adds the co-update repairs that trial's failures call
+// for (see repairsFor) and re-trials, bounded by maxRepairRounds. Repairs
+// are inputs of this pin set only: they are derived from its own failing
+// trials and never carried over to another. Returns the last outcome that
+// resolved and the repairs it was built with.
+func (l *loop) repairFixpoint(ctx context.Context, g *gateRun, purpose, subject string, live []*candState) (*trialOutcome, map[string]string, error) {
+	pins := l.trialPins(g, live, nil)
+	out, err := l.trial(ctx, purpose, subject, pins)
+	if err != nil {
+		return nil, nil, err
+	}
+	var repairs map[string]string
+	for range maxRepairRounds {
+		if out.reject != "" || len(out.failures) == 0 {
+			break
+		}
+		next, added, err := l.repairsFor(ctx, out, pins, repairs)
+		if err != nil {
+			return nil, nil, err
 		}
 		if !added {
 			break
 		}
-		st, reject, err = l.gateTry(ctx, "gate: coherence round", "", l.activeCandidates())
+		nextPins := l.trialPins(g, live, next)
+		nextOut, err := l.trial(ctx, "gate: repair round", subject, nextPins)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if reject != "" {
+		if nextOut.reject != "" {
 			break
 		}
-		if len(st.failures) == 0 {
-			return l.gateFinish(ctx, l.activeCandidates(), result)
-		}
-		maps.Copy(suspects, l.blame(ctx, st, l.activeCandidates()))
+		out, repairs, pins = nextOut, next, nextPins
 	}
-	return l.gateGreedy(ctx, suspects, result)
+	return out, repairs, nil
 }
 
-// gateTry applies exactly keep and compiles it. A non-empty reject reason
-// means keep itself would not resolve (a trial verdict, not an error); an
-// error means the gate cannot continue (cancellation, tool failure).
-// purpose/subject only label the trial's debug record (see logTrial).
-func (l *loop) gateTry(ctx context.Context, purpose, subject string, keep []*candState) (*gateState, string, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, "", err
-	}
-	ordered := l.inApplyOrder(keep)
-	if err := l.applyExact(ctx, ordered); err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return nil, "", cerr
+// trialPins materializes one trial's pin set as candidate snapshots: every
+// live candidate at its active rung (raised in place when a repair targets
+// its module), then the repairs for modules without a candidate. Snapshots
+// keep trials stateless - nothing a trial does touches a live candidate.
+func (l *loop) trialPins(g *gateRun, live []*candState, repairs map[string]string) []*candState {
+	pins := make([]*candState, 0, len(live)+len(repairs))
+	pinned := make(map[string]struct{}, len(live))
+	for _, c := range live {
+		pin := *c
+		pin.Version = g.rung(c).Version
+		if v, ok := repairs[c.Module]; ok && semver.Compare(v, pin.Version) > 0 {
+			pin.Version = v
 		}
-		reject := firstLine(err.Error())
-		l.logTrial(ctx, trialLog{purpose: purpose, subject: subject, pins: ordered, reject: reject})
-		return nil, reject, nil
+		pins = append(pins, &pin)
+		pinned[c.Module] = struct{}{}
+	}
+	for _, module := range sortedKeys(repairs) {
+		if _, ok := pinned[module]; !ok {
+			pins = append(pins, &candState{Candidate: Candidate{Module: module, Version: repairs[module]}, repair: true})
+		}
+	}
+	return pins
+}
+
+// trial applies exactly pins from the pristine snapshot (see applyExact),
+// lists the resolved graph and compiles it. It is stateless: the outcome is
+// returned, nothing on the loop or the candidates changes. A resolve/tidy
+// failure is a verdict (outcome.reject); an error means the gate cannot
+// continue. purpose/subject only label the trial's debug record.
+func (l *loop) trial(ctx context.Context, purpose, subject string, pins []*candState) (*trialOutcome, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := l.applyExact(ctx, pins); err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, gateErr(ctx, cerr)
+		}
+		out := &trialOutcome{reject: firstLine(err.Error())}
+		l.logTrial(ctx, trialLog{purpose: purpose, subject: subject, pins: pins, reject: out.reject})
+		return out, nil
 	}
 	resolved, err := l.tc.ListModules(ctx, l.dir)
 	if err != nil {
-		return nil, "", err
+		return nil, gateErr(ctx, err)
 	}
 	report, err := l.compiler.Compile(ctx, l.dir, l.buildPatterns, l.req.Tags)
 	if err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return nil, "", cerr
-		}
-		return nil, "", fmt.Errorf("compile gate: %w", err)
+		return nil, gateErr(ctx, err)
 	}
-	failures := make(map[string][]string)
+	out := &trialOutcome{report: report, resolved: resolved, failures: make(map[string][]string)}
 	for pkg, lines := range report.Failed {
 		if _, known := l.baselineFailed[pkg]; !known {
-			failures[pkg] = lines
+			out.failures[pkg] = lines
 		}
 	}
-	st := &gateState{report: report, resolved: resolved, failures: failures}
-	l.logTrial(ctx, trialLog{purpose: purpose, subject: subject, pins: ordered, resolved: resolved, compiled: st})
-	return st, "", nil
+	l.logTrial(ctx, trialLog{purpose: purpose, subject: subject, pins: pins, resolved: resolved, compiled: out})
+	return out, nil
 }
 
 // inApplyOrder orders a candidate subset like apply does: ambiguity
@@ -1744,65 +1859,154 @@ func (l *loop) inApplyOrder(keep []*candState) []*candState {
 	return ordered
 }
 
-// blame returns the candidates (keyed by module) suspected of a trial's new
-// compile failures. For a failing package P in module F:
-//   - when P imports packages of dependencies D raised above both baseline
-//     and what F's own go.mod requires (see outgrownDeps), F is the victim
-//     of those raises (a coherence candidate, never a suspect): blame the
-//     candidates behind each D;
-//   - otherwise (a) a candidate that moved F itself is suspect, and (b) so
-//     is any candidate behind a moved module P imports.
-//
-// A candidate is "behind" a moved module M when it is M, or its own go.mod
-// requires M above baseline (the raise traces back to it). Remedies and
-// coherence raises are never suspects. When nothing can be attributed,
-// every other candidate is suspect (the greedy pass then sorts it out).
-func (l *loop) blame(ctx context.Context, st *gateState, active []*candState) map[string]*candState {
-	byModule := make(map[string]*candState)
-	for _, c := range active {
-		if !c.remedy && !c.coherence && c.coherenceVersion == "" {
-			byModule[c.Module] = c
-		}
+// repairsFor derives co-update repairs from one failing trial: each failing
+// package's module F that raised dependencies have outgrown (see
+// outgrownDeps) is raised to the minimal same-major version built against
+// them (see minCoherentVersion). A pinned F is raised in place - candidates
+// and existing entries are floors, never skipped as "blamed" - except a
+// replace or ambiguity-remedy pin, which is not a plain version pin.
+// Returns prev merged with the new repairs, and whether anything was added.
+func (l *loop) repairsFor(ctx context.Context, out *trialOutcome, pins []*candState, prev map[string]string) (map[string]string, bool, error) {
+	repairs := maps.Clone(prev)
+	if repairs == nil {
+		repairs = make(map[string]string)
 	}
-	suspects := make(map[string]*candState)
-	blameBehind := func(module string) {
-		if c, ok := byModule[module]; ok {
-			suspects[module] = c
-			return
+	pinned := make(map[string]*candState, len(pins))
+	for _, p := range pins {
+		pinned[p.Module] = p
+	}
+	added := false
+	for _, pkg := range sortedKeys(out.failures) {
+		owner, outgrown := l.outgrownDeps(ctx, out, pkg)
+		if len(outgrown) == 0 {
+			continue
 		}
-		for candidateModule, c := range byModule {
-			if l.candidateRaises(ctx, c, module) {
-				suspects[candidateModule] = c
+		from := out.resolved[owner]
+		if p, ok := pinned[owner]; ok && (p.Replace || p.remedy) {
+			l.logRepair(ctx, repairLog{module: owner, from: from, outgrown: outgrown, skip: "owner is a replace or ambiguity-remedy pin"})
+			continue
+		}
+		version, err := l.minCoherentVersion(ctx, owner, from, outgrown)
+		if err != nil {
+			return nil, false, gateErr(ctx, err)
+		}
+		if version == "" {
+			l.logRepair(ctx, repairLog{module: owner, from: from, outgrown: outgrown, skip: "no coherent version"})
+			continue
+		}
+		if semver.Compare(version, repairs[owner]) <= 0 {
+			continue // another failing package of the same module already asked for it
+		}
+		repairs[owner] = version
+		added = true
+		l.logRepair(ctx, repairLog{module: owner, from: from, to: version, source: "version walk", outgrown: outgrown})
+	}
+	return repairs, added, nil
+}
+
+// relaxTarget picks the live candidate to step down one rung after a failed
+// repair fixpoint. Implicated candidates come first: those whose module the
+// failure points at (an outgrown dependency, else a moved failing module or
+// moved import; for a resolve failure, a module the error names), or whose
+// own go.mod requires such a module above baseline (the raise traces back
+// to them). Among them - or among every relaxable candidate when nothing is
+// implicated - the least severe active rung goes first, then the one moved
+// furthest from baseline, then the latest added. Ambiguity remedies and
+// user-authored replaces are never relaxed. nil when nothing is relaxable.
+func (l *loop) relaxTarget(ctx context.Context, g *gateRun, out *trialOutcome, live []*candState) *candState {
+	suspects := l.implicatedModules(ctx, out, live)
+	var relaxable, implicated []*candState
+	for _, c := range live {
+		if c.remedy || (c.Replace && c.seed) {
+			continue
+		}
+		relaxable = append(relaxable, c)
+		version := g.rung(c).Version
+		if _, ok := suspects[c.Module]; ok {
+			implicated = append(implicated, c)
+			continue
+		}
+		for _, dep := range sortedKeys(suspects) {
+			if l.candidateRaises(ctx, c.Module, version, dep) {
+				implicated = append(implicated, c)
+				break
 			}
 		}
 	}
+	pool := implicated
+	if len(pool) == 0 {
+		pool = relaxable
+	}
+	var best *candState
+	for _, c := range pool { // pool is in apply order: later wins ties
+		if best == nil || l.relaxBefore(g, c, best) >= 0 {
+			best = c
+		}
+	}
+	return best
+}
 
-	for _, pkg := range sortedKeys(st.failures) {
-		owner, outgrown := l.outgrownDeps(ctx, st, pkg)
+// relaxBefore orders relaxation candidates: positive when a should be
+// relaxed before b (less severe active rung, then further moved from
+// baseline), 0 on a tie.
+func (l *loop) relaxBefore(g *gateRun, a, b *candState) int {
+	if ra, rb := scan.SeverityRank(g.rung(a).Severity), scan.SeverityRank(g.rung(b).Severity); ra != rb {
+		return ra - rb
+	}
+	da := versionDistance(l.baselineResolved[a.Module], g.rung(a).Version)
+	db := versionDistance(l.baselineResolved[b.Module], g.rung(b).Version)
+	return slices.Compare(da[:], db[:])
+}
+
+// implicatedModules returns the modules a failing trial points at (see
+// relaxTarget).
+func (l *loop) implicatedModules(ctx context.Context, out *trialOutcome, live []*candState) map[string]struct{} {
+	suspects := make(map[string]struct{})
+	if out.reject != "" {
+		for _, c := range live {
+			if strings.Contains(out.reject, c.Module) {
+				suspects[c.Module] = struct{}{}
+			}
+		}
+		return suspects
+	}
+	for _, pkg := range sortedKeys(out.failures) {
+		owner, outgrown := l.outgrownDeps(ctx, out, pkg)
 		if len(outgrown) > 0 {
-			for _, dep := range sortedKeys(outgrown) {
-				blameBehind(dep)
+			for dep := range outgrown {
+				suspects[dep] = struct{}{}
 			}
 			continue
 		}
-		if c, ok := byModule[owner]; ok && l.moved(st, owner) {
-			suspects[owner] = c
+		if l.moved(out, owner) {
+			suspects[owner] = struct{}{}
 		}
-		for _, imp := range st.report.Imports[pkg] {
-			if dep, known := st.report.Modules[imp]; known && dep != owner && l.moved(st, dep) {
-				blameBehind(dep)
+		for _, imp := range out.report.Imports[pkg] {
+			if dep := out.report.Modules[imp]; dep != owner && l.moved(out, dep) {
+				suspects[dep] = struct{}{}
 			}
 		}
-	}
-	if len(suspects) == 0 {
-		maps.Copy(suspects, byModule)
 	}
 	return suspects
 }
 
+// versionDistance is how far `to` moves a module from `from`, as
+// (major, minor, patch) deltas.
+func versionDistance(from, to string) [3]int {
+	parse := func(v string) (out [3]int) {
+		core, _, _ := strings.Cut(strings.TrimPrefix(semver.Canonical(v), "v"), "-")
+		for i, part := range strings.SplitN(core, ".", 3) {
+			out[i], _ = strconv.Atoi(part)
+		}
+		return out
+	}
+	f, t := parse(from), parse(to)
+	return [3]int{t[0] - f[0], t[1] - f[1], t[2] - f[2]}
+}
+
 // moved reports whether module resolves differently than at baseline.
-func (l *loop) moved(st *gateState, module string) bool {
-	return module != "" && st.resolved[module] != "" && st.resolved[module] != l.baselineResolved[module]
+func (l *loop) moved(out *trialOutcome, module string) bool {
+	return module != "" && out.resolved[module] != "" && out.resolved[module] != l.baselineResolved[module]
 }
 
 // outgrownDeps returns failing package pkg's module F and the dependencies
@@ -1810,9 +2014,9 @@ func (l *loop) moved(st *gateState, module string) bool {
 // above baseline AND above the version F's own go.mod (at its resolved
 // version) requires - the lockstep-family break MVS cannot see (no upper
 // bounds). Empty for main-module packages or when F's go.mod is unknown.
-func (l *loop) outgrownDeps(ctx context.Context, st *gateState, pkg string) (string, map[string]string) {
-	owner := st.report.Modules[pkg]
-	ownerVersion := st.resolved[owner]
+func (l *loop) outgrownDeps(ctx context.Context, out *trialOutcome, pkg string) (string, map[string]string) {
+	owner := out.report.Modules[pkg]
+	ownerVersion := out.resolved[owner]
 	if owner == "" || ownerVersion == "" {
 		return owner, nil
 	}
@@ -1821,12 +2025,12 @@ func (l *loop) outgrownDeps(ctx context.Context, st *gateState, pkg string) (str
 		return owner, nil
 	}
 	outgrown := make(map[string]string)
-	for _, imp := range st.report.Imports[pkg] {
-		dep, known := st.report.Modules[imp]
+	for _, imp := range out.report.Imports[pkg] {
+		dep, known := out.report.Modules[imp]
 		if !known || dep == "" || dep == owner {
 			continue
 		}
-		base, current := l.baselineResolved[dep], st.resolved[dep]
+		base, current := l.baselineResolved[dep], out.resolved[dep]
 		if base == "" || semver.Compare(current, base) <= 0 {
 			continue
 		}
@@ -1837,104 +2041,16 @@ func (l *loop) outgrownDeps(ctx context.Context, st *gateState, pkg string) (str
 	return owner, outgrown
 }
 
-// candidateRaises reports whether candidate c's own go.mod requires dep
+// candidateRaises reports whether module@version's own go.mod requires dep
 // above its baseline version (best-effort: lookup failures attribute
 // nothing).
-func (l *loop) candidateRaises(ctx context.Context, c *candState, dep string) bool {
-	requires, err := l.compiler.ModuleRequires(ctx, l.dir, c.Module, c.Version)
+func (l *loop) candidateRaises(ctx context.Context, module, version, dep string) bool {
+	requires, err := l.compiler.ModuleRequires(ctx, l.dir, module, version)
 	if err != nil {
 		return false
 	}
-	version, ok := requires[dep]
-	return ok && semver.Compare(version, l.baselineResolved[dep]) > 0
-}
-
-// addCoherenceRemedies raises each newly failing module F (at most once)
-// that raised dependencies have outgrown (see outgrownDeps) to the minimal
-// F version built against them (see minCoherentVersion), falling back to
-// omnibump's co-update recommendation. An existing candidate for F is
-// raised in place - deps entries are floors, not frozen pins - unless it is
-// a replace or an ambiguity remedy, or is itself blamed. Bounded and never
-// escalation: cross-major raises are not attempted. Returns whether
-// anything was raised.
-func (l *loop) addCoherenceRemedies(ctx context.Context, st *gateState, suspects map[string]*candState, remedied map[string]struct{}) (bool, error) {
-	added := false
-	for _, pkg := range sortedKeys(st.failures) {
-		owner, outgrown := l.outgrownDeps(ctx, st, pkg)
-		if len(outgrown) == 0 {
-			continue
-		}
-		ownerVersion := st.resolved[owner]
-		if _, done := remedied[owner]; done {
-			l.logRepair(ctx, repairLog{module: owner, from: ownerVersion, outgrown: outgrown, skip: "already repaired in this gate"})
-			continue
-		}
-		if _, blamed := suspects[owner]; blamed {
-			l.logRepair(ctx, repairLog{module: owner, from: ownerVersion, outgrown: outgrown, skip: "owner is itself a blamed candidate"})
-			continue
-		}
-		if c, ok := l.byModule[owner]; ok && !c.dropped && (c.Replace || c.remedy) {
-			l.logRepair(ctx, repairLog{module: owner, from: ownerVersion, outgrown: outgrown, skip: "owner is a replace or ambiguity-remedy candidate"})
-			continue
-		}
-		remedied[owner] = struct{}{}
-
-		version, err := l.minCoherentVersion(ctx, owner, ownerVersion, outgrown)
-		if err != nil {
-			return false, err
-		}
-		source := "version walk"
-		if version == "" {
-			version, source = l.coUpdateFor(ctx, owner, ownerVersion), "omnibump co-update"
-		}
-		if version == "" {
-			logging.From(ctx).Debug("compile gate: no coherent version for failing module",
-				"modroot", l.req.Modroot, "module", owner, "version", ownerVersion)
-			l.logRepair(ctx, repairLog{module: owner, from: ownerVersion, outgrown: outgrown, skip: "no coherent version (version walk and omnibump co-update both empty)"})
-			continue
-		}
-
-		var previous string
-		existing, exists := l.byModule[owner]
-		if exists && !existing.dropped {
-			previous = existing.Version
-		}
-		state := l.addCandidate(Candidate{Module: owner, Version: version}, false)
-		if previous != "" && state.Version == previous {
-			l.logRepair(ctx, repairLog{module: owner, from: ownerVersion, to: version, source: source, outgrown: outgrown,
-				skip: "existing candidate already at or above " + previous})
-			continue // already at or above the coherent version
-		}
-		if previous != "" {
-			if state.coherenceFrom == "" {
-				state.coherenceFrom = previous
-			}
-		} else {
-			state.coherence = true
-		}
-		state.coherenceVersion = state.Version
-		if state.coherenceFor == nil {
-			state.coherenceFor = make(map[string]struct{})
-		}
-		for module, c := range suspects {
-			if _, direct := outgrown[module]; direct {
-				state.coherenceFor[module] = struct{}{}
-				continue
-			}
-			for dep := range outgrown {
-				if l.candidateRaises(ctx, c, dep) {
-					state.coherenceFor[module] = struct{}{}
-					break
-				}
-			}
-		}
-		added = true
-		logging.From(ctx).Info("compile gate: coherence raise",
-			"modroot", l.req.Modroot, "module", owner, "from", ownerVersion, "to", state.Version, "source", source)
-		l.logRepair(ctx, repairLog{module: owner, from: ownerVersion, to: state.Version, source: source, outgrown: outgrown,
-			supports: sortedKeys(state.coherenceFor)})
-	}
-	return added, nil
+	required, ok := requires[dep]
+	return ok && semver.Compare(required, l.baselineResolved[dep]) > 0
 }
 
 // minCoherentVersion walks module's released versions upward from `from`
@@ -1997,187 +2113,35 @@ func (l *loop) minCoherentVersion(ctx context.Context, module, from string, rais
 	return "", nil
 }
 
-// coUpdateFor returns omnibump's required co-update version for module when
-// it is a same-major raise above from (the co-update analysis is computed
-// once per gate, for the full candidate set against the pristine go.mod).
-func (l *loop) coUpdateFor(ctx context.Context, module, from string) string {
-	if l.opts.CoUpdates == nil {
-		return ""
+// gateAdopt commits the accepted pin set to the candidates - each at its
+// active rung, raised in place by a repair of its module, plus a
+// coherence-only candidate per repair of an unpinned module - then
+// re-applies and rescans it (see gateFinish).
+func (l *loop) gateAdopt(ctx context.Context, g *gateRun, live []*candState, repairs, rejected map[string]string, result *ModrootResult) (map[string]string, error) {
+	for _, c := range live {
+		c.Version = g.rung(c).Version
 	}
-	if !l.coUpdatesLoaded {
-		l.coUpdatesLoaded = true
-		modFile, err := modfile.ParseLax("go.mod", l.pristine["go.mod"], nil)
-		if err != nil {
-			return ""
-		}
-		updates := make(map[string]string)
-		for _, c := range l.activeCandidates() {
-			if !c.remedy && !c.coherence {
-				updates[c.Module] = c.Version
+	for _, module := range sortedKeys(repairs) {
+		if c, ok := l.byModule[module]; ok && !c.dropped {
+			if semver.Compare(repairs[module], c.Version) > 0 {
+				c.Version = repairs[module]
 			}
-		}
-		l.coUpdates = l.opts.CoUpdates(ctx, updates, modFile)
-	}
-	version := l.coUpdates[module]
-	if !semver.IsValid(version) || semver.Major(version) != semver.Major(from) || semver.Compare(version, from) <= 0 {
-		return ""
-	}
-	return version
-}
-
-// gateGreedy is the compile gate's fallback: keep every unblamed candidate,
-// then re-admit blamed ones most-severe-first (CVE fixes before coherence
-// pins at equal severity), each with the coherence raises supporting it,
-// keeping a candidate only when the build still has no new failures. A
-// rejected candidate is dropped with a "breaks compile" reason (and, when
-// CVE-backed, a residual).
-func (l *loop) gateGreedy(ctx context.Context, suspects map[string]*candState, result *ModrootResult) (map[string]string, error) {
-	// Coherence raises are re-admitted only alongside the candidate they
-	// support; existing entries they raised fall back to their own version.
-	for _, c := range l.activeCandidates() {
-		if c.coherenceFrom != "" {
-			c.Version = c.coherenceFrom
-		}
-	}
-	baseSet := func() []*candState {
-		var keep []*candState
-		for _, c := range l.activeCandidates() {
-			if _, blamed := suspects[c.Module]; !blamed && !c.coherence {
-				keep = append(keep, c)
-			}
-		}
-		return keep
-	}
-
-	keep := baseSet()
-	st, reject, err := l.gateTry(ctx, "gate: unblamed base", "", keep)
-	if err != nil {
-		return nil, err
-	}
-	if reject != "" || len(st.failures) > 0 {
-		// Blame was incomplete: widen it to every candidate except remedies
-		// and user-authored replaces, then retry from that base once.
-		for _, c := range keep {
-			if userReplace := c.Replace && c.seed; !c.remedy && !userReplace {
-				suspects[c.Module] = c
-			}
-		}
-		keep = baseSet()
-		if st, reject, err = l.gateTry(ctx, "gate: widened base", "", keep); err != nil {
-			return nil, err
-		}
-		if reject != "" {
-			return nil, fmt.Errorf("compile gate: the build does not resolve even without the blamed bumps: %s", reject)
-		}
-		if len(st.failures) > 0 {
-			return nil, fmt.Errorf("compile gate: the build fails even without the blamed bumps: %s", firstCompileError(st.failures))
-		}
-	}
-
-	index := make(map[*candState]int, len(l.cands))
-	for i, c := range l.cands {
-		index[c] = i
-	}
-	order := make([]*candState, 0, len(suspects))
-	for _, c := range suspects {
-		order = append(order, c)
-	}
-	sort.Slice(order, func(i, j int) bool {
-		ri, rj := scan.SeverityRank(order[i].Severity), scan.SeverityRank(order[j].Severity)
-		if ri != rj {
-			return ri < rj
-		}
-		if order[i].FromCVE != order[j].FromCVE {
-			return order[i].FromCVE
-		}
-		return index[order[i]] < index[order[j]]
-	})
-
-	accepted := make(map[*candState]struct{})
-	for _, suspect := range order {
-		trial := append([]*candState{}, keep...)
-		trial = append(trial, suspect)
-		var partners []*candState
-		for _, c := range l.activeCandidates() {
-			if _, supports := c.coherenceFor[suspect.Module]; !supports || c.coherenceVersion == "" {
-				continue
-			}
-			if _, done := accepted[c]; done {
-				continue
-			}
-			partners = append(partners, c)
-			c.Version = c.coherenceVersion
-			if !slices.Contains(trial, c) {
-				trial = append(trial, c)
-			}
-		}
-
-		st, reject, err := l.gateTry(ctx, "gate: admit", suspect.Module, trial)
-		if err != nil {
-			return nil, err
-		}
-		if reject == "" && len(st.failures) == 0 {
-			keep = trial
-			for _, c := range partners {
-				accepted[c] = struct{}{}
-			}
-			logging.From(ctx).Debug("compile gate: admitted bump", "modroot", l.req.Modroot,
-				"module", suspect.Module, "version", suspect.Version, "partners", len(partners))
 			continue
 		}
-
-		for _, c := range partners {
-			if c.coherenceFrom != "" {
-				c.Version = c.coherenceFrom
-			}
-		}
-		reason := "breaks module graph: " + reject
-		if reject == "" {
-			reason = "breaks compile: " + firstCompileError(st.failures)
-		}
-		l.rejectForCompile(ctx, suspect, reason)
+		l.addCandidate(Candidate{Module: module, Version: repairs[module]}, false).repair = true
 	}
-
-	for _, c := range l.activeCandidates() {
-		if _, ok := accepted[c]; ok || !c.coherence {
-			continue
-		}
-		l.drop(c, "coherence raise not needed: the bump it supported was rejected by the compile gate")
-	}
-	return l.gateFinish(ctx, keep, result)
-}
-
-// rejectForCompile drops a candidate the compile gate could not admit,
-// recording a pending residual for a CVE-backed one (kept only if the final
-// rescan still wants its fix - see gateFinish).
-func (l *loop) rejectForCompile(ctx context.Context, c *candState, reason string) {
-	l.drop(c, reason)
-	logging.From(ctx).Warn("compile gate rejected bump", "modroot", l.req.Modroot,
-		"module", c.Module, "version", c.Version, "reason", reason)
-	if !c.FromCVE {
-		return
-	}
-	c.residualized = true
-	l.gateResiduals[c.Module] = Residual{
-		Module:       c.Module,
-		FixedVersion: c.Version,
-		VulnIDs:      c.VulnIDs,
-		Reason:       reason,
-	}
+	return l.gateFinish(ctx, l.inApplyOrder(l.activeCandidates()), rejected, result)
 }
 
 // gateFinish adopts the compile gate's accepted set: re-applies it,
-// rescans, and refreshes the loop's accepted state. A rejected fix's
-// residual stands only while the rescan still wants that fix; any other
-// fix the rescan wants is surfaced as a residual rather than raised (it was
-// never compile-validated).
-func (l *loop) gateFinish(ctx context.Context, keep []*candState, result *ModrootResult) (map[string]string, error) {
-	tr, err := l.trialApply(ctx, "gate: adopt accepted set", l.inApplyOrder(keep))
+// rescans, and refreshes the loop's accepted state. An advisory the rescan
+// still finds for a module whose higher rung was rejected is a residual
+// carrying that rejection; any other fix the rescan wants is surfaced as a
+// residual rather than raised (it was never compile-validated).
+func (l *loop) gateFinish(ctx context.Context, keep []*candState, rejected map[string]string, result *ModrootResult) (map[string]string, error) {
+	tr, err := l.trialApply(ctx, "gate: adopt accepted set", keep)
 	if err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return nil, cerr
-		}
-		return nil, fmt.Errorf("compile gate: re-applying the accepted set: %w", err)
+		return nil, gateErr(ctx, fmt.Errorf("re-applying the accepted set: %w", err))
 	}
 	if !l.sustained(tr, keep) {
 		logging.From(ctx).Warn("compile gate: accepted set not fully sustained by the tidied go.mod",
@@ -2185,17 +2149,16 @@ func (l *loop) gateFinish(ctx context.Context, keep []*candState, result *Modroo
 	}
 	l.adoptTrial(ctx, tr, result)
 	for _, r := range tr.raises {
-		if residual, rejected := l.gateResiduals[r.module]; rejected {
-			residual.ResolvedVersion = tr.resolved[r.module]
-			l.persistentResiduals = append(l.persistentResiduals, residual)
-			continue
+		reason, wasRejected := rejected[r.module]
+		if !wasRejected {
+			reason = "advisory surfaced after compile-gate adjustments; fix not validated"
 		}
-		l.scanResiduals = append(l.scanResiduals, Residual{
+		l.persistentResiduals = append(l.persistentResiduals, Residual{
 			Module:          r.module,
 			ResolvedVersion: tr.resolved[r.module],
 			FixedVersion:    r.version,
 			VulnIDs:         r.vulnIDs,
-			Reason:          "advisory surfaced after compile-gate adjustments; fix not validated",
+			Reason:          reason,
 		})
 	}
 	return tr.resolved, nil
@@ -2218,23 +2181,23 @@ const (
 // compile report (gate trials), or a rescan (refinement trials).
 type trialLog struct {
 	purpose   string
-	subject   string // module the trial is about, when it has one (gate admission)
+	subject   string // module the trial is about, when it has one (the relaxed bump)
 	pins      []*candState
 	reject    string
 	resolved  map[string]string
-	compiled  *gateState
+	compiled  *trialOutcome
 	raises    []raise
 	residuals int
 }
 
 // pinRole names the provenance a pin carries in the loop, for tracing:
-// remedy (ambiguous-import repair), coherence (compile-gate co-update),
-// cve (advisory-backed), seed (caller-provided, no advisory), raise.
+// remedy (ambiguous-import repair), coherence (compile-gate co-update
+// repair), cve (advisory-backed), seed (caller-provided, no advisory), raise.
 func pinRole(c *candState) string {
 	switch {
 	case c.remedy:
 		return "remedy"
-	case c.coherence || c.coherenceVersion != "":
+	case c.repair:
 		return "coherence"
 	case c.FromCVE:
 		return "cve"
@@ -2334,7 +2297,7 @@ func (l *loop) resolvedDiff(resolved map[string]string) []string {
 
 // failingOwners lists the distinct modules owning a trial's newly failing
 // packages ("(main)" for the main module), sorted.
-func failingOwners(st *gateState) []string {
+func failingOwners(st *trialOutcome) []string {
 	owners := make(map[string]struct{})
 	for pkg := range st.failures {
 		owner := st.report.Modules[pkg]
@@ -2361,11 +2324,10 @@ func firstCompileErrors(failures map[string][]string, n int) []string {
 
 // repairLog describes one compile-gate repair decision for logRepair: the
 // failing module, its version, the raised dependencies that outgrew it,
-// and either the chosen raise (to/source/supports) or the skip reason.
+// and either the chosen raise (to/source) or the skip reason.
 type repairLog struct {
 	module, from, to, source string
 	outgrown                 map[string]string
-	supports                 []string
 	skip                     string
 }
 
@@ -2383,11 +2345,8 @@ func (l *loop) logRepair(ctx context.Context, rl repairLog) {
 	attrs := []any{"modroot", l.req.Modroot, "module", rl.module, "from", rl.from, "outgrown", outgrown}
 	if rl.skip != "" {
 		attrs = append(attrs, "decision", "skip", "reason", rl.skip)
-		if rl.to != "" {
-			attrs = append(attrs, "to", rl.to, "source", rl.source)
-		}
 	} else {
-		attrs = append(attrs, "decision", "raise", "to", rl.to, "source", rl.source, "supports", rl.supports)
+		attrs = append(attrs, "decision", "raise", "to", rl.to, "source", rl.source)
 	}
 	logger.Debug(repairLogMsg, attrs...)
 }

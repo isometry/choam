@@ -318,16 +318,27 @@ func otelFamilyAdvisories() *fakeScanner {
 	}}
 }
 
-// opentofuSeeds are the seeds today's analysis hands the loop for the
-// spec's existing deps (sdk@v1.43.0, otlploghttp@v0.19.0,
-// otlptracehttp@v1.43.0) merged with the baseline scan's bumps: FilterBumps
-// keeps the higher version per module, seedCandidates marks every module
-// with a bump as CVE-backed with all of its advisory IDs.
+// sdkRungs is otel/sdk's fix ladder as seedCandidates builds it: the
+// v1.45.0 (LOW) and v1.43.0 (HIGH, also the existing YAML pin) fixes.
+var sdkRungs = []Rung{
+	{Version: "v1.45.0", VulnIDs: []string{advSDKLow}, Severity: "LOW"},
+	{Version: "v1.43.0", VulnIDs: []string{advSDKHigh}, Severity: "HIGH"},
+}
+
+// opentofuSeeds are the seeds the analysis hands the loop for the spec's
+// existing deps (sdk@v1.43.0, otlploghttp@v0.19.0, otlptracehttp@v1.43.0)
+// merged with the baseline scan's bumps: FilterBumps keeps the higher
+// version per module, seedCandidates marks every module with a bump as
+// CVE-backed with all of its advisory IDs and keeps the per-advisory fix
+// rungs.
 func opentofuSeeds() []Candidate {
 	return []Candidate{
-		{Module: modSDK, Version: "v1.45.0", FromCVE: true, VulnIDs: []string{advSDKLow, advSDKHigh}, Severity: "HIGH"},
+		{Module: modSDK, Version: "v1.45.0", FromCVE: true, VulnIDs: []string{advSDKLow, advSDKHigh}, Severity: "HIGH", Rungs: sdkRungs},
 		{Module: modLogHTTP, Version: "v0.19.0", FromCVE: true, VulnIDs: []string{advLogHTTP}, Severity: "MEDIUM"},
-		{Module: modTraceHTTP, Version: "v1.45.0", FromCVE: true, VulnIDs: []string{advTraceHigh, advTraceLow}, Severity: "HIGH"},
+		{Module: modTraceHTTP, Version: "v1.45.0", FromCVE: true, VulnIDs: []string{advTraceHigh, advTraceLow}, Severity: "HIGH", Rungs: []Rung{
+			{Version: "v1.45.0", VulnIDs: []string{advTraceLow}, Severity: "LOW"},
+			{Version: "v1.43.0", VulnIDs: []string{advTraceHigh}, Severity: "HIGH"},
+		}},
 		{Module: modGRPC, Version: "v1.83.2", FromCVE: true, VulnIDs: []string{advGRPC}, Severity: "HIGH"},
 		{Module: modSDKLog, Version: "v0.21.0", FromCVE: true, VulnIDs: []string{advSDKLog}, Severity: "MEDIUM"},
 		{Module: modLogGRPC, Version: "v0.21.0", FromCVE: true, VulnIDs: []string{advLogGRPC}, Severity: "MEDIUM"},
@@ -352,7 +363,7 @@ func logResult(t tb, result *ModrootResult) {
 func TestReplay_OpentofuOtelFamily(t *testing.T) {
 	f := newReplayFixture(t, otelFamilyModules(), opentofuMain())
 
-	knownDefect(t, defectFamilyCoUpdate, func(t tb) {
+	assertFixed(t, defectFamilyCoUpdate, func(t tb) {
 		result, err := RunLoop(t.Context(), f.tc, otelFamilyAdvisories(), f.dir, ModrootRequest{
 			Modroot: ".",
 			Seeds:   opentofuSeeds(),
@@ -399,11 +410,11 @@ func TestReplay_RungFallback(t *testing.T) {
 		{module: modSDK, id: advSDKLow, fixed: "v1.45.0", severity: "LOW"},
 	}}
 
-	knownDefect(t, defectRungFallback, func(t tb) {
+	assertFixed(t, defectRungFallback, func(t tb) {
 		result, err := RunLoop(t.Context(), f.tc, sc, f.dir, ModrootRequest{
 			Modroot: ".",
 			Seeds: []Candidate{
-				{Module: modSDK, Version: "v1.45.0", FromCVE: true, VulnIDs: []string{advSDKLow, advSDKHigh}, Severity: "HIGH"},
+				{Module: modSDK, Version: "v1.45.0", FromCVE: true, VulnIDs: []string{advSDKLow, advSDKHigh}, Severity: "HIGH", Rungs: sdkRungs},
 			},
 			Baseline: map[string]string{modSDK: "v1.42.0"},
 			Tags:     replayTags,
@@ -466,7 +477,7 @@ func TestReplay_NoCrossContamination(t *testing.T) {
 		{module: modB, id: "GO-TEST-B", fixed: "v0.2.0", severity: "HIGH"},
 	}}
 
-	knownDefect(t, defectTrialPollution, func(t tb) {
+	assertFixed(t, defectTrialPollution, func(t tb) {
 		trace := &traceCapture{}
 		ctx := logging.Into(t.Context(), slog.New(trace))
 		result, err := RunLoop(ctx, f.tc, sc, f.dir, ModrootRequest{
