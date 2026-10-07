@@ -1,6 +1,7 @@
 // Package simulate validates a proposed set of Go module bumps by doing what
-// the melange build's go/bump step will do, ahead of time: clone the upstream
-// source at the exact tag, apply the bumps with the real go toolchain, then
+// the melange build's bump step will do, ahead of time: clone the upstream
+// source at the exact tag, apply the bumps with the step's own semantics
+// (gobump for `uses: go/bump`, omnibump for `uses: bump` - see Engine), then
 // OSV-rescan the resolved module graph and raise versions until a fixpoint.
 // The deps list that survives is proven to (a) resolve cleanly and (b) leave
 // no known-fixable vulnerability behind; anything unreachable is reported as
@@ -274,7 +275,8 @@ type ModrootResult struct {
 	// MaxDepGoVersion is the highest go directive across the final resolved
 	// build list's non-main modules (bare form, e.g. "1.25"); empty when
 	// unavailable. The scratch main module's own directive is deliberately
-	// not consulted: the parity tidy rewrites it with -go=<host>.
+	// not consulted: the engine rewrites it (gobump: -go=<host>; omnibump:
+	// lowered to the build's Go).
 	MaxDepGoVersion string `json:"max_dep_go_version,omitempty" yaml:"max_dep_go_version,omitempty"`
 
 	// StdPackages is the stdlib slice of the final artifact import graph
@@ -326,6 +328,14 @@ type ModrootRequest struct {
 	// are reported and counted separately. Nil disables introduced-vuln
 	// classification (fail open).
 	BaselineVulnIDs map[string]struct{}
+	// Engine is the bump step's apply semantics (see Engine).
+	Engine Engine
+	// NoTidy mirrors a `tidy: false` bump step (EngineOmnibump only).
+	NoTidy bool
+	// GoVersion is the build's Go version (bare, e.g. "1.25.9"); omnibump
+	// lowers the go directive to it, never raises it. "" means the host go
+	// (EngineOmnibump only).
+	GoVersion string
 }
 
 // Options tunes the simulation.

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -103,6 +104,21 @@ func TestLoader_FindBumpSteps_Language(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, noLangSteps, 1)
 	assert.Equal(t, "", noLangSteps[0].Language)
+}
+
+func TestLoader_FindBumpSteps_Tidy(t *testing.T) {
+	const yamlFmt = `pipeline:
+  - uses: bump
+    with:
+      deps: golang.org/x/net@v0.55.0
+%s`
+	loader := NewLoader()
+	for line, noTidy := range map[string]bool{"": false, "      tidy: false\n": true, "      tidy: true\n": false} {
+		steps, err := loader.FindBumpSteps(fmt.Appendf(nil, yamlFmt, line))
+		require.NoError(t, err)
+		require.Len(t, steps, 1)
+		assert.Equal(t, noTidy, steps[0].NoTidy, "with %q", line)
+	}
 }
 
 func TestLoader_FindBumpSteps_GoVersion(t *testing.T) {

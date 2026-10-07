@@ -100,10 +100,19 @@ func copyFile(t *testing.T, from, to string) {
 	require.NoError(t, os.WriteFile(to, content, 0o644))
 }
 
-// compileFailuresWith applies deps to a fresh copy of the pristine module
-// (tidy, go get each, tidy - what the build's bump step does) and returns
-// the compile failures ("" when the result compiles).
-func (f replayFixture) compileFailuresWith(t tb, deps []string) string {
+// forEachEngine runs fn once per apply engine, as named sub-tests.
+func forEachEngine(t *testing.T, fn func(t *testing.T, eng Engine)) {
+	t.Helper()
+	for _, eng := range []Engine{EngineGobump, EngineOmnibump} {
+		t.Run(eng.String(), func(t *testing.T) { fn(t, eng) })
+	}
+}
+
+// compileFailuresWith applies deps to a fresh copy of the pristine module the
+// way the build's bump step does (gobump: tidy, go get each, tidy; omnibump:
+// its filter and DoUpdate) and returns the compile failures ("" when the
+// result compiles).
+func (f replayFixture) compileFailuresWith(t tb, eng Engine, deps []string) string {
 	t.Helper()
 	ctx := t.Context()
 	dir, err := os.MkdirTemp("", "choam-replay-verify-")
@@ -116,11 +125,15 @@ func (f replayFixture) compileFailuresWith(t tb, deps []string) string {
 		require.NoError(t, err)
 		require.NoError(t, os.WriteFile(filepath.Join(dir, e.Name()), content, 0o644))
 	}
-	require.NoError(t, f.tc.ModTidy(ctx, dir))
-	for _, dep := range deps {
-		require.NoError(t, f.tc.Get(ctx, dir, dep))
+	if eng == EngineOmnibump {
+		require.NoError(t, omnibumpApply(ctx, f.tc, dir, ModrootRequest{Engine: eng}, deps))
+	} else {
+		require.NoError(t, f.tc.ModTidy(ctx, dir))
+		for _, dep := range deps {
+			require.NoError(t, f.tc.Get(ctx, dir, dep))
+		}
+		require.NoError(t, f.tc.ModTidy(ctx, dir))
 	}
-	require.NoError(t, f.tc.ModTidy(ctx, dir))
 	report, err := f.tc.Compile(ctx, dir, nil, replayTags)
 	require.NoError(t, err)
 	if len(report.Failed) == 0 {
@@ -361,33 +374,36 @@ func logResult(t tb, result *ModrootResult) {
 // trace side and grpc to their top fixes, leaves no "breaks compile"
 // residual, and the written deps compile from scratch.
 func TestReplay_OpentofuOtelFamily(t *testing.T) {
-	f := newReplayFixture(t, otelFamilyModules(), opentofuMain())
+	forEachEngine(t, func(t *testing.T, eng Engine) {
+		f := newReplayFixture(t, otelFamilyModules(), opentofuMain())
 
-	assertFixed(t, defectFamilyCoUpdate, func(t tb) {
-		result, err := RunLoop(t.Context(), f.tc, otelFamilyAdvisories(), f.dir, ModrootRequest{
-			Modroot: ".",
-			Seeds:   opentofuSeeds(),
-			Baseline: map[string]string{
-				modLog: "v0.18.0", modSDKLog: "v0.18.0", modLogHTTP: "v0.18.0", modLogGRPC: "v0.18.0",
-				modStdoutLog: "v0.18.0", modSDK: "v1.42.0", modTraceHTTP: "v1.42.0", modGRPC: "v1.79.3",
-			},
-			Tags: replayTags,
-		}, Options{})
-		require.NoError(t, err)
-		logResult(t, result)
+		assertFixed(t, defectFamilyCoUpdate, func(t tb) {
+			result, err := RunLoop(t.Context(), f.tc, otelFamilyAdvisories(), f.dir, ModrootRequest{
+				Modroot: ".",
+				Seeds:   opentofuSeeds(),
+				Baseline: map[string]string{
+					modLog: "v0.18.0", modSDKLog: "v0.18.0", modLogHTTP: "v0.18.0", modLogGRPC: "v0.18.0",
+					modStdoutLog: "v0.18.0", modSDK: "v1.42.0", modTraceHTTP: "v1.42.0", modGRPC: "v1.79.3",
+				},
+				Tags:   replayTags,
+				Engine: eng,
+			}, Options{})
+			require.NoError(t, err)
+			logResult(t, result)
 
-		want := map[string]string{
-			modSDK: "v1.45.0", modTraceHTTP: "v1.45.0", modGRPC: "v1.83.2",
-			modLog: "v0.21.0", modSDKLog: "v0.21.0", modLogGRPC: "v0.21.0", modLogHTTP: "v0.21.0", modStdoutLog: "v0.21.0",
-		}
-		for module, version := range want {
-			assert.Equal(t, version, result.Resolved[module], "resolved %s", module)
-		}
-		for _, r := range result.Residuals {
-			assert.NotContains(t, r.Reason, "breaks compile", "no family member may be left as a compile residual: %s", r.Module)
-		}
-		assert.Empty(t, result.Residuals)
-		assert.Empty(t, f.compileFailuresWith(t, result.FinalDeps), "the written deps must compile")
+			want := map[string]string{
+				modSDK: "v1.45.0", modTraceHTTP: "v1.45.0", modGRPC: "v1.83.2",
+				modLog: "v0.21.0", modSDKLog: "v0.21.0", modLogGRPC: "v0.21.0", modLogHTTP: "v0.21.0", modStdoutLog: "v0.21.0",
+			}
+			for module, version := range want {
+				assert.Equal(t, version, result.Resolved[module], "resolved %s", module)
+			}
+			for _, r := range result.Residuals {
+				assert.NotContains(t, r.Reason, "breaks compile", "no family member may be left as a compile residual: %s", r.Module)
+			}
+			assert.Empty(t, result.Residuals)
+			assert.Empty(t, f.compileFailuresWith(t, eng, result.FinalDeps), "the written deps must compile")
+		})
 	})
 }
 
@@ -396,37 +412,40 @@ func TestReplay_OpentofuOtelFamily(t *testing.T) {
 // rung to v1.43.0 - never stay at the v1.42.0 baseline - leaving only the
 // v1.45.0-only advisory residual.
 func TestReplay_RungFallback(t *testing.T) {
-	sdkSrc := func(body string) string { return "package sdk\n\nfunc Version() string { return " + body + " }\n" }
-	f := newReplayFixture(t, map[string]map[string]string{
-		modSDK + "@v1.42.0": stubModule(modSDK, "sdk.go", sdkSrc(`"1.42.0"`), nil),
-		modSDK + "@v1.43.0": stubModule(modSDK, "sdk.go", sdkSrc(`"1.43.0"`), nil),
-		modSDK + "@v1.45.0": stubModule(modSDK, "sdk.go", sdkSrc(`145`), nil), // type error: does not compile
-	}, map[string]string{
-		"go.mod":  "module example.com/app\n\ngo 1.21\n\nrequire " + modSDK + " v1.42.0\n",
-		"main.go": "package main\n\nimport (\n\t\"fmt\"\n\n\t\"" + modSDK + "\"\n)\n\nfunc main() { fmt.Println(sdk.Version()) }\n",
-	})
-	sc := &fakeScanner{advisories: []fakeAdvisory{
-		{module: modSDK, id: advSDKHigh, fixed: "v1.43.0", severity: "HIGH"},
-		{module: modSDK, id: advSDKLow, fixed: "v1.45.0", severity: "LOW"},
-	}}
+	forEachEngine(t, func(t *testing.T, eng Engine) {
+		sdkSrc := func(body string) string { return "package sdk\n\nfunc Version() string { return " + body + " }\n" }
+		f := newReplayFixture(t, map[string]map[string]string{
+			modSDK + "@v1.42.0": stubModule(modSDK, "sdk.go", sdkSrc(`"1.42.0"`), nil),
+			modSDK + "@v1.43.0": stubModule(modSDK, "sdk.go", sdkSrc(`"1.43.0"`), nil),
+			modSDK + "@v1.45.0": stubModule(modSDK, "sdk.go", sdkSrc(`145`), nil), // type error: does not compile
+		}, map[string]string{
+			"go.mod":  "module example.com/app\n\ngo 1.21\n\nrequire " + modSDK + " v1.42.0\n",
+			"main.go": "package main\n\nimport (\n\t\"fmt\"\n\n\t\"" + modSDK + "\"\n)\n\nfunc main() { fmt.Println(sdk.Version()) }\n",
+		})
+		sc := &fakeScanner{advisories: []fakeAdvisory{
+			{module: modSDK, id: advSDKHigh, fixed: "v1.43.0", severity: "HIGH"},
+			{module: modSDK, id: advSDKLow, fixed: "v1.45.0", severity: "LOW"},
+		}}
 
-	assertFixed(t, defectRungFallback, func(t tb) {
-		result, err := RunLoop(t.Context(), f.tc, sc, f.dir, ModrootRequest{
-			Modroot: ".",
-			Seeds: []Candidate{
-				{Module: modSDK, Version: "v1.45.0", FromCVE: true, VulnIDs: []string{advSDKLow, advSDKHigh}, Severity: "HIGH", Rungs: sdkRungs},
-			},
-			Baseline: map[string]string{modSDK: "v1.42.0"},
-			Tags:     replayTags,
-		}, Options{})
-		require.NoError(t, err)
-		logResult(t, result)
+		assertFixed(t, defectRungFallback, func(t tb) {
+			result, err := RunLoop(t.Context(), f.tc, sc, f.dir, ModrootRequest{
+				Modroot: ".",
+				Seeds: []Candidate{
+					{Module: modSDK, Version: "v1.45.0", FromCVE: true, VulnIDs: []string{advSDKLow, advSDKHigh}, Severity: "HIGH", Rungs: sdkRungs},
+				},
+				Baseline: map[string]string{modSDK: "v1.42.0"},
+				Tags:     replayTags,
+				Engine:   eng,
+			}, Options{})
+			require.NoError(t, err)
+			logResult(t, result)
 
-		assert.Equal(t, "v1.43.0", result.Resolved[modSDK], "one rung down from the uncompilable v1.45.0")
-		assert.Equal(t, []string{modSDK + "@v1.43.0"}, result.FinalDeps)
-		assert.Equal(t, []string{advSDKLow}, residualIDs(result.Residuals, modSDK),
-			"only the advisory fixed solely in v1.45.0 remains")
-		assert.Empty(t, f.compileFailuresWith(t, result.FinalDeps))
+			assert.Equal(t, "v1.43.0", result.Resolved[modSDK], "one rung down from the uncompilable v1.45.0")
+			assert.Equal(t, []string{modSDK + "@v1.43.0"}, result.FinalDeps)
+			assert.Equal(t, []string{advSDKLow}, residualIDs(result.Residuals, modSDK),
+				"only the advisory fixed solely in v1.45.0 remains")
+			assert.Empty(t, f.compileFailuresWith(t, eng, result.FinalDeps))
+		})
 	})
 }
 
@@ -437,73 +456,76 @@ func TestReplay_RungFallback(t *testing.T) {
 // raised API), so it must never be attached to a trial without B, and A
 // must be admitted.
 func TestReplay_NoCrossContamination(t *testing.T) {
-	const (
-		modAPI = "example.com/api"
-		modA   = "example.com/a"
-		modB   = "example.com/b"
-		modS   = "example.com/s"
-		modL   = "example.com/l"
-	)
-	oldAPI := "package api\n\ntype KeyValue struct{ Key string }\n\nfunc Name() string { return \"api\" }\n"
-	newAPI := "package api\n\ntype Attr struct{ Key string }\n\nfunc Name() string { return \"api\" }\n"
-	aSrc := "package a\n\nfunc Name() string { return \"a\" }\n"
-	userSrc := func(pkg, typ string, importsA bool) string {
-		imports := "import \"" + modAPI + "\"\n"
-		body := "api." + typ + "{Key: \"" + pkg + "\"}.Key"
-		if importsA {
-			imports = "import (\n\t\"" + modA + "\"\n\t\"" + modAPI + "\"\n)\n"
-			body += " + a.Name()"
-		}
-		return "package " + pkg + "\n\n" + imports + "\nfunc Name() string { return " + body + " }\n"
-	}
-	f := newReplayFixture(t, map[string]map[string]string{
-		modAPI + "@v0.1.0": stubModule(modAPI, "api.go", oldAPI, nil),
-		modAPI + "@v0.2.0": stubModule(modAPI, "api.go", newAPI, nil),
-		modA + "@v1.0.0":   stubModule(modA, "a.go", aSrc, nil),
-		modA + "@v1.1.0":   stubModule(modA, "a.go", aSrc, nil),
-		modB + "@v0.1.0":   stubModule(modB, "b.go", userSrc("b", "KeyValue", false), map[string]string{modAPI: "v0.1.0"}),
-		modB + "@v0.2.0":   stubModule(modB, "b.go", userSrc("b", "Attr", false), map[string]string{modAPI: "v0.2.0"}),
-		modS + "@v0.1.0":   stubModule(modS, "s.go", userSrc("s", "KeyValue", true), map[string]string{modAPI: "v0.1.0", modA: "v1.0.0"}),
-		modS + "@v0.2.0":   stubModule(modS, "s.go", userSrc("s", "Attr", true), map[string]string{modAPI: "v0.2.0", modA: "v1.1.0"}),
-		modL + "@v0.1.0":   stubModule(modL, "l.go", userSrc("l", "KeyValue", false), map[string]string{modAPI: "v0.1.0"}),
-	}, map[string]string{
-		"go.mod": "module example.com/app\n\ngo 1.21\n\nrequire (\n\t" + modA + " v1.0.0\n\t" + modB + " v0.1.0\n\t" +
-			modS + " v0.1.0\n\t" + modL + " v0.1.0\n)\n",
-		"main.go": "package main\n\nimport (\n\t\"fmt\"\n\n\t\"" + modA + "\"\n\t\"" + modB + "\"\n\t\"" + modL + "\"\n\t\"" + modS + "\"\n)\n\n" +
-			"func main() { fmt.Println(a.Name(), b.Name(), s.Name(), l.Name()) }\n",
-	})
-	sc := &fakeScanner{advisories: []fakeAdvisory{
-		{module: modA, id: "GO-TEST-A", fixed: "v1.1.0", severity: "HIGH"},
-		{module: modB, id: "GO-TEST-B", fixed: "v0.2.0", severity: "HIGH"},
-	}}
-
-	assertFixed(t, defectTrialPollution, func(t tb) {
-		trace := &traceCapture{}
-		ctx := logging.Into(t.Context(), slog.New(trace))
-		result, err := RunLoop(ctx, f.tc, sc, f.dir, ModrootRequest{
-			Modroot: ".",
-			Seeds: []Candidate{
-				{Module: modA, Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-TEST-A"}, Severity: "HIGH"},
-				{Module: modB, Version: "v0.2.0", FromCVE: true, VulnIDs: []string{"GO-TEST-B"}, Severity: "HIGH"},
-			},
-			Baseline: map[string]string{modA: "v1.0.0", modB: "v0.1.0", modS: "v0.1.0", modL: "v0.1.0", modAPI: "v0.1.0"},
-			Tags:     replayTags,
-		}, Options{})
-		require.NoError(t, err)
-		logResult(t, result)
-
-		trials := trace.trials()
-		require.NotEmpty(t, trials, "trial trace records must be emitted")
-		for i, pins := range trials {
-			t.Logf("trial %d: %v", i, pins)
-			if slices.Contains(pins, modS+"@v0.2.0") {
-				assert.True(t, containsPinFor(pins, modB), "trial %d carries B's repair %s@v0.2.0 without B: %v", i, modS, pins)
+	forEachEngine(t, func(t *testing.T, eng Engine) {
+		const (
+			modAPI = "example.com/api"
+			modA   = "example.com/a"
+			modB   = "example.com/b"
+			modS   = "example.com/s"
+			modL   = "example.com/l"
+		)
+		oldAPI := "package api\n\ntype KeyValue struct{ Key string }\n\nfunc Name() string { return \"api\" }\n"
+		newAPI := "package api\n\ntype Attr struct{ Key string }\n\nfunc Name() string { return \"api\" }\n"
+		aSrc := "package a\n\nfunc Name() string { return \"a\" }\n"
+		userSrc := func(pkg, typ string, importsA bool) string {
+			imports := "import \"" + modAPI + "\"\n"
+			body := "api." + typ + "{Key: \"" + pkg + "\"}.Key"
+			if importsA {
+				imports = "import (\n\t\"" + modA + "\"\n\t\"" + modAPI + "\"\n)\n"
+				body += " + a.Name()"
 			}
+			return "package " + pkg + "\n\n" + imports + "\nfunc Name() string { return " + body + " }\n"
 		}
-		assert.Contains(t, result.FinalDeps, modA+"@v1.1.0", "the independent, compiling fix must be admitted")
-		assert.Equal(t, "v1.1.0", result.Resolved[modA])
-		assert.Equal(t, []string{"GO-TEST-B"}, residualIDs(result.Residuals, modB), "B cannot be fixed without breaking L")
-		assert.Empty(t, f.compileFailuresWith(t, result.FinalDeps))
+		f := newReplayFixture(t, map[string]map[string]string{
+			modAPI + "@v0.1.0": stubModule(modAPI, "api.go", oldAPI, nil),
+			modAPI + "@v0.2.0": stubModule(modAPI, "api.go", newAPI, nil),
+			modA + "@v1.0.0":   stubModule(modA, "a.go", aSrc, nil),
+			modA + "@v1.1.0":   stubModule(modA, "a.go", aSrc, nil),
+			modB + "@v0.1.0":   stubModule(modB, "b.go", userSrc("b", "KeyValue", false), map[string]string{modAPI: "v0.1.0"}),
+			modB + "@v0.2.0":   stubModule(modB, "b.go", userSrc("b", "Attr", false), map[string]string{modAPI: "v0.2.0"}),
+			modS + "@v0.1.0":   stubModule(modS, "s.go", userSrc("s", "KeyValue", true), map[string]string{modAPI: "v0.1.0", modA: "v1.0.0"}),
+			modS + "@v0.2.0":   stubModule(modS, "s.go", userSrc("s", "Attr", true), map[string]string{modAPI: "v0.2.0", modA: "v1.1.0"}),
+			modL + "@v0.1.0":   stubModule(modL, "l.go", userSrc("l", "KeyValue", false), map[string]string{modAPI: "v0.1.0"}),
+		}, map[string]string{
+			"go.mod": "module example.com/app\n\ngo 1.21\n\nrequire (\n\t" + modA + " v1.0.0\n\t" + modB + " v0.1.0\n\t" +
+				modS + " v0.1.0\n\t" + modL + " v0.1.0\n)\n",
+			"main.go": "package main\n\nimport (\n\t\"fmt\"\n\n\t\"" + modA + "\"\n\t\"" + modB + "\"\n\t\"" + modL + "\"\n\t\"" + modS + "\"\n)\n\n" +
+				"func main() { fmt.Println(a.Name(), b.Name(), s.Name(), l.Name()) }\n",
+		})
+		sc := &fakeScanner{advisories: []fakeAdvisory{
+			{module: modA, id: "GO-TEST-A", fixed: "v1.1.0", severity: "HIGH"},
+			{module: modB, id: "GO-TEST-B", fixed: "v0.2.0", severity: "HIGH"},
+		}}
+
+		assertFixed(t, defectTrialPollution, func(t tb) {
+			trace := &traceCapture{}
+			ctx := logging.Into(t.Context(), slog.New(trace))
+			result, err := RunLoop(ctx, f.tc, sc, f.dir, ModrootRequest{
+				Modroot: ".",
+				Seeds: []Candidate{
+					{Module: modA, Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-TEST-A"}, Severity: "HIGH"},
+					{Module: modB, Version: "v0.2.0", FromCVE: true, VulnIDs: []string{"GO-TEST-B"}, Severity: "HIGH"},
+				},
+				Baseline: map[string]string{modA: "v1.0.0", modB: "v0.1.0", modS: "v0.1.0", modL: "v0.1.0", modAPI: "v0.1.0"},
+				Tags:     replayTags,
+				Engine:   eng,
+			}, Options{})
+			require.NoError(t, err)
+			logResult(t, result)
+
+			trials := trace.trials()
+			require.NotEmpty(t, trials, "trial trace records must be emitted")
+			for i, pins := range trials {
+				t.Logf("trial %d: %v", i, pins)
+				if slices.Contains(pins, modS+"@v0.2.0") {
+					assert.True(t, containsPinFor(pins, modB), "trial %d carries B's repair %s@v0.2.0 without B: %v", i, modS, pins)
+				}
+			}
+			assert.Contains(t, result.FinalDeps, modA+"@v1.1.0", "the independent, compiling fix must be admitted")
+			assert.Equal(t, "v1.1.0", result.Resolved[modA])
+			assert.Equal(t, []string{"GO-TEST-B"}, residualIDs(result.Residuals, modB), "B cannot be fixed without breaking L")
+			assert.Empty(t, f.compileFailuresWith(t, eng, result.FinalDeps))
+		})
 	})
 }
 
@@ -512,35 +534,38 @@ func TestReplay_NoCrossContamination(t *testing.T) {
 // is removed, while a pin above baseline that still fixes a live advisory
 // is kept.
 func TestReplay_RedundantPinsRemoved(t *testing.T) {
-	netSrc := "package net\n\nfunc Name() string { return \"net\" }\n"
-	grpcSrc := "package grpc\n\nimport \"" + modXNet + "\"\n\nfunc Version() string { return net.Name() }\n"
-	f := newReplayFixture(t, map[string]map[string]string{
-		modXNet + "@v0.55.0": stubModule(modXNet, "net.go", netSrc, nil),
-		modXNet + "@v0.57.0": stubModule(modXNet, "net.go", netSrc, nil),
-		modGRPC + "@v1.79.3": stubModule(modGRPC, "grpc.go", grpcSrc, map[string]string{modXNet: "v0.57.0"}),
-		modGRPC + "@v1.83.2": stubModule(modGRPC, "grpc.go", grpcSrc, map[string]string{modXNet: "v0.57.0"}),
-	}, map[string]string{
-		"go.mod": "module example.com/app\n\ngo 1.21\n\nrequire (\n\t" + modGRPC + " v1.79.3\n\t" + modXNet + " v0.57.0\n)\n",
-		"main.go": "package main\n\nimport (\n\t\"fmt\"\n\n\t\"" + modXNet + "\"\n\t\"" + modGRPC + "\"\n)\n\n" +
-			"func main() { fmt.Println(net.Name(), grpc.Version()) }\n",
+	forEachEngine(t, func(t *testing.T, eng Engine) {
+		netSrc := "package net\n\nfunc Name() string { return \"net\" }\n"
+		grpcSrc := "package grpc\n\nimport \"" + modXNet + "\"\n\nfunc Version() string { return net.Name() }\n"
+		f := newReplayFixture(t, map[string]map[string]string{
+			modXNet + "@v0.55.0": stubModule(modXNet, "net.go", netSrc, nil),
+			modXNet + "@v0.57.0": stubModule(modXNet, "net.go", netSrc, nil),
+			modGRPC + "@v1.79.3": stubModule(modGRPC, "grpc.go", grpcSrc, map[string]string{modXNet: "v0.57.0"}),
+			modGRPC + "@v1.83.2": stubModule(modGRPC, "grpc.go", grpcSrc, map[string]string{modXNet: "v0.57.0"}),
+		}, map[string]string{
+			"go.mod": "module example.com/app\n\ngo 1.21\n\nrequire (\n\t" + modGRPC + " v1.79.3\n\t" + modXNet + " v0.57.0\n)\n",
+			"main.go": "package main\n\nimport (\n\t\"fmt\"\n\n\t\"" + modXNet + "\"\n\t\"" + modGRPC + "\"\n)\n\n" +
+				"func main() { fmt.Println(net.Name(), grpc.Version()) }\n",
+		})
+		sc := &fakeScanner{advisories: []fakeAdvisory{{module: modGRPC, id: advGRPC, fixed: "v1.83.2", severity: "HIGH"}}}
+
+		result, err := RunLoop(t.Context(), f.tc, sc, f.dir, ModrootRequest{
+			Modroot: ".",
+			Seeds: []Candidate{
+				{Module: modXNet, Version: "v0.55.0"}, // existing YAML pin, below upstream
+				{Module: modGRPC, Version: "v1.83.2", FromCVE: true, VulnIDs: []string{advGRPC}, Severity: "HIGH"},
+			},
+			Baseline: map[string]string{modXNet: "v0.57.0", modGRPC: "v1.79.3"},
+			Tags:     replayTags,
+			Engine:   eng,
+		}, Options{})
+		require.NoError(t, err)
+		logResult(t, result)
+
+		assert.Equal(t, []string{modGRPC + "@v1.83.2"}, result.FinalDeps, "redundant x/net pin removed, needed grpc pin kept")
+		assert.Equal(t, "v0.57.0", result.Resolved[modXNet], "never regressed below upstream")
+		assert.Empty(t, result.Residuals)
+		assert.True(t, slices.ContainsFunc(result.Dropped, func(d DroppedCandidate) bool { return d.Module == modXNet }),
+			"the redundant pin is reported as dropped")
 	})
-	sc := &fakeScanner{advisories: []fakeAdvisory{{module: modGRPC, id: advGRPC, fixed: "v1.83.2", severity: "HIGH"}}}
-
-	result, err := RunLoop(t.Context(), f.tc, sc, f.dir, ModrootRequest{
-		Modroot: ".",
-		Seeds: []Candidate{
-			{Module: modXNet, Version: "v0.55.0"}, // existing YAML pin, below upstream
-			{Module: modGRPC, Version: "v1.83.2", FromCVE: true, VulnIDs: []string{advGRPC}, Severity: "HIGH"},
-		},
-		Baseline: map[string]string{modXNet: "v0.57.0", modGRPC: "v1.79.3"},
-		Tags:     replayTags,
-	}, Options{})
-	require.NoError(t, err)
-	logResult(t, result)
-
-	assert.Equal(t, []string{modGRPC + "@v1.83.2"}, result.FinalDeps, "redundant x/net pin removed, needed grpc pin kept")
-	assert.Equal(t, "v0.57.0", result.Resolved[modXNet], "never regressed below upstream")
-	assert.Empty(t, result.Residuals)
-	assert.True(t, slices.ContainsFunc(result.Dropped, func(d DroppedCandidate) bool { return d.Module == modXNet }),
-		"the redundant pin is reported as dropped")
 }

@@ -1053,7 +1053,7 @@ func TestRunLoop_SeedReplacePreservedAndRaised(t *testing.T) {
 // entry, a replace directive is never checked against Requirements for a
 // seed (only a PROMOTED replace is - see TestRunLoop_PrunedPromotedReplace-
 // BackfillsResidual for that contrast case); it only has to survive tidy.
-// This mirrors omnibump v0.23.1's AUTO-954: absentReplacePins re-adds
+// This mirrors omnibump's AUTO-954 (current release): absentReplacePins re-adds
 // replace-type deps missing from a sub-module's go.mod because the
 // directive (unlike a bare require) survives go mod tidy.
 func TestRunLoop_SeedReplaceForModuleAbsentFromGoModSurvives(t *testing.T) {

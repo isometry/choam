@@ -193,6 +193,7 @@ func writeFileProxy(t *testing.T, modules map[string]map[string]string) string {
 		dir := filepath.Join(src, filepath.FromSlash(modPath)+"@"+version)
 		require.NoError(t, os.MkdirAll(dir, 0o755))
 		for name, content := range files {
+			require.NoError(t, os.MkdirAll(filepath.Dir(filepath.Join(dir, name)), 0o755))
 			require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644))
 		}
 

@@ -56,6 +56,7 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `internal/gobump/processor.go` - `NewGoBumpProcessor()` constructor
 - `internal/gobump/stages.go` - language-agnostic orchestrator (discovery, analysis, reconcile)
 - `internal/gobump/simulate_stage.go` + `internal/simulate/` - bump simulation (proves candidate sets resolve and cover advisories with a real go toolchain)
+- `internal/simulate/engine.go` - apply engines: `uses: bump` steps (and new steps) simulate with the linked omnibump's `golang.DoUpdate` behind its CLI's raw-go.mod filter; `uses: go/bump` steps keep the gobump model
 - `internal/gobump/gopin.go` - `go-package` toolchain pin parsing and raising on `go/build`/`go/install` steps
 - `internal/gobump/goversion_fallback.go` - best-effort `go-version` proxy fallback used under `--no-validate`
 - `internal/gobump/stdlib.go` + `internal/gobump/stdlib_stage.go` - Go stdlib staleness check and epoch-bump trigger (`--no-stdlib` to disable)

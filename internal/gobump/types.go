@@ -107,6 +107,14 @@ type ModrootAnalysis struct {
 	// the simulation's compile gate. Empty when no go/build step covers it.
 	BuildTags []string `json:"build_tags,omitempty" yaml:"build_tags,omitempty"`
 
+	// BumpEngine is the apply semantics the build's bump step will use for
+	// this modroot (see analysisUnit.Engine); BumpNoTidy mirrors that step's
+	// `tidy: false`; GoPackageMinor is the Go minor its go/build steps pin
+	// via go-package ("" when unpinned). Go only.
+	BumpEngine     simulate.Engine `json:"-" yaml:"-"`
+	BumpNoTidy     bool            `json:"-" yaml:"-"`
+	GoPackageMinor string          `json:"-" yaml:"-"`
+
 	Deps         *ecosystem.ModuleDeps `json:"-" yaml:"-"` // ecosystem-internal, not serialized
 	ScanResult   *scan.ScanResult      `json:"scan_result" yaml:"scan_result"`
 	ExistingDeps []string              `json:"existing_deps" yaml:"existing_deps"` // deps currently declared for this root

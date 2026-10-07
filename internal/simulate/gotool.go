@@ -75,6 +75,9 @@ func NewToolchain(ctx context.Context, commandTimeout time.Duration) (*GoToolcha
 	return t, nil
 }
 
+// hostGoVersion is the local go's bare version ("" when the probe failed).
+func (t *GoToolchain) hostGoVersion() string { return t.goVersion }
+
 func (t *GoToolchain) run(ctx context.Context, dir string, args ...string) ([]byte, error) {
 	return t.runEnv(ctx, dir, nil, args...)
 }
@@ -450,6 +453,20 @@ func (t *GoToolchain) ModuleVersions(ctx context.Context, dir, modulePath string
 	versions := fields[1:]
 	sort.Slice(versions, func(i, j int) bool { return semver.Compare(versions[i], versions[j]) < 0 })
 	return versions, nil
+}
+
+// ResolveQuery resolves module@query (e.g. @latest) to a concrete version
+// (`go list -m`).
+func (t *GoToolchain) ResolveQuery(ctx context.Context, dir, modulePath, query string) (string, error) {
+	output, err := t.run(ctx, dir, "list", "-m", "-f", "{{.Version}}", modulePath+"@"+query)
+	if err != nil {
+		return "", err
+	}
+	version := strings.TrimSpace(string(output))
+	if version == "" {
+		return "", fmt.Errorf("go list -m %s@%s: no version", modulePath, query)
+	}
+	return version, nil
 }
 
 // ModuleRequires returns the require entries of module@version's own go.mod

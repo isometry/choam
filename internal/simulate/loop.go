@@ -68,6 +68,8 @@ type loop struct {
 	req  ModrootRequest
 	opts Options
 
+	engine engine // the bump step's apply semantics (see Engine)
+
 	cands    []*candState
 	byModule map[string]*candState
 
@@ -132,6 +134,7 @@ type raise struct {
 func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req ModrootRequest, opts Options) (*ModrootResult, error) {
 	opts = opts.WithDefaults()
 
+	var pristineReplaces map[string]ReplaceTarget
 	l := &loop{
 		tc:            tc,
 		sc:            sc,
@@ -152,7 +155,12 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	if err := l.savePristine(ctx); err != nil {
 		return nil, err
 	}
-	pristineReplaces, err := tc.Replaces(ctx, dir)
+	eng, err := l.newEngine(ctx)
+	if err != nil {
+		return nil, err
+	}
+	l.engine = eng
+	pristineReplaces, err = tc.Replaces(ctx, dir)
 	if err != nil {
 		return nil, fmt.Errorf("reading upstream replace directives: %w", err)
 	}
@@ -202,10 +210,10 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 			if err != nil {
 				return nil, err
 			}
-			// The tidied go.mod's go directive cannot change between tidies
-			// run with the same `-go=` flag (see GoToolchain.ModTidy), so
-			// this needs no recompute in adoptTrial - the trial's tidy uses
-			// the same flag as the main loop's.
+			// The tidied go.mod's go directive cannot change between applies
+			// by the same engine (gobump tidies with the same `-go=` flag,
+			// omnibump lowers to the same build Go), so this needs no
+			// recompute in adoptTrial.
 			l.tidiedModern = l.tidiedGoModern()
 			if l.tidiedModern && l.linked == nil && !l.degradedNoted {
 				l.degradedNoted = true
@@ -479,73 +487,41 @@ func (l *loop) restore(_ context.Context) error {
 }
 
 // apply establishes a clean toolchain state with every active candidate
-// applied, in gobump-parity order: tidy first (what melange's go/bump does),
-// then one `go get` per candidate, then a final tidy. Any failure repairs or
-// removes exactly one candidate and restarts the attempt, so the loop is
-// bounded by the candidate count (a repair happens at most once per module).
+// applied by the step's engine (see Engine), in apply order. Any failure
+// repairs or removes exactly one candidate and restarts the attempt, so the
+// loop is bounded by the candidate count (a repair happens at most once per
+// module).
 func (l *loop) apply(ctx context.Context) error {
 	for attempt := 0; attempt < 3*len(l.cands)+8; attempt++ {
 		if err := ctx.Err(); err != nil {
 			// Without this, a cancellation mid-loop can still burn several
-			// more attempts (restore/getSatisfied succeed regardless of
-			// ctx), and exhausting the attempt budget afterward would report
-			// a misleading "module graph did not stabilize" instead of the
-			// real cancellation.
-			return err
-		}
-		if err := l.restore(ctx); err != nil {
+			// more attempts, and exhausting the attempt budget afterward
+			// would report a misleading "module graph did not stabilize"
+			// instead of the real cancellation.
 			return err
 		}
 		for _, c := range l.cands {
 			c.satisfiedTransitively = false
 		}
-		if err := l.tc.ModTidy(ctx, l.dir); err != nil {
-			return fmt.Errorf("initial go mod tidy: %w", err)
+		skipped, fail := l.engine.apply(ctx, l.inApplyOrder(l.activeCandidates()))
+		for _, c := range skipped {
+			c.satisfiedTransitively = true
 		}
-
-		// Replace directives first (gobump parity), then the gets. A
-		// replace edit is syntactic - failure is fatal, not a graph problem.
-		for _, c := range l.activeCandidates() {
-			if !c.Replace {
-				continue
-			}
-			if c.Version == latestQuery {
-				return fmt.Errorf("internal error: replace candidate %s has unresolved @latest version", c.Module)
-			}
-			if err := l.tc.Replace(ctx, l.dir, c.OldPath(), c.Module, c.Version); err != nil {
-				return fmt.Errorf("applying replace %s=%s@%s: %w", c.OldPath(), c.Module, c.Version, err)
-			}
-		}
-
-		failed := false
-		for _, c := range l.applyOrder() {
-			if l.getSatisfied(ctx, c) {
-				// gobump parity: melange's go/bump skips any deps entry
-				// whose current require already exceeds the requested
-				// version. Running the get anyway would be a DOWNGRADE that
-				// can drag an earlier candidate's module back below its fix.
-				c.satisfiedTransitively = true
-				logging.From(ctx).Debug("skipping go get: require already exceeds target",
-					"modroot", l.req.Modroot, "module", c.Module, "target", c.Version)
-				continue
-			}
-			if err := l.tc.Get(ctx, l.dir, c.Module+"@"+c.Version); err != nil {
-				l.handleGetFailure(c, err)
-				failed = true
-				break
+		switch {
+		case fail == nil, fail.step == stepVerify:
+			// A verification failure leaves the tidied result on disk: the
+			// sustain checks (dropUnsustained) shed or promote the rejected
+			// entry exactly as they do for gobump's identical verification.
+			return nil
+		case fail.step == stepSetup:
+			return fail.err
+		case fail.step == stepGet && fail.cand != nil:
+			l.handleGetFailure(fail.cand, fail.err)
+		default: // the closing tidy, or a get failure no candidate is named in
+			if !l.handleTidyFailure(fail.err) {
+				return fmt.Errorf("final go mod tidy: %w", fail.err)
 			}
 		}
-		if failed {
-			continue
-		}
-
-		if err := l.tc.ModTidy(ctx, l.dir); err != nil {
-			if l.handleTidyFailure(err) {
-				continue
-			}
-			return fmt.Errorf("final go mod tidy: %w", err)
-		}
-		return nil
 	}
 	return fmt.Errorf("module graph did not stabilize after %d apply attempts", 3*len(l.cands)+8)
 }
@@ -710,27 +686,6 @@ func (l *loop) shedCandidate(err error, eligible func(*candState) bool) bool {
 		})
 	}
 	return true
-}
-
-// applyOrder returns the active candidates to `go get`, with ambiguity
-// remedies first: an ambiguous import blocks the `go get` of the module that
-// trips it, so the repair must land before that module is fetched.
-// Replace-channel candidates are excluded - they are applied as go.mod
-// edits before any get (see apply).
-func (l *loop) applyOrder() []*candState {
-	active := l.activeCandidates()
-	ordered := make([]*candState, 0, len(active))
-	for _, c := range active {
-		if c.remedy && !c.Replace {
-			ordered = append(ordered, c)
-		}
-	}
-	for _, c := range active {
-		if !c.remedy && !c.Replace {
-			ordered = append(ordered, c)
-		}
-	}
-	return ordered
 }
 
 // getSatisfied reports whether the current go.mod already requires the
@@ -1297,10 +1252,9 @@ type trialResult struct {
 	residuals    []Residual
 }
 
-// trialApply re-applies exactly the keep set from the pristine snapshot
-// (tidy, replaces, skip-guarded gets, tidy - gobump parity throughout),
-// refreshes reachability for the trial graph, rescans it, and classifies the
-// findings. Single-shot: any failure rejects the trial (non-nil error) with
+// trialApply re-applies exactly the keep set from the pristine snapshot with
+// the step's engine (see applyExact), refreshes reachability for the trial
+// graph, rescans it, and classifies the findings. Single-shot: any failure rejects the trial (non-nil error) with
 // no repair ladder. Reachability must be recomputed for the trial graph and
 // its rescan filtered identically to the main loop's - otherwise
 // introducesNewVulns would compare linked-filtered accepted residuals
@@ -1335,34 +1289,14 @@ func (l *loop) trialApply(ctx context.Context, purpose string, keep []*candState
 	return tr, nil
 }
 
-// applyExact re-applies exactly the keep set from the pristine snapshot
-// (tidy, replaces, skip-guarded gets, tidy - gobump parity throughout), in
-// keep's order. Single-shot: any failure is returned with no repair ladder.
+// applyExact re-applies exactly the keep set from the pristine snapshot with
+// the step's engine, in keep's order. Single-shot: any failure (including
+// omnibump's post-tidy verification) is returned with no repair ladder.
 func (l *loop) applyExact(ctx context.Context, keep []*candState) error {
-	if err := l.restore(ctx); err != nil {
-		return err
+	if _, fail := l.engine.apply(ctx, keep); fail != nil {
+		return fail.err
 	}
-	if err := l.tc.ModTidy(ctx, l.dir); err != nil {
-		return err
-	}
-	// gobump parity: replace directives before any get.
-	for _, c := range keep {
-		if !c.Replace {
-			continue
-		}
-		if err := l.tc.Replace(ctx, l.dir, c.OldPath(), c.Module, c.Version); err != nil {
-			return err
-		}
-	}
-	for _, c := range keep {
-		if c.Replace || l.getSatisfied(ctx, c) {
-			continue
-		}
-		if err := l.tc.Get(ctx, l.dir, c.Module+"@"+c.Version); err != nil {
-			return err
-		}
-	}
-	return l.tc.ModTidy(ctx, l.dir)
+	return nil
 }
 
 // sustained verifies every keep candidate against the trial's tidied state:
@@ -1625,10 +1559,7 @@ func (o *trialOutcome) why() string {
 // code, host-only noise) are excluded from every later verdict, so only
 // failures a bump introduces count.
 func (l *loop) compileBaseline(ctx context.Context) error {
-	if err := l.restore(ctx); err != nil {
-		return err
-	}
-	if err := l.tc.ModTidy(ctx, l.dir); err != nil {
+	if err := l.engine.tidyBaseline(ctx); err != nil {
 		return gateErr(ctx, fmt.Errorf("baseline go mod tidy: %w", err))
 	}
 	resolved, err := l.tc.ListModules(ctx, l.dir)
@@ -1841,8 +1772,11 @@ func (l *loop) trial(ctx context.Context, purpose, subject string, pins []*candS
 	return out, nil
 }
 
-// inApplyOrder orders a candidate subset like apply does: ambiguity
-// remedies first, then candidates in the order they were added.
+// inApplyOrder orders a candidate subset for an engine apply: ambiguity
+// remedies first (an ambiguous import blocks the get of the module that
+// trips it, so the repair must land before that module is fetched), then
+// candidates in the order they were added. Engines apply replace candidates
+// before any get.
 func (l *loop) inApplyOrder(keep []*candState) []*candState {
 	include := make(map[*candState]struct{}, len(keep))
 	for _, c := range keep {

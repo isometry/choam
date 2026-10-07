@@ -1100,3 +1100,21 @@ func TestSeedCandidates_ThreadsSeverity(t *testing.T) {
 	}, seeds[0])
 	assert.Equal(t, simulate.Candidate{Module: "example.com/b", Version: "v1.2.0"}, seeds[1])
 }
+
+// TestSimulationStage_ThreadsEngine: the modroot's bump-step engine and tidy
+// setting reach the simulation request, and an omnibump-engine run reports
+// the omnibump version it simulated with.
+func TestSimulationStage_ThreadsEngine(t *testing.T) {
+	fake := &fakeBumpSimulator{results: map[string]*simulate.ModrootResult{".": {Modroot: ".", Converged: true}}}
+	stage := newStageWithFake(fake)
+	gp := newSimulationProcessor()
+	m := &gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0]
+	m.BumpEngine, m.BumpNoTidy = simulate.EngineOmnibump, true
+
+	require.NoError(t, stage.Apply(t.Context(), gp))
+	require.Len(t, fake.gotReqs, 1)
+	assert.Equal(t, simulate.EngineOmnibump, fake.gotReqs[0].Engine)
+	assert.True(t, fake.gotReqs[0].NoTidy)
+	assert.Equal(t, "", fake.gotReqs[0].GoVersion, "no go-package pin: the host go")
+	assert.Contains(t, gp.GetMessages(), "simulation: uses: bump applied with omnibump "+simulate.OmnibumpVersion())
+}

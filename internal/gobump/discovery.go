@@ -8,7 +8,9 @@ import (
 	melange "chainguard.dev/melange/pkg/config"
 	"github.com/isometry/choam/internal/config"
 	"github.com/isometry/choam/internal/ecosystem"
+	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/logging"
+	"github.com/isometry/choam/internal/simulate"
 )
 
 // buildStepSignals maps a melange build-pipeline "uses:" name to the
@@ -43,6 +45,16 @@ type analysisUnit struct {
 	// Tags are the build tags of the go/build steps sharing the modroot
 	// (toolchaintags, default netgo,osusergo, plus tags), unioned.
 	Tags []string
+	// Engine is the apply semantics of the bump step the build will run for
+	// the modroot: gobump when the first existing step covering it is
+	// `uses: go/bump`, else omnibump - also for a root no step covers yet,
+	// since choam writes new steps as `uses: bump`. NoTidy mirrors that
+	// step's `tidy: false`.
+	Engine simulate.Engine
+	NoTidy bool
+	// GoMinor is the lowest Go minor the go/build steps building the
+	// modroot pin via go-package (e.g. "1.25"); "" when none is pinned.
+	GoMinor string
 }
 
 // defaultToolchainTags mirrors melange's go/build toolchaintags default.
@@ -58,21 +70,27 @@ const defaultToolchainTags = "netgo,osusergo"
 // from the result had no modroots from any source.
 func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bumpSteps []config.BumpStep) map[string][]analysisUnit {
 	// language -> modroot -> sets of build package patterns and tags
-	type unitSets struct{ patterns, tags map[string]struct{} }
+	type unitSets struct {
+		patterns, tags map[string]struct{}
+		step           *config.BumpStep // first bump step covering the root
+		goMinor        string
+	}
 	units := make(map[string]map[string]*unitSets)
 
-	add := func(language string, modroots, packages, tags []string) {
+	add := func(language string, modroots, packages, tags []string) []*unitSets {
 		byRoot, ok := units[language]
 		if !ok {
 			byRoot = make(map[string]*unitSets)
 			units[language] = byRoot
 		}
+		added := make([]*unitSets, 0, len(modroots))
 		for _, root := range modroots {
 			sets, ok := byRoot[root]
 			if !ok {
 				sets = &unitSets{patterns: make(map[string]struct{}), tags: make(map[string]struct{})}
 				byRoot[root] = sets
 			}
+			added = append(added, sets)
 			for _, pattern := range packages {
 				sets.patterns[pattern] = struct{}{}
 			}
@@ -80,20 +98,30 @@ func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bump
 				sets.tags[tag] = struct{}{}
 			}
 		}
+		return added
 	}
 
-	for _, step := range bumpSteps {
+	for i := range bumpSteps {
+		step := &bumpSteps[i]
 		language := step.Language
 		if language == "" {
 			language = "go" // legacy go/bump and language-less bump steps default to go
 		}
-		add(language, step.Modroots, nil, nil)
+		for _, sets := range add(language, step.Modroots, nil, nil) {
+			if sets.step == nil {
+				sets.step = step
+			}
+		}
 	}
 
 	if cfg != nil {
 		for language, buildUnits := range unitsFromBuildSteps(ctx, cfg) {
 			for _, unit := range buildUnits {
-				add(language, []string{unit.Modroot}, unit.Packages, unit.Tags)
+				for _, sets := range add(language, []string{unit.Modroot}, unit.Packages, unit.Tags) {
+					if unit.GoMinor != "" && (sets.goMinor == "" || goversion.Compare(unit.GoMinor, sets.goMinor) < 0) {
+						sets.goMinor = unit.GoMinor
+					}
+				}
 			}
 		}
 		for language, modroots := range modrootsFromAnnotations(cfg) {
@@ -108,7 +136,13 @@ func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bump
 		}
 		langUnits := make([]analysisUnit, 0, len(byRoot))
 		for root, sets := range byRoot {
-			unit := analysisUnit{Modroot: root}
+			unit := analysisUnit{Modroot: root, Engine: simulate.EngineOmnibump, GoMinor: sets.goMinor}
+			if sets.step != nil {
+				unit.NoTidy = sets.step.NoTidy
+				if sets.step.Action == "go/bump" {
+					unit.Engine = simulate.EngineGobump
+				}
+			}
 			for pattern := range sets.patterns {
 				unit.Packages = append(unit.Packages, pattern)
 			}
@@ -183,6 +217,9 @@ func unitsFromBuildSteps(ctx context.Context, cfg *melange.Configuration) map[st
 					toolchainTags = defaultToolchainTags
 				}
 				unit.Tags = splitBuildTags(render(toolchainTags) + "," + render(step.With["tags"]))
+				if _, minor, ok := parseGoPackagePin(render(step.With["go-package"])); ok {
+					unit.GoMinor = minor
+				}
 			}
 			result[language] = append(result[language], unit)
 		}

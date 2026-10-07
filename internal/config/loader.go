@@ -450,6 +450,7 @@ type BumpStep struct {
 	Action    string   // "bump" or "go/bump"
 	Language  string   // parsed with.language entry ("" when absent)
 	GoVersion string   // parsed with.go-version entry ("" when absent)
+	NoTidy    bool     // with.tidy is literally false (the input defaults to true)
 	Modroots  []string // parsed with.modroot entries; defaults to ["."] when absent
 	Deps      []string // parsed with.deps entries ("module@version")
 	Replaces  []string // parsed with.replaces entries ("old=new@version")
@@ -483,9 +484,11 @@ func (l *Loader) FindBumpSteps(yamlContent []byte) ([]BumpStep, error) {
 			}
 
 			var language, goVersion string
+			var noTidy bool
 			if withFields, err := l.GetPipelineWithField(yamlContent, idx); err == nil {
 				language = withFields["language"]
 				goVersion = withFields["go-version"]
+				noTidy = strings.TrimSpace(withFields["tidy"]) == "false"
 			}
 
 			steps = append(steps, BumpStep{
@@ -493,6 +496,7 @@ func (l *Loader) FindBumpSteps(yamlContent []byte) ([]BumpStep, error) {
 				Action:    action,
 				Language:  language,
 				GoVersion: goVersion,
+				NoTidy:    noTidy,
 				Modroots:  modroots,
 				Deps:      deps,
 				Replaces:  replaces,

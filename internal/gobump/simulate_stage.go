@@ -131,7 +131,11 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 
 		goEco := ecogolang.New()
 		reqs := make([]simulate.ModrootRequest, 0, len(lang.ByModroot))
+		omnibumpRoots := 0
 		for _, m := range lang.ByModroot {
+			if m.BumpEngine == simulate.EngineOmnibump {
+				omnibumpRoots++
+			}
 			reqs = append(reqs, simulate.ModrootRequest{
 				Modroot:         m.Modroot,
 				Seeds:           seedCandidates(m),
@@ -140,7 +144,15 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 				Tags:            m.BuildTags,
 				VulnImports:     vulnImportPaths(m.ScanResult),
 				BaselineVulnIDs: baselineVulnIDs(m.ScanResult),
+				Engine:          m.BumpEngine,
+				NoTidy:          m.BumpNoTidy,
+				GoVersion:       s.buildGoVersion(ctx, m.GoPackageMinor),
 			})
+		}
+		if omnibumpRoots > 0 {
+			version := simulate.OmnibumpVersion()
+			logging.From(ctx).Debug("simulating uses: bump steps with omnibump", "omnibump", version, "modroots", omnibumpRoots)
+			gp.AddMessage(fmt.Sprintf("simulation: uses: bump applied with omnibump %s", version))
 		}
 
 		results, err := sim.Simulate(ctx, analysis.RepoURL, analysis.Tag, analysis.ExpectedCommit, reqs)
@@ -283,6 +295,23 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 	return nil
 }
 
+// buildGoVersion is the Go version the build's bump step runs with, for the
+// omnibump engine's go-directive lowering: the latest release of the minor
+// the modroot's go/build steps pin via go-package. "" (the host go) when
+// nothing is pinned or the release index cannot answer.
+func (s *SimulationStage) buildGoVersion(ctx context.Context, minor string) string {
+	if minor == "" || s.Analyzer == nil || s.Analyzer.goReleases == nil {
+		return ""
+	}
+	version, err := s.Analyzer.goReleases.LatestAvailable(ctx, minor)
+	if err != nil {
+		logging.From(ctx).Debug("could not resolve the pinned Go minor's latest release - simulating with the host go",
+			"go_minor", minor, "error", err)
+		return ""
+	}
+	return version
+}
+
 // coUpdateBudget bounds each declareCoUpdates round - DetectCoUpdates
 // prefetches dependency go.mod files from proxy.golang.org and can be slow
 // on huge module graphs; failing open just means the build-time advisory
@@ -311,9 +340,9 @@ const coUpdateBudget = 2 * time.Minute
 // another simulation round. Best-effort throughout: any failure leaves the
 // deps list unchanged. Appended entries are absent from
 // SecurityBumpModules, so accounting never credits them as security fixes.
-// The build image may run a different omnibump version than the omnibump
-// v0.23.1 CHOAM links (the parity target), so silence is parity-by-
-// same-function, not a guarantee.
+// The build runs the same function from the omnibump release its image
+// installs; choam links the latest release, so silence is parity-by-same-
+// function.
 func (s *SimulationStage) declareCoUpdates(ctx context.Context, gp *GoBumpProcessor, m *ModrootAnalysis, result *simulate.ModrootResult) {
 	if len(result.FinalDeps) == 0 || len(result.Requires) == 0 {
 		return
@@ -394,7 +423,7 @@ func (s *SimulationStage) safeDetectCoUpdates(ctx context.Context, packagesToUpd
 			missing = nil
 		}
 	}()
-	return s.detectCoUpdates(ctx, packagesToUpdate, modFile)
+	return s.detectCoUpdates(logging.Library(ctx, "omnibump"), packagesToUpdate, modFile)
 }
 
 // failClosed reports whether a simulation error must fail the file instead
