@@ -159,6 +159,12 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 		return nil, err
 	}
 	l.engine = eng
+	baselineTidies := false
+	if prober, ok := eng.(*omnibumpEngine); ok && req.ProbeTidy && req.NoTidy {
+		if baselineTidies, err = prober.probeTidy(ctx); err != nil {
+			return nil, err
+		}
+	}
 	pristineReplaces, err = tc.Replaces(ctx, dir)
 	if err != nil {
 		return nil, fmt.Errorf("reading upstream replace directives: %w", err)
@@ -182,7 +188,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 		}
 	}
 
-	result := &ModrootResult{Modroot: req.Modroot}
+	result := &ModrootResult{Modroot: req.Modroot, BaselineTidies: baselineTidies}
 
 	var resolved map[string]string
 	for iter := 1; iter <= opts.MaxIterations; iter++ {
@@ -1576,11 +1582,16 @@ func (l *loop) dropRedundant(ctx context.Context, c *candState, why string) {
 // fallbacks are substituted with the resolved version. Redundant entries are
 // already gone (see minimise); a deps entry the final tidy pruned is dropped
 // here because gobump rejects it at build time.
+//
+// Entries are rendered in apply order (see inApplyOrder), not insertion
+// order: the build's bump step applies the written list in order, so an
+// ambiguous-import remedy must precede the split-module entry it unblocks,
+// exactly as the simulation applied it.
 func (l *loop) finalOutputs(resolved map[string]string) ([]string, []string, []string) {
 	var deps []string
 	var replaces []string
 	var cveModules []string
-	for _, c := range l.activeCandidates() {
+	for _, c := range l.inApplyOrder(l.activeCandidates()) {
 		if c.Replace {
 			replaces = append(replaces, fmt.Sprintf("%s=%s@%s", c.OldPath(), c.Module, c.Version))
 			if c.FromCVE {

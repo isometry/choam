@@ -291,6 +291,11 @@ type ModrootResult struct {
 	// equivalent of the checker's SecurityBumpModules.
 	CVEBackedModules []string `json:"cve_backed_modules,omitempty" yaml:"cve_backed_modules,omitempty"`
 
+	// BaselineTidies answers ModrootRequest.ProbeTidy: the pristine module
+	// tidies under omnibump (so a `tidy: false` may no longer be needed).
+	// Always false when no probe was requested.
+	BaselineTidies bool `json:"baseline_tidies,omitempty" yaml:"baseline_tidies,omitempty"`
+
 	Residuals []Residual         `json:"residuals,omitempty" yaml:"residuals,omitempty"`
 	Dropped   []DroppedCandidate `json:"dropped,omitempty" yaml:"dropped,omitempty"`
 
@@ -340,6 +345,11 @@ type ModrootRequest struct {
 	// lowers the go directive to it, never raises it. "" means the host go
 	// (EngineOmnibump only).
 	GoVersion string
+	// ProbeTidy asks, for a NoTidy EngineOmnibump request, whether the
+	// pristine module would tidy under omnibump anyway (DoUpdate with tidy
+	// on and no entries); the answer is ModrootResult.BaselineTidies. It is
+	// informational only - the simulation itself still honours NoTidy.
+	ProbeTidy bool
 }
 
 // Options tunes the simulation.

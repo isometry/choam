@@ -305,6 +305,34 @@ func (e *omnibumpEngine) tidyBaseline(ctx context.Context) error {
 	return nil
 }
 
+// probeTidy reports whether the pristine module tidies under omnibump with
+// tidy on and no entries (DoUpdate's initial and final tidy), regardless of
+// the step's own `tidy: false`. The checkout is restored afterwards. A
+// cancellation propagates as an error; any other failure is a "no".
+func (e *omnibumpEngine) probeTidy(ctx context.Context) (bool, error) {
+	if err := e.l.restore(ctx); err != nil {
+		return false, err
+	}
+	ctx, cancel := context.WithTimeout(ctx, 3*e.l.opts.CommandTimeout)
+	defer cancel()
+	cfg := &omnibump.UpdateConfig{Modroot: e.l.dir, Tidy: true, GoVersion: e.goVersion}
+	err := withProcessEnv(e.env, func() error {
+		_, err := omnibumpUpdate(logging.Library(ctx, "omnibump"), map[string]*omnibump.Package{}, cfg)
+		return err
+	})
+	if rerr := e.l.restore(ctx); rerr != nil {
+		return false, rerr
+	}
+	if cerr := ctx.Err(); cerr != nil && errors.Is(cerr, context.Canceled) {
+		return false, cerr
+	}
+	if err != nil {
+		logging.From(ctx).Debug("omnibump tidy probe failed", "modroot", e.l.req.Modroot, "error", err)
+		return false, nil
+	}
+	return true, nil
+}
+
 // upstreamSkip is the CLI's raw-go.mod filter (see rawSkip).
 func (e *omnibumpEngine) upstreamSkip(c *candState) string {
 	if c.Version == latestQuery {

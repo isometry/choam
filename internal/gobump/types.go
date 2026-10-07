@@ -108,12 +108,17 @@ type ModrootAnalysis struct {
 	BuildTags []string `json:"build_tags,omitempty" yaml:"build_tags,omitempty"`
 
 	// BumpEngine is the apply semantics the build's bump step will use for
-	// this modroot (see analysisUnit.Engine); BumpNoTidy mirrors that step's
-	// `tidy: false`; GoPackageMinor is the Go minor its go/build steps pin
-	// via go-package ("" when unpinned). Go only.
+	// this modroot once written (see analysisUnit.Engine); BumpMigrating
+	// marks a go/bump step that migrates to `uses: bump` when rewritten;
+	// BumpNoTidy mirrors that step's `tidy: false`; GoPackageMinor is the Go
+	// minor the build pins ("" when unpinned). BaselineTidies records that
+	// the simulation found the pristine module tidies under omnibump (only
+	// probed for a migrating `tidy: false` step). Go only.
 	BumpEngine     simulate.Engine `json:"-" yaml:"-"`
+	BumpMigrating  bool            `json:"-" yaml:"-"`
 	BumpNoTidy     bool            `json:"-" yaml:"-"`
 	GoPackageMinor string          `json:"-" yaml:"-"`
+	BaselineTidies bool            `json:"-" yaml:"-"`
 
 	Deps         *ecosystem.ModuleDeps `json:"-" yaml:"-"` // ecosystem-internal, not serialized
 	ScanResult   *scan.ScanResult      `json:"scan_result" yaml:"scan_result"`

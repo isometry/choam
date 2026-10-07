@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -265,6 +266,118 @@ func TestRunLoop_AmbiguousImportBothEngines(t *testing.T) {
 		}
 		assert.Empty(t, f.compileFailuresWith(t, eng, append(result.FinalReplaces, result.FinalDeps...)))
 	})
+}
+
+// TestRunLoop_AmbiguityRemedyWrittenFirst is the regression test for the
+// written order of an ambiguous-import remedy: the build applies the deps
+// list in order, so the monolith remedy (added by the loop AFTER the seeds)
+// must be rendered before the split-module entry it unblocks - the order the
+// simulation applied them in. Here the remedied monolith m@v1.1.0 itself
+// requires m/sub@v1.0.5, below the m/sub fix, so the m/sub entry is not
+// implied and survives next to the remedy (an unrelated entry x sits between
+// them in seed order). The final list is replayed from scratch in its written
+// order under each engine.
+func TestRunLoop_AmbiguityRemedyWrittenFirst(t *testing.T) {
+	forEachEngine(t, func(t *testing.T, eng Engine) {
+		subSrc := "package sub\n\nfunc Name() string { return \"sub\" }\n"
+		mSrc := "package m\n\nfunc Name() string { return \"m\" }\n"
+		xSrc := "package x\n\nfunc Name() string { return \"x\" }\n"
+		f := newReplayFixture(t, map[string]map[string]string{
+			"example.com/m@v1.0.0":     {"go.mod": "module example.com/m\n\ngo 1.21\n", "m.go": mSrc, "sub/sub.go": subSrc},
+			"example.com/m@v1.1.0":     {"go.mod": "module example.com/m\n\ngo 1.21\n\nrequire example.com/m/sub v1.0.5\n", "m.go": mSrc},
+			"example.com/m/sub@v1.0.5": stubModule("example.com/m/sub", "sub.go", subSrc, nil),
+			"example.com/m/sub@v1.1.0": stubModule("example.com/m/sub", "sub.go", subSrc, nil),
+			"example.com/x@v1.0.0":     stubModule("example.com/x", "x.go", xSrc, nil),
+			"example.com/x@v1.1.0":     stubModule("example.com/x", "x.go", xSrc, nil),
+		}, map[string]string{
+			"go.mod": "module example.com/app\n\ngo 1.21\n\nrequire (\n\texample.com/m v1.0.0\n\texample.com/x v1.0.0\n)\n",
+			"main.go": "package main\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/m\"\n\t\"example.com/m/sub\"\n\t\"example.com/x\"\n)\n\n" +
+				"func main() { fmt.Println(m.Name(), sub.Name(), x.Name()) }\n",
+		})
+		sc := &fakeScanner{advisories: []fakeAdvisory{
+			{module: "example.com/x", id: "GO-X", fixed: "v1.1.0"},
+			{module: "example.com/m/sub", id: "GO-SUB", fixed: "v1.1.0"},
+		}}
+		result, err := RunLoop(t.Context(), f.tc, sc, f.dir, ModrootRequest{
+			Modroot: ".",
+			Seeds: []Candidate{
+				{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-X"}},
+				{Module: "example.com/m/sub", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-SUB"}},
+			},
+			Baseline: map[string]string{"example.com/m": "v1.0.0", "example.com/x": "v1.0.0"},
+			Packages: []string{"./does-not-exist"},
+			Engine:   eng,
+		}, Options{NoCompile: true})
+		require.NoError(t, err)
+		logResult(t, result)
+		assert.Empty(t, result.Residuals)
+		assert.Equal(t, "v1.1.0", result.Resolved["example.com/m/sub"])
+		require.NotEmpty(t, result.FinalDeps)
+		assert.Equal(t, "example.com/m@v1.1.0", result.FinalDeps[0], "the remedy is written first")
+		if i := slices.Index(result.FinalDeps, "example.com/m/sub@v1.1.0"); i >= 0 {
+			assert.Positive(t, i, "the split-module entry follows its remedy")
+		}
+		assert.Empty(t, f.compileFailuresWith(t, eng, append(result.FinalReplaces, result.FinalDeps...)),
+			"the written list, applied in order, reproduces the simulated graph")
+	})
+}
+
+// TestOmnibumpEngine_PreservesGodebugAndLowGoDirective: a go.mod whose go
+// directive is below the build's Go and which carries a godebug block (the
+// terraform shape) comes out of DoUpdate with both untouched - omnibump only
+// ever lowers the directive, and neither omnibump nor go mod tidy edit
+// godebug. Unlike gobump's --go-version, nothing raises the directive.
+func TestOmnibumpEngine_PreservesGodebugAndLowGoDirective(t *testing.T) {
+	pkg := func(path, name string) map[string]string {
+		return stubModule(path, name+".go", "package "+name+"\n\nfunc Name() string { return \""+name+"\" }\n", nil)
+	}
+	f := newReplayFixture(t, map[string]map[string]string{
+		"example.com/a@v1.0.0": pkg("example.com/a", "a"),
+		"example.com/a@v1.1.0": pkg("example.com/a", "a"),
+	}, map[string]string{
+		"go.mod":  "module example.com/app\n\ngo 1.23.2\n\ngodebug winsymlink=0\n\nrequire example.com/a v1.0.0\n",
+		"main.go": "package main\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/a\"\n)\n\nfunc main() { fmt.Println(a.Name()) }\n",
+	})
+	for _, buildGo := range []string{"1.24.13", "1.30.0"} {
+		t.Run(buildGo, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, name := range []string{"go.mod", "go.sum", "main.go"} {
+				copyFile(t, filepath.Join(f.pristine, name), filepath.Join(dir, name))
+			}
+			require.NoError(t, omnibumpApply(t.Context(), f.tc, dir, ModrootRequest{GoVersion: buildGo}, []string{"example.com/a@v1.1.0"}))
+			mf := readModFile(t, dir)
+			assert.Equal(t, "1.23.2", mf.Go.Version, "the go directive is neither raised nor rewritten")
+			require.Len(t, mf.Godebug, 1, "the godebug stanza survives")
+			assert.Equal(t, "winsymlink", mf.Godebug[0].Key)
+			assert.Equal(t, "0", mf.Godebug[0].Value)
+			assert.Equal(t, "v1.1.0", requireVersions(mf)["example.com/a"])
+		})
+	}
+}
+
+// TestRunLoop_ProbeTidy: a NoTidy omnibump request may ask whether the
+// pristine module tidies anyway (the "tidy: false may no longer be needed"
+// hint); the simulation itself still runs without tidy.
+func TestRunLoop_ProbeTidy(t *testing.T) {
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/a", id: "GO-A", fixed: "v1.2.0"}}}
+	req := ModrootRequest{
+		Modroot:  ".",
+		Seeds:    []Candidate{{Module: "example.com/a", Version: "v1.2.0", FromCVE: true, VulnIDs: []string{"GO-A"}}},
+		Baseline: map[string]string{"example.com/a": "v1.0.0"},
+		Engine:   EngineOmnibump,
+		NoTidy:   true,
+	}
+	tc, dir := doUpdateFixture(t)
+	result, err := RunLoop(t.Context(), tc, sc, dir, req, Options{NoCompile: true})
+	require.NoError(t, err)
+	assert.False(t, result.BaselineTidies, "no probe requested")
+
+	tc, dir = doUpdateFixture(t) // the loop leaves its checkout bumped
+	req.ProbeTidy = true
+	result, err = RunLoop(t.Context(), tc, sc, dir, req, Options{NoCompile: true})
+	require.NoError(t, err)
+	assert.True(t, result.BaselineTidies)
+	assert.Equal(t, []string{"example.com/a@v1.2.0"}, result.FinalDeps)
 }
 
 func TestRawSkip(t *testing.T) {

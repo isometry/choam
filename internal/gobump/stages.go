@@ -20,6 +20,7 @@ import (
 	"github.com/isometry/choam/internal/processor"
 	"github.com/isometry/choam/internal/processor/stages"
 	"github.com/isometry/choam/internal/scan"
+	"github.com/isometry/choam/internal/simulate"
 )
 
 // Analyzer holds the shared, ecosystem-agnostic infrastructure - remote
@@ -423,7 +424,13 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoB
 		return nil, fmt.Errorf("finding bump pipelines: %w", err)
 	}
 
-	units := discoverAnalysisUnits(ctx, gp.Config, bumpSteps)
+	// Migration is decided before simulation so the simulated engine is the
+	// one the written step will run (see planMigration).
+	var releases *gorelease.Index
+	if v.Analyzer != nil {
+		releases = v.Analyzer.goReleases
+	}
+	units := discoverAnalysisUnits(ctx, gp.Config, bumpSteps, planMigrations(ctx, gp.GetCurrentYAML(), bumpSteps, releases))
 	if len(units) == 0 {
 		logging.From(ctx).Debug("not a bumpable project")
 		gp.AddMessage("Not a bumpable project - skipping dependency analysis")
@@ -536,9 +543,8 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 	modroots := unitRoots(langUnits)
 	existingDepsByRoot := existingDepsForModroots(modroots, bumpSteps)
 	existingReplacesByRoot := existingReplacesForModroots(modroots, bumpSteps)
-	// go-version is a Go-only pipeline input - other languages' analyses must
-	// never carry one (the coalesce key includes it; a stray value would
-	// split their groups).
+	// go-version is a Go-only (go/bump) pipeline input - other languages'
+	// analyses never carry one.
 	existingGoVersionByRoot := make(map[string]string)
 	if language == "go" {
 		existingGoVersionByRoot = existingGoVersionsForModroots(modroots, bumpSteps)
@@ -610,6 +616,7 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 			BuildPackages:  unit.Packages,
 			BuildTags:      unit.Tags,
 			BumpEngine:     unit.Engine,
+			BumpMigrating:  unit.Migrating,
 			BumpNoTidy:     unit.NoTidy,
 			GoPackageMinor: unit.GoMinor,
 			Deps:           deps,
@@ -659,8 +666,9 @@ func existingReplacesForModroots(modroots []string, bumpSteps []config.BumpStep)
 // covers a root when its modroot list contains it), but only go/bump steps
 // count: go-version is a gobump input, and the `uses: bump` pipeline has no
 // such input (omnibump never sees it). Values goversion can't order
-// (templated expressions) are ignored here; the fast-path reconciler warns
-// about them instead of editing.
+// (templated expressions) are ignored here; the reconciler warns about them
+// instead of editing (see fastPathGoVersion). Only go/bump steps that are not
+// migrated to `uses: bump` keep and raise their go-version.
 func existingGoVersionsForModroots(modroots []string, bumpSteps []config.BumpStep) map[string]string {
 	result := make(map[string]string, len(modroots))
 	for _, root := range modroots {
@@ -865,19 +873,8 @@ func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProces
 }
 
 // reconcileBumpSteps writes the desired per-modroot dependency sets back into
-// the package's bump/go-bump pipeline steps.
-//
-// Fast path: when a single existing step already covers exactly the analyzed
-// modroot set and every one of those roots desires an identical dependency
-// set, its deps are updated in place, preserving its action (bump or
-// go/bump), modroot list, and language.
-//
-// General path: otherwise, all existing bump/go-bump steps are removed and
-// replaced with freshly coalesced "bump" steps - one per distinct desired
-// dependency set, each covering every modroot that shares it, with an
-// explicit with.language. This is what produces cert-manager-style
-// multi-step output when modroots genuinely diverge, while collapsing to a
-// single step when they agree.
+// the package's bump/go-bump pipeline steps, one language at a time (see
+// reconcileLanguageBumpSteps).
 func (g *GoBumpApplier) reconcileBumpSteps(ctx context.Context, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis, loader *config.Loader) error {
 	for _, langAnalysis := range analysis.ByLanguage {
 		if len(langAnalysis.ByModroot) == 0 {
@@ -890,31 +887,35 @@ func (g *GoBumpApplier) reconcileBumpSteps(ctx context.Context, gp *GoBumpProces
 	return nil
 }
 
+// stepEdit is one existing bump step's reconciliation: the modroots it owns
+// (it is the first step covering them) grouped by identical desired
+// deps/replaces.
+type stepEdit struct {
+	step    config.BumpStep
+	groups  []modrootGroup
+	owned   []*ModrootAnalysis
+	changed bool
+}
+
 // reconcileLanguageBumpSteps writes one language's desired per-modroot
 // dependency sets back into its own bump/go-bump pipeline steps, leaving
-// every other language's steps untouched (existing steps are filtered to
-// this language before any fast-path/rebuild decision is made).
+// every other language's steps untouched.
 //
-// Fast path: when a single existing step of this language already covers
-// exactly its analyzed modroot set and every one of those roots desires an
-// identical dependency set and replace set, its deps/replaces are updated in
-// place, preserving its action (bump or go/bump), modroot list, and
-// language. Only a go/bump step carries go-version (the `uses: bump`
-// pipeline has no such input, so a bump step's stale one is removed). Per-
-// root effective go-versions are NOT required to match to take this path:
-// go-version is a floor (never-lowered downstream by fastPathGoVersion), so
-// the single step is simply raised to the highest effective go-version
-// across all covered roots (maxEffectiveGoVersion), which safely satisfies
-// the most demanding root even when roots diverge.
-//
-// General path: otherwise, all of this language's existing steps are
-// removed and replaced with freshly coalesced "bump" steps (no go-version) -
-// one per distinct desired dependency set (deps and replaces), each covering
-// every modroot that shares it, with an explicit with.language. This is what produces cert-manager-style multi-step output
-// when modroots genuinely diverge, while collapsing to a single step when
-// they agree.
+// Existing steps are edited IN PLACE: each keeps its position, its comments
+// and every `with:` option choam does not manage (tidy, tidy-compat, work,
+// show-diff, name, if, ...); only deps/replaces (and, for a migrated go/bump
+// step, uses/language/go-version - see migrateStep) change. A step is only
+// touched when its own content changes. Each analyzed modroot belongs to the
+// first step covering it; a multi-modroot step whose roots now diverge keeps
+// the first group and gets a clone (same options) per further group directly
+// after it; roots left with nothing to declare leave the step's modroot list,
+// and a step left with nothing at all is removed. Existing steps are never
+// merged. Modroots no step covers get fresh `uses: bump` steps (coalesced by
+// identical sets) after the first git-checkout. Deps are written in the
+// order the simulation applied them (see simulate.ModrootResult.FinalDeps).
 func (g *GoBumpApplier) reconcileLanguageBumpSteps(ctx context.Context, gp *GoBumpProcessor, langAnalysis LanguageAnalysis, loader *config.Loader) error {
-	allSteps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
+	yamlContent := gp.GetCurrentYAML()
+	allSteps, err := loader.FindBumpSteps(yamlContent)
 	if err != nil {
 		return fmt.Errorf("finding existing bump steps: %w", err)
 	}
@@ -930,99 +931,226 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(ctx context.Context, gp *GoBu
 		}
 	}
 
-	if len(existingSteps) == 1 &&
-		sameRootSet(existingSteps[0].Modroots, allModroots(langAnalysis.ByModroot)) &&
-		allRootsShareDeps(langAnalysis.ByModroot) &&
-		allRootsShareReplaces(langAnalysis.ByModroot) {
-		step := existingSteps[0]
-		desired := desiredDepsForSingleGroup(langAnalysis.ByModroot)
-		desiredReplaces := desiredReplacesForSingleGroup(langAnalysis.ByModroot)
-		var goVersion string
-		if step.Action == "go/bump" {
-			goVersion = g.fastPathGoVersion(gp, step, maxEffectiveGoVersion(langAnalysis.ByModroot))
-		}
-
-		updated, err := loader.UpdateGoBumpStep(gp.GetCurrentYAML(), step.Index, desired, desiredReplaces, goVersion)
-		if err != nil {
-			return fmt.Errorf("updating %s pipeline[%d]: %w", step.Action, step.Index, err)
-		}
-		if step.Action != "go/bump" && step.GoVersion != "" && (len(desired) > 0 || len(desiredReplaces) > 0) {
-			// The bump pipeline has no go-version input: drop a stale one.
-			if updated, err = loader.RemovePipelineWithField(updated, step.Index, "go-version"); err != nil {
-				return fmt.Errorf("removing go-version from %s pipeline[%d]: %w", step.Action, step.Index, err)
+	byRoot := make(map[string]*ModrootAnalysis, len(langAnalysis.ByModroot))
+	for i := range langAnalysis.ByModroot {
+		byRoot[langAnalysis.ByModroot[i].Modroot] = &langAnalysis.ByModroot[i]
+	}
+	owner := make(map[string]int)
+	for i, step := range existingSteps {
+		for _, root := range step.Modroots {
+			if _, ok := owner[root]; !ok {
+				owner[root] = i
 			}
 		}
+	}
 
-		gp.SetCurrentYAML(updated)
-		gp.MarkActualChangesApplied()
-		gp.AddMessage(fmt.Sprintf("Updated %s pipeline[%d] with %d dependencies and %d replaces", step.Action, step.Index, len(desired), len(desiredReplaces)))
-		g.recordSecurityFixes(gp, langAnalysis, addedAcrossRoots(langAnalysis.ByModroot))
+	edits := make([]stepEdit, 0, len(existingSteps))
+	for i, step := range existingSteps {
+		edit := stepEdit{step: step}
+		analyzed := false
+		for _, root := range step.Modroots {
+			if owner[root] != i {
+				continue
+			}
+			m, ok := byRoot[root]
+			if !ok {
+				// Not analyzed (its manifest could not be fetched or
+				// parsed): it keeps exactly what the step declares today.
+				m = &ModrootAnalysis{Modroot: root, ExistingDeps: step.Deps, DesiredDeps: step.Deps,
+					ExistingReplaces: step.Replaces, DesiredReplaces: step.Replaces}
+			} else {
+				analyzed = true
+			}
+			edit.owned = append(edit.owned, m)
+		}
+		if !analyzed {
+			continue
+		}
+		ownedAnalyses := make([]ModrootAnalysis, len(edit.owned))
+		for j, m := range edit.owned {
+			ownedAnalyses[j] = *m
+		}
+		edit.groups = coalesceModroots(ownedAnalyses)
+		switch len(edit.groups) {
+		case 0:
+			edit.changed = len(step.Deps) > 0 || len(step.Replaces) > 0
+		case 1:
+			group := edit.groups[0]
+			edit.changed = !sameRootSet(group.Modroots, step.Modroots) ||
+				haveDepsChanged(step.Deps, group.Deps) || haveDepsChanged(step.Replaces, group.Replaces)
+		default:
+			edit.changed = true
+		}
+		edits = append(edits, edit)
+	}
+
+	// Edit from the last step backwards: removals and clones only shift the
+	// indices of steps already handled.
+	sort.Slice(edits, func(i, j int) bool { return edits[i].step.Index > edits[j].step.Index })
+	hasBlankLines := loader.HasBlankLinesBetweenPipelineSteps(yamlContent)
+	changed := false
+	for _, edit := range edits {
+		if !edit.changed {
+			continue
+		}
+		updated, err := g.rewriteStep(ctx, gp, yamlContent, edit, hasBlankLines)
+		if err != nil {
+			return err
+		}
+		yamlContent = updated
+		changed = true
+	}
+
+	var unowned []ModrootAnalysis
+	for _, m := range langAnalysis.ByModroot {
+		if _, ok := owner[m.Modroot]; !ok {
+			unowned = append(unowned, m)
+		}
+	}
+	if groups := coalesceModroots(unowned); len(groups) > 0 {
+		gitCheckoutIndices, err := loader.FindPipelinesByUse(yamlContent, "git-checkout")
+		if err != nil {
+			return fmt.Errorf("finding git-checkout pipeline: %w", err)
+		}
+		insertPos := 0
+		if len(gitCheckoutIndices) > 0 {
+			insertPos = gitCheckoutIndices[0] + 1
+		}
+		for _, group := range groups {
+			spec := config.BumpStepSpec{
+				Action:   "bump",
+				Language: langAnalysis.Language,
+				Modroots: group.Modroots,
+				Deps:     group.Deps,
+				Replaces: group.Replaces,
+			}
+			updated, err := loader.InsertBumpPipelineStep(yamlContent, insertPos, spec, hasBlankLines)
+			if err != nil {
+				return fmt.Errorf("inserting bump step: %w", err)
+			}
+			yamlContent = updated
+			gp.AddMessage(fmt.Sprintf("Added %s bump step pipeline[%d] for modroot(s) %s with %d dependencies and %d replaces",
+				langAnalysis.Language, insertPos, strings.Join(group.Modroots, ", "), len(group.Deps), len(group.Replaces)))
+			insertPos++
+			changed = true
+		}
+	}
+
+	if !changed {
 		return nil
 	}
-
-	groups := coalesceModroots(langAnalysis.ByModroot)
-
-	indices := make([]int, len(existingSteps))
-	for i, step := range existingSteps {
-		indices[i] = step.Index
-	}
-	sort.Sort(sort.Reverse(sort.IntSlice(indices)))
-
-	yamlContent := gp.GetCurrentYAML()
-
-	// Capture the file's step-separation convention BEFORE stripping steps -
-	// a pipeline reduced to a lone git-checkout has nothing left to detect it from.
-	hasBlankLines := loader.HasBlankLinesBetweenPipelineSteps(yamlContent)
-
-	for _, idx := range indices {
-		updated, err := loader.RemovePipelineStep(yamlContent, idx)
-		if err != nil {
-			return fmt.Errorf("removing bump step[%d]: %w", idx, err)
-		}
-		yamlContent = updated
-	}
-
-	gitCheckoutIndices, err := loader.FindPipelinesByUse(yamlContent, "git-checkout")
-	if err != nil {
-		return fmt.Errorf("finding git-checkout pipeline: %w", err)
-	}
-	insertPos := 0
-	if len(gitCheckoutIndices) > 0 {
-		insertPos = gitCheckoutIndices[0] + 1
-	}
-
-	for _, group := range groups {
-		// Fresh steps are `uses: bump`, which takes no go-version input.
-		spec := config.BumpStepSpec{
-			Action:   "bump",
-			Language: langAnalysis.Language,
-			Modroots: group.Modroots,
-			Deps:     group.Deps,
-			Replaces: group.Replaces,
-		}
-		updated, err := loader.InsertBumpPipelineStep(yamlContent, insertPos, spec, hasBlankLines)
-		if err != nil {
-			return fmt.Errorf("inserting bump step: %w", err)
-		}
-		yamlContent = updated
-		insertPos++
-	}
-
 	gp.SetCurrentYAML(yamlContent)
 	gp.MarkActualChangesApplied()
-	gp.AddMessage(fmt.Sprintf("Rebuilt %s bump pipeline into %d step(s) across %d modroot(s)", langAnalysis.Language, len(groups), len(langAnalysis.ByModroot)))
 	g.recordSecurityFixes(gp, langAnalysis, addedAcrossRoots(langAnalysis.ByModroot))
-
 	return nil
 }
 
-// fastPathGoVersion decides the go-version argument for a fast-path in-place
-// update of step: the group's effective value when it genuinely raises the
-// step's current one, "" (leave the field untouched, byte-for-byte) when the
-// step already carries an equal-or-higher value - so re-running the applier
-// on already-updated YAML never churns it, and an existing value is NEVER
-// lowered. A step value goversion can't order (templated expression) is
-// warned about, never overwritten.
+// rewriteStep applies one changed stepEdit in place (see
+// reconcileLanguageBumpSteps): removal when nothing is left, else the first
+// group's deps/replaces/modroot on the step itself - migrating a go/bump
+// step when it can (see migrationFor) - and one clone per further group.
+func (g *GoBumpApplier) rewriteStep(ctx context.Context, gp *GoBumpProcessor, yamlContent []byte, edit stepEdit, hasBlankLines bool) ([]byte, error) {
+	loader := config.NewLoader()
+	step := edit.step
+	if len(edit.groups) == 0 {
+		updated, err := loader.RemovePipelineStep(yamlContent, step.Index)
+		if err != nil {
+			return nil, fmt.Errorf("removing %s pipeline[%d]: %w", step.Action, step.Index, err)
+		}
+		gp.AddMessage(fmt.Sprintf("Removed %s pipeline[%d]: no dependencies or replaces left to declare", step.Action, step.Index))
+		return updated, nil
+	}
+
+	migrate, plan := g.migrationFor(ctx, gp, yamlContent, edit)
+	first := edit.groups[0]
+	var goVersion string
+	if step.Action == "go/bump" && !migrate {
+		goVersion = g.fastPathGoVersion(gp, step, maxEffectiveGoVersion(edit.owned))
+	}
+	updated, err := loader.UpdateGoBumpStep(yamlContent, step.Index, first.Deps, first.Replaces, goVersion)
+	if err != nil {
+		return nil, fmt.Errorf("updating %s pipeline[%d]: %w", step.Action, step.Index, err)
+	}
+	if !sameRootSet(first.Modroots, step.Modroots) {
+		if updated, err = loader.SetBumpModroots(updated, step.Index, first.Modroots); err != nil {
+			return nil, fmt.Errorf("updating modroot of %s pipeline[%d]: %w", step.Action, step.Index, err)
+		}
+	}
+	switch {
+	case migrate:
+		if updated, err = migrateStep(gp, updated, step, plan); err != nil {
+			return nil, fmt.Errorf("migrating go/bump pipeline[%d]: %w", step.Index, err)
+		}
+		if step.NoTidy && anyBaselineTidies(edit.owned) {
+			gp.AddMessage(fmt.Sprintf("pipeline[%d]: tidy: false may no longer be needed (omnibump tidies without -go; the upstream module tidies under omnibump) - left as written", step.Index))
+		}
+	case step.Action != "go/bump" && step.GoVersion != "":
+		// The bump pipeline has no go-version input: drop a stale one.
+		if updated, err = loader.RemovePipelineWithFieldLines(updated, step.Index, "go-version"); err != nil {
+			return nil, fmt.Errorf("removing go-version from %s pipeline[%d]: %w", step.Action, step.Index, err)
+		}
+	}
+	gp.AddMessage(fmt.Sprintf("Updated %s pipeline[%d] in place with %d dependencies and %d replaces", step.Action, step.Index, len(first.Deps), len(first.Replaces)))
+
+	// Further groups: clones of the rewritten step, in group order.
+	for gi := len(edit.groups) - 1; gi >= 1; gi-- {
+		group := edit.groups[gi]
+		if updated, err = loader.ClonePipelineStepAfter(updated, step.Index, hasBlankLines); err != nil {
+			return nil, fmt.Errorf("splitting pipeline[%d]: %w", step.Index, err)
+		}
+		clone := step.Index + 1
+		if updated, err = loader.UpdateGoBumpStep(updated, clone, group.Deps, group.Replaces, ""); err != nil {
+			return nil, fmt.Errorf("updating split of pipeline[%d]: %w", step.Index, err)
+		}
+		if updated, err = loader.SetBumpModroots(updated, clone, group.Modroots); err != nil {
+			return nil, fmt.Errorf("updating modroot of split of pipeline[%d]: %w", step.Index, err)
+		}
+		gp.AddMessage(fmt.Sprintf("Split pipeline[%d]: modroot(s) %s now diverge, written to a copy of the step with %d dependencies and %d replaces",
+			step.Index, strings.Join(group.Modroots, ", "), len(group.Deps), len(group.Replaces)))
+	}
+	return updated, nil
+}
+
+// migrationFor decides whether a go/bump step being rewritten migrates to
+// `uses: bump`: its plan allows it (see planMigration) AND every modroot it
+// owns was simulated with the omnibump engine - so what is written is what
+// was validated. A step that does not migrate gets a message saying why.
+func (g *GoBumpApplier) migrationFor(ctx context.Context, gp *GoBumpProcessor, yamlContent []byte, edit stepEdit) (bool, migrationPlan) {
+	step := edit.step
+	if step.Action != "go/bump" {
+		return false, migrationPlan{}
+	}
+	plan := planMigration(ctx, yamlContent, step, g.releaseIndex())
+	if !plan.ok {
+		gp.AddMessage(fmt.Sprintf("go/bump pipeline[%d] not migrated to uses: bump: %s", step.Index, plan.reason))
+		return false, plan
+	}
+	for _, m := range edit.owned {
+		if !m.Simulated || m.BumpEngine != simulate.EngineOmnibump {
+			gp.AddMessage(fmt.Sprintf("go/bump pipeline[%d] not migrated to uses: bump: modroot %s was not validated with the omnibump engine", step.Index, m.Modroot))
+			return false, plan
+		}
+	}
+	return true, plan
+}
+
+// anyBaselineTidies reports whether any of the modroots tidies under omnibump.
+func anyBaselineTidies(roots []*ModrootAnalysis) bool {
+	for _, m := range roots {
+		if m.BaselineTidies {
+			return true
+		}
+	}
+	return false
+}
+
+// fastPathGoVersion decides the go-version argument for the in-place update
+// of a go/bump step that is not migrated: the group's effective value when
+// it genuinely raises the step's current one, "" (leave the field untouched,
+// byte-for-byte) when the step already carries an equal-or-higher value - so
+// re-running the applier on already-updated YAML never churns it, and an
+// existing value is NEVER lowered. A step value goversion can't order
+// (templated expression) is warned about, never overwritten.
 func (g *GoBumpApplier) fastPathGoVersion(gp *GoBumpProcessor, step config.BumpStep, effective string) string {
 	if effective == "" {
 		return ""
@@ -1050,8 +1178,10 @@ type modrootGroup struct {
 }
 
 // coalesceModroots groups modroots that end up with identical desired
-// dependency AND replace sets into a single step, in first-seen order. Roots
-// with neither desired deps nor replaces are omitted entirely.
+// dependency AND replace sets (compared as sets) into a single step, in
+// first-seen order. A group's lists keep its first modroot's order (the
+// order the simulation applied them in). Roots with neither desired deps nor
+// replaces are omitted entirely.
 func coalesceModroots(byModroot []ModrootAnalysis) []modrootGroup {
 	var order []string
 	byKey := make(map[string]*modrootGroup)
@@ -1063,7 +1193,7 @@ func coalesceModroots(byModroot []ModrootAnalysis) []modrootGroup {
 		key := groupKey(m.DesiredDeps) + "\x00" + groupKey(m.DesiredReplaces)
 		group, ok := byKey[key]
 		if !ok {
-			group = &modrootGroup{Deps: sortedCopy(m.DesiredDeps), Replaces: sortedCopy(m.DesiredReplaces)}
+			group = &modrootGroup{Deps: slices.Clone(m.DesiredDeps), Replaces: slices.Clone(m.DesiredReplaces)}
 			byKey[key] = group
 			order = append(order, key)
 		}
@@ -1097,46 +1227,9 @@ func sameRootSet(a, b []string) bool {
 	return slices.Equal(sortedCopy(a), sortedCopy(b))
 }
 
-func allModroots(byModroot []ModrootAnalysis) []string {
-	roots := make([]string, len(byModroot))
-	for i, m := range byModroot {
-		roots[i] = m.Modroot
-	}
-	return roots
-}
-
-// allRootsShareDeps reports whether every analyzed modroot desires an identical dependency set.
-func allRootsShareDeps(byModroot []ModrootAnalysis) bool {
-	if len(byModroot) <= 1 {
-		return true
-	}
-	key := groupKey(byModroot[0].DesiredDeps)
-	for _, m := range byModroot[1:] {
-		if groupKey(m.DesiredDeps) != key {
-			return false
-		}
-	}
-	return true
-}
-
-// allRootsShareReplaces reports whether every analyzed modroot desires an
-// identical replace-directive set.
-func allRootsShareReplaces(byModroot []ModrootAnalysis) bool {
-	if len(byModroot) <= 1 {
-		return true
-	}
-	key := groupKey(byModroot[0].DesiredReplaces)
-	for _, m := range byModroot[1:] {
-		if groupKey(m.DesiredReplaces) != key {
-			return false
-		}
-	}
-	return true
-}
-
-// effectiveGoVersion is the go-version a modroot's bump step should end up
-// carrying: the max of what its existing steps already declare and what the
-// proven/probed candidate set requires. Max never picks the lower of two
+// effectiveGoVersion is the go-version a modroot's go/bump step should end
+// up carrying: the max of what its existing steps already declare and what
+// the proven/probed candidate set requires. Max never picks the lower of two
 // valid values, so an existing value is never lowered. "" for non-Go
 // modroots (both fields are Go-only) and when neither side has a value.
 func effectiveGoVersion(m ModrootAnalysis) string {
@@ -1144,36 +1237,16 @@ func effectiveGoVersion(m ModrootAnalysis) string {
 }
 
 // maxEffectiveGoVersion returns the highest effective go-version
-// (effectiveGoVersion) across all analyzed modroots, "" if none has one. Used
-// by the fast path, whose single step must satisfy every covered root at
-// once: go-version is a floor, not an exact requirement, so raising to the
-// maximum is always safe even when roots' effective versions diverge -
-// fastPathGoVersion still enforces never-lower against the step's current
-// value on top of this.
-func maxEffectiveGoVersion(byModroot []ModrootAnalysis) string {
+// (effectiveGoVersion) across the given modroots, "" if none has one: a step
+// covering several roots must satisfy all of them, and go-version is a floor,
+// so raising to the maximum is always safe - fastPathGoVersion still
+// enforces never-lower against the step's current value on top of this.
+func maxEffectiveGoVersion(roots []*ModrootAnalysis) string {
 	var max string
-	for _, m := range byModroot {
-		max = goversion.Max(max, effectiveGoVersion(m))
+	for _, m := range roots {
+		max = goversion.Max(max, effectiveGoVersion(*m))
 	}
 	return max
-}
-
-// desiredDepsForSingleGroup returns the desired deps shared by every
-// analyzed modroot (only valid when allRootsShareDeps is true).
-func desiredDepsForSingleGroup(byModroot []ModrootAnalysis) []string {
-	if len(byModroot) == 0 {
-		return nil
-	}
-	return byModroot[0].DesiredDeps
-}
-
-// desiredReplacesForSingleGroup returns the desired replaces shared by every
-// analyzed modroot (only valid when allRootsShareReplaces is true).
-func desiredReplacesForSingleGroup(byModroot []ModrootAnalysis) []string {
-	if len(byModroot) == 0 {
-		return nil
-	}
-	return byModroot[0].DesiredReplaces
 }
 
 // addedAcrossRoots returns the deduplicated union, across all modroots, of

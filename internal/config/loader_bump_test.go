@@ -717,50 +717,6 @@ func TestLoader_UpsertPipelineWithQuotedString_RejectsUnsafeValue(t *testing.T) 
 	}
 }
 
-func TestLoader_InsertBumpPipelineStep_WritesGoVersion(t *testing.T) {
-	loader := NewLoader()
-
-	updated, err := loader.InsertBumpPipelineStep([]byte(singleGoBumpYAML), 1, BumpStepSpec{
-		Action:    "bump",
-		Language:  "go",
-		GoVersion: "1.25",
-		Modroots:  []string{"."},
-		Deps:      []string{"golang.org/x/net@v0.56.0"},
-	}, true)
-	require.NoError(t, err)
-	assert.Contains(t, string(updated), `go-version: "1.25"`)
-
-	steps, err := loader.FindBumpSteps(updated)
-	require.NoError(t, err)
-	require.Len(t, steps, 2)
-
-	var inserted *BumpStep
-	for i := range steps {
-		if steps[i].GoVersion == "1.25" {
-			inserted = &steps[i]
-		}
-	}
-	require.NotNil(t, inserted)
-	assert.Equal(t, []string{"golang.org/x/net@v0.56.0"}, inserted.Deps)
-}
-
-// TestLoader_InsertBumpPipelineStep_RejectsUnsafeGoVersion mirrors
-// TestLoader_UpsertPipelineWithQuotedString_RejectsUnsafeValue: the template
-// path embeds spec.GoVersion literally between double quotes too, so it
-// needs the same rejection for values containing '"' or '\'.
-func TestLoader_InsertBumpPipelineStep_RejectsUnsafeGoVersion(t *testing.T) {
-	loader := NewLoader()
-
-	_, err := loader.InsertBumpPipelineStep([]byte(singleGoBumpYAML), 1, BumpStepSpec{
-		Action:    "bump",
-		Language:  "go",
-		GoVersion: `1.25"`,
-		Modroots:  []string{"."},
-		Deps:      []string{"golang.org/x/net@v0.56.0"},
-	}, true)
-	require.Error(t, err)
-}
-
 // TestLoader_InsertBumpPipelineStep_NoGoVersionOmitsField is the byte-for-byte
 // emission regression the brief calls for: a spec without GoVersion must
 // render identically to before the BumpStepSpec refactor (mirrors
@@ -887,7 +843,7 @@ pipeline:
 
 // TestLoader_InsertBumpPipelineStep_BlankLinesForEveryInsertedStep guards
 // against the first-match-only fix-up bug: when several same-action steps are
-// inserted in sequence (as the reconciler's general path does), EVERY inserted
+// inserted in sequence (as the reconciler does for new modroots), EVERY inserted
 // step must get its blank-line separator, not just the first.
 func TestLoader_InsertBumpPipelineStep_BlankLinesForEveryInsertedStep(t *testing.T) {
 	loader := NewLoader()

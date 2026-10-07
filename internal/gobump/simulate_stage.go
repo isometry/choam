@@ -128,6 +128,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 				BaselineVulnIDs: baselineVulnIDs(m.ScanResult),
 				Engine:          m.BumpEngine,
 				NoTidy:          m.BumpNoTidy,
+				ProbeTidy:       m.BumpMigrating && m.BumpNoTidy,
 				GoVersion:       s.buildGoVersion(ctx, m.GoPackageMinor),
 			})
 		}
@@ -181,6 +182,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			m.SimulationConverged = result.Converged
 			m.Residuals = result.Residuals
 			m.Dropped = result.Dropped
+			m.BaselineTidies = result.BaselineTidies
 			gp.AddResiduals(result.Residuals)
 			unlinkedHere := reach.observe(*m, result.Linked, result.LinkedPackages, true, degradedUnlinkedSet(result))
 

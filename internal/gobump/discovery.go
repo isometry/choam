@@ -46,14 +46,19 @@ type analysisUnit struct {
 	// (toolchaintags, default netgo,osusergo, plus tags), unioned.
 	Tags []string
 	// Engine is the apply semantics of the bump step the build will run for
-	// the modroot: gobump when the first existing step covering it is
-	// `uses: go/bump`, else omnibump - also for a root no step covers yet,
-	// since choam writes new steps as `uses: bump`. NoTidy mirrors that
-	// step's `tidy: false`.
-	Engine simulate.Engine
-	NoTidy bool
+	// the modroot once choam writes it: omnibump for a `uses: bump` step, for
+	// a root no step covers yet (new steps are `uses: bump`) and for a
+	// `uses: go/bump` step choam will migrate when it rewrites it (see
+	// planMigration); gobump only for a go/bump step that cannot migrate.
+	// Migrating marks the last case's migratable go/bump steps. NoTidy
+	// mirrors the covering step's `tidy: false`.
+	Engine    simulate.Engine
+	Migrating bool
+	NoTidy    bool
 	// GoMinor is the lowest Go minor the go/build steps building the
-	// modroot pin via go-package (e.g. "1.25"); "" when none is pinned.
+	// modroot pin via go-package (e.g. "1.25"), else the Go minor a
+	// migration will pin, else a versioned go package in the environment;
+	// "" when none is pinned.
 	GoMinor string
 }
 
@@ -67,8 +72,9 @@ const defaultToolchainTags = "netgo,osusergo"
 // pipeline and every subpackage's pipeline (also capturing their
 // with.packages build patterns), and (3) package.annotations explicit
 // opt-ins. Returns language -> units sorted by modroot; a language absent
-// from the result had no modroots from any source.
-func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bumpSteps []config.BumpStep) map[string][]analysisUnit {
+// from the result had no modroots from any source. migrations are the
+// go/bump steps' migration plans by pipeline index (see planMigration).
+func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bumpSteps []config.BumpStep, migrations map[int]migrationPlan) map[string][]analysisUnit {
 	// language -> modroot -> sets of build package patterns and tags
 	type unitSets struct {
 		patterns, tags map[string]struct{}
@@ -129,6 +135,16 @@ func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bump
 		}
 	}
 
+	envMinor := ""
+	if cfg != nil {
+		for _, pkg := range cfg.Environment.Contents.Packages {
+			if _, minor, ok := parseGoPackagePin(pkg); ok && minor != "" {
+				envMinor = minor
+				break
+			}
+		}
+	}
+
 	result := make(map[string][]analysisUnit, len(units))
 	for language, byRoot := range units {
 		if len(byRoot) == 0 {
@@ -140,8 +156,18 @@ func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bump
 			if sets.step != nil {
 				unit.NoTidy = sets.step.NoTidy
 				if sets.step.Action == "go/bump" {
-					unit.Engine = simulate.EngineGobump
+					if plan := migrations[sets.step.Index]; plan.ok {
+						unit.Migrating = true
+						if unit.GoMinor == "" {
+							unit.GoMinor = plan.goMinor
+						}
+					} else {
+						unit.Engine = simulate.EngineGobump
+					}
 				}
+			}
+			if unit.GoMinor == "" && language == "go" {
+				unit.GoMinor = envMinor
 			}
 			for pattern := range sets.patterns {
 				unit.Packages = append(unit.Packages, pattern)
