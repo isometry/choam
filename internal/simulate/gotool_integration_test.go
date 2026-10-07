@@ -349,7 +349,10 @@ func TestRunLoop_CompileGateRepairsLockstepBreak(t *testing.T) {
 	}, Options{})
 	require.NoError(t, err)
 
-	assert.ElementsMatch(t, []string{"example.com/api@v0.21.0", "example.com/exporter@v0.21.0"}, result.FinalDeps)
+	// The repair alone carries the fix: exporter@v0.21.0 requires
+	// api@v0.21.0, so the api entry is implied and removed as redundant.
+	assert.Equal(t, []string{"example.com/exporter@v0.21.0"}, result.FinalDeps)
+	assert.Empty(t, result.CVEBackedModules)
 	assert.Empty(t, result.Residuals)
 	assert.Equal(t, "v0.21.0", result.Resolved["example.com/exporter"])
 }

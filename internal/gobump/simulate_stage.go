@@ -7,16 +7,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
-	omnibumpgolang "github.com/chainguard-dev/omnibump/pkg/languages/golang"
 	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
 	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/processor"
 	"github.com/isometry/choam/internal/scan"
 	"github.com/isometry/choam/internal/simulate"
-	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
 )
 
@@ -43,11 +40,6 @@ type SimulationStage struct {
 	// degrades at Apply time (with a message) instead of failing pipeline
 	// construction; tests override it.
 	newSimulator func(ctx context.Context, opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error)
-
-	// detectCoUpdates reproduces melange gobump's build-time co-update
-	// advisory (see declareCoUpdates); a func field so tests can inject a
-	// fake without live proxy.golang.org access.
-	detectCoUpdates func(ctx context.Context, packagesToUpdate map[string]string, modFile *modfile.File) map[string]omnibumpgolang.MissingDependency
 }
 
 func NewSimulationStage(analyzer *Analyzer, opts ProcessorOptions) *SimulationStage {
@@ -56,20 +48,10 @@ func NewSimulationStage(analyzer *Analyzer, opts ProcessorOptions) *SimulationSt
 			StageName:        "bump_simulation",
 			StageDescription: "Validate Go bump candidates against a source checkout",
 		},
-		Analyzer:        analyzer,
-		Options:         opts,
-		newSimulator:    defaultSimulator,
-		detectCoUpdates: defaultDetectCoUpdates,
+		Analyzer:     analyzer,
+		Options:      opts,
+		newSimulator: defaultSimulator,
 	}
-}
-
-// defaultDetectCoUpdates wraps omnibump's DetectCoUpdates - the exact
-// function melange's bump pipeline runs at build time - discarding its
-// API-compat alert map (a heuristic "verify manually" tier, not actionable
-// here).
-func defaultDetectCoUpdates(ctx context.Context, packagesToUpdate map[string]string, modFile *modfile.File) map[string]omnibumpgolang.MissingDependency {
-	missing, _ := omnibumpgolang.DetectCoUpdates(ctx, packagesToUpdate, modFile)
-	return missing
 }
 
 func defaultSimulator(ctx context.Context, opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error) {
@@ -216,8 +198,6 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 				stdComplete = false
 			}
 
-			s.declareCoUpdates(ctx, gp, m, result)
-
 			// The proven graph's Go language requirement, gated against the
 			// module's own pristine baseline: only a genuine raise is recorded
 			// (an existing step's go-version is additionally never lowered -
@@ -236,6 +216,10 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 				m.Modroot, convergedWord(result.Converged), result.Iterations,
 				len(result.FinalDeps), len(result.FinalReplaces), len(result.Dropped), len(result.RemainingVulnIDs), unlinkedHere))
 			for _, dropped := range result.Dropped {
+				if dropped.Redundant {
+					gp.AddMessage(fmt.Sprintf("modroot %s: removed redundant %s@%s (%s)",
+						m.Modroot, dropped.Module, dropped.Version, strings.TrimPrefix(dropped.Reason, "redundant: ")))
+				}
 				logging.From(ctx).Info("bump candidate dropped by simulation",
 					"module", dropped.Module, "version", dropped.Version, "reason", dropped.Reason)
 			}
@@ -310,120 +294,6 @@ func (s *SimulationStage) buildGoVersion(ctx context.Context, minor string) stri
 		return ""
 	}
 	return version
-}
-
-// coUpdateBudget bounds each declareCoUpdates round - DetectCoUpdates
-// prefetches dependency go.mod files from proxy.golang.org and can be slow
-// on huge module graphs; failing open just means the build-time advisory
-// reappears.
-const coUpdateBudget = 2 * time.Minute
-
-// declareCoUpdates makes the written deps list satisfy melange gobump's
-// build-time co-update advisory. It runs omnibump's own DetectCoUpdates -
-// the exact check the build will run - with the PROVEN final deps against
-// the pristine go.mod, and appends the recommendations that are already
-// true in the validated graph as explicit, coherence-only deps entries.
-// Gates keep this a pure declaration step with zero resolution impact:
-//   - sustained: the final tidied go.mod must require the module at >= the
-//     recommended version (a pin above that is unproven and would fail
-//     gobump's post-tidy verification);
-//   - linked: an unlinked pin would be re-dropped by the NEXT run's
-//     reachability pruning, churning the YAML forever - skip those (the
-//     build-time advisory persists for them, rarely);
-//   - absent: never duplicate a coordinate already in the list.
-//
-// Appending can itself trigger new group recommendations at build time
-// (e.g. otel -> otel/trace -> otel/metric), so the check iterates to a
-// small fixpoint. Recommendations the proven graph did NOT satisfy (a
-// lagging family member MVS didn't raise, cross-major suggestions) are
-// skipped by the sustained gate - bumping those for real would need
-// another simulation round. Best-effort throughout: any failure leaves the
-// deps list unchanged. Appended entries are absent from
-// SecurityBumpModules, so accounting never credits them as security fixes.
-// The build runs the same function from the omnibump release its image
-// installs; choam links the latest release, so silence is parity-by-same-
-// function.
-func (s *SimulationStage) declareCoUpdates(ctx context.Context, gp *GoBumpProcessor, m *ModrootAnalysis, result *simulate.ModrootResult) {
-	if len(result.FinalDeps) == 0 || len(result.Requires) == 0 {
-		return
-	}
-	modFile := ecogolang.ModFileOf(m.Deps)
-	if modFile == nil {
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(ctx, coUpdateBudget)
-	defer cancel()
-
-	const maxRounds = 3
-	for range maxRounds {
-		// Build-time omnibump's update list spans deps AND replaces, so the
-		// parity check must too ("old=new@version" contributes new@version).
-		packagesToUpdate := make(map[string]string, len(m.DesiredDeps)+len(m.DesiredReplaces))
-		for _, dep := range m.DesiredDeps {
-			if module, version, ok := splitCoordVersion(dep); ok {
-				packagesToUpdate[module] = version
-			}
-		}
-		for _, replace := range m.DesiredReplaces {
-			coord, version, ok := splitCoordVersion(replace)
-			if !ok {
-				continue
-			}
-			if _, newPath, found := strings.Cut(coord, "="); found {
-				packagesToUpdate[newPath] = version
-			}
-		}
-		if len(packagesToUpdate) == 0 {
-			return
-		}
-
-		missing := s.safeDetectCoUpdates(ctx, packagesToUpdate, modFile)
-
-		appended := false
-		for module, rec := range missing {
-			if _, present := packagesToUpdate[module]; present {
-				continue
-			}
-			sustainedVersion, required := result.Requires[module]
-			if !required || semver.Compare(sustainedVersion, rec.RequiredVersion) < 0 {
-				logging.From(ctx).Debug("co-update recommendation not satisfied by the validated graph - skipping",
-					"module", module, "recommended", rec.RequiredVersion, "reason", rec.Reason)
-				continue
-			}
-			if result.Linked != nil {
-				if _, linked := result.Linked[module]; !linked {
-					logging.From(ctx).Debug("co-update recommendation for unlinked module - skipping",
-						"module", module, "recommended", rec.RequiredVersion)
-					continue
-				}
-			}
-
-			entry := module + "@" + sustainedVersion
-			m.DesiredDeps = append(m.DesiredDeps, entry)
-			appended = true
-			gp.AddMessage(fmt.Sprintf("declared co-update: %s (required alongside the validated bumps; already satisfied by the proven graph)", entry))
-			logging.From(ctx).Info("declared co-update", "module", module,
-				"version", sustainedVersion, "reason", rec.Reason)
-		}
-
-		if !appended {
-			return
-		}
-	}
-}
-
-// safeDetectCoUpdates guards the injected detector (omnibump internals or a
-// test double) so a panic or late failure never breaks the run - worst case
-// the build-time advisory reappears.
-func (s *SimulationStage) safeDetectCoUpdates(ctx context.Context, packagesToUpdate map[string]string, modFile *modfile.File) (missing map[string]omnibumpgolang.MissingDependency) {
-	defer func() {
-		if r := recover(); r != nil {
-			logging.From(ctx).Debug("co-update declaration panicked - skipping", "recover", r)
-			missing = nil
-		}
-	}()
-	return s.detectCoUpdates(logging.Library(ctx, "omnibump"), packagesToUpdate, modFile)
 }
 
 // failClosed reports whether a simulation error must fail the file instead

@@ -7,13 +7,11 @@ import (
 	"strings"
 	"testing"
 
-	omnibumpgolang "github.com/chainguard-dev/omnibump/pkg/languages/golang"
 	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
 	"github.com/isometry/choam/internal/scan"
 	"github.com/isometry/choam/internal/simulate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"golang.org/x/mod/modfile"
 )
 
 type fakeBumpSimulator struct {
@@ -409,8 +407,7 @@ func TestSimulationStage_UnreachableCrossModrootDedup(t *testing.T) {
 }
 
 // coUpdateTestProcessor builds a processor whose modroot carries a parsed
-// pristine go.mod (via the golang ecosystem's Analyze), as declareCoUpdates
-// requires.
+// pristine go.mod (via the golang ecosystem's Analyze) and an otel bump.
 func coUpdateTestProcessor(t *testing.T) *GoBumpProcessor {
 	t.Helper()
 	goMod := `module example.com/app
@@ -448,8 +445,8 @@ require (
 	return gp
 }
 
-// otelResult is the proven simulation outcome for the co-update tests: otel
-// bumped, its release-group siblings raised by MVS in the tidied go.mod.
+// otelResult is a proven simulation outcome: otel bumped, its release-group
+// siblings raised by MVS in the tidied go.mod.
 func otelResult() *simulate.ModrootResult {
 	return &simulate.ModrootResult{
 		Modroot:          ".",
@@ -469,147 +466,26 @@ func otelResult() *simulate.ModrootResult {
 	}
 }
 
-func TestSimulationStage_DeclaresCoUpdates(t *testing.T) {
-	fake := &fakeBumpSimulator{results: map[string]*simulate.ModrootResult{".": otelResult()}}
+// TestSimulationStage_WritesOnlyProvenDeps: the written deps are exactly the
+// simulation's FinalDeps (no co-update entries appended), and each redundant
+// removal is reported as a processor message.
+func TestSimulationStage_WritesOnlyProvenDeps(t *testing.T) {
+	result := otelResult()
+	result.Dropped = []simulate.DroppedCandidate{{
+		Module: "go.opentelemetry.io/otel/trace", Version: "v1.41.0", Redundant: true,
+		Reason: "redundant: implied by go.opentelemetry.io/otel@v1.41.0 (final go.mod unchanged without it)",
+	}}
+	fake := &fakeBumpSimulator{results: map[string]*simulate.ModrootResult{".": result}}
 	stage := newStageWithFake(fake)
-	stage.detectCoUpdates = func(_ context.Context, packagesToUpdate map[string]string, _ *modfile.File) map[string]omnibumpgolang.MissingDependency {
-		if _, present := packagesToUpdate["go.opentelemetry.io/otel/trace"]; present {
-			return nil // already declared - silent, fixpoint reached
-		}
-		return map[string]omnibumpgolang.MissingDependency{
-			"go.opentelemetry.io/otel/trace": {
-				Package: "go.opentelemetry.io/otel/trace", RequiredVersion: "v1.41.0",
-				CurrentVersion: "v1.39.0", Reason: "version group with go.opentelemetry.io/otel",
-			},
-		}
-	}
 	gp := coUpdateTestProcessor(t)
 
 	require.NoError(t, stage.Apply(t.Context(), gp))
 
 	m := gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0]
-	assert.Equal(t, []string{"go.opentelemetry.io/otel@v1.41.0", "go.opentelemetry.io/otel/trace@v1.41.0"}, m.DesiredDeps)
-	assert.Equal(t, []string{"go.opentelemetry.io/otel"}, m.SecurityBumpModules, "declared co-update must not become a security module")
-
-	var messaged bool
-	for _, msg := range gp.GetMessages() {
-		if strings.Contains(msg, "declared co-update: go.opentelemetry.io/otel/trace@v1.41.0") {
-			messaged = true
-		}
-	}
-	assert.True(t, messaged, "expected a declared co-update message, got %v", gp.GetMessages())
-
-	// Accounting: the coherence pin is neither fixed nor a security fix.
-	result := gp.ToResult()
-	assert.Equal(t, 1, result.VulnerabilitiesFixed)
-
-	// The rebuilt action carries the full declared list.
-	require.Len(t, gp.VulnerabilityAnalysis.BumpActions, 1)
-	assert.Contains(t, gp.VulnerabilityAnalysis.BumpActions[0].Dependencies, "go.opentelemetry.io/otel/trace@v1.41.0")
-}
-
-func TestSimulationStage_CoUpdateGates(t *testing.T) {
-	recommend := func(module, version string) map[string]omnibumpgolang.MissingDependency {
-		return map[string]omnibumpgolang.MissingDependency{
-			module: {Package: module, RequiredVersion: version, CurrentVersion: "v1.39.0", Reason: "version group"},
-		}
-	}
-
-	t.Run("unsustained recommendation skipped", func(t *testing.T) {
-		result := otelResult()
-		result.Requires["go.opentelemetry.io/otel/trace"] = "v1.40.0" // tidied require BELOW recommendation
-		fake := &fakeBumpSimulator{results: map[string]*simulate.ModrootResult{".": result}}
-		stage := newStageWithFake(fake)
-		stage.detectCoUpdates = func(context.Context, map[string]string, *modfile.File) map[string]omnibumpgolang.MissingDependency {
-			return recommend("go.opentelemetry.io/otel/trace", "v1.41.0")
-		}
-		gp := coUpdateTestProcessor(t)
-
-		require.NoError(t, stage.Apply(t.Context(), gp))
-		assert.Equal(t, []string{"go.opentelemetry.io/otel@v1.41.0"},
-			gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0].DesiredDeps)
-	})
-
-	t.Run("unlinked recommendation skipped", func(t *testing.T) {
-		result := otelResult()
-		delete(result.Linked, "go.opentelemetry.io/otel/trace")
-		fake := &fakeBumpSimulator{results: map[string]*simulate.ModrootResult{".": result}}
-		stage := newStageWithFake(fake)
-		stage.detectCoUpdates = func(context.Context, map[string]string, *modfile.File) map[string]omnibumpgolang.MissingDependency {
-			return recommend("go.opentelemetry.io/otel/trace", "v1.41.0")
-		}
-		gp := coUpdateTestProcessor(t)
-
-		require.NoError(t, stage.Apply(t.Context(), gp))
-		assert.Equal(t, []string{"go.opentelemetry.io/otel@v1.41.0"},
-			gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0].DesiredDeps)
-	})
-
-	t.Run("nil linked set fails open - appended", func(t *testing.T) {
-		result := otelResult()
-		result.Linked = nil
-		fake := &fakeBumpSimulator{results: map[string]*simulate.ModrootResult{".": result}}
-		stage := newStageWithFake(fake)
-		calls := 0
-		stage.detectCoUpdates = func(context.Context, map[string]string, *modfile.File) map[string]omnibumpgolang.MissingDependency {
-			calls++
-			if calls > 1 {
-				return nil
-			}
-			return recommend("go.opentelemetry.io/otel/trace", "v1.41.0")
-		}
-		gp := coUpdateTestProcessor(t)
-
-		require.NoError(t, stage.Apply(t.Context(), gp))
-		assert.Contains(t, gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0].DesiredDeps,
-			"go.opentelemetry.io/otel/trace@v1.41.0")
-	})
-}
-
-func TestSimulationStage_CoUpdateDetectorFailureFailsOpen(t *testing.T) {
-	fake := &fakeBumpSimulator{results: map[string]*simulate.ModrootResult{".": otelResult()}}
-	stage := newStageWithFake(fake)
-	stage.detectCoUpdates = func(context.Context, map[string]string, *modfile.File) map[string]omnibumpgolang.MissingDependency {
-		panic("simulated proxy failure")
-	}
-	gp := coUpdateTestProcessor(t)
-
-	require.NoError(t, stage.Apply(t.Context(), gp))
-	assert.Equal(t, []string{"go.opentelemetry.io/otel@v1.41.0"},
-		gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0].DesiredDeps)
-	assert.True(t, gp.Validated, "co-update declaration failure must not degrade validation")
-}
-
-// TestSimulationStage_CoUpdateFixpoint: declaring trace triggers a new group
-// recommendation for metric on the next round; both end up declared.
-func TestSimulationStage_CoUpdateFixpoint(t *testing.T) {
-	fake := &fakeBumpSimulator{results: map[string]*simulate.ModrootResult{".": otelResult()}}
-	stage := newStageWithFake(fake)
-	stage.detectCoUpdates = func(_ context.Context, packagesToUpdate map[string]string, _ *modfile.File) map[string]omnibumpgolang.MissingDependency {
-		_, hasTrace := packagesToUpdate["go.opentelemetry.io/otel/trace"]
-		_, hasMetric := packagesToUpdate["go.opentelemetry.io/otel/metric"]
-		switch {
-		case !hasTrace:
-			return map[string]omnibumpgolang.MissingDependency{
-				"go.opentelemetry.io/otel/trace": {Package: "go.opentelemetry.io/otel/trace", RequiredVersion: "v1.41.0"},
-			}
-		case !hasMetric:
-			return map[string]omnibumpgolang.MissingDependency{
-				"go.opentelemetry.io/otel/metric": {Package: "go.opentelemetry.io/otel/metric", RequiredVersion: "v1.41.0"},
-			}
-		default:
-			return nil
-		}
-	}
-	gp := coUpdateTestProcessor(t)
-
-	require.NoError(t, stage.Apply(t.Context(), gp))
-	m := gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0]
-	assert.Equal(t, []string{
-		"go.opentelemetry.io/otel@v1.41.0",
-		"go.opentelemetry.io/otel/trace@v1.41.0",
-		"go.opentelemetry.io/otel/metric@v1.41.0",
-	}, m.DesiredDeps)
+	assert.Equal(t, []string{"go.opentelemetry.io/otel@v1.41.0"}, m.DesiredDeps)
+	assert.Contains(t, gp.GetMessages(),
+		"modroot .: removed redundant go.opentelemetry.io/otel/trace@v1.41.0 (implied by go.opentelemetry.io/otel@v1.41.0 (final go.mod unchanged without it))")
+	assert.Equal(t, 1, gp.ToResult().VulnerabilitiesFixed)
 }
 
 // TestSimulationStage_RequiredGoVersion: the simulation's MaxDepGoVersion

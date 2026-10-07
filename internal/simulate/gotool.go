@@ -469,6 +469,49 @@ func (t *GoToolchain) ResolveQuery(ctx context.Context, dir, modulePath, query s
 	return version, nil
 }
 
+// RequiredBy returns, from `go mod graph`, each module's requirers in the
+// build list: required module -> requiring module path -> required version.
+// Only edges from a requirer's selected version (the highest version of it
+// in the graph, as MVS picks) count; the main module's own requirements are
+// excluded.
+func (t *GoToolchain) RequiredBy(ctx context.Context, dir string) (map[string]map[string]string, error) {
+	output, err := t.run(ctx, dir, "mod", "graph")
+	if err != nil {
+		return nil, err
+	}
+	type edge struct{ from, fromVersion, to, toVersion string }
+	var edges []edge
+	selected := make(map[string]string)
+	for line := range strings.SplitSeq(string(output), "\n") {
+		from, to, ok := strings.Cut(strings.TrimSpace(line), " ")
+		if !ok {
+			continue
+		}
+		fromPath, fromVersion, fromVersioned := strings.Cut(from, "@")
+		toPath, toVersion, _ := strings.Cut(to, "@")
+		if !fromVersioned || fromPath == "go" || fromPath == "toolchain" || toPath == "go" || toPath == "toolchain" {
+			continue // main module or go/toolchain pseudo-nodes
+		}
+		edges = append(edges, edge{fromPath, fromVersion, toPath, toVersion})
+		for path, version := range map[string]string{fromPath: fromVersion, toPath: toVersion} {
+			if semver.Compare(version, selected[path]) > 0 {
+				selected[path] = version
+			}
+		}
+	}
+	requiredBy := make(map[string]map[string]string)
+	for _, e := range edges {
+		if selected[e.from] != e.fromVersion {
+			continue
+		}
+		if requiredBy[e.to] == nil {
+			requiredBy[e.to] = make(map[string]string)
+		}
+		requiredBy[e.to][e.from] = e.toVersion
+	}
+	return requiredBy, nil
+}
+
 // ModuleRequires returns the require entries of module@version's own go.mod
 // (`go list -m -json` fetches only the .mod/.info, never the zip), memoized
 // per toolchain: module versions are immutable.

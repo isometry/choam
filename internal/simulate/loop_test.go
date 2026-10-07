@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/scan"
@@ -575,7 +576,8 @@ func TestRunLoop_BaselineNoopsDropped(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"example.com/bbb@v0.5.0"}, result.FinalDeps)
 	require.Len(t, result.Dropped, 1)
-	assert.Contains(t, result.Dropped[0].Reason, "no-op")
+	assert.Contains(t, result.Dropped[0].Reason, "redundant: matches or regresses upstream")
+	assert.True(t, result.Dropped[0].Redundant)
 }
 
 func TestRunLoop_ConfirmationDropsRedundantPins(t *testing.T) {
@@ -606,7 +608,7 @@ func TestRunLoop_ConfirmationDropsRedundantPins(t *testing.T) {
 	assert.Equal(t, []string{"example.com/vuln@v2.0.0"}, result.FinalDeps)
 	require.Len(t, result.Dropped, 1)
 	assert.Equal(t, "example.com/pin", result.Dropped[0].Module)
-	assert.Contains(t, result.Dropped[0].Reason, "redundant")
+	assert.Contains(t, result.Dropped[0].Reason, "not needed")
 }
 
 func TestRunLoop_ConfirmationKeepsProtectivePins(t *testing.T) {
@@ -1236,7 +1238,7 @@ func TestRunLoop_ConfirmMinimalSetKeepsReplaces(t *testing.T) {
 	for _, dropped := range result.Dropped {
 		if dropped.Module == "example.com/pin" {
 			pinDropped = true
-			assert.Contains(t, dropped.Reason, "redundant")
+			assert.Contains(t, dropped.Reason, "not needed")
 		}
 	}
 	assert.True(t, pinDropped, "coherence pin must be dropped as redundant")
@@ -1268,11 +1270,11 @@ func TestRunLoop_PromotedReplaceBaselineNoop(t *testing.T) {
 	assert.Empty(t, result.FinalReplaces)
 	var noop bool
 	for _, dropped := range result.Dropped {
-		if strings.Contains(dropped.Reason, "no-op") {
+		if strings.Contains(dropped.Reason, "matches or regresses upstream") {
 			noop = true
 		}
 	}
-	assert.True(t, noop, "promotion at baseline must be dropped as a no-op")
+	assert.True(t, noop, "promotion at baseline must be dropped as redundant")
 }
 
 // TestRunLoop_UnreachableSeedDroppedNoResidual: a CVE-backed seed whose
@@ -1561,7 +1563,7 @@ func TestRunLoop_PackageGateFailsOpen(t *testing.T) {
 // transitively raises timestamp-authority past its own candidate version, so
 // the timestamp-authority get - which a real go toolchain would execute as a
 // DOWNGRADE dragging sigstore-go back to a vulnerable version - must be
-// skipped (gobump parity) and the superseded entry dropped from FinalDeps
+// skipped (gobump parity) and the implied entry dropped from FinalDeps
 // entirely, with both advisory sets counted as fixed.
 func TestRunLoop_SkipGuardPreventsDowngrade(t *testing.T) {
 	const (
@@ -1591,8 +1593,9 @@ func TestRunLoop_SkipGuardPreventsDowngrade(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.True(t, result.Converged)
-	assert.NotContains(t, tc.getLog, tsa+"@v2.1.0", "the downgrade get must be skipped")
-	assert.Equal(t, []string{sigstoreGo + "@v1.2.0"}, result.FinalDeps, "superseded entry must not be written")
+	// (The minimisation trial without sigstore-go does get tsa@v2.1.0; that
+	// trial's go.mod differs, so it proves nothing about the main apply.)
+	assert.Equal(t, []string{sigstoreGo + "@v1.2.0"}, result.FinalDeps, "implied entry must not be written")
 	assert.Equal(t, []string{sigstoreGo}, result.CVEBackedModules)
 	assert.Equal(t, "v2.1.2", result.Resolved[tsa], "transitively carried above its own candidate")
 	assert.Empty(t, result.Residuals, "both advisories are fixed by the surviving entry")
@@ -1604,13 +1607,13 @@ func TestRunLoop_SkipGuardPreventsDowngrade(t *testing.T) {
 		}
 	}
 	require.Len(t, reasons, 1)
-	assert.Contains(t, reasons[0], "superseded")
-	assert.Contains(t, reasons[0], "v2.1.2")
+	assert.Contains(t, reasons[0], "redundant: implied by")
 }
 
 // TestRunLoop_SkipGuardEqualVersionStillGets: the guard is strict-exceed
 // (gobump parity) - a require raised to exactly the candidate version still
-// gets, and an exactly-satisfied entry is not a supersession suspect.
+// gets; the entry is then implied by a (go.mod identical without it) and
+// removed as redundant.
 func TestRunLoop_SkipGuardEqualVersionStillGets(t *testing.T) {
 	tc := &fakeToolchain{
 		base: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"},
@@ -1635,8 +1638,8 @@ func TestRunLoop_SkipGuardEqualVersionStillGets(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, result.Converged)
 	assert.Contains(t, tc.getLog, "example.com/b@v2.0.0", "equal require must still get")
-	assert.ElementsMatch(t, []string{"example.com/a@v2.0.0", "example.com/b@v2.0.0"}, result.FinalDeps)
-	assert.Equal(t, 1, sc.scans, "no suspects - no supersession trial")
+	assert.Equal(t, []string{"example.com/a@v2.0.0"}, result.FinalDeps)
+	assert.Empty(t, result.Residuals)
 }
 
 // TestRunLoop_SkipGuardLatestNeverSkipped: an @latest fallback bypasses the
@@ -1666,11 +1669,11 @@ func TestRunLoop_SkipGuardLatestNeverSkipped(t *testing.T) {
 	assert.Empty(t, result.Residuals)
 }
 
-// TestRunLoop_SupersessionTrialRejectedKeepsEntry: a suspect whose explicit
-// get had load-bearing side effects (its closure fixed a third, non-candidate
-// module) is kept - the trial without it re-exposes that module's advisory as
-// a raise, rejecting the reduced set.
-func TestRunLoop_SupersessionTrialRejectedKeepsEntry(t *testing.T) {
+// TestRunLoop_LoadBearingRaisedEntryKept: an entry whose module another
+// entry's closure raises past it, but whose own get had load-bearing side
+// effects (its closure fixed a third, non-candidate module), is kept - the
+// final go.mod differs without it.
+func TestRunLoop_LoadBearingRaisedEntryKept(t *testing.T) {
 	tc := &fakeToolchain{
 		base: map[string]string{
 			"example.com/a": "v1.0.0",
@@ -1691,7 +1694,7 @@ func TestRunLoop_SupersessionTrialRejectedKeepsEntry(t *testing.T) {
 	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
 		Modroot: ".",
 		// b first: its get executes (and fixes d) before a's closure raises b
-		// past its own candidate version, making b a supersession suspect.
+		// past its own candidate version.
 		Seeds: []Candidate{
 			{Module: "example.com/b", Version: "v1.4.0", FromCVE: true, VulnIDs: []string{"GO-B-1"}},
 			{Module: "example.com/a", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-A-1"}},
@@ -1704,7 +1707,7 @@ func TestRunLoop_SupersessionTrialRejectedKeepsEntry(t *testing.T) {
 	assert.ElementsMatch(t, []string{"example.com/a@v2.0.0", "example.com/b@v1.4.0"}, result.FinalDeps,
 		"the suspect is load-bearing and must be kept")
 	for _, d := range result.Dropped {
-		assert.NotContains(t, d.Reason, "superseded")
+		assert.False(t, d.Redundant, "%s dropped: %s", d.Module, d.Reason)
 	}
 	assert.Empty(t, result.Residuals)
 	assert.Equal(t, "v2.0.0", result.Resolved["example.com/d"])
@@ -2180,7 +2183,7 @@ func TestRunLoop_DegradedReachability_TrialUsesTrialRequirements(t *testing.T) {
 
 	require.Len(t, result.Dropped, 1, "the trial-filtered rescan must confirm pin redundant")
 	assert.Equal(t, "example.com/pin", result.Dropped[0].Module)
-	assert.Contains(t, result.Dropped[0].Reason, "redundant")
+	assert.Contains(t, result.Dropped[0].Reason, "not needed")
 
 	assert.Empty(t, result.FinalDeps, "pin must not survive: confirmed redundant")
 	assert.Empty(t, result.Residuals,
@@ -2252,6 +2255,27 @@ func (f *fakeCompiler) Compile(ctx context.Context, dir string, _, _ []string) (
 
 func (f *fakeCompiler) ModuleVersions(_ context.Context, _, module string) ([]string, error) {
 	return f.versions[module], nil
+}
+
+// RequiredBy derives `go mod graph` requirers from requires: every
+// resolved module@version with a requires entry.
+func (f *fakeCompiler) RequiredBy(ctx context.Context, dir string) (map[string]map[string]string, error) {
+	lastCall := f.lastCall
+	resolved, err := f.ListModules(ctx, dir)
+	f.lastCall = lastCall
+	if err != nil {
+		return nil, err
+	}
+	requiredBy := make(map[string]map[string]string)
+	for module, version := range resolved {
+		for dep, need := range f.requires[module+"@"+version] {
+			if requiredBy[dep] == nil {
+				requiredBy[dep] = make(map[string]string)
+			}
+			requiredBy[dep][module] = need
+		}
+	}
+	return requiredBy, nil
 }
 
 func (f *fakeCompiler) ModuleRequires(_ context.Context, _, module, version string) (map[string]string, error) {
@@ -2691,4 +2715,192 @@ func TestLogTrial_RecordShape(t *testing.T) {
 	l.logTrial(quiet, trialLog{purpose: "gate: relaxed", pins: pins, resolved: resolved, compiled: st})
 	l.logRepair(quiet, repairLog{module: "example.com/s", skip: "x"})
 	assert.Empty(t, buf.String(), "trace records are Debug-only")
+}
+
+// impliesFixture: a@v2.0.0's closure raises b to v2.0.0 (and, when mutual,
+// b@v2.0.0's raises a); both carry an advisory fixed at v2.0.0.
+func impliesFixture(mutual bool) (*fakeCompiler, *fakeScanner) {
+	effects := map[string]map[string]string{"example.com/a@v2.0.0": {"example.com/b": "v2.0.0"}}
+	requires := map[string]map[string]string{
+		"example.com/a@v2.0.0": {"example.com/b": "v2.0.0"},
+		"example.com/b@v2.0.0": {},
+	}
+	if mutual {
+		effects["example.com/b@v2.0.0"] = map[string]string{"example.com/a": "v2.0.0"}
+		requires["example.com/b@v2.0.0"] = map[string]string{"example.com/a": "v2.0.0"}
+	}
+	tc := &fakeCompiler{
+		fakeToolchain: &fakeToolchain{
+			base:       map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"},
+			getEffects: effects,
+		},
+		requires: requires,
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/a", id: "GO-A-1", fixed: "v2.0.0", severity: "HIGH"},
+		{module: "example.com/b", id: "GO-B-1", fixed: "v2.0.0", severity: "HIGH"},
+	}}
+	return tc, sc
+}
+
+func impliesRequest(seeds ...string) ModrootRequest {
+	req := ModrootRequest{
+		Modroot:  ".",
+		Baseline: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"},
+	}
+	for _, module := range seeds {
+		req.Seeds = append(req.Seeds, Candidate{Module: module, Version: "v2.0.0", FromCVE: true,
+			VulnIDs: []string{"GO-" + strings.ToUpper(module[len(module)-1:]) + "-1"}, Severity: "HIGH"})
+	}
+	return req
+}
+
+// TestMinimise_BelowBaselineRemoved: an entry older than upstream is removed
+// as matching/regressing upstream, without a trial.
+func TestMinimise_BelowBaselineRemoved(t *testing.T) {
+	tc := &fakeToolchain{base: map[string]string{"example.com/old": "v1.2.0", "example.com/x": "v1.0.0"}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-X-1", fixed: "v1.1.0"}}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/old", Version: "v1.0.0", FromCVE: true, VulnIDs: []string{"GO-OLD-1"}},
+			{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-X-1"}},
+		},
+		Baseline: map[string]string{"example.com/old": "v1.2.0", "example.com/x": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/x@v1.1.0"}, result.FinalDeps)
+	require.Len(t, result.Dropped, 1)
+	assert.True(t, result.Dropped[0].Redundant)
+	assert.Contains(t, result.Dropped[0].Reason, "go.mod already at newer v1.2.0")
+}
+
+// TestMinimise_ImpliedPinRemoved: b is implied by a (a's go.mod requires it),
+// so it is removed - its advisory stays fixed, the removal names a - and a
+// second run on the output removes nothing and adds nothing.
+func TestMinimise_ImpliedPinRemoved(t *testing.T) {
+	tc, sc := impliesFixture(false)
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest("example.com/a", "example.com/b"), Options{NoCompile: true})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/a@v2.0.0"}, result.FinalDeps)
+	assert.Equal(t, "v2.0.0", result.Resolved["example.com/b"])
+	assert.Empty(t, result.Residuals)
+	require.Len(t, result.Dropped, 1)
+	assert.Equal(t, "example.com/b", result.Dropped[0].Module)
+	assert.True(t, result.Dropped[0].Redundant)
+	assert.Contains(t, result.Dropped[0].Reason, "implied by example.com/a@v2.0.0")
+
+	tc, sc = impliesFixture(false)
+	again, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest("example.com/a"), Options{NoCompile: true})
+	require.NoError(t, err)
+	assert.Equal(t, result.FinalDeps, again.FinalDeps, "idempotent")
+	assert.Empty(t, again.Dropped)
+}
+
+// TestMinimise_MutuallyImplyingKeepsOne: of two entries implying each other
+// exactly one survives, the same one whatever the seed order.
+func TestMinimise_MutuallyImplyingKeepsOne(t *testing.T) {
+	for _, seeds := range [][]string{{"example.com/a", "example.com/b"}, {"example.com/b", "example.com/a"}} {
+		tc, sc := impliesFixture(true)
+		result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest(seeds...), Options{NoCompile: true})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"example.com/b@v2.0.0"}, result.FinalDeps, "seeds %v", seeds)
+		assert.Empty(t, result.Residuals)
+	}
+}
+
+// TestMinimise_EffectiveEntriesKept: entries that each change the final
+// go.mod are kept.
+func TestMinimise_EffectiveEntriesKept(t *testing.T) {
+	tc, sc := impliesFixture(false)
+	tc.getEffects = nil
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest("example.com/a", "example.com/b"), Options{NoCompile: true})
+
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"example.com/a@v2.0.0", "example.com/b@v2.0.0"}, result.FinalDeps)
+	assert.Empty(t, result.Dropped)
+}
+
+// TestMinimise_UserReplaceKept: a user-authored replace is never removed,
+// even when upstream already carries the same directive.
+func TestMinimise_UserReplaceKept(t *testing.T) {
+	pin := ReplaceTarget{Path: "example.com/x", Version: "v1.1.0"}
+	tc := &fakeToolchain{
+		base:             map[string]string{"example.com/x": "v1.0.0"},
+		pristineReplaces: map[string]ReplaceTarget{"example.com/x": pin},
+	}
+	result, err := RunLoop(t.Context(), tc, &fakeScanner{}, newTestModuleDir(t), ModrootRequest{
+		Modroot:  ".",
+		Seeds:    []Candidate{{Module: "example.com/x", Version: "v1.1.0", Replace: true}},
+		Baseline: map[string]string{"example.com/x": "v1.1.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/x=example.com/x@v1.1.0"}, result.FinalReplaces)
+	assert.Empty(t, result.Dropped)
+}
+
+// TestMinimise_BudgetExhaustionKeepsSet: when the simulation budget runs out
+// during minimisation the remaining entries are kept and the run succeeds.
+func TestMinimise_BudgetExhaustionKeepsSet(t *testing.T) {
+	tc, sc := impliesFixture(false)
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+	withoutB := false // this attempt got a but not (yet) b
+	tc.getErr = func(moduleAtVersion string, _ map[string]string) error {
+		withoutB = strings.HasPrefix(moduleAtVersion, "example.com/a@")
+		return nil
+	}
+	tc.tidyErr = func(map[string]string) error {
+		if withoutB {
+			<-ctx.Done() // the trial without the implied entry outlives the budget
+		}
+		return nil
+	}
+	result, err := RunLoop(ctx, tc, sc, newTestModuleDir(t), impliesRequest("example.com/a", "example.com/b"), Options{NoCompile: true})
+
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"example.com/a@v2.0.0", "example.com/b@v2.0.0"}, result.FinalDeps)
+	assert.Empty(t, result.Dropped)
+}
+
+// tidyCounter counts go mod tidy runs. Without tidies the fake never resets
+// its applied set, so it accumulates across attempts (and trials): only
+// tidy counts and the resolved graph are meaningful.
+type tidyCounter struct {
+	*fakeToolchain
+	tidies int
+}
+
+func (c *tidyCounter) Get(ctx context.Context, dir, moduleAtVersion string) error {
+	if c.applied == nil {
+		c.applied = make(map[string]string)
+	}
+	return c.fakeToolchain.Get(ctx, dir, moduleAtVersion)
+}
+
+func (c *tidyCounter) ModTidy(ctx context.Context, dir string) error {
+	c.tidies++
+	return c.fakeToolchain.ModTidy(ctx, dir)
+}
+
+// TestGobumpEngine_NoTidyRunsNoTidy: a `tidy: false` go/bump step
+// (gobump --tidy=false) runs no go mod tidy before or after the gets.
+func TestGobumpEngine_NoTidyRunsNoTidy(t *testing.T) {
+	tc := &tidyCounter{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot:  ".",
+		Seeds:    []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
+		Baseline: map[string]string{"example.com/x": "v1.0.0"},
+		NoTidy:   true,
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, "v1.1.0", result.Resolved["example.com/x"])
+	assert.Zero(t, tc.tidies)
 }

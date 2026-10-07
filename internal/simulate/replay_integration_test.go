@@ -2,6 +2,7 @@ package simulate
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -567,5 +568,67 @@ func TestReplay_RedundantPinsRemoved(t *testing.T) {
 		assert.Empty(t, result.Residuals)
 		assert.True(t, slices.ContainsFunc(result.Dropped, func(d DroppedCandidate) bool { return d.Module == modXNet }),
 			"the redundant pin is reported as dropped")
+	})
+}
+
+// TestReplay_ImpliedPinRemovedBothEngines: b@v1.1.0 is implied by a@v1.1.0
+// (whose go.mod requires it), so under either engine the final tidied go.mod
+// is identical without the b entry: it is removed as redundant, naming a,
+// and its advisory stays fixed. Applying the remaining entry alone still
+// compiles.
+//
+// With `tidy: false` nothing tidies: omnibump sets a's version in place, so
+// the b entry is the only thing raising b in go.mod and must stay; gobump's
+// `go get a` writes the raise itself, so b is still redundant there.
+func TestReplay_ImpliedPinRemovedBothEngines(t *testing.T) {
+	for _, noTidy := range []bool{false, true} {
+		t.Run(fmt.Sprintf("notidy=%v", noTidy), func(t *testing.T) { impliedPinReplay(t, noTidy) })
+	}
+}
+
+func impliedPinReplay(t *testing.T, noTidy bool) {
+	forEachEngine(t, func(t *testing.T, eng Engine) {
+		src := func(pkg string) string {
+			return "package " + pkg + "\n\nfunc Name() string { return \"" + pkg + "\" }\n"
+		}
+		f := newReplayFixture(t, map[string]map[string]string{
+			"example.com/a@v1.0.0": stubModule("example.com/a", "a.go", src("a"), map[string]string{"example.com/b": "v1.0.0"}),
+			"example.com/a@v1.1.0": stubModule("example.com/a", "a.go", src("a"), map[string]string{"example.com/b": "v1.1.0"}),
+			"example.com/b@v1.0.0": stubModule("example.com/b", "b.go", src("b"), nil),
+			"example.com/b@v1.1.0": stubModule("example.com/b", "b.go", src("b"), nil),
+		}, map[string]string{
+			"go.mod":  "module example.com/app\n\ngo 1.21\n\nrequire (\n\texample.com/a v1.0.0\n\texample.com/b v1.0.0\n)\n",
+			"main.go": "package main\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/a\"\n\t\"example.com/b\"\n)\n\nfunc main() { fmt.Println(a.Name(), b.Name()) }\n",
+		})
+		sc := &fakeScanner{advisories: []fakeAdvisory{
+			{module: "example.com/a", id: "GO-A", fixed: "v1.1.0", severity: "HIGH"},
+			{module: "example.com/b", id: "GO-B", fixed: "v1.1.0", severity: "LOW"},
+		}}
+		result, err := RunLoop(t.Context(), f.tc, sc, f.dir, ModrootRequest{
+			Modroot: ".",
+			Seeds: []Candidate{
+				{Module: "example.com/a", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-A"}, Severity: "HIGH"},
+				{Module: "example.com/b", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-B"}, Severity: "LOW"},
+			},
+			Baseline: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"},
+			Engine:   eng,
+			NoTidy:   noTidy,
+		}, Options{})
+		require.NoError(t, err)
+		logResult(t, result)
+		if noTidy && eng == EngineOmnibump {
+			assert.ElementsMatch(t, []string{"example.com/a@v1.1.0", "example.com/b@v1.1.0"}, result.FinalDeps)
+			assert.Empty(t, result.Dropped)
+			return
+		}
+		assert.Equal(t, []string{"example.com/a@v1.1.0"}, result.FinalDeps)
+		assert.Equal(t, "v1.1.0", result.Resolved["example.com/b"])
+		assert.Empty(t, result.Residuals)
+		require.Len(t, result.Dropped, 1)
+		assert.True(t, result.Dropped[0].Redundant)
+		assert.Contains(t, result.Dropped[0].Reason, "implied by example.com/a@v1.1.0")
+		if !noTidy {
+			assert.Empty(t, f.compileFailuresWith(t, eng, result.FinalDeps))
+		}
 	})
 }

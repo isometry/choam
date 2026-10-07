@@ -526,11 +526,6 @@ func (l *Loader) GetBumpModroots(yamlContent []byte, pipelineIndex int) ([]strin
 	return splitWhitespaceList(modroot), nil
 }
 
-// UpdateGoBumpDeps updates the deps field in a go/bump pipeline
-func (l *Loader) UpdateGoBumpDeps(yamlContent []byte, pipelineIndex int, newDeps []string) ([]byte, error) {
-	return l.UpdateGoBumpStep(yamlContent, pipelineIndex, newDeps, nil, "")
-}
-
 // UpdateGoBumpStep updates a bump/go-bump step's deps, replaces and
 // go-version fields in place. Both deps and replaces empty removes the whole
 // step; deps empty with replaces present keeps the step (gobump accepts a

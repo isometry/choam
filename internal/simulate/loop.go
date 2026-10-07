@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/logging"
@@ -32,14 +33,12 @@ type candState struct {
 	dropped     bool
 	origVersion string // pre-@latest-fallback version, for reporting
 
-	// satisfiedTransitively records that the last successful apply skipped
-	// this candidate's `go get` because the go.mod require already exceeded
-	// the requested version (gobump-parity skip guard) - another candidate's
-	// closure carries the module. Reset at the start of each apply attempt.
-	satisfiedTransitively bool
+	// userReplace marks a user-authored YAML replace (a replace seed): load-
+	// bearing intent, never removed as redundant.
+	userReplace bool
 	// residualized marks a dropped candidate whose advisories were accounted
 	// for at drop time - either recorded as a residual or deliberately
-	// residual-free (unreachable, superseded). The rescan backfill only
+	// residual-free (unreachable, redundant). The rescan backfill only
 	// synthesizes residuals for dropped CVE candidates NOT marked here.
 	residualized bool
 	// dropReason mirrors the DroppedCandidate reason, for backfill wording.
@@ -248,7 +247,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	// Dependency-graph capabilities (max go directive, linked stdlib set) are
 	// computed HERE: right after the fixpoint loop exits (converged or
 	// iteration-cap exhausted) and BEFORE the refinement phases
-	// (dropSuperseded, confirmMinimalSet) run. At this exact point the
+	// (confirmMinimalSet, the compile gate, minimise) run. At this exact point the
 	// checkout on disk is guaranteed to be the state that produced
 	// `resolved` - the loop body's last apply() is always immediately
 	// followed by ListModules/Requirements/Replaces/refreshLinked with no
@@ -293,11 +292,8 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 			})
 		}
 	} else {
-		// Post-convergence refinement, one pass each, ≤1 trial apiece:
-		// supersession first (a superseded entry must never be re-included
-		// as "essential" by the minimal-set confirmation, and dropping it
-		// shrinks that trial), then the coherence-pin minimization.
-		resolved = l.dropSuperseded(ctx, resolved, result)
+		// Post-convergence refinement (one trial): shed pins no advisory
+		// needs.
 		resolved = l.confirmMinimalSet(ctx, resolved, result)
 	}
 
@@ -311,6 +307,13 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 			return nil, err
 		}
 		resolved = gated
+	}
+
+	// Last, on the final set: remove every redundant entry. The final
+	// tidied go.mod is unchanged by construction, so resolved and the
+	// capability fields still describe it.
+	if err := l.minimise(ctx); err != nil {
+		return nil, err
 	}
 
 	result.Resolved = resolved
@@ -342,7 +345,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 // to the replace channel (a `go get` cannot out-vote a replace directive).
 func (l *loop) seedCandidate(c Candidate) {
 	if c.Replace {
-		l.addCandidate(c, true)
+		l.addCandidate(c, true).userReplace = true
 		return
 	}
 
@@ -500,13 +503,7 @@ func (l *loop) apply(ctx context.Context) error {
 			// instead of the real cancellation.
 			return err
 		}
-		for _, c := range l.cands {
-			c.satisfiedTransitively = false
-		}
-		skipped, fail := l.engine.apply(ctx, l.inApplyOrder(l.activeCandidates()))
-		for _, c := range skipped {
-			c.satisfiedTransitively = true
-		}
+		fail := l.engine.apply(ctx, l.inApplyOrder(l.activeCandidates()))
 		switch {
 		case fail == nil, fail.step == stepVerify:
 			// A verification failure leaves the tidied result on disk: the
@@ -1293,7 +1290,7 @@ func (l *loop) trialApply(ctx context.Context, purpose string, keep []*candState
 // the step's engine, in keep's order. Single-shot: any failure (including
 // omnibump's post-tidy verification) is returned with no repair ladder.
 func (l *loop) applyExact(ctx context.Context, keep []*candState) error {
-	if _, fail := l.engine.apply(ctx, keep); fail != nil {
+	if fail := l.engine.apply(ctx, keep); fail != nil {
 		return fail.err
 	}
 	return nil
@@ -1342,58 +1339,11 @@ func (l *loop) adoptTrial(ctx context.Context, tr *trialResult, result *ModrootR
 	}
 }
 
-// dropSuperseded checks whether candidates that another candidate's closure
-// already carries - the apply skip guard bypassed their get, or the
-// converged graph resolves their module strictly above the requested version
-// - can be removed from the written deps entirely (melange's gobump would
-// only warn-skip such entries anyway). One trial without all suspects,
-// adopted when it demands no raises, surfaces no new residual advisories,
-// and sustains every kept candidate; a suspect whose advisories resurface in
-// the trial appears as a raise or a net-new residual ID, rejecting it. On
-// rejection the converged full set is kept.
-func (l *loop) dropSuperseded(ctx context.Context, resolved map[string]string, result *ModrootResult) map[string]string {
-	active := l.activeCandidates()
-	keep := make([]*candState, 0, len(active))
-	suspects := make([]*candState, 0, len(active))
-	for _, c := range active {
-		superseded := !c.Replace && !c.remedy &&
-			(c.satisfiedTransitively ||
-				(c.Version != latestQuery && resolved[c.Module] != "" &&
-					semver.Compare(resolved[c.Module], c.Version) > 0))
-		if superseded {
-			suspects = append(suspects, c)
-		} else {
-			keep = append(keep, c)
-		}
-	}
-	if len(suspects) == 0 {
-		return resolved
-	}
-
-	convergedLinked, convergedPackages := l.linked, l.linkedPackages
-	tr, err := l.trialApply(ctx, "refine: drop superseded", keep)
-	if err != nil || len(tr.raises) > 0 ||
-		introducesNewVulns(tr.residuals, l.scanResiduals) || !l.sustained(tr, keep) {
-		l.linked, l.linkedPackages = convergedLinked, convergedPackages
-		return resolved
-	}
-
-	for _, c := range suspects {
-		l.drop(c, fmt.Sprintf("superseded: other bumps already resolve %s at %s",
-			c.Module, tr.resolved[c.Module]))
-		// The suspect's advisories are genuinely fixed by the remaining set
-		// (the trial rescan proved it) - no residual, and the rescan
-		// backfill must not create one.
-		c.residualized = true
-	}
-	l.adoptTrial(ctx, tr, result)
-	return tr.resolved
-}
-
-// confirmMinimalSet checks whether the CVE-backed candidates alone reach the
-// same clean state - MVS pulls required co-updates in by itself, so
-// coherence-only entries are usually redundant (and are exactly where
-// unvalidated vulnerable floors come from). Adopts the smaller set when the
+// confirmMinimalSet checks whether the CVE-backed candidates alone reach a
+// clean state: pins no advisory backs (existing YAML hints, raises) are
+// shed when nothing needs them - this may change the graph, unlike the
+// effect-based redundancy check (see minimise); the compile gate re-adds any
+// a build turns out to need. Adopts the smaller set when the
 // confirmation apply succeeds and its rescan demands no further raises and
 // no new residual advisories; otherwise keeps the converged full set.
 // result's MaxDepGoVersion/StdPackages - set by the caller from the
@@ -1427,36 +1377,211 @@ func (l *loop) confirmMinimalSet(ctx context.Context, resolved map[string]string
 		if isEssential(c) {
 			continue
 		}
-		l.drop(c, "redundant: module graph resolves identically without it")
+		l.drop(c, "not needed: no advisory depends on it and the advisory-backed set resolves cleanly without it")
 	}
 	l.adoptTrial(ctx, tr, result)
 	return tr.resolved
 }
 
+// goModState is the effect of a pin set: the go.mod the step's engine leaves
+// behind - require (path -> version, `// indirect` ignored) and replace
+// directives, plus the go/toolchain lines - and, for go < 1.17 modules
+// (whose require block does not pin the whole build list), the resolved
+// build list.
+type goModState struct {
+	requires map[string]string
+	replaces map[string]ReplaceTarget
+	goLines  string
+	graph    map[string]string
+}
+
+func (s *goModState) equal(o *goModState) bool {
+	return maps.Equal(s.requires, o.requires) && maps.Equal(s.replaces, o.replaces) &&
+		s.goLines == o.goLines && maps.Equal(s.graph, o.graph)
+}
+
+// finalState applies pins with the step's engine (its own tidy mode: no tidy
+// at all for `tidy: false`) and reads the resulting go.mod. go.mod is read
+// before any go list runs, so nothing but the engine has touched it. ok is
+// false when the apply fails - the set is then not equivalent to anything.
+func (l *loop) finalState(ctx context.Context, pins []*candState) (st *goModState, ok bool, err error) {
+	if fail := l.engine.apply(ctx, l.inApplyOrder(pins)); fail != nil {
+		return nil, false, ctx.Err()
+	}
+	st = &goModState{}
+	if st.requires, err = l.tc.Requirements(ctx, l.dir); err != nil {
+		return nil, false, err
+	}
+	if st.replaces, err = l.tc.Replaces(ctx, l.dir); err != nil {
+		return nil, false, err
+	}
+	if content, rerr := os.ReadFile(filepath.Join(l.dir, "go.mod")); rerr == nil {
+		if f, perr := modfile.ParseLax("go.mod", content, nil); perr == nil {
+			if f.Go != nil {
+				st.goLines = f.Go.Version
+			}
+			if f.Toolchain != nil {
+				st.goLines += " " + f.Toolchain.Name
+			}
+		}
+	}
+	if !l.tidiedGoModern() {
+		if st.graph, err = l.tc.ListModules(ctx, l.dir); err != nil {
+			return nil, false, err
+		}
+	}
+	return st, true, nil
+}
+
+// minimise removes every redundant entry from the final set (design
+// principle 2): first those that match or regress the upstream go.mod (no
+// trial needed), then, one at a time, every entry whose removal leaves the
+// final go.mod unchanged - re-checked after each removal, so of two entries
+// that imply each other exactly one survives. Derived entries (no advisory)
+// go first, then advisory-backed ones from the least severe; ties by module
+// path, so the outcome is deterministic and a second run removes nothing.
+// User-authored replaces are never removed. When the simulation budget runs
+// low the remaining entries are kept (correct, merely not minimal); only a
+// cancellation is returned as an error. The checkout is left holding the
+// final set.
+func (l *loop) minimise(ctx context.Context) error {
+	var set, order []*candState
+	for _, c := range l.activeCandidates() {
+		if !c.userReplace {
+			if why := l.engine.upstreamSkip(c); why != "" {
+				l.dropRedundant(ctx, c, "matches or regresses upstream go.mod ("+why+")")
+				continue
+			}
+			if !c.Replace { // removing a replace always changes the replace set
+				order = append(order, c)
+			}
+		}
+		set = append(set, c)
+	}
+	if len(order) == 0 {
+		return nil
+	}
+	slices.SortFunc(order, func(a, b *candState) int {
+		if a.FromCVE != b.FromCVE {
+			if a.FromCVE {
+				return 1
+			}
+			return -1
+		}
+		if ra, rb := scan.SeverityRank(a.Severity), scan.SeverityRank(b.Severity); a.FromCVE && ra != rb {
+			return rb - ra
+		}
+		return strings.Compare(a.Module, b.Module)
+	})
+
+	// settle leaves the checkout holding the final set, as the build's bump
+	// step will: a later modroot of the same clone may depend on this one
+	// (e.g. through a local replace), so a trial's state must not linger.
+	settle := func() error {
+		if fail := l.engine.apply(ctx, l.inApplyOrder(set)); fail != nil && errors.Is(ctx.Err(), context.Canceled) {
+			return ctx.Err()
+		}
+		return nil
+	}
+	stop := func(err error, why string) error {
+		if errors.Is(ctx.Err(), context.Canceled) {
+			return ctx.Err()
+		}
+		logging.From(ctx).Info("redundancy check stopped; keeping the remaining entries",
+			"modroot", l.req.Modroot, "reason", why, "error", err)
+		return settle()
+	}
+	start := time.Now()
+	ref, ok, err := l.finalState(ctx, set)
+	if err != nil || !ok {
+		return stop(err, "the final set no longer applies")
+	}
+	cost := time.Since(start)
+	// Necessary condition, from the final graph's requirement edges: an
+	// entry for a module upstream already requires can only be implied when
+	// some other selected module requires it at >= its version (tidy never
+	// re-resolves an existing requirement; a module new to go.mod, by
+	// contrast, may be re-added at @latest for a main-module import).
+	// Unknown edges (no lister, or it failed) trial everything.
+	var requiredBy map[string]map[string]string
+	if g, ok := l.tc.(interface {
+		RequiredBy(ctx context.Context, dir string) (map[string]map[string]string, error)
+	}); ok {
+		if requiredBy, err = g.RequiredBy(ctx, l.dir); err != nil {
+			requiredBy = nil
+		}
+	}
+	for _, c := range order {
+		requirers := l.requirers(requiredBy, c, set)
+		if _, upstream := l.req.Baseline[c.Module]; upstream && requiredBy != nil &&
+			semver.IsValid(c.Version) && len(requirers) == 0 {
+			continue
+		}
+		if dl, has := ctx.Deadline(); has && time.Until(dl) < 2*cost {
+			return stop(nil, "simulation budget nearly exhausted")
+		}
+		without := slices.DeleteFunc(slices.Clone(set), func(p *candState) bool { return p == c })
+		start := time.Now()
+		st, ok, err := l.finalState(ctx, without)
+		cost = max(cost, time.Since(start))
+		if err != nil || ctx.Err() != nil {
+			return stop(err, "trial interrupted")
+		}
+		if !ok || !st.equal(ref) {
+			continue
+		}
+		set = without
+		implied := "the remaining pins"
+		if len(requirers) > 0 {
+			implied = strings.Join(requirers, ", ")
+		}
+		l.dropRedundant(ctx, c, "implied by "+implied+" (final go.mod unchanged without it)")
+	}
+	return settle()
+}
+
+// requirers names the selected modules requiring c's module at >= c's
+// version: the pins among them ("module@version"), else the others.
+func (l *loop) requirers(requiredBy map[string]map[string]string, c *candState, set []*candState) []string {
+	var pins, others []string
+	for _, from := range sortedKeys(requiredBy[c.Module]) {
+		if from == c.Module || semver.Compare(requiredBy[c.Module][from], c.Version) < 0 {
+			continue
+		}
+		if p := slices.IndexFunc(set, func(p *candState) bool { return p.Module == from && p != c }); p >= 0 {
+			pins = append(pins, from+"@"+set[p].Version)
+		} else {
+			others = append(others, from)
+		}
+	}
+	if len(pins) > 0 {
+		return pins
+	}
+	return others
+}
+
+// dropRedundant drops c as redundant: it did no work, so its advisories (if
+// any) are exactly as fixed without it - no residual.
+func (l *loop) dropRedundant(ctx context.Context, c *candState, why string) {
+	l.drop(c, "redundant: "+why)
+	l.dropped[len(l.dropped)-1].Redundant = true
+	c.residualized = true
+	logging.From(ctx).Debug("redundant entry removed", "modroot", l.req.Modroot,
+		"module", c.Module, "version", c.Version, "reason", why)
+}
+
 // finalOutputs renders the surviving candidates: deps entries
 // (module@version), replace entries (old=new@version, gobump grammar), and
 // the modules among them that address at least one advisory. @latest
-// fallbacks are substituted with the resolved version; entries the baseline
-// manifest already satisfies are dropped as no-ops (for promoted replaces
-// the baseline resolves upstream replace directives, so an upstream replace
-// already at >= target naturally no-ops - mirroring gobump's warn+skip).
+// fallbacks are substituted with the resolved version. Redundant entries are
+// already gone (see minimise); a deps entry the final tidy pruned is dropped
+// here because gobump rejects it at build time.
 func (l *loop) finalOutputs(resolved map[string]string) ([]string, []string, []string) {
 	var deps []string
 	var replaces []string
 	var cveModules []string
 	for _, c := range l.activeCandidates() {
 		if c.Replace {
-			_, wasPromoted := l.promoted[c.Module]
-			if wasPromoted {
-				if baseline, ok := l.req.Baseline[c.Module]; ok && semver.Compare(c.Version, baseline) <= 0 {
-					l.dropped = append(l.dropped, DroppedCandidate{
-						Module:  c.Module,
-						Version: c.Version,
-						Reason:  fmt.Sprintf("no-op: baseline already at %s", baseline),
-					})
-					continue
-				}
-			}
 			replaces = append(replaces, fmt.Sprintf("%s=%s@%s", c.OldPath(), c.Module, c.Version))
 			if c.FromCVE {
 				cveModules = append(cveModules, c.Module)
@@ -1495,14 +1620,6 @@ func (l *loop) finalOutputs(resolved map[string]string) ([]string, []string, []s
 			if version == "" {
 				version = l.requirements[c.Module]
 			}
-		}
-		if baseline, ok := l.req.Baseline[c.Module]; ok && semver.Compare(version, baseline) <= 0 {
-			l.dropped = append(l.dropped, DroppedCandidate{
-				Module:  c.Module,
-				Version: version,
-				Reason:  fmt.Sprintf("no-op: baseline already at %s", baseline),
-			})
-			continue
 		}
 		deps = append(deps, c.Module+"@"+version)
 		if c.FromCVE {

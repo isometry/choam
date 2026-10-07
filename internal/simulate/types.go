@@ -204,6 +204,9 @@ type DroppedCandidate struct {
 	Module  string `json:"module" yaml:"module"`
 	Version string `json:"version" yaml:"version"`
 	Reason  string `json:"reason" yaml:"reason"`
+	// Redundant marks an entry removed because it did no work: it matched or
+	// regressed upstream, or the final tidied go.mod is identical without it.
+	Redundant bool `json:"redundant,omitempty" yaml:"redundant,omitempty"`
 }
 
 // Residual is a vulnerability the simulation could not eliminate, with the
@@ -330,7 +333,8 @@ type ModrootRequest struct {
 	BaselineVulnIDs map[string]struct{}
 	// Engine is the bump step's apply semantics (see Engine).
 	Engine Engine
-	// NoTidy mirrors a `tidy: false` bump step (EngineOmnibump only).
+	// NoTidy mirrors a `tidy: false` bump step: the engine runs no go mod
+	// tidy at all.
 	NoTidy bool
 	// GoVersion is the build's Go version (bare, e.g. "1.25.9"); omnibump
 	// lowers the go directive to it, never raises it. "" means the host go

@@ -42,12 +42,13 @@ func omnibumpApplySkips(ctx context.Context, tc Toolchain, dir string, req Modro
 		}
 		keep = append(keep, &candState{Candidate: c})
 	}
-	skipped, fail := eng.apply(ctx, keep)
 	var names []string
-	for _, c := range skipped {
-		names = append(names, c.Module+"@"+c.Version)
+	for _, c := range keep {
+		if eng.upstreamSkip(c) != "" {
+			names = append(names, c.Module+"@"+c.Version)
+		}
 	}
-	if fail != nil {
+	if fail := eng.apply(ctx, keep); fail != nil {
 		return names, fail.err
 	}
 	return names, nil
@@ -227,9 +228,8 @@ func TestRunLoop_OmnibumpDowngradeVerification(t *testing.T) {
 // omnibump applies the remedy's concrete version as an in-place require edit,
 // which runs after every `go get`, so fetching m/sub stays ambiguous until
 // the loop promotes the m/sub fix to a replace directive (replaces apply
-// first). Only the omnibump result is re-applied from scratch: gobump runs
-// the gets in the written order (m/sub sorts before m), which the simulation
-// does not model.
+// first). Under gobump the m/sub entry is then redundant (implied by the
+// remedy), so both results are re-applied from scratch.
 func TestRunLoop_AmbiguousImportBothEngines(t *testing.T) {
 	forEachEngine(t, func(t *testing.T, eng Engine) {
 		subSrc := "package sub\n\nfunc Name() string { return \"sub\" }\n"
@@ -255,12 +255,14 @@ func TestRunLoop_AmbiguousImportBothEngines(t *testing.T) {
 		assert.Empty(t, result.Residuals)
 		assert.Equal(t, "v1.1.0", result.Resolved["example.com/m"])
 		assert.Equal(t, "v1.1.0", result.Resolved["example.com/m/sub"])
-		if eng == EngineGobump {
-			assert.ElementsMatch(t, []string{"example.com/m@v1.1.0", "example.com/m/sub@v1.1.0"}, result.FinalDeps)
-			return
-		}
 		assert.Equal(t, []string{"example.com/m@v1.1.0"}, result.FinalDeps)
-		assert.Equal(t, []string{"example.com/m/sub=example.com/m/sub@v1.1.0"}, result.FinalReplaces)
+		if eng == EngineGobump {
+			// The m/sub entry is implied by the remedied monolith: the
+			// final go.mod is identical without it.
+			assert.Empty(t, result.FinalReplaces)
+		} else {
+			assert.Equal(t, []string{"example.com/m/sub=example.com/m/sub@v1.1.0"}, result.FinalReplaces)
+		}
 		assert.Empty(t, f.compileFailuresWith(t, eng, append(result.FinalReplaces, result.FinalDeps...)))
 	})
 }

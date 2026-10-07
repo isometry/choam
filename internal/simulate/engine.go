@@ -97,11 +97,15 @@ type applyFailure struct {
 // what a failure or a skip means for loop state.
 type engine interface {
 	// apply restores the pristine snapshot and applies keep (in apply
-	// order), returning the candidates it skipped as already satisfied.
-	apply(ctx context.Context, keep []*candState) (skipped []*candState, fail *applyFailure)
+	// order); nil means it applied cleanly.
+	apply(ctx context.Context, keep []*candState) *applyFailure
 	// tidyBaseline restores the pristine snapshot and runs only the
 	// engine's own tidying (the compile gate's baseline state).
 	tidyBaseline(ctx context.Context) error
+	// upstreamSkip reports why c matches or regresses the upstream go.mod
+	// (the build's bump step would skip it, or it would only re-pin what
+	// upstream already has), "" when it does not.
+	upstreamSkip(c *candState) string
 }
 
 func (l *loop) newEngine(ctx context.Context) (engine, error) {
@@ -127,13 +131,14 @@ func (l *loop) newEngine(ctx context.Context) (engine, error) {
 }
 
 // gobumpEngine is EngineGobump: tidy, replace edits, one skip-guarded
-// `go get` per entry, tidy.
+// `go get` per entry, tidy - both tidies skipped for a `tidy: false` step
+// (gobump --tidy=false).
 type gobumpEngine struct{ l *loop }
 
-func (e gobumpEngine) apply(ctx context.Context, keep []*candState) ([]*candState, *applyFailure) {
+func (e gobumpEngine) apply(ctx context.Context, keep []*candState) *applyFailure {
 	l := e.l
 	if err := e.tidyBaseline(ctx); err != nil {
-		return nil, &applyFailure{step: stepSetup, err: fmt.Errorf("initial go mod tidy: %w", err)}
+		return &applyFailure{step: stepSetup, err: fmt.Errorf("initial go mod tidy: %w", err)}
 	}
 	// gobump parity: replace directives before any get. A replace edit is
 	// syntactic - failure is fatal, not a graph problem.
@@ -142,13 +147,12 @@ func (e gobumpEngine) apply(ctx context.Context, keep []*candState) ([]*candStat
 			continue
 		}
 		if c.Version == latestQuery {
-			return nil, &applyFailure{step: stepSetup, err: fmt.Errorf("internal error: replace candidate %s has unresolved @latest version", c.Module)}
+			return &applyFailure{step: stepSetup, err: fmt.Errorf("internal error: replace candidate %s has unresolved @latest version", c.Module)}
 		}
 		if err := l.tc.Replace(ctx, l.dir, c.OldPath(), c.Module, c.Version); err != nil {
-			return nil, &applyFailure{step: stepSetup, err: fmt.Errorf("applying replace %s=%s@%s: %w", c.OldPath(), c.Module, c.Version, err)}
+			return &applyFailure{step: stepSetup, err: fmt.Errorf("applying replace %s=%s@%s: %w", c.OldPath(), c.Module, c.Version, err)}
 		}
 	}
-	var skipped []*candState
 	for _, c := range keep {
 		if c.Replace {
 			continue
@@ -158,26 +162,48 @@ func (e gobumpEngine) apply(ctx context.Context, keep []*candState) ([]*candStat
 			// already exceeds the requested version. Running the get anyway
 			// would be a DOWNGRADE that can drag an earlier candidate's
 			// module back below its fix.
-			skipped = append(skipped, c)
 			logging.From(ctx).Debug("skipping go get: require already exceeds target",
 				"modroot", l.req.Modroot, "module", c.Module, "target", c.Version)
 			continue
 		}
 		if err := l.tc.Get(ctx, l.dir, c.Module+"@"+c.Version); err != nil {
-			return skipped, &applyFailure{step: stepGet, cand: c, err: err}
+			return &applyFailure{step: stepGet, cand: c, err: err}
 		}
 	}
-	if err := l.tc.ModTidy(ctx, l.dir); err != nil {
-		return skipped, &applyFailure{step: stepTidy, err: err}
+	if l.req.NoTidy {
+		return nil
 	}
-	return skipped, nil
+	if err := l.tc.ModTidy(ctx, l.dir); err != nil {
+		return &applyFailure{step: stepTidy, err: err}
+	}
+	return nil
 }
 
 func (e gobumpEngine) tidyBaseline(ctx context.Context) error {
 	if err := e.l.restore(ctx); err != nil {
 		return err
 	}
+	if e.l.req.NoTidy {
+		return nil
+	}
 	return e.l.tc.ModTidy(ctx, e.l.dir)
+}
+
+// upstreamSkip: an entry at or below the module's upstream version (replace
+// directives applied) is a no-op or a regression - gobump skips an entry the
+// go.mod already exceeds, and an equal one changes nothing.
+func (e gobumpEngine) upstreamSkip(c *candState) string {
+	baseline, ok := e.l.req.Baseline[c.Module]
+	if !ok || !semver.IsValid(baseline) || !semver.IsValid(c.Version) {
+		return ""
+	}
+	switch cmp := semver.Compare(baseline, c.Version); {
+	case cmp == 0:
+		return "go.mod already at " + baseline
+	case cmp > 0:
+		return "go.mod already at newer " + baseline
+	}
+	return ""
 }
 
 // omnibumpEngine is EngineOmnibump (see its doc).
@@ -227,29 +253,27 @@ func (e *omnibumpEngine) resolveLatest(ctx context.Context, c *candState) (strin
 	return v, nil
 }
 
-func (e *omnibumpEngine) apply(ctx context.Context, keep []*candState) ([]*candState, *applyFailure) {
+func (e *omnibumpEngine) apply(ctx context.Context, keep []*candState) *applyFailure {
 	if !e.pristineTidies {
 		if err := e.tidyBaseline(ctx); err != nil {
-			return nil, &applyFailure{step: stepSetup, err: fmt.Errorf("initial go mod tidy: %w", err)}
+			return &applyFailure{step: stepSetup, err: fmt.Errorf("initial go mod tidy: %w", err)}
 		}
 	}
 	if err := e.l.restore(ctx); err != nil {
-		return nil, &applyFailure{step: stepSetup, err: err}
+		return &applyFailure{step: stepSetup, err: err}
 	}
-	var skipped []*candState
 	pkgs := make(map[string]*omnibump.Package, len(keep))
 	for i, c := range keep {
 		version, err := e.resolveLatest(ctx, c)
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
-				return skipped, &applyFailure{step: stepSetup, err: cerr}
+				return &applyFailure{step: stepSetup, err: cerr}
 			}
-			return skipped, &applyFailure{step: stepGet, cand: c, err: err}
+			return &applyFailure{step: stepGet, cand: c, err: err}
 		}
 		resolved := *c
 		resolved.Version = version
 		if reason := rawSkip(e.raw, &resolved); reason != "" {
-			skipped = append(skipped, c)
 			logging.From(ctx).Debug("omnibump skips entry", "modroot", e.l.req.Modroot,
 				"module", c.Module, "target", version, "reason", reason)
 			continue
@@ -262,12 +286,12 @@ func (e *omnibumpEngine) apply(ctx context.Context, keep []*candState) ([]*candS
 	}
 	if len(pkgs) == 0 {
 		// The CLI returns before DoUpdate: nothing is tidied at all.
-		return skipped, nil
+		return nil
 	}
 	if err := e.doUpdate(ctx, pkgs); err != nil {
-		return skipped, e.classify(ctx, err, keep)
+		return e.classify(ctx, err, keep)
 	}
-	return skipped, nil
+	return nil
 }
 
 func (e *omnibumpEngine) tidyBaseline(ctx context.Context) error {
@@ -279,6 +303,14 @@ func (e *omnibumpEngine) tidyBaseline(ctx context.Context) error {
 	}
 	e.pristineTidies = true
 	return nil
+}
+
+// upstreamSkip is the CLI's raw-go.mod filter (see rawSkip).
+func (e *omnibumpEngine) upstreamSkip(c *candState) string {
+	if c.Version == latestQuery {
+		return ""
+	}
+	return rawSkip(e.raw, c)
 }
 
 // doUpdate runs omnibump's DoUpdate in the checkout, with its go tool
