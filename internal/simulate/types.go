@@ -46,16 +46,17 @@ type Toolchain interface {
 	Replaces(ctx context.Context, dir string) (map[string]ReplaceTarget, error)
 	// Linked returns the module paths AND package import paths in the
 	// transitive non-test import graph of the given build patterns (empty
-	// means ./...) - the modules the linker records in the binary's
+	// means ./...) under the given build tags, for the same build target as
+	// Compiler.Compile - the modules the linker records in the binary's
 	// buildinfo, i.e. what actually ships, plus the package-level detail
 	// for checking advisories' vulnerable import paths. Errors make
 	// reachability filtering fail OPEN (treat everything as linked).
-	Linked(ctx context.Context, dir string, patterns []string) (modules, packages map[string]struct{}, err error)
+	Linked(ctx context.Context, dir string, patterns, tags []string) (modules, packages map[string]struct{}, err error)
 	// LinkedStd returns the set of standard-library import paths in the
 	// transitive non-test import graph of the given build patterns (empty
-	// means ./...), evaluated for GOOS=linux (same walk semantics as
-	// Linked, inverted filter).
-	LinkedStd(ctx context.Context, dir string, patterns []string) (map[string]struct{}, error)
+	// means ./...) and tags (same target and walk semantics as Linked,
+	// inverted filter).
+	LinkedStd(ctx context.Context, dir string, patterns, tags []string) (map[string]struct{}, error)
 }
 
 // Compiler is the optional compile-gate seam: a Toolchain that also
@@ -104,9 +105,9 @@ type Scanner interface {
 }
 
 // Candidate is one proposed module@version bump. FromCVE marks candidates
-// backed by an OSV advisory: they are defended (retried at @latest, reported
-// as residuals when unreachable), whereas coherence-only candidates
-// (carried-forward pins) are the first to be sacrificed when the
+// backed by an OSV advisory: they are defended (stepped down their fix
+// ladder, reported as residuals when unreachable), whereas coherence-only
+// candidates (carried-forward pins) are the first to be sacrificed when the
 // module graph won't resolve.
 type Candidate struct {
 	Module  string
@@ -124,11 +125,10 @@ type Candidate struct {
 	// the single rung {Version, VulnIDs, Severity}.
 	Rungs []Rung
 
-	// Replace marks a candidate applied as a go.mod replace directive
-	// (survives `go mod tidy`, unlike a plain require pin) rather than a
-	// `go get`. ReplaceOld is the directive's left-hand side; empty means a
-	// self-replace (ReplaceOld == Module). User-authored YAML replaces enter
-	// as replace seeds; the loop also promotes tidy-unsustainable CVE pins.
+	// Replace marks a user-authored YAML replace (a replace seed), applied
+	// as a go.mod replace directive rather than a `go get`; the loop never
+	// creates replace directives of its own. ReplaceOld is the directive's
+	// left-hand side; empty means a self-replace (ReplaceOld == Module).
 	Replace    bool
 	ReplaceOld string
 }
@@ -177,7 +177,7 @@ func FixRungs(vulns []scan.Vulnerability, module string, ids []string, also ...s
 }
 
 // mergeRungs unions two ladders by version (advisories merged, most severe
-// level kept), dropping non-semver versions (@latest), highest first.
+// level kept), dropping non-semver versions, highest first.
 func mergeRungs(a, b []Rung) []Rung {
 	byVersion := make(map[string]*Rung)
 	var merged []Rung
@@ -235,10 +235,9 @@ type ModrootResult struct {
 	// relative to the original manifest.
 	FinalDeps []string `json:"final_deps" yaml:"final_deps"`
 
-	// FinalReplaces are the replace directives ("old=new@version", gobump
-	// grammar) proven to apply cleanly: user-authored seeds plus pins the
-	// loop promoted because go mod tidy would not sustain them as plain
-	// requires. Note a replace pins its module exactly - future graph
+	// FinalReplaces are the user-authored replace directives ("old=new@version",
+	// gobump grammar) proven to apply cleanly, raised where an advisory
+	// demanded it. Note a replace pins its module exactly - future graph
 	// demands for a higher version are overridden until a later choam run
 	// re-raises the directive.
 	FinalReplaces []string `json:"final_replaces,omitempty" yaml:"final_replaces,omitempty"`

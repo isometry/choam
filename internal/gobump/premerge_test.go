@@ -93,7 +93,7 @@ func TestSeedCandidates_PreLoopMergeKeepsFixRungs(t *testing.T) {
 	}
 	existing := []string{sdk + "@v1.43.0"}
 
-	desired := eco.FilterBumps(t.Context(), existing, scanResult.SecurityBumps, deps)
+	desired, _ := eco.FilterBumps(t.Context(), existing, scanResult.SecurityBumps, deps)
 	seeds := seedCandidates(ModrootAnalysis{Modroot: ".", Deps: deps, ScanResult: scanResult, ExistingDeps: existing, DesiredDeps: desired})
 	var sdkSeeds []simulate.Candidate
 	for _, seed := range seeds {

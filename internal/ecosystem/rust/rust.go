@@ -5,6 +5,8 @@ package rust
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -95,16 +97,18 @@ func (e *Ecosystem) BumpCoords(_ context.Context, bumps []scan.SecurityBump, _ *
 
 // FilterBumps keeps a candidate bump only when the crate is present in this
 // modroot's Cargo.lock and the candidate version is newer than the highest
-// locked version (Cargo.lock may pin a crate at multiple versions across the
-// dependency graph). This does not replicate omnibump's own per-line
-// semver-constraint resolution (that requires parsing Cargo.toml's caret
-// requirements, which CHOAM doesn't fetch) - it's a simpler "is this newer
-// than what's locked" check, sufficient to decide whether a bump applies.
-func (e *Ecosystem) FilterBumps(_ context.Context, existing []string, bumps []scan.SecurityBump, deps *ecosystem.ModuleDeps) []string {
-	maxLocked := make(map[string]string, len(deps.Deps))
+// locked version. An existing entry above an advisory's fix is kept (never
+// lowered). A fix is held back, never written, when the crate is locked at
+// several versions (one entry cannot say which to move) or when it is not a
+// Cargo-compatible upgrade of the locked version (a different major, or for
+// 0.x a different minor: 0.12 -> 0.14 is a breaking change under Cargo's
+// caret rules, which Cargo.toml requirements - not fetched here - would
+// refuse). Omnibump's own per-line constraint resolution is not replicated.
+func (e *Ecosystem) FilterBumps(_ context.Context, existing []string, bumps []scan.SecurityBump, deps *ecosystem.ModuleDeps) ([]string, []ecosystem.HeldBump) {
+	locked := make(map[string][]string, len(deps.Deps))
 	for _, dep := range deps.Deps {
-		if current, ok := maxLocked[dep.Name]; !ok || semver.Compare(scan.EnsureVPrefix(dep.Version), scan.EnsureVPrefix(current)) > 0 {
-			maxLocked[dep.Name] = dep.Version
+		if !slices.Contains(locked[dep.Name], dep.Version) {
+			locked[dep.Name] = append(locked[dep.Name], dep.Version)
 		}
 	}
 
@@ -116,22 +120,61 @@ func (e *Ecosystem) FilterBumps(_ context.Context, existing []string, bumps []sc
 		}
 		candidateVersions[name] = version
 	}
+	var held []ecosystem.HeldBump
 	for _, bump := range bumps {
+		versions := locked[bump.Name]
+		switch {
+		case len(versions) == 0:
+			continue // crate not present in this modroot's Cargo.lock
+		case len(versions) > 1:
+			slices.SortFunc(versions, compareCrateVersions)
+			held = append(held, ecosystem.HeldBump{Bump: bump, Reason: fmt.Sprintf(
+				"crate locked at multiple versions (%s): one bump entry cannot target a single one", strings.Join(versions, ", "))})
+			continue
+		case !cargoCompatible(versions[0], bump.FixedVersion):
+			held = append(held, ecosystem.HeldBump{Bump: bump, Reason: fmt.Sprintf(
+				"fix %s is a semver-incompatible upgrade from locked %s", bump.FixedVersion, versions[0])})
+			continue
+		}
+		if current, ok := candidateVersions[bump.Name]; ok && compareCrateVersions(current, bump.FixedVersion) >= 0 {
+			continue // an existing pin at or above the fix is kept
+		}
 		candidateVersions[bump.Name] = bump.FixedVersion
 	}
 
 	var result []string
 	for name, version := range candidateVersions {
-		locked, ok := maxLocked[name]
-		if !ok {
+		versions := locked[name]
+		if len(versions) == 0 {
 			continue // crate not present in this modroot's Cargo.lock
 		}
-		if semver.Compare(scan.EnsureVPrefix(version), scan.EnsureVPrefix(locked)) <= 0 {
+		if compareCrateVersions(version, slices.MaxFunc(versions, compareCrateVersions)) <= 0 {
 			continue // not newer than what's already locked
 		}
 		result = append(result, name+"@"+version)
 	}
 
 	sort.Strings(result)
-	return result
+	return result, held
+}
+
+// compareCrateVersions compares two bare crate versions as semver.
+func compareCrateVersions(a, b string) int {
+	return semver.Compare(scan.EnsureVPrefix(a), scan.EnsureVPrefix(b))
+}
+
+// cargoCompatible reports whether to is a Cargo caret-compatible upgrade of
+// from: the same major for 1.x+, the same minor for 0.x, the same patch for
+// 0.0.x.
+func cargoCompatible(from, to string) bool {
+	f, t := scan.EnsureVPrefix(from), scan.EnsureVPrefix(to)
+	switch {
+	case semver.Major(f) != "v0":
+		return semver.Major(f) == semver.Major(t)
+	case semver.MajorMinor(f) != "v0.0":
+		return semver.MajorMinor(f) == semver.MajorMinor(t)
+	default:
+		release := func(v string) string { return strings.TrimSuffix(semver.Canonical(v), semver.Prerelease(v)) }
+		return release(f) == release(t)
+	}
 }

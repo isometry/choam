@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -138,7 +139,7 @@ func TestGoToolchain_LinkedModules(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	linked, linkedPackages, err := toolchain.Linked(t.Context(), dir, nil) // nil -> ./...
+	linked, linkedPackages, err := toolchain.Linked(t.Context(), dir, nil, nil) // nil -> ./...
 	require.NoError(t, err)
 
 	assert.Contains(t, linked, "golang.org/x/text", "main-linked module must be reachable")
@@ -173,10 +174,54 @@ func TestGoToolchain_DepGoVersionsAndLinkedStd(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, versions, "dependency-free module has no non-main modules to report")
 
-	std, err := toolchain.LinkedStd(t.Context(), dir, nil) // nil -> ./...
+	std, err := toolchain.LinkedStd(t.Context(), dir, nil, nil) // nil -> ./...
 	require.NoError(t, err)
 	assert.Contains(t, std, "fmt")
 	assert.Contains(t, std, "os")
+}
+
+// TestGoToolchain_LinkedUsesCompileTarget pins that reachability (Linked,
+// LinkedStd) evaluates the same build target and tags as Compile (see
+// targetBuildEnv): GOARCH=amd64 whatever the host, the go/build tags, and
+// CGO only on a native linux/amd64 host - so the linked set and the compile
+// gate never disagree about which files are built. Stdlib-only fixture, no
+// network.
+func TestGoToolchain_LinkedUsesCompileTarget(t *testing.T) {
+	toolchain, err := NewToolchain(t.Context(), time.Minute)
+	if err != nil {
+		t.Skipf("go toolchain unavailable: %v", err)
+	}
+	dir := t.TempDir()
+	files := map[string]string{
+		"go.mod":      "module example.com/targetfixture\n\ngo 1.21\n",
+		"main.go":     "package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println() }\n",
+		"a_amd64.go":  "package main\n\nimport _ \"net/http\"\n",
+		"b_arm64.go":  "package main\n\nimport _ \"net/rpc\"\n",
+		"c_tagged.go": "//go:build choamtag\n\npackage main\n\nimport _ \"encoding/xml\"\n",
+		"d_cgo.go":    "//go:build cgo\n\npackage main\n\nimport _ \"os/user\"\n",
+	}
+	for name, content := range files {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644))
+	}
+
+	std, err := toolchain.LinkedStd(t.Context(), dir, nil, []string{"choamtag"})
+	require.NoError(t, err)
+	assert.Contains(t, std, "net/http", "GOARCH=amd64 files are built")
+	assert.NotContains(t, std, "net/rpc", "host-arch files are not")
+	assert.Contains(t, std, "encoding/xml", "go/build tags apply")
+	_, cgoLinked := std["os/user"]
+	assert.Equal(t, runtime.GOOS == "linux" && runtime.GOARCH == compileTargetArch, cgoLinked,
+		"cgo files are built exactly when Compile enables CGO")
+
+	untagged, err := toolchain.LinkedStd(t.Context(), dir, nil, nil)
+	require.NoError(t, err)
+	assert.NotContains(t, untagged, "encoding/xml")
+
+	_, _, err = toolchain.Linked(t.Context(), dir, nil, []string{"choamtag"})
+	require.NoError(t, err)
+	report, err := toolchain.Compile(t.Context(), dir, nil, []string{"choamtag"})
+	require.NoError(t, err)
+	assert.Empty(t, report.Failed)
 }
 
 // writeFileProxy builds a file:// GOPROXY serving the given module versions

@@ -178,8 +178,8 @@ func TestRunLoop_OmnibumpPrunedEntryDropped(t *testing.T) {
 // TestRunLoop_OmnibumpDowngradeVerification: omnibump's post-tidy
 // verification rejects an entry the tidy left below its version
 // (ErrPackageDowngrade). The tidied result is what the sustain checks see,
-// so a CVE pin is promoted to a replace directive - as for gobump's
-// identical verification.
+// so the CVE pin is shed as not sustained and its advisory is a residual -
+// as for gobump's identical verification (no promotion to a replace).
 func TestRunLoop_OmnibumpDowngradeVerification(t *testing.T) {
 	tc, dir := doUpdateFixture(t)
 	real := omnibumpUpdate
@@ -213,24 +213,25 @@ func TestRunLoop_OmnibumpDowngradeVerification(t *testing.T) {
 	require.NoError(t, err)
 	logResult(t, result)
 	assert.Empty(t, result.FinalDeps)
-	assert.Equal(t, []string{"example.com/a=example.com/a@v1.2.0"}, result.FinalReplaces, "reverted CVE pin promoted to a replace")
-	assert.Equal(t, "v1.2.0", result.Resolved["example.com/a"])
-	assert.Empty(t, result.Residuals)
+	assert.Empty(t, result.FinalReplaces, "a reverted CVE pin is never promoted to a replace")
+	require.Len(t, result.Residuals, 1)
+	assert.Equal(t, "example.com/a", result.Residuals[0].Module)
+	assert.Contains(t, result.Residuals[0].Reason, "fix not sustained")
 }
 
 // TestRunLoop_AmbiguousImportBothEngines: fetching the split-out module
 // m/sub while the old monolith m still carries its package fails with
-// "ambiguous import" (the genproto shape). Both engines repair it by
-// advancing the monolith (the remedy) - the classification survives
+// "ambiguous import" (the genproto shape). Both engines classify it and
+// advance the monolith (the remedy) - the classification survives
 // omnibump's wrapped error text. Reachability is made unavailable so the
 // not-yet-linked split module is not shed before the apply.
 //
-// The engines then differ. gobump gets the remedy first and m/sub after it.
-// omnibump applies the remedy's concrete version as an in-place require edit,
-// which runs after every `go get`, so fetching m/sub stays ambiguous until
-// the loop promotes the m/sub fix to a replace directive (replaces apply
-// first). Under gobump the m/sub entry is then redundant (implied by the
-// remedy), so both results are re-applied from scratch.
+// The engines then differ. gobump gets the remedy first and m/sub after it;
+// the m/sub entry is then redundant (implied by the remedy). omnibump
+// applies the remedy's concrete version as an in-place require edit, which
+// runs after every `go get`, so fetching m/sub stays ambiguous whatever the
+// remedy: the build's bump step could not apply it either, so the m/sub fix
+// is a residual and nothing is written.
 func TestRunLoop_AmbiguousImportBothEngines(t *testing.T) {
 	forEachEngine(t, func(t *testing.T, eng Engine) {
 		subSrc := "package sub\n\nfunc Name() string { return \"sub\" }\n"
@@ -253,18 +254,21 @@ func TestRunLoop_AmbiguousImportBothEngines(t *testing.T) {
 		}, Options{NoCompile: true})
 		require.NoError(t, err)
 		logResult(t, result)
+		assert.Empty(t, result.FinalReplaces)
+		if eng == EngineOmnibump {
+			assert.NotContains(t, result.FinalDeps, "example.com/m/sub@v1.1.0")
+			require.Len(t, result.Residuals, 1)
+			assert.Equal(t, "example.com/m/sub", result.Residuals[0].Module)
+			assert.Contains(t, result.Residuals[0].Reason, "ambiguous import")
+			return
+		}
 		assert.Empty(t, result.Residuals)
 		assert.Equal(t, "v1.1.0", result.Resolved["example.com/m"])
 		assert.Equal(t, "v1.1.0", result.Resolved["example.com/m/sub"])
+		// The m/sub entry is implied by the remedied monolith: the final
+		// go.mod is identical without it.
 		assert.Equal(t, []string{"example.com/m@v1.1.0"}, result.FinalDeps)
-		if eng == EngineGobump {
-			// The m/sub entry is implied by the remedied monolith: the
-			// final go.mod is identical without it.
-			assert.Empty(t, result.FinalReplaces)
-		} else {
-			assert.Equal(t, []string{"example.com/m/sub=example.com/m/sub@v1.1.0"}, result.FinalReplaces)
-		}
-		assert.Empty(t, f.compileFailuresWith(t, eng, append(result.FinalReplaces, result.FinalDeps...)))
+		assert.Empty(t, f.compileFailuresWith(t, eng, result.FinalDeps))
 	})
 }
 
@@ -310,8 +314,16 @@ func TestRunLoop_AmbiguityRemedyWrittenFirst(t *testing.T) {
 		}, Options{NoCompile: true})
 		require.NoError(t, err)
 		logResult(t, result)
-		assert.Empty(t, result.Residuals)
-		assert.Equal(t, "v1.1.0", result.Resolved["example.com/m/sub"])
+		if eng == EngineOmnibump {
+			// omnibump fetches m/sub before its in-place require edits, so no
+			// remedy can unblock it (see TestRunLoop_AmbiguousImportBothEngines).
+			require.Len(t, result.Residuals, 1)
+			assert.Equal(t, "example.com/m/sub", result.Residuals[0].Module)
+			assert.Contains(t, result.Residuals[0].Reason, "ambiguous import")
+		} else {
+			assert.Empty(t, result.Residuals)
+			assert.Equal(t, "v1.1.0", result.Resolved["example.com/m/sub"])
+		}
 		require.NotEmpty(t, result.FinalDeps)
 		assert.Equal(t, "example.com/m@v1.1.0", result.FinalDeps[0], "the remedy is written first")
 		if i := slices.Index(result.FinalDeps, "example.com/m/sub@v1.1.0"); i >= 0 {
@@ -394,7 +406,6 @@ func TestRawSkip(t *testing.T) {
 		{"equal", Candidate{Module: "example.com/a", Version: "v1.1.0"}, true},
 		{"newer", Candidate{Module: "example.com/a", Version: "v1.2.0"}, false},
 		{"absent", Candidate{Module: "example.com/new", Version: "v1.0.0"}, false},
-		{"latest query", Candidate{Module: "example.com/a", Version: latestQuery}, false},
 		{"main module", Candidate{Module: "example.com/app", Version: "v9.0.0"}, true},
 		{"deps entry for a replace-pinned module", Candidate{Module: "example.com/p", Version: "v1.5.0"}, true},
 		{"replace entry for a replace-pinned module", Candidate{Module: "example.com/p", Version: "v1.5.0", Replace: true}, false},

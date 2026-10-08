@@ -233,7 +233,7 @@ func (s *StdlibStage) checkoutLinkedStd(ctx context.Context, gp *GoBumpProcessor
 		if unit.Modroot != "" && unit.Modroot != "." {
 			dir = filepath.Join(cloneDir, filepath.FromSlash(unit.Modroot))
 		}
-		std, err := toolchain.LinkedStd(ctx, dir, unit.Packages)
+		std, err := toolchain.LinkedStd(ctx, dir, unit.Packages, unit.Tags)
 		if err != nil {
 			return nil, fmt.Errorf("computing linked stdlib packages for modroot %s: %w", unit.Modroot, err)
 		}

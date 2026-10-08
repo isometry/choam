@@ -144,9 +144,10 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 				return cerr
 			}
 			if s.failClosed(err) {
-				// The compile gate could not prove the candidate set builds:
-				// writing it (or the raw pre-simulation set) could break the
-				// build, so fail the file and leave its deps untouched.
+				// The simulation could not prove the candidate set (compile
+				// gate, or a go tool infrastructure failure): writing it (or
+				// the raw pre-simulation set) could break the build, so fail
+				// the file and leave its deps untouched.
 				return fmt.Errorf("bump simulation could not validate the deps (file left unchanged): %w", err)
 			}
 			s.degrade(ctx, gp, err)
@@ -299,10 +300,12 @@ func (s *SimulationStage) buildGoVersion(ctx context.Context, minor string) stri
 }
 
 // failClosed reports whether a simulation error must fail the file instead
-// of degrading to the unvalidated candidate set: a compile-gate failure, or
-// a timeout while the gate is enabled (the set was never proven to compile).
+// of degrading to the unvalidated candidate set: a compile-gate failure, an
+// infrastructure failure of the go tool (network, proxy, per-command
+// timeout - no verdict could be reached), or a timeout while the gate is
+// enabled (the set was never proven to compile).
 func (s *SimulationStage) failClosed(err error) bool {
-	return errors.Is(err, simulate.ErrCompileGate) ||
+	return errors.Is(err, simulate.ErrCompileGate) || errors.Is(err, simulate.ErrInfrastructure) ||
 		(s.Options.Compile && errors.Is(err, context.DeadlineExceeded))
 }
 
@@ -415,8 +418,9 @@ func rebuildLanguageActions(analysis *VulnerabilityAnalysis, lang *LanguageAnaly
 		}
 	}
 	for _, m := range lang.ByModroot {
-		// Replaces-only changes (a promotion with unchanged deps) must also
-		// produce an action, or the applier never writes them.
+		// Replaces-only changes (a raised or retired user replace with
+		// unchanged deps) must also produce an action, or the applier never
+		// writes them.
 		if haveDepsChanged(m.ExistingDeps, m.DesiredDeps) || haveDepsChanged(m.ExistingReplaces, m.DesiredReplaces) {
 			kept = append(kept, BumpAction{
 				Action:       "needs_bump",

@@ -173,11 +173,12 @@ func (e *Ecosystem) BumpCoords(ctx context.Context, bumps []scan.SecurityBump, d
 // and removal of no-ops/downgrades/missing modules. Graph coherence (pulling
 // in release-group siblings and transitive requirement gaps) is deliberately
 // NOT handled here - the bump simulation owns it with the real toolchain
-// (go get / go mod tidy / MVS; see internal/simulate).
-func (e *Ecosystem) FilterBumps(ctx context.Context, existing []string, bumps []scan.SecurityBump, deps *ecosystem.ModuleDeps) []string {
+// (go get / go mod tidy / MVS; see internal/simulate), which also reports
+// the fixes it cannot apply, so nothing is held here.
+func (e *Ecosystem) FilterBumps(ctx context.Context, existing []string, bumps []scan.SecurityBump, deps *ecosystem.ModuleDeps) ([]string, []ecosystem.HeldBump) {
 	info, ok := deps.Raw.(*GoModInfo)
 	if !ok || info == nil {
-		return nil
+		return nil, nil
 	}
 
 	candidate := make([]string, 0, len(existing)+len(bumps))
@@ -187,5 +188,5 @@ func (e *Ecosystem) FilterBumps(ctx context.Context, existing []string, bumps []
 	}
 
 	_, filtered := e.analyzer.analyzeBumps(ctx, candidate, info)
-	return filtered
+	return filtered, nil
 }

@@ -150,9 +150,9 @@ func TestSimulationStage_DegradesOnSimulatorError(t *testing.T) {
 	assert.Contains(t, gp.Messages[len(gp.Messages)-1], "NOT validated")
 }
 
-// TestSimulationStage_FailsClosedOnCompileGate: a compile-gate failure (or a
-// timeout with the gate enabled) must fail the file, never fall through to
-// the raw pre-simulation candidates.
+// TestSimulationStage_FailsClosedOnCompileGate: a compile-gate failure, a go
+// tool infrastructure failure (or a timeout with the gate enabled) must fail
+// the file, never fall through to the raw pre-simulation candidates.
 func TestSimulationStage_FailsClosedOnCompileGate(t *testing.T) {
 	for _, tt := range []struct {
 		name    string
@@ -161,6 +161,7 @@ func TestSimulationStage_FailsClosedOnCompileGate(t *testing.T) {
 	}{
 		{"gate error", fmt.Errorf("simulating modroot .: %w: baseline: boom", simulate.ErrCompileGate), false},
 		{"budget timeout with gate on", fmt.Errorf("simulating modroot .: %w", context.DeadlineExceeded), true},
+		{"go tool infrastructure failure", fmt.Errorf("simulating modroot .: %w: dial tcp: i/o timeout", simulate.ErrInfrastructure), false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			stage := newStageWithFake(&fakeBumpSimulator{err: tt.err})

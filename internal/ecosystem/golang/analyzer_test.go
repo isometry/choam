@@ -122,16 +122,16 @@ func TestAnalyzer_AnalyzeBumps(t *testing.T) {
 			deps: []string{
 				"",
 				"  ",
-				"github.com/valid/module@v1.0.0",
+				"github.com/valid/module@v1.1.0",
 				"\t",
 			},
 			goModInfo: &GoModInfo{
 				AllRequirements: map[string]string{
-					"github.com/valid/module": "v0.9.0",
+					"github.com/valid/module": "v1.0.0",
 				},
 				Replacements: map[string]*modfile.Replace{},
 			},
-			wantKeep: []string{"github.com/valid/module@v1.0.0"},
+			wantKeep: []string{"github.com/valid/module@v1.1.0"},
 		},
 		{
 			name: "complex scenario - multiple modules, mixed outcomes",
@@ -431,20 +431,20 @@ func TestAnalyzer_GetEffectiveVersion(t *testing.T) {
 
 func TestAnalyzer_AnalyzeBumps_SortingStability(t *testing.T) {
 	deps := []string{
-		"github.com/z-package/zoo@v1.0.0",      // indirect
-		"github.com/a-package/alpha@v1.0.0",    // direct
-		"github.com/m-package/middle@v1.0.0",   // indirect
-		"github.com/new-package/newpkg@v1.0.0", // indirect (in AllRequirements but not Requirements)
+		"github.com/z-package/zoo@v1.1.0",      // indirect
+		"github.com/a-package/alpha@v1.1.0",    // direct
+		"github.com/m-package/middle@v1.1.0",   // indirect
+		"github.com/new-package/newpkg@v1.1.0", // indirect (in AllRequirements but not Requirements)
 	}
 	goModInfo := &GoModInfo{
 		Requirements: map[string]string{
-			"github.com/a-package/alpha": "v0.9.0",
+			"github.com/a-package/alpha": "v1.0.0",
 		},
 		AllRequirements: map[string]string{
-			"github.com/a-package/alpha":    "v0.9.0",
-			"github.com/z-package/zoo":      "v0.9.0",
-			"github.com/m-package/middle":   "v0.9.0",
-			"github.com/new-package/newpkg": "v0.9.0",
+			"github.com/a-package/alpha":    "v1.0.0",
+			"github.com/z-package/zoo":      "v1.0.0",
+			"github.com/m-package/middle":   "v1.0.0",
+			"github.com/new-package/newpkg": "v1.0.0",
 		},
 		Replacements: map[string]*modfile.Replace{},
 	}
@@ -453,10 +453,10 @@ func TestAnalyzer_AnalyzeBumps_SortingStability(t *testing.T) {
 	_, filteredDeps := a.analyzeBumps(t.Context(), deps, goModInfo)
 
 	expected := []string{
-		"github.com/m-package/middle@v1.0.0",
-		"github.com/new-package/newpkg@v1.0.0",
-		"github.com/z-package/zoo@v1.0.0",
-		"github.com/a-package/alpha@v1.0.0",
+		"github.com/m-package/middle@v1.1.0",
+		"github.com/new-package/newpkg@v1.1.0",
+		"github.com/z-package/zoo@v1.1.0",
+		"github.com/a-package/alpha@v1.1.0",
 	}
 
 	if len(filteredDeps) != len(expected) {
@@ -501,54 +501,54 @@ func TestAnalyzer_AnalyzeBumps_DependencyOrdering(t *testing.T) {
 		{
 			name: "all indirect - alphabetical",
 			deps: []string{
-				"github.com/z/pkg@v1.0.0",
-				"github.com/a/pkg@v1.0.0",
-				"github.com/m/pkg@v1.0.0",
+				"github.com/z/pkg@v1.1.0",
+				"github.com/a/pkg@v1.1.0",
+				"github.com/m/pkg@v1.1.0",
 			},
 			goModInfo: &GoModInfo{
 				Requirements: map[string]string{},
 				AllRequirements: map[string]string{
-					"github.com/z/pkg": "v0.9.0",
-					"github.com/a/pkg": "v0.9.0",
-					"github.com/m/pkg": "v0.9.0",
+					"github.com/z/pkg": "v1.0.0",
+					"github.com/a/pkg": "v1.0.0",
+					"github.com/m/pkg": "v1.0.0",
 				},
 				Replacements: map[string]*modfile.Replace{},
 			},
 			wantOrdered: []string{
-				"github.com/a/pkg@v1.0.0",
-				"github.com/m/pkg@v1.0.0",
-				"github.com/z/pkg@v1.0.0",
+				"github.com/a/pkg@v1.1.0",
+				"github.com/m/pkg@v1.1.0",
+				"github.com/z/pkg@v1.1.0",
 			},
 		},
 		{
 			name: "mixed types - correct grouping",
 			deps: []string{
-				"github.com/new/pkg@v1.0.0",
-				"github.com/direct-z/pkg@v1.0.0",
-				"github.com/indirect-a/pkg@v1.0.0",
-				"github.com/direct-a/pkg@v1.0.0",
-				"github.com/indirect-z/pkg@v1.0.0",
+				"github.com/new/pkg@v1.1.0",
+				"github.com/direct-z/pkg@v1.1.0",
+				"github.com/indirect-a/pkg@v1.1.0",
+				"github.com/direct-a/pkg@v1.1.0",
+				"github.com/indirect-z/pkg@v1.1.0",
 			},
 			goModInfo: &GoModInfo{
 				Requirements: map[string]string{
-					"github.com/direct-z/pkg": "v0.9.0",
-					"github.com/direct-a/pkg": "v0.9.0",
+					"github.com/direct-z/pkg": "v1.0.0",
+					"github.com/direct-a/pkg": "v1.0.0",
 				},
 				AllRequirements: map[string]string{
-					"github.com/direct-z/pkg":   "v0.9.0",
-					"github.com/direct-a/pkg":   "v0.9.0",
-					"github.com/indirect-a/pkg": "v0.9.0",
-					"github.com/indirect-z/pkg": "v0.9.0",
-					"github.com/new/pkg":        "v0.9.0",
+					"github.com/direct-z/pkg":   "v1.0.0",
+					"github.com/direct-a/pkg":   "v1.0.0",
+					"github.com/indirect-a/pkg": "v1.0.0",
+					"github.com/indirect-z/pkg": "v1.0.0",
+					"github.com/new/pkg":        "v1.0.0",
 				},
 				Replacements: map[string]*modfile.Replace{},
 			},
 			wantOrdered: []string{
-				"github.com/indirect-a/pkg@v1.0.0",
-				"github.com/indirect-z/pkg@v1.0.0",
-				"github.com/new/pkg@v1.0.0",
-				"github.com/direct-a/pkg@v1.0.0",
-				"github.com/direct-z/pkg@v1.0.0",
+				"github.com/indirect-a/pkg@v1.1.0",
+				"github.com/indirect-z/pkg@v1.1.0",
+				"github.com/new/pkg@v1.1.0",
+				"github.com/direct-a/pkg@v1.1.0",
+				"github.com/direct-z/pkg@v1.1.0",
 			},
 		},
 	}
@@ -723,6 +723,19 @@ func TestAnalyzer_NormalizeModulePath(t *testing.T) {
 			},
 			wantNormalized: "github.com/example/v0module",
 			wantFound:      true,
+		},
+		{
+			name:    "v0 to v1 - a major change, not compatible",
+			module:  "github.com/example/young",
+			version: "v1.0.1",
+			goModInfo: &GoModInfo{
+				AllRequirements: map[string]string{
+					"github.com/example/young": "v0.9.3",
+				},
+				Replacements: map[string]*modfile.Replace{},
+			},
+			wantNormalized: "github.com/example/young",
+			wantFound:      false,
 		},
 		{
 			name:    "major version upgrade v1 to v2 - not compatible",

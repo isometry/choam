@@ -18,24 +18,23 @@ import (
 	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/scan"
 	"golang.org/x/mod/modfile"
+	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
 )
 
-// latestQuery is the go tool's "highest release" version query, used as the
-// fallback when a CVE-backed candidate's exact fix version fails to resolve.
-const latestQuery = "latest"
-
-// candState is a Candidate plus its lifecycle within the loop.
+// candState is a Candidate plus its lifecycle within the loop. A replace
+// candidate (Candidate.Replace) is always a user-authored YAML replace: the
+// loop never creates replace directives of its own.
 type candState struct {
 	Candidate
-	seed        bool // seeded by the caller (vs raised by a rescan)
-	remedy      bool // added to repair an ambiguous import (applied first)
-	dropped     bool
-	origVersion string // pre-@latest-fallback version, for reporting
+	seed    bool // seeded by the caller (vs raised by a rescan)
+	remedy  bool // added to repair an ambiguous import (applied first)
+	dropped bool
 
-	// userReplace marks a user-authored YAML replace (a replace seed): load-
-	// bearing intent, never removed as redundant.
-	userReplace bool
+	// ceiling is the lowest version whose fetch failed (see stepDown): the
+	// candidate never raises to it or above again, so the residual recorded
+	// for it stands.
+	ceiling string
 	// residualized marks a dropped candidate whose advisories were accounted
 	// for at drop time - either recorded as a residual or deliberately
 	// residual-free (unreachable, redundant). The rescan backfill only
@@ -78,12 +77,16 @@ type loop struct {
 	persistentResiduals []Residual // apply-time failures: survive rescans
 	scanResiduals       []Residual // recomputed from each rescan
 	lastRaised          []*candState
-	remedied            map[string]struct{} // modules already advanced to repair an ambiguous import
-	requirements        map[string]string   // go.mod requires after the last clean apply
+	remedied            map[string]remedyState // monoliths advanced to repair an ambiguous import
+	requirements        map[string]string      // go.mod requires after the last clean apply
 
 	replaces         map[string]ReplaceTarget // go.mod replace directives after the last clean apply
 	pristineReplaces map[string]ReplaceTarget // upstream go.mod replace directives at clone time
-	promoted         map[string]struct{}      // modules promoted deps->replace (once each)
+
+	// infraErr is the first infrastructure failure a best-effort lookup
+	// swallowed (see recordInfra): once set, no further verdict is trusted
+	// and the simulation fails with it.
+	infraErr error
 
 	// Artifact reachability: buildPatterns are the go/build package patterns
 	// (default ./...) whose non-test import graph decides what actually
@@ -141,8 +144,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 		req:           req,
 		opts:          opts,
 		byModule:      make(map[string]*candState),
-		remedied:      make(map[string]struct{}),
-		promoted:      make(map[string]struct{}),
+		remedied:      make(map[string]remedyState),
 		buildPatterns: req.Packages,
 	}
 	if len(l.buildPatterns) == 0 {
@@ -300,7 +302,9 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	} else {
 		// Post-convergence refinement (one trial): shed pins no advisory
 		// needs.
-		resolved = l.confirmMinimalSet(ctx, resolved, result)
+		if resolved, err = l.confirmMinimalSet(ctx, resolved, result); err != nil {
+			return nil, err
+		}
 	}
 
 	// The compile gate runs last, against the final candidate set: the
@@ -320,6 +324,12 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	// capability fields still describe it.
 	if err := l.minimise(ctx); err != nil {
 		return nil, err
+	}
+
+	if l.infraErr != nil {
+		// A best-effort lookup hit an infrastructure failure: some verdict
+		// above may rest on it, so nothing here is trusted.
+		return nil, l.infraErr
 	}
 
 	result.Resolved = resolved
@@ -345,13 +355,16 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 }
 
 // seedCandidate routes one caller-provided seed into the right channel.
-// Replace seeds (user-authored YAML replaces) enter as-is; a deps seed for a
-// module that is already replace-pinned - by an earlier replace seed or by
-// the upstream go.mod - is either superseded (candidate exists) or converted
-// to the replace channel (a `go get` cannot out-vote a replace directive).
+// Replace seeds (user-authored YAML replaces) enter as-is, and a deps seed
+// for a module a replace seed already claims merges into that replace (a
+// `go get` cannot out-vote a replace directive). A deps seed for a module the
+// upstream go.mod replace-pins is held back: the build's bump step cannot
+// move it and the loop never adds replace directives of its own, so it is
+// dropped here and the rescan reports any advisory it would have fixed as a
+// hold-back residual (see scanFindings).
 func (l *loop) seedCandidate(c Candidate) {
 	if c.Replace {
-		l.addCandidate(c, true).userReplace = true
+		l.addCandidate(c, true)
 		return
 	}
 
@@ -374,14 +387,21 @@ func (l *loop) seedCandidate(c Candidate) {
 			l.dropLocalReplacePinned(c, oldPath)
 			return
 		}
-		l.addCandidate(Candidate{
-			Module: target.Path, Version: c.Version, FromCVE: c.FromCVE, VulnIDs: c.VulnIDs,
-			Replace: true, ReplaceOld: oldPath,
-		}, true)
+		l.dropped = append(l.dropped, DroppedCandidate{
+			Module:  c.Module,
+			Version: c.Version,
+			Reason:  holdBackReason(oldPath),
+		})
 		return
 	}
 
 	l.addCandidate(c, true)
+}
+
+// holdBackReason is the residual/drop reason for a fix the upstream go.mod's
+// replace directive for module holds back.
+func holdBackReason(module string) string {
+	return fmt.Sprintf("upstream go.mod replace-pins %s (hold-back)", module)
 }
 
 // pristinePinFor reports whether module is subject to an upstream go.mod
@@ -497,11 +517,16 @@ func (l *loop) restore(_ context.Context) error {
 
 // apply establishes a clean toolchain state with every active candidate
 // applied by the step's engine (see Engine), in apply order. Any failure
-// repairs or removes exactly one candidate and restarts the attempt, so the
-// loop is bounded by the candidate count (a repair happens at most once per
-// module).
+// repairs, steps down or removes exactly one candidate and restarts the
+// attempt, so the loop is bounded by the candidates and their fix rungs (a
+// repair happens at most once per module). An infrastructure failure (see
+// ErrInfrastructure) is never a verdict on a candidate: it fails the apply.
 func (l *loop) apply(ctx context.Context) error {
-	for attempt := 0; attempt < 3*len(l.cands)+8; attempt++ {
+	attempts := 3*len(l.cands) + 8 + maxRemedySteps
+	for _, c := range l.cands {
+		attempts += len(c.Rungs)
+	}
+	for attempt := 0; attempt < attempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			// Without this, a cancellation mid-loop can still burn several
 			// more attempts, and exhausting the attempt budget afterward
@@ -510,46 +535,45 @@ func (l *loop) apply(ctx context.Context) error {
 			return err
 		}
 		fail := l.engine.apply(ctx, l.inApplyOrder(l.activeCandidates()))
+		if fail != nil {
+			if ierr := l.recordInfra(fail.err); ierr != nil {
+				return ierr
+			}
+		}
 		switch {
 		case fail == nil, fail.step == stepVerify:
 			// A verification failure leaves the tidied result on disk: the
-			// sustain checks (dropUnsustained) shed or promote the rejected
-			// entry exactly as they do for gobump's identical verification.
+			// sustain checks (dropUnsustained) shed the rejected entry
+			// exactly as they do for gobump's identical verification.
 			return nil
 		case fail.step == stepSetup:
 			return fail.err
 		case fail.step == stepGet && fail.cand != nil:
-			l.handleGetFailure(fail.cand, fail.err)
+			l.handleGetFailure(ctx, fail.cand, fail.err)
 		default: // the closing tidy, or a get failure no candidate is named in
-			if !l.handleTidyFailure(fail.err) {
+			if !l.handleTidyFailure(ctx, fail.err) {
 				return fmt.Errorf("final go mod tidy: %w", fail.err)
 			}
 		}
 	}
-	return fmt.Errorf("module graph did not stabilize after %d apply attempts", 3*len(l.cands)+8)
+	return fmt.Errorf("module graph did not stabilize after %d apply attempts", attempts)
 }
 
 // handleTidyFailure repairs or sheds exactly one candidate after a
 // failed attempt-closing tidy, in escalating order of sacrifice:
 //  1. Repair a monolith-vs-split-module "ambiguous import" by advancing the
 //     monolith module past the split point (once per module).
-//  2. Promote the CVE-backed deps candidate the failure names to a replace
-//     directive (once per module) - replace-pinned modules resolve without
-//     graph negotiation, so this often repairs what a require pin breaks.
-//  3. Drop the most recently raised (non-seed) candidate - the likeliest
+//  2. Drop the most recently raised (non-seed) candidate - the likeliest
 //     culprit for a graph that resolves per-module but won't tidy.
-//  4. Drop the last coherence-only seed.
-//  5. Drop the last CVE-backed candidate, recording its advisories as
+//  3. Drop the last coherence-only seed.
+//  4. Drop the last CVE-backed candidate, recording its advisories as
 //     residuals ("bump as high as viable, report the rest").
-//  6. Only then drop remedies - they are load-bearing repairs, not
+//  5. Only then drop remedies - they are load-bearing repairs, not
 //     candidates, and must outlive the candidates that depend on them.
 //
 // Returns false only when nothing is left to shed.
-func (l *loop) handleTidyFailure(err error) bool {
-	if l.addAmbiguityRemedies(err) {
-		return true
-	}
-	if l.promoteBlamedCandidate(err) {
+func (l *loop) handleTidyFailure(ctx context.Context, err error) bool {
+	if l.addAmbiguityRemedies(ctx, err) {
 		return true
 	}
 	if l.dropLatestRaise(err) {
@@ -564,82 +588,149 @@ func (l *loop) handleTidyFailure(err error) bool {
 	return l.dropLastRemedy(err)
 }
 
-// promoteBlamedCandidate promotes the most recently added CVE-backed deps
-// candidate whose module path is named in the failure text. Blame-gated:
-// promoting an uninvolved candidate would just churn apply attempts.
-func (l *loop) promoteBlamedCandidate(err error) bool {
-	errText := err.Error()
-	for i := len(l.cands) - 1; i >= 0; i-- {
-		c := l.cands[i]
-		if c.dropped || c.Replace || !c.FromCVE || c.Version == latestQuery {
-			continue
-		}
-		if _, done := l.promoted[c.Module]; done {
-			continue
-		}
-		if !strings.Contains(errText, c.Module) {
-			continue
-		}
-		return l.promoteCandidate(c)
-	}
-	return false
+// versionLister is the module-version lookup the ambiguous-import remedy
+// walks with (*GoToolchain implements it; without it no remedy is found).
+type versionLister interface {
+	ModuleVersions(ctx context.Context, dir, module string) ([]string, error)
+	ModuleRequires(ctx context.Context, dir, module, version string) (map[string]string, error)
+	ResolveQuery(ctx context.Context, dir, module, query string) (string, error)
+}
+
+// maxRemedySteps bounds how often one monolith is advanced to repair a
+// recurring ambiguous import.
+const maxRemedySteps = 8
+
+// remedyState tracks one monolith's ambiguous-import repair: the version it
+// was last advanced to and how many times.
+type remedyState struct {
+	version string
+	steps   int
 }
 
 // addAmbiguityRemedies parses "ambiguous import: found package ... in
-// multiple modules" tidy failures and advances the monolith module of each
-// ambiguous pair to @latest, past the point where the split module took the
-// packages over (the canonical google.golang.org/genproto case). Returns
-// true when it changed at least one candidate.
-func (l *loop) addAmbiguityRemedies(err error) bool {
+// multiple modules" failures and advances the monolith module of each
+// ambiguous pair to the minimal version that resolves it (see
+// ambiguityRemedy; the canonical google.golang.org/genproto case). If the
+// same ambiguity recurs at the remedied version, the monolith advances again
+// from there (bounded by maxRemedySteps); if it recurs below it, the remedy
+// never took effect where the failure happens (omnibump edits required
+// modules in place only after every `go get`), so nothing further is tried.
+// A replace-pinned monolith is left alone: a version pin cannot move it, so
+// the sacrifice ladder proceeds instead. Returns true when it changed at
+// least one candidate.
+func (l *loop) addAmbiguityRemedies(ctx context.Context, err error) bool {
 	changed := false
-	for _, module := range ambiguousImportModules(err.Error()) {
-		if _, done := l.remedied[module]; done {
+	for _, amb := range ambiguousImports(err.Error()) {
+		module := amb.monolith
+		state, seen := l.remedied[module]
+		if seen && (state.steps >= maxRemedySteps || semver.Compare(amb.from, state.version) < 0) {
 			continue
 		}
-		l.remedied[module] = struct{}{}
-
-		if existing, ok := l.byModule[module]; ok && !existing.dropped {
-			if existing.Replace {
-				// A remedy is a `go get @latest`, which cannot move a
-				// replace-pinned module. Shed a promotion so the ordinary
-				// remedy can take over; a seed replace is user intent and
-				// stays - let the sacrifice ladder proceed instead.
-				if _, wasPromoted := l.promoted[module]; !wasPromoted {
-					continue
-				}
-				l.drop(existing, "promotion conflicts with ambiguous-import repair")
-				if existing.FromCVE {
-					existing.residualized = true
-					l.persistentResiduals = append(l.persistentResiduals, Residual{
-						Module:       module,
-						FixedVersion: existing.Version,
-						VulnIDs:      existing.VulnIDs,
-						Reason:       "fix conflicts with ambiguous-import repair",
-					})
-				}
-				delete(l.byModule, module)
-				state := l.addCandidate(Candidate{Module: module, Version: latestQuery}, false)
-				state.remedy = true
-				changed = true
-				continue
+		existing, ok := l.byModule[module]
+		active := ok && !existing.dropped
+		if active && existing.Replace {
+			continue
+		}
+		if _, _, upstream := l.pristinePinFor(module); upstream {
+			continue
+		}
+		version := l.ambiguityRemedy(ctx, amb)
+		if version == "" {
+			logging.From(ctx).Info("ambiguous import: no monolith version resolves the split",
+				"modroot", l.req.Modroot, "module", module, "from", amb.from, "split", amb.split+"@"+amb.splitVersion)
+			continue
+		}
+		l.remedied[module] = remedyState{version: version, steps: state.steps + 1}
+		logging.From(ctx).Debug("ambiguous import remedy", "modroot", l.req.Modroot,
+			"module", module, "from", amb.from, "to", version, "split", amb.split+"@"+amb.splitVersion)
+		if active {
+			if semver.Compare(version, existing.Version) > 0 {
+				existing.Version = version
 			}
-			if existing.Version == latestQuery {
-				continue
-			}
-			existing.origVersion = existing.Version
-			existing.Version = latestQuery
 			existing.remedy = true
 			changed = true
 			continue
 		}
-		if _, target, pinned := l.pristinePinFor(module); pinned && target.Version == "" {
-			continue // local-path pinned: nothing can move it
-		}
-		state := l.addCandidate(Candidate{Module: module, Version: latestQuery}, false)
-		state.remedy = true
+		delete(l.byModule, module)
+		l.addCandidate(Candidate{Module: module, Version: version}, false).remedy = true
 		changed = true
 	}
 	return changed
+}
+
+// ambiguityRemedy returns the minimal version of amb's monolith above its
+// current one that should no longer provide the split module's packages, ""
+// when none is found (or the toolchain cannot look versions up). When the
+// split module's version is a pseudo-version its commit decides: both
+// modules live in one repository (genproto's case: the monolith has no
+// releases at all), and the monolith at that very commit cannot contain a
+// directory the nested module owns. Otherwise the monolith's releases are
+// walked upward (same major, no pre-releases unless already on one,
+// bounded): the first whose go.mod requires the split module (the carve-out's
+// signature), else the next release - a recurrence advances again (see
+// addAmbiguityRemedies). Lookup failures find nothing, except an
+// infrastructure failure, which is recorded (see recordInfra).
+func (l *loop) ambiguityRemedy(ctx context.Context, amb ambiguity) string {
+	lister, ok := l.tc.(versionLister)
+	if !ok || !semver.IsValid(amb.from) {
+		return ""
+	}
+	if rev, err := module.PseudoVersionRev(amb.splitVersion); err == nil {
+		version, err := lister.ResolveQuery(ctx, l.dir, amb.monolith, rev)
+		if err != nil {
+			if l.recordInfra(err) != nil {
+				return ""
+			}
+		} else if semver.Compare(version, amb.from) > 0 {
+			return version
+		}
+	}
+	versions, err := lister.ModuleVersions(ctx, l.dir, amb.monolith)
+	if err != nil {
+		_ = l.recordInfra(err) // recorded: fails the run (see RunLoop)
+		return ""
+	}
+	next, inspected := "", 0
+	for _, version := range versions {
+		if semver.Compare(version, amb.from) <= 0 {
+			continue
+		}
+		if semver.Major(version) != semver.Major(amb.from) {
+			break
+		}
+		if semver.Prerelease(version) != "" && semver.Prerelease(amb.from) == "" {
+			continue
+		}
+		if next == "" {
+			next = version
+		}
+		if inspected++; inspected > maxCoherenceWalk {
+			break
+		}
+		requires, err := lister.ModuleRequires(ctx, l.dir, amb.monolith, version)
+		if err != nil {
+			if l.recordInfra(err) != nil {
+				return ""
+			}
+			continue
+		}
+		if _, ok := requires[amb.split]; ok {
+			return version
+		}
+	}
+	return next
+}
+
+// recordInfra classifies err (see asInfra) and, when it is an
+// infrastructure failure, records the first one on the loop and returns it;
+// nil otherwise. Best-effort lookups call it so a network or proxy outage
+// they would otherwise swallow still fails the simulation (see RunLoop).
+func (l *loop) recordInfra(err error) error {
+	ierr := asInfra(err)
+	if ierr != nil && l.infraErr == nil {
+		l.infraErr = ierr
+	}
+	return ierr
 }
 
 // dropLastCandidate sheds an active non-remedy candidate of the given CVE
@@ -698,9 +789,6 @@ func (l *loop) shedCandidate(err error, eligible func(*candState) bool) bool {
 // no-op seeds on their existing baseline-drop path. Fails open (get anyway)
 // when go.mod cannot be read.
 func (l *loop) getSatisfied(ctx context.Context, c *candState) bool {
-	if c.Version == latestQuery {
-		return false
-	}
 	requirements, err := l.tc.Requirements(ctx, l.dir)
 	if err != nil {
 		logging.From(ctx).Debug("go.mod requirements unavailable during apply - not skipping",
@@ -711,60 +799,67 @@ func (l *loop) getSatisfied(ctx context.Context, c *candState) bool {
 	return ok && semver.Compare(required, c.Version) > 0
 }
 
-// handleGetFailure implements the repair-then-sacrifice policy: an
-// ambiguous-import failure is repaired without penalizing the candidate;
-// otherwise coherence-only candidates are dropped outright, and CVE-backed
-// candidates get one retry at @latest, then one promotion to a replace
-// directive (a `go mod edit -replace` needs no get-time resolution and
-// survives tidy) before being dropped and reported as an unresolvable-fix
-// residual.
-func (l *loop) handleGetFailure(c *candState, err error) {
-	if l.addAmbiguityRemedies(err) {
+// handleGetFailure implements the repair-then-sacrifice policy for a failed
+// fetch of one candidate: an ambiguous-import failure is repaired without
+// penalizing the candidate; otherwise a coherence-only candidate is dropped
+// outright and a CVE-backed one steps down one fix rung (see stepDown).
+func (l *loop) handleGetFailure(ctx context.Context, c *candState, err error) {
+	if l.addAmbiguityRemedies(ctx, err) {
 		return
 	}
 	if !c.FromCVE {
 		l.drop(c, fmt.Sprintf("unresolvable: %v", err))
 		return
 	}
-	if c.Version != latestQuery {
-		c.origVersion = c.Version
-		c.Version = latestQuery
-		return
-	}
-	if l.promoteCandidate(c) {
-		c.Version = c.origVersion // replaces carry the concrete fix version
-		return
-	}
-	c.dropped = true
-	c.dropReason = fmt.Sprintf("fix unresolvable even at @latest: %v", err)
-	c.residualized = true
-	l.dropped = append(l.dropped, DroppedCandidate{
-		Module:  c.Module,
-		Version: c.origVersion,
-		Reason:  c.dropReason,
-	})
-	l.persistentResiduals = append(l.persistentResiduals, Residual{
-		Module:       c.Module,
-		FixedVersion: c.origVersion,
-		VulnIDs:      c.VulnIDs,
-		Reason:       fmt.Sprintf("fix unresolvable: %v", err),
-	})
+	l.stepDown(ctx, c, fmt.Sprintf("fix unresolvable: %v", err))
 }
 
-// promoteCandidate moves a deps-channel candidate into the replace channel
-// (self-replace at its current target), once per module. Returns false when
-// the promotion was already spent or the candidate is already a replace.
-func (l *loop) promoteCandidate(c *candState) bool {
-	if c.Replace {
-		return false
+// stepDown moves CVE candidate c, whose current version cannot be fetched,
+// to its next lower fix rung still above the baseline, giving up the
+// advisories only the rejected rungs fix (recorded as residuals with
+// reason); with no rung left it is dropped and every advisory it addressed
+// becomes a residual. c never raises to the rejected version again.
+func (l *loop) stepDown(ctx context.Context, c *candState, reason string) {
+	rejected := c.Version
+	if c.ceiling == "" || semver.Compare(rejected, c.ceiling) < 0 {
+		c.ceiling = rejected
 	}
-	if _, done := l.promoted[c.Module]; done {
-		return false
+	var below []Rung
+	for _, r := range c.fixRungs() {
+		if semver.Compare(r.Version, rejected) < 0 && semver.Compare(r.Version, l.req.Baseline[c.Module]) > 0 {
+			below = append(below, r)
+		}
 	}
-	l.promoted[c.Module] = struct{}{}
-	c.Replace = true
-	c.ReplaceOld = c.Module
-	return true
+	if len(below) == 0 {
+		l.drop(c, reason)
+		c.residualized = true
+		l.persistentResiduals = append(l.persistentResiduals, Residual{
+			Module:       c.Module,
+			FixedVersion: rejected,
+			VulnIDs:      c.VulnIDs,
+			Reason:       reason,
+		})
+		return
+	}
+	var kept []string
+	severity := ""
+	for _, r := range below {
+		kept = mergeIDs(kept, r.VulnIDs)
+		severity = mergeSeverity(severity, r.Severity)
+	}
+	lost := slices.DeleteFunc(slices.Clone(c.VulnIDs), func(id string) bool { return slices.Contains(kept, id) })
+	if len(lost) > 0 {
+		l.persistentResiduals = append(l.persistentResiduals, Residual{
+			Module:       c.Module,
+			FixedVersion: rejected,
+			VulnIDs:      lost,
+			Reason:       reason,
+		})
+	}
+	c.Version, c.Rungs, c.VulnIDs, c.Severity = below[0].Version, below, kept, severity
+	c.FromCVE = len(kept) > 0
+	logging.From(ctx).Info("fix unresolvable: stepped down one fix rung", "modroot", l.req.Modroot,
+		"module", c.Module, "from", rejected, "to", c.Version, "reason", reason)
 }
 
 // dropLatestRaise handles a final-tidy failure by removing a raised
@@ -775,14 +870,6 @@ func (l *loop) dropLatestRaise(err error) bool {
 	return l.shedCandidate(err, func(c *candState) bool { return !c.seed && !c.remedy })
 }
 
-// dropUnsustained repairs or sheds candidates the tidied go.mod does not
-// sustain: melange's gobump errors when a requested package is missing from
-// the post-tidy go.mod ("was not found on the go.mod file") or is required
-// at a version below the requested one ("is less than the desired version").
-// A CVE-backed pin that tidy reverts is PROMOTED to a replace directive
-// (once per module) - replaces survive tidy unconditionally and gobump
-// verifies them against the Replace entries, not Require. Returns true when
-// anything changed (the apply must then be redone).
 // refreshLinked recomputes the artifact-linked module and package sets for
 // the current go.mod state. Recomputed every sustain pass rather than once:
 // membership can drift as versions move (a raised module can import new
@@ -790,7 +877,7 @@ func (l *loop) dropLatestRaise(err error) bool {
 // OPEN: both sets become nil and no reachability filtering happens (warned
 // once per loop).
 func (l *loop) refreshLinked(ctx context.Context) {
-	linked, linkedPackages, err := l.tc.Linked(ctx, l.dir, l.buildPatterns)
+	linked, linkedPackages, err := l.tc.Linked(ctx, l.dir, l.buildPatterns, l.req.Tags)
 	if err != nil {
 		if !l.linkedWarned {
 			logging.From(ctx).Warn("artifact reachability unavailable - not filtering",
@@ -822,7 +909,7 @@ func (l *loop) maxDepGoVersion(ctx context.Context) string {
 // linkedStdPackages computes the stdlib slice of the current artifact import
 // graph. Fail-open: a toolchain error is logged and nil returned.
 func (l *loop) linkedStdPackages(ctx context.Context) map[string]struct{} {
-	std, err := l.tc.LinkedStd(ctx, l.dir, l.buildPatterns)
+	std, err := l.tc.LinkedStd(ctx, l.dir, l.buildPatterns, l.req.Tags)
 	if err != nil {
 		if !l.linkedStdWarned {
 			logging.From(ctx).Warn("linked stdlib package lookup unavailable",
@@ -1011,6 +1098,11 @@ func (l *loop) vulnApplies(v scan.Vulnerability) bool {
 	return false
 }
 
+// dropUnsustained sheds candidates the tidied go.mod does not sustain:
+// melange's gobump errors when a requested package is missing from the
+// post-tidy go.mod ("was not found on the go.mod file") or is required at a
+// version below the requested one ("is less than the desired version").
+// Returns true when anything changed (the apply must then be redone).
 func (l *loop) dropUnsustained() bool {
 	changed := false
 	for _, c := range l.activeCandidates() {
@@ -1031,18 +1123,7 @@ func (l *loop) dropUnsustained() bool {
 			// decides whether the advisory actually persists.
 			l.drop(c, "pruned by go mod tidy: not required by the tidied go.mod")
 			changed = true
-		case c.Version != latestQuery && semver.Compare(requiredVersion, c.Version) < 0:
-			if c.FromCVE {
-				if _, done := l.promoted[c.Module]; !done {
-					// Promote: apply the validated fix version as a replace
-					// directive instead of shedding it.
-					l.promoted[c.Module] = struct{}{}
-					c.Replace = true
-					c.ReplaceOld = c.Module
-					changed = true
-					continue
-				}
-			}
+		case semver.Compare(requiredVersion, c.Version) < 0:
 			l.drop(c, fmt.Sprintf("go mod tidy reverts the pin to %s", requiredVersion))
 			if c.FromCVE {
 				c.residualized = true
@@ -1060,41 +1141,26 @@ func (l *loop) dropUnsustained() bool {
 	return changed
 }
 
-// checkReplaceCandidate verifies a replace-channel candidate against the
-// tidied go.mod: the directive must be present at >= the requested version
-// (always true after a clean apply - defensively shed otherwise), and a
-// PROMOTED replace whose module the build graph no longer requires is inert
-// and dropped (a seed replace is user intent and preserved). Returns true
-// when the candidate was shed.
+// checkReplaceCandidate verifies a (user-authored) replace candidate against
+// the tidied go.mod: the directive must be present at >= the requested
+// version (always true after a clean apply - defensively shed otherwise).
+// Returns true when the candidate was shed.
 func (l *loop) checkReplaceCandidate(c *candState) bool {
 	target, present := l.replaces[c.OldPath()]
-	if !present || target.Path != c.Module ||
-		(c.Version != latestQuery && semver.Compare(target.Version, c.Version) < 0) {
-		l.drop(c, "replace directive not sustained by the tidied go.mod")
-		if c.FromCVE {
-			c.residualized = true
-			l.persistentResiduals = append(l.persistentResiduals, Residual{
-				Module:       c.Module,
-				FixedVersion: c.Version,
-				VulnIDs:      c.VulnIDs,
-				Reason:       "fix not sustained: replace directive lost during tidy",
-			})
-		}
-		return true
+	if present && target.Path == c.Module && semver.Compare(target.Version, c.Version) >= 0 {
+		return false
 	}
-
-	if _, wasPromoted := l.promoted[c.Module]; wasPromoted {
-		_, oldRequired := l.requirements[c.OldPath()]
-		_, newRequired := l.requirements[c.Module]
-		if !oldRequired && !newRequired {
-			// NOT residualized: like the deps-channel prune above, the
-			// module may still resolve at a vulnerable version - the rescan
-			// backfill decides.
-			l.drop(c, "pruned by go mod tidy: replaced module no longer required")
-			return true
-		}
+	l.drop(c, "replace directive not sustained by the tidied go.mod")
+	if c.FromCVE {
+		c.residualized = true
+		l.persistentResiduals = append(l.persistentResiduals, Residual{
+			Module:       c.Module,
+			FixedVersion: c.Version,
+			VulnIDs:      c.VulnIDs,
+			Reason:       "fix not sustained: replace directive lost during tidy",
+		})
 	}
-	return false
+	return true
 }
 
 // processScan converts a rescan of the resolved graph into raised candidates
@@ -1140,12 +1206,12 @@ func (l *loop) processScan(ctx context.Context, scanResult *scan.ScanResult, res
 			// again as a defended candidate.
 			delete(l.byModule, r.module)
 		}
-		if existing, ok := l.byModule[r.module]; ok &&
-			existing.Version != latestQuery &&
-			semver.Compare(r.version, existing.Version) <= 0 {
-			// Already at or above the requested fix; nothing to raise. (A
-			// rescan should not produce this - it scans the resolved graph -
-			// but guard against loops.)
+		if existing, ok := l.byModule[r.module]; ok && (semver.Compare(r.version, existing.Version) <= 0 ||
+			(existing.ceiling != "" && semver.Compare(r.version, existing.ceiling) >= 0)) {
+			// Already at or above the requested fix (a rescan should not
+			// produce this - it scans the resolved graph - but guard against
+			// loops), or at/above a version that could not be fetched (its
+			// residual stands; see stepDown).
 			continue
 		}
 		candidate := Candidate{
@@ -1156,15 +1222,13 @@ func (l *loop) processScan(ctx context.Context, scanResult *scan.ScanResult, res
 			Severity: r.severity,
 			Rungs:    r.rungs,
 		}
-		// A raise for a replace-pinned module must update the replace - a
-		// plain `go get` cannot out-vote the directive. (Local-path pins
-		// never surface here: ListModules skips them, so they're never
-		// scanned.) The scan reports the replacement path, so identity
-		// already matches the replace candidate/directive target.
+		// A raise for a module a user-authored replace pins must update that
+		// replace - a plain `go get` cannot out-vote the directive. The scan
+		// reports the replacement path, so identity already matches the
+		// replace candidate's target. (Upstream-pinned modules never get
+		// here: scanFindings holds them back.)
 		if existing, ok := l.byModule[r.module]; ok && !existing.dropped && existing.Replace {
 			candidate.Replace, candidate.ReplaceOld = true, existing.ReplaceOld
-		} else if oldPath, target, pinned := l.pristinePinFor(r.module); pinned && target.Version != "" {
-			candidate.Replace, candidate.ReplaceOld = true, oldPath
 		}
 		state := l.addCandidate(candidate, false)
 		l.lastRaised = append(l.lastRaised, state)
@@ -1173,10 +1237,23 @@ func (l *loop) processScan(ctx context.Context, scanResult *scan.ScanResult, res
 	return applied
 }
 
+// upstreamHoldBack returns the replaced path when the upstream go.mod
+// replace-pins module (either side of the directive) to a module version and
+// no user-authored replace candidate takes it over, "" otherwise.
+func (l *loop) upstreamHoldBack(module string) string {
+	if c, ok := l.byModule[module]; ok && !c.dropped && c.Replace {
+		return ""
+	}
+	if oldPath, target, pinned := l.pristinePinFor(module); pinned && target.Version != "" {
+		return oldPath
+	}
+	return ""
+}
+
 // scanFindings classifies a scan of the resolved graph without mutating loop
 // state: advisories whose fix can be applied become raises; the rest become
-// residuals (no released fix, or the fix requires a major-version import
-// path change that go/bump cannot express).
+// residuals (no released fix, a fix across a major version that a deps entry
+// cannot express, or a module the upstream go.mod replace-pins).
 func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]string) ([]raise, []Residual) {
 	// Package-level applicability: a finding whose vulnerable packages are
 	// all outside the artifact's import graph is neither raised nor a
@@ -1228,13 +1305,19 @@ func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]str
 		if resolvedVersion != "" && semver.Compare(bump.FixedVersion, resolvedVersion) <= 0 {
 			continue
 		}
-		if majorPathChange(bump.FixedVersion, resolvedVersion) {
+		reason := ""
+		if majorChange(bump.Name, bump.FixedVersion, resolvedVersion) {
+			reason = fmt.Sprintf("fix requires a major version change (%s -> %s)", resolvedVersion, bump.FixedVersion)
+		} else if oldPath := l.upstreamHoldBack(bump.Name); oldPath != "" {
+			reason = holdBackReason(oldPath)
+		}
+		if reason != "" {
 			residuals = append(residuals, Residual{
 				Module:          bump.Name,
 				ResolvedVersion: resolvedVersion,
 				FixedVersion:    bump.FixedVersion,
 				VulnIDs:         bump.VulnIDs,
-				Reason:          "fix requires major version import path change",
+				Reason:          reason,
 			})
 			continue
 		}
@@ -1266,6 +1349,9 @@ type trialResult struct {
 // beforehand and restore them when rejecting.
 func (l *loop) trialApply(ctx context.Context, purpose string, keep []*candState) (*trialResult, error) {
 	if err := l.applyExact(ctx, keep); err != nil {
+		if ierr := l.recordInfra(err); ierr != nil {
+			return nil, ierr
+		}
 		l.logTrial(ctx, trialLog{purpose: purpose, pins: keep, reject: err.Error()})
 		return nil, err
 	}
@@ -1315,7 +1401,7 @@ func (l *loop) sustained(tr *trialResult, keep []*candState) bool {
 			continue
 		}
 		requiredVersion, required := tr.requirements[c.Module]
-		if !required || (c.Version != latestQuery && semver.Compare(requiredVersion, c.Version) < 0) {
+		if !required || semver.Compare(requiredVersion, c.Version) < 0 {
 			return false
 		}
 	}
@@ -1354,29 +1440,32 @@ func (l *loop) adoptTrial(ctx context.Context, tr *trialResult, result *ModrootR
 // no new residual advisories; otherwise keeps the converged full set.
 // result's MaxDepGoVersion/StdPackages - set by the caller from the
 // converged full set - are refreshed in place on adoption (see adoptTrial).
-func (l *loop) confirmMinimalSet(ctx context.Context, resolved map[string]string, result *ModrootResult) map[string]string {
+// Only an infrastructure failure or a cancellation is returned as an error.
+func (l *loop) confirmMinimalSet(ctx context.Context, resolved map[string]string, result *ModrootResult) (map[string]string, error) {
 	// Essential candidates: CVE-backed fixes, remedies (they keep the graph
-	// resolvable at all), and user-authored replace seeds (load-bearing fork
-	// redirects - never dropped as redundant). Promoted replaces are
-	// CVE-backed by construction.
+	// resolvable at all), and user-authored replaces (load-bearing fork
+	// redirects - never dropped as redundant).
 	active := l.activeCandidates()
 	essential := make([]*candState, 0, len(active))
-	isEssential := func(c *candState) bool { return c.FromCVE || c.remedy || (c.Replace && c.seed) }
+	isEssential := func(c *candState) bool { return c.FromCVE || c.remedy || c.Replace }
 	for _, c := range active {
 		if isEssential(c) {
 			essential = append(essential, c)
 		}
 	}
 	if len(essential) == len(active) {
-		return resolved
+		return resolved, nil
 	}
 
 	convergedLinked, convergedPackages := l.linked, l.linkedPackages
 	tr, err := l.trialApply(ctx, "refine: minimal set", essential)
+	if err != nil && (errors.Is(err, ErrInfrastructure) || ctx.Err() != nil) {
+		return nil, err
+	}
 	if err != nil || len(tr.raises) > 0 ||
 		introducesNewVulns(tr.residuals, l.scanResiduals) || !l.sustained(tr, essential) {
 		l.linked, l.linkedPackages = convergedLinked, convergedPackages
-		return resolved
+		return resolved, nil
 	}
 
 	for _, c := range active {
@@ -1386,7 +1475,7 @@ func (l *loop) confirmMinimalSet(ctx context.Context, resolved map[string]string
 		l.drop(c, "not needed: no advisory depends on it and the advisory-backed set resolves cleanly without it")
 	}
 	l.adoptTrial(ctx, tr, result)
-	return tr.resolved
+	return tr.resolved, nil
 }
 
 // goModState is the effect of a pin set: the go.mod the step's engine leaves
@@ -1412,6 +1501,9 @@ func (s *goModState) equal(o *goModState) bool {
 // false when the apply fails - the set is then not equivalent to anything.
 func (l *loop) finalState(ctx context.Context, pins []*candState) (st *goModState, ok bool, err error) {
 	if fail := l.engine.apply(ctx, l.inApplyOrder(pins)); fail != nil {
+		if ierr := l.recordInfra(fail.err); ierr != nil {
+			return nil, false, ierr
+		}
 		return nil, false, ctx.Err()
 	}
 	st = &goModState{}
@@ -1446,21 +1538,28 @@ func (l *loop) finalState(ctx context.Context, pins []*candState) (st *goModStat
 // that imply each other exactly one survives. Derived entries (no advisory)
 // go first, then advisory-backed ones from the least severe; ties by module
 // path, so the outcome is deterministic and a second run removes nothing.
-// User-authored replaces are never removed. When the simulation budget runs
-// low the remaining entries are kept (correct, merely not minimal); only a
-// cancellation is returned as an error. The checkout is left holding the
-// final set.
+// User-authored replaces are kept, except a self-replace (old == new) at or
+// below the module's baseline-resolved version: it pins nothing upstream
+// does not already select. When the simulation budget runs low the remaining
+// entries are kept (correct, merely not minimal); only a cancellation or an
+// infrastructure failure is returned as an error. The checkout is left
+// holding the final set.
 func (l *loop) minimise(ctx context.Context) error {
 	var set, order []*candState
 	for _, c := range l.activeCandidates() {
-		if !c.userReplace {
+		switch {
+		case c.Replace:
+			if base := l.baselineVersion(c.Module); c.OldPath() == c.Module && semver.IsValid(base) &&
+				semver.Compare(c.Version, base) <= 0 {
+				l.dropRedundant(ctx, c, "self-replace at or below the baseline-resolved "+base)
+				continue
+			}
+		default:
 			if why := l.engine.upstreamSkip(c); why != "" {
 				l.dropRedundant(ctx, c, "matches or regresses upstream go.mod ("+why+")")
 				continue
 			}
-			if !c.Replace { // removing a replace always changes the replace set
-				order = append(order, c)
-			}
+			order = append(order, c)
 		}
 		set = append(set, c)
 	}
@@ -1492,6 +1591,9 @@ func (l *loop) minimise(ctx context.Context) error {
 	stop := func(err error, why string) error {
 		if errors.Is(ctx.Err(), context.Canceled) {
 			return ctx.Err()
+		}
+		if errors.Is(err, ErrInfrastructure) {
+			return err
 		}
 		logging.From(ctx).Info("redundancy check stopped; keeping the remaining entries",
 			"modroot", l.req.Modroot, "reason", why, "error", err)
@@ -1546,6 +1648,15 @@ func (l *loop) minimise(ctx context.Context) error {
 	return settle()
 }
 
+// baselineVersion is module's version in the pristine graph: the compile
+// gate's tidied baseline when known, else the caller's go.mod view.
+func (l *loop) baselineVersion(module string) string {
+	if v, ok := l.baselineResolved[module]; ok {
+		return v
+	}
+	return l.req.Baseline[module]
+}
+
 // requirers names the selected modules requiring c's module at >= c's
 // version: the pins among them ("module@version"), else the others.
 func (l *loop) requirers(requiredBy map[string]map[string]string, c *candState, set []*candState) []string {
@@ -1578,9 +1689,8 @@ func (l *loop) dropRedundant(ctx context.Context, c *candState, why string) {
 
 // finalOutputs renders the surviving candidates: deps entries
 // (module@version), replace entries (old=new@version, gobump grammar), and
-// the modules among them that address at least one advisory. @latest
-// fallbacks are substituted with the resolved version. Redundant entries are
-// already gone (see minimise); a deps entry the final tidy pruned is dropped
+// the modules among them that address at least one advisory. Redundant
+// entries are already gone (see minimise); a deps entry the final tidy pruned is dropped
 // here because gobump rejects it at build time.
 //
 // Entries are rendered in apply order (see inApplyOrder), not insertion
@@ -1607,8 +1717,7 @@ func (l *loop) finalOutputs(resolved map[string]string) ([]string, []string, []s
 			// off, it hard-errors with ErrPackageNotFound instead). Writing
 			// it is at best a churn-prone no-op, so drop it here too.
 			l.drop(c, "pruned by go mod tidy: not required by the tidied go.mod")
-			if c.FromCVE && c.Version != latestQuery &&
-				resolved[c.Module] != "" && semver.Compare(resolved[c.Module], c.Version) < 0 {
+			if c.FromCVE && resolved[c.Module] != "" && semver.Compare(resolved[c.Module], c.Version) < 0 {
 				// Defensive: this runs after the last rescan, so the
 				// processScan backfill can no longer catch it. A CVE entry
 				// pruned here while its module still resolves below the fix
@@ -1625,14 +1734,7 @@ func (l *loop) finalOutputs(resolved map[string]string) ([]string, []string, []s
 			}
 			continue
 		}
-		version := c.Version
-		if version == latestQuery {
-			version = resolved[c.Module]
-			if version == "" {
-				version = l.requirements[c.Module]
-			}
-		}
-		deps = append(deps, c.Module+"@"+version)
+		deps = append(deps, c.Module+"@"+c.Version)
 		if c.FromCVE {
 			cveModules = append(cveModules, c.Module)
 		}
@@ -1785,11 +1887,10 @@ func (l *loop) compileGate(ctx context.Context, resolved map[string]string, resu
 // ladder returns candidate c's target versions, highest first: its current
 // version, then every lower fix rung still above the baseline-resolved
 // version. Each rung carries the advisories first fixed there - what
-// relaxing below it gives up. @latest fallbacks and ambiguity remedies have
-// a single rung.
+// relaxing below it gives up. Ambiguity remedies have a single rung.
 func (l *loop) ladder(c *candState) []Rung {
 	top := Rung{Version: c.Version}
-	if c.Version == latestQuery || c.remedy {
+	if c.remedy {
 		return []Rung{top}
 	}
 	var lower []Rung
@@ -1874,9 +1975,15 @@ func (l *loop) trial(ctx context.Context, purpose, subject string, pins []*candS
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if l.infraErr != nil {
+		return nil, gateErr(ctx, l.infraErr)
+	}
 	if err := l.applyExact(ctx, pins); err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, gateErr(ctx, cerr)
+		}
+		if ierr := l.recordInfra(err); ierr != nil {
+			return nil, gateErr(ctx, ierr)
 		}
 		out := &trialOutcome{reject: firstLine(err.Error())}
 		l.logTrial(ctx, trialLog{purpose: purpose, subject: subject, pins: pins, reject: out.reject})
@@ -1979,7 +2086,7 @@ func (l *loop) relaxTarget(ctx context.Context, g *gateRun, out *trialOutcome, l
 	suspects := l.implicatedModules(ctx, out, live)
 	var relaxable, implicated []*candState
 	for _, c := range live {
-		if c.remedy || (c.Replace && c.seed) {
+		if c.remedy || c.Replace {
 			continue
 		}
 		relaxable = append(relaxable, c)
@@ -2084,6 +2191,7 @@ func (l *loop) outgrownDeps(ctx context.Context, out *trialOutcome, pkg string) 
 	}
 	requires, err := l.compiler.ModuleRequires(ctx, l.dir, owner, ownerVersion)
 	if err != nil {
+		_ = l.recordInfra(err) // recorded: fails the run (see RunLoop)
 		return owner, nil
 	}
 	outgrown := make(map[string]string)
@@ -2109,6 +2217,7 @@ func (l *loop) outgrownDeps(ctx context.Context, out *trialOutcome, pkg string) 
 func (l *loop) candidateRaises(ctx context.Context, module, version, dep string) bool {
 	requires, err := l.compiler.ModuleRequires(ctx, l.dir, module, version)
 	if err != nil {
+		_ = l.recordInfra(err) // recorded: fails the run (see RunLoop)
 		return false
 	}
 	required, ok := requires[dep]
@@ -2124,6 +2233,9 @@ func (l *loop) candidateRaises(ctx context.Context, module, version, dep string)
 func (l *loop) minCoherentVersion(ctx context.Context, module, from string, raised map[string]string) (string, error) {
 	current, err := l.compiler.ModuleRequires(ctx, l.dir, module, from)
 	if err != nil {
+		if ierr := l.recordInfra(err); ierr != nil {
+			return "", ierr
+		}
 		return "", ctx.Err()
 	}
 	relevant := make(map[string]string)
@@ -2137,6 +2249,9 @@ func (l *loop) minCoherentVersion(ctx context.Context, module, from string, rais
 	}
 	versions, err := l.compiler.ModuleVersions(ctx, l.dir, module)
 	if err != nil {
+		if ierr := l.recordInfra(err); ierr != nil {
+			return "", ierr
+		}
 		return "", ctx.Err()
 	}
 	inspected := 0
@@ -2158,6 +2273,9 @@ func (l *loop) minCoherentVersion(ctx context.Context, module, from string, rais
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
 				return "", cerr
+			}
+			if ierr := l.recordInfra(err); ierr != nil {
+				return "", ierr
 			}
 			continue
 		}
@@ -2452,19 +2570,22 @@ func packagesFor(resolved map[string]string) []scan.Package {
 	return pkgs
 }
 
-// majorPathChange reports whether moving from the resolved version to the
-// fixed version crosses a v2+ major boundary, which changes the module's
-// import path - not expressible as a go/bump dependency entry.
-func majorPathChange(fixedVersion, resolvedVersion string) bool {
+// majorChange reports whether moving module from the resolved version to
+// the fixed version crosses a major version boundary - v0 -> v1 included:
+// v0 promises no compatibility, and a v1 release is the API break that
+// declares the stable one - unless module's path already encodes the fixed
+// version's major (/vN, gopkg.in .vN). Such a fix is not a compatible raise
+// a deps entry can express.
+func majorChange(modulePath, fixedVersion, resolvedVersion string) bool {
 	if resolvedVersion == "" {
 		return false
 	}
-	fixedMajor, resolvedMajor := semver.Major(fixedVersion), semver.Major(resolvedVersion)
-	if fixedMajor == resolvedMajor {
+	fixedMajor := semver.Major(fixedVersion)
+	if fixedMajor == semver.Major(resolvedVersion) {
 		return false
 	}
-	isLow := func(major string) bool { return major == "v0" || major == "v1" }
-	return !isLow(fixedMajor) || !isLow(resolvedMajor)
+	_, pathMajor, ok := module.SplitPathVersion(modulePath)
+	return !ok || strings.TrimLeft(pathMajor, "/.") != fixedMajor
 }
 
 // introducesNewVulns reports whether candidate residuals reference advisories
@@ -2487,15 +2608,24 @@ func introducesNewVulns(candidate, accepted []Residual) bool {
 	return false
 }
 
-// ambiguousImportModules extracts, from a go tool "ambiguous import: found
-// package X in multiple modules" failure, the module of each ambiguous pair
-// that must move forward: when one module path is a prefix of another (the
+// ambiguity is one "ambiguous import" pair to repair: the monolith module
+// (at version from) that must move past the version where the split module
+// (at splitVersion) took the package over.
+type ambiguity struct {
+	monolith, from      string
+	split, splitVersion string
+}
+
+// ambiguousImports extracts, from a go tool "ambiguous import: found package
+// X in multiple modules" failure, the pair to repair for each ambiguous
+// package: when one module path is a prefix of another (the
 // monolith-vs-split case, e.g. google.golang.org/genproto vs
 // google.golang.org/genproto/googleapis/rpc), the monolith must advance past
 // the version where the split module took the packages over. Falls back to
-// the first-listed module when neither path nests in the other.
-func ambiguousImportModules(errText string) []string {
-	var remedies []string
+// the first-listed module (against the second) when neither path nests in
+// the other.
+func ambiguousImports(errText string) []ambiguity {
+	var pairs []ambiguity
 	seen := make(map[string]struct{})
 
 	lines := strings.Split(errText, "\n")
@@ -2503,32 +2633,33 @@ func ambiguousImportModules(errText string) []string {
 		if !strings.Contains(lines[i], "ambiguous import: found package") {
 			continue
 		}
-		var modules []string
+		var modules, versions []string
 		for j := i + 1; j < len(lines); j++ {
 			fields := strings.Fields(lines[j])
 			if len(fields) < 2 || !strings.HasPrefix(fields[1], "v") || strings.HasSuffix(fields[0], ":") {
 				break
 			}
 			modules = append(modules, fields[0])
+			versions = append(versions, fields[1])
 		}
 		if len(modules) < 2 {
 			continue
 		}
 
-		remedy := modules[0]
-		for _, candidate := range modules {
-			for _, other := range modules {
+		pair := ambiguity{monolith: modules[0], from: versions[0], split: modules[1], splitVersion: versions[1]}
+		for ci, candidate := range modules {
+			for oi, other := range modules {
 				if candidate != other && strings.HasPrefix(other, candidate+"/") {
-					remedy = candidate
+					pair = ambiguity{monolith: candidate, from: versions[ci], split: other, splitVersion: versions[oi]}
 				}
 			}
 		}
-		if _, ok := seen[remedy]; !ok {
-			seen[remedy] = struct{}{}
-			remedies = append(remedies, remedy)
+		if _, ok := seen[pair.monolith]; !ok {
+			seen[pair.monolith] = struct{}{}
+			pairs = append(pairs, pair)
 		}
 	}
-	return remedies
+	return pairs
 }
 
 // classifyIntroduced marks residual advisories absent from the baseline

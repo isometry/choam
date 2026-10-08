@@ -595,7 +595,19 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 
 		existingDeps := existingDepsByRoot[root]
 		existingReplaces := existingReplacesByRoot[root]
-		desiredDeps := eco.FilterBumps(ctx, existingDeps, scanResult.SecurityBumps, deps)
+		desiredDeps, held := eco.FilterBumps(ctx, existingDeps, scanResult.SecurityBumps, deps)
+		heldResiduals := make([]simulate.Residual, 0, len(held))
+		for _, h := range held {
+			heldResiduals = append(heldResiduals, simulate.Residual{
+				Module:          h.Bump.Name,
+				ResolvedVersion: h.Bump.CurrentVersion,
+				FixedVersion:    h.Bump.FixedVersion,
+				VulnIDs:         h.Bump.VulnIDs,
+				Reason:          h.Reason,
+			})
+			logging.From(ctx).Warn("fix held back", "module", h.Bump.Name, "fix", h.Bump.FixedVersion, "reason", h.Reason)
+		}
+		gp.AddResiduals(heldResiduals)
 
 		for _, bump := range scanResult.SecurityBumps {
 			result.RawBumps = append(result.RawBumps, fmt.Sprintf("%s@%s", bump.Name, bump.FixedVersion))
@@ -624,13 +636,15 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 			ExistingDeps:   existingDeps,
 			DesiredDeps:    desiredDeps,
 			// Analysis never invents replaces - it carries existing ones
-			// forward; only the simulation promotes pins into this channel.
-			// This also keeps the --no-validate degrade path a pass-through.
+			// forward (the simulation may raise or retire them, never add
+			// any). This also keeps the --no-validate degrade path a
+			// pass-through.
 			ExistingReplaces:     existingReplaces,
 			DesiredReplaces:      existingReplaces,
 			ExistingGoVersion:    existingGoVersionByRoot[root],
 			SecurityBumpModules:  securityBumpModules,
 			SecurityBumpsByCoord: bumpCoords,
+			Residuals:            heldResiduals,
 		})
 
 		if haveDepsChanged(existingDeps, desiredDeps) {
@@ -1285,8 +1299,8 @@ func addedAcrossRoots(byModroot []ModrootAnalysis) []string {
 			}
 		}
 
-		// A new/changed replace directive that fixes a CVE counts as a
-		// security fix too - promotions must feed epoch accounting. The
+		// A changed replace directive that fixes a CVE counts as a
+		// security fix too - raised replaces must feed epoch accounting. The
 		// module coordinate is the directive's new path ("old=new@version").
 		for _, replace := range newlyAddedDeps(m.ExistingReplaces, m.DesiredReplaces) {
 			coord, version, ok := splitCoordVersion(replace)

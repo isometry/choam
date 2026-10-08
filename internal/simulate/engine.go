@@ -146,9 +146,6 @@ func (e gobumpEngine) apply(ctx context.Context, keep []*candState) *applyFailur
 		if !c.Replace {
 			continue
 		}
-		if c.Version == latestQuery {
-			return &applyFailure{step: stepSetup, err: fmt.Errorf("internal error: replace candidate %s has unresolved @latest version", c.Module)}
-		}
 		if err := l.tc.Replace(ctx, l.dir, c.OldPath(), c.Module, c.Version); err != nil {
 			return &applyFailure{step: stepSetup, err: fmt.Errorf("applying replace %s=%s@%s: %w", c.OldPath(), c.Module, c.Version, err)}
 		}
@@ -216,41 +213,6 @@ type omnibumpEngine struct {
 	// so a later "go mod tidy" failure is the closing tidy (the initial one
 	// runs on identical input every time).
 	pristineTidies bool
-	// latest memoizes @latest resolutions (see resolveLatest).
-	latest map[string]string
-}
-
-// queryResolver is implemented by toolchains that can resolve a version
-// query (*GoToolchain does).
-type queryResolver interface {
-	ResolveQuery(ctx context.Context, dir, module, query string) (string, error)
-}
-
-// resolveLatest resolves c's @latest target to a concrete version, as
-// omnibump's CLI does before filtering: the written deps carry the concrete
-// version, which DoUpdate applies as an in-place require edit (after every
-// `go get`), not as a get - so the simulation must too. Without a resolver
-// (test fakes) the query passes through.
-func (e *omnibumpEngine) resolveLatest(ctx context.Context, c *candState) (string, error) {
-	if c.Version != latestQuery {
-		return c.Version, nil
-	}
-	r, ok := e.l.tc.(queryResolver)
-	if !ok {
-		return c.Version, nil
-	}
-	if v, ok := e.latest[c.Module]; ok {
-		return v, nil
-	}
-	v, err := r.ResolveQuery(ctx, e.l.dir, c.Module, latestQuery)
-	if err != nil {
-		return "", err
-	}
-	if e.latest == nil {
-		e.latest = make(map[string]string)
-	}
-	e.latest[c.Module] = v
-	return v, nil
 }
 
 func (e *omnibumpEngine) apply(ctx context.Context, keep []*candState) *applyFailure {
@@ -264,21 +226,12 @@ func (e *omnibumpEngine) apply(ctx context.Context, keep []*candState) *applyFai
 	}
 	pkgs := make(map[string]*omnibump.Package, len(keep))
 	for i, c := range keep {
-		version, err := e.resolveLatest(ctx, c)
-		if err != nil {
-			if cerr := ctx.Err(); cerr != nil {
-				return &applyFailure{step: stepSetup, err: cerr}
-			}
-			return &applyFailure{step: stepGet, cand: c, err: err}
-		}
-		resolved := *c
-		resolved.Version = version
-		if reason := rawSkip(e.raw, &resolved); reason != "" {
+		if reason := rawSkip(e.raw, c); reason != "" {
 			logging.From(ctx).Debug("omnibump skips entry", "modroot", e.l.req.Modroot,
-				"module", c.Module, "target", version, "reason", reason)
+				"module", c.Module, "target", c.Version, "reason", reason)
 			continue
 		}
-		pkg := &omnibump.Package{Name: c.Module, Version: version, Index: i}
+		pkg := &omnibump.Package{Name: c.Module, Version: c.Version, Index: i}
 		if c.Replace {
 			pkg.Replace, pkg.OldName = true, c.OldPath()
 		}
@@ -335,25 +288,27 @@ func (e *omnibumpEngine) probeTidy(ctx context.Context) (bool, error) {
 
 // upstreamSkip is the CLI's raw-go.mod filter (see rawSkip).
 func (e *omnibumpEngine) upstreamSkip(c *candState) string {
-	if c.Version == latestQuery {
-		return ""
-	}
 	return rawSkip(e.raw, c)
 }
 
 // doUpdate runs omnibump's DoUpdate in the checkout, with its go tool
 // subprocesses configured by e.env and its clog output routed into ctx's
-// logger.
+// logger. Running out of the per-call time bound (while ctx itself is still
+// live) is an infrastructure failure, not a verdict on the entries.
 func (e *omnibumpEngine) doUpdate(ctx context.Context, pkgs map[string]*omnibump.Package) error {
 	// DoUpdate chains several go invocations (two tidies plus gets).
-	ctx, cancel := context.WithTimeout(ctx, 3*e.l.opts.CommandTimeout)
+	callCtx, cancel := context.WithTimeout(ctx, 3*e.l.opts.CommandTimeout)
 	defer cancel()
 	cfg := &omnibump.UpdateConfig{Modroot: e.l.dir, Tidy: !e.l.req.NoTidy, GoVersion: e.goVersion}
-	libCtx := logging.Library(ctx, "omnibump")
-	return withProcessEnv(e.env, func() error {
+	libCtx := logging.Library(callCtx, "omnibump")
+	err := withProcessEnv(e.env, func() error {
 		_, err := omnibumpUpdate(libCtx, pkgs, cfg)
 		return err
 	})
+	if err != nil && ctx.Err() == nil && callCtx.Err() != nil {
+		return fmt.Errorf("%w: omnibump timed out after %s: %w", ErrInfrastructure, 3*e.l.opts.CommandTimeout, err)
+	}
+	return err
 }
 
 // classify maps a DoUpdate error onto an applyFailure. omnibump wraps go tool
@@ -401,7 +356,7 @@ func namedCandidate(keep []*candState, msg string) *candState {
 // entry for a replace-pinned module is skipped, and an entry equal to or
 // older than the go.mod version is skipped (a replace entry for a module
 // without its replace directive yet is kept: it creates the pin). Returns
-// the skip reason, "" to apply. Version queries (@latest) are never skipped.
+// the skip reason, "" to apply.
 func rawSkip(raw *modfile.File, c *candState) string {
 	if raw.Module != nil && c.Module == raw.Module.Mod.Path {
 		return "main module"

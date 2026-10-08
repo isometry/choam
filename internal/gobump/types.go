@@ -127,8 +127,8 @@ type ModrootAnalysis struct {
 
 	// Replace directives ("old=new@version", Go only): what the root's bump
 	// steps currently declare, and what they should end up declaring.
-	// Analysis only carries existing replaces forward; the simulation adds
-	// promotions (see SimulationStage and internal/simulate).
+	// Analysis only carries existing replaces forward; the simulation may
+	// raise or retire them (see SimulationStage and internal/simulate).
 	ExistingReplaces []string `json:"existing_replaces,omitempty" yaml:"existing_replaces,omitempty"`
 	DesiredReplaces  []string `json:"desired_replaces,omitempty" yaml:"desired_replaces,omitempty"`
 
@@ -151,7 +151,7 @@ type ModrootAnalysis struct {
 	// actually flagged as vulnerable for this modroot - i.e.
 	// scanResult.SecurityBumps, not DesiredDeps. The desired set may carry
 	// additional entries with no CVE of their own (e.g. coherence pins the
-	// simulation promotes to keep the module graph resolvable); this
+	// simulation adds to keep the module graph resolvable); this
 	// narrower list lets the applier credit only genuine CVE fixes toward
 	// SecurityFixes/epoch-bump accounting, so a coherence-only entry can't
 	// masquerade as a vulnerability fix. The simulation overwrites it

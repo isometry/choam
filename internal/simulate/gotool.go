@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -91,9 +93,10 @@ func (t *GoToolchain) runEnv(ctx context.Context, dir string, extraEnv []string,
 // runEnvTimeout is runEnv with an explicit per-command timeout. Only stdout
 // is returned: the go tool writes progress ("go: downloading ...") and
 // diagnostics to stderr, which would otherwise corrupt JSON decodes of
-// stdout. stderr (falling back to stdout) is folded into the error instead.
-func (t *GoToolchain) runEnvTimeout(ctx context.Context, dir string, extraEnv []string, timeout time.Duration, args ...string) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+// stdout. stderr (falling back to stdout) is folded into the error instead,
+// and an environment failure is marked ErrInfrastructure (see asInfra).
+func (t *GoToolchain) runEnvTimeout(parent context.Context, dir string, extraEnv []string, timeout time.Duration, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, t.goBin, args...)
@@ -115,9 +118,65 @@ func (t *GoToolchain) runEnvTimeout(ctx context.Context, dir string, extraEnv []
 		if len(bytes.TrimSpace(diagnostics)) == 0 {
 			diagnostics = stdout.Bytes()
 		}
-		return nil, fmt.Errorf("go %s: %w: %s", strings.Join(args, " "), err, condenseOutput(diagnostics))
+		err = fmt.Errorf("go %s: %w: %s", strings.Join(args, " "), err, condenseOutput(diagnostics))
+		if parent.Err() == nil && ctx.Err() != nil {
+			// The per-command bound fired while the simulation itself is
+			// still live: a stalled proxy or network, not a verdict.
+			return nil, fmt.Errorf("%w: timed out after %s: %w", ErrInfrastructure, timeout, err)
+		}
+		if ierr := asInfra(err); ierr != nil {
+			return nil, ierr
+		}
+		return nil, err
 	}
 	return stdout.Bytes(), nil
+}
+
+// ErrInfrastructure marks a go tool failure caused by the environment - the
+// network, the module proxy or VCS host (connection errors, TLS timeouts,
+// 5xx responses) or a per-command timeout - rather than by the module graph.
+// It is never a verdict on a candidate: the simulation fails (closed) with
+// it instead of shedding or residualising anything.
+var ErrInfrastructure = errors.New("go tool infrastructure failure")
+
+// infraMarkers are go tool / net/http error texts that only an environment
+// problem produces.
+var infraMarkers = []string{
+	"dial tcp",
+	"TLS handshake timeout",
+	"connection reset",
+	"connection refused",
+	"i/o timeout",
+	"no such host",
+	"net/http: request canceled",
+	"server misbehaving",
+	"unexpected EOF",
+}
+
+// proxy5xx matches a 5xx status line in go tool output (e.g. "reading
+// https://proxy.golang.org/...: 502 Bad Gateway").
+var proxy5xx = regexp.MustCompile(`\b5\d\d (?:[A-Z][a-z]+ ?)+`)
+
+// asInfra classifies err: an infrastructure failure (see ErrInfrastructure)
+// is returned wrapped in it (or as is when already wrapped); anything else,
+// nil included, yields nil.
+func asInfra(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, ErrInfrastructure) {
+		return err
+	}
+	msg := err.Error()
+	for _, marker := range infraMarkers {
+		if strings.Contains(msg, marker) {
+			return fmt.Errorf("%w: %w", ErrInfrastructure, err)
+		}
+	}
+	if proxy5xx.MatchString(msg) {
+		return fmt.Errorf("%w: %w", ErrInfrastructure, err)
+	}
+	return nil
 }
 
 func (t *GoToolchain) ModTidy(ctx context.Context, dir string) error {
@@ -232,17 +291,12 @@ func (t *GoToolchain) DepGoVersions(ctx context.Context, dir string) (map[string
 //     graph and wrongly drop real fixes - the one unacceptable failure mode.
 //   - Replace directives resolve to the replacement path, matching
 //     ListModules' identity space (scan findings name the replacement).
-//   - GOOS=linux for build-target parity (melange targets linux; GOOS is the
-//     axis that flips import sets via _linux.go files). GOARCH stays host,
-//     and melange's build tags (netgo, osusergo, user tags) are not
-//     replicated - an over-approximation, acceptable.
-func (t *GoToolchain) Linked(ctx context.Context, dir string, patterns []string) (modules, packages map[string]struct{}, err error) {
-	if len(patterns) == 0 {
-		patterns = []string{"./..."}
-	}
+//   - The build target (GOOS/GOARCH/CGO_ENABLED, see targetBuildEnv) and the
+//     go/build steps' tags are exactly Compile's, so the linked set and the
+//     compile gate judge the same files.
+func (t *GoToolchain) Linked(ctx context.Context, dir string, patterns, tags []string) (modules, packages map[string]struct{}, err error) {
 	const tmpl = `{{if and .Module (not .Standard)}}{{.ImportPath}} {{if .Module.Replace}}{{.Module.Replace.Path}}{{else}}{{.Module.Path}}{{end}}{{end}}`
-	args := append([]string{"list", "-deps", "-f", tmpl}, patterns...)
-	output, err := t.runEnv(ctx, dir, []string{"GOOS=linux"}, args...)
+	output, err := t.runEnv(ctx, dir, targetBuildEnv(), targetListArgs([]string{"list", "-deps", "-f", tmpl}, patterns, tags)...)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -262,15 +316,11 @@ func (t *GoToolchain) Linked(ctx context.Context, dir string, patterns []string)
 
 // LinkedStd returns the set of standard-library import paths in the
 // transitive non-test import graph of the given build patterns, evaluated
-// for GOOS=linux (same walk semantics as Linked, inverted filter: standard
-// library packages instead of non-standard ones).
-func (t *GoToolchain) LinkedStd(ctx context.Context, dir string, patterns []string) (map[string]struct{}, error) {
-	if len(patterns) == 0 {
-		patterns = []string{"./..."}
-	}
+// for the same build target and tags as Linked (same walk semantics,
+// inverted filter: standard library packages instead of non-standard ones).
+func (t *GoToolchain) LinkedStd(ctx context.Context, dir string, patterns, tags []string) (map[string]struct{}, error) {
 	const tmpl = `{{if .Standard}}{{.ImportPath}}{{end}}`
-	args := append([]string{"list", "-deps", "-f", tmpl}, patterns...)
-	output, err := t.runEnv(ctx, dir, []string{"GOOS=linux"}, args...)
+	output, err := t.runEnv(ctx, dir, targetBuildEnv(), targetListArgs([]string{"list", "-deps", "-f", tmpl}, patterns, tags)...)
 	if err != nil {
 		return nil, err
 	}
@@ -290,6 +340,32 @@ func (t *GoToolchain) LinkedStd(ctx context.Context, dir string, patterns []stri
 // target arch of the melange build is not threaded through yet; amd64 is
 // the common denominator (arch-specific files rarely carry API breaks).
 const compileTargetArch = "amd64"
+
+// targetBuildEnv is the build target every artifact-graph query (Linked,
+// LinkedStd, Compile) evaluates under: GOOS=linux (melange builds linux
+// packages), GOARCH=compileTargetArch, and CGO enabled only when the host
+// can build cgo for the target natively (no linux C toolchain is assumed on
+// other hosts: cross-cgo would fail runtime/cgo and mask every package
+// above it).
+func targetBuildEnv() []string {
+	cgo := "0"
+	if runtime.GOOS == "linux" && runtime.GOARCH == compileTargetArch {
+		cgo = "1"
+	}
+	return []string{"GOOS=linux", "GOARCH=" + compileTargetArch, "CGO_ENABLED=" + cgo}
+}
+
+// targetListArgs completes a `go list` invocation with the go/build steps'
+// tags and the build patterns (empty means ./...).
+func targetListArgs(args, patterns, tags []string) []string {
+	if len(tags) > 0 {
+		args = append(args, "-tags", strings.Join(tags, ","))
+	}
+	if len(patterns) == 0 {
+		patterns = []string{"./..."}
+	}
+	return append(args, patterns...)
+}
 
 // maxCompileErrorLines caps the error lines kept per failing package.
 const maxCompileErrorLines = 5
@@ -313,28 +389,13 @@ type goListPackage struct {
 // on its .Error instead of aborting the walk - structured, per-package, no
 // vet noise, no link step. A package whose dependency failed is not compiled
 // at all (only DepsErrors), so failures surface on the deepest broken
-// package - exactly the module that needs blaming. CGO is enabled only when
-// the host can build cgo for the target natively (no linux C toolchain is
-// assumed on other hosts: cross-cgo would fail runtime/cgo and mask every
-// package above it). The build cache is the user's GOCACHE, shared and
+// package - exactly the module that needs blaming. The build target is
+// targetBuildEnv's. The build cache is the user's GOCACHE, shared and
 // incremental across compiles and runs. An error return means the go tool
 // itself failed (not that packages failed to compile).
 func (t *GoToolchain) Compile(ctx context.Context, dir string, patterns, tags []string) (*CompileReport, error) {
-	if len(patterns) == 0 {
-		patterns = []string{"./..."}
-	}
-	args := []string{"list", "-e", "-export", "-deps", "-json=ImportPath,Standard,Module,Imports,Error"}
-	if len(tags) > 0 {
-		args = append(args, "-tags", strings.Join(tags, ","))
-	}
-	args = append(args, patterns...)
-
-	cgo := "0"
-	if runtime.GOOS == "linux" && runtime.GOARCH == compileTargetArch {
-		cgo = "1"
-	}
-	env := []string{"GOOS=linux", "GOARCH=" + compileTargetArch, "CGO_ENABLED=" + cgo}
-	output, err := t.runEnvTimeout(ctx, dir, env, t.compileTimeout, args...)
+	args := targetListArgs([]string{"list", "-e", "-export", "-deps", "-json=ImportPath,Standard,Module,Imports,Error"}, patterns, tags)
+	output, err := t.runEnvTimeout(ctx, dir, targetBuildEnv(), t.compileTimeout, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -455,8 +516,8 @@ func (t *GoToolchain) ModuleVersions(ctx context.Context, dir, modulePath string
 	return versions, nil
 }
 
-// ResolveQuery resolves module@query (e.g. @latest) to a concrete version
-// (`go list -m`).
+// ResolveQuery resolves module@query (e.g. a commit hash) to a concrete
+// version (`go list -m`).
 func (t *GoToolchain) ResolveQuery(ctx context.Context, dir, modulePath, query string) (string, error) {
 	output, err := t.run(ctx, dir, "list", "-m", "-f", "{{.Version}}", modulePath+"@"+query)
 	if err != nil {
