@@ -1,9 +1,11 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -35,10 +37,16 @@ Path can be a single file or a directory containing .yaml files.`,
 	cmd.Flags().BoolVar(&noValidate, "no-validate", false, "Skip bump simulation (writes deps lists without proving they resolve or cover all advisories, and skips artifact-reachability filtering; go.sum narrowing still applies); requires a go toolchain otherwise")
 	cmd.Flags().DurationVar(&simulationTimeout, "simulation-timeout", 10*time.Minute, "Per-package budget for bump simulation")
 	cmd.Flags().BoolVar(&noCompile, "no-compile", false, "Skip the simulation's compile gate (validated deps are then only proven to resolve, not to compile the go/build packages); implied by --no-validate")
+	cmd.Flags().BoolVar(&failOnResidual, "fail-on-residual", false, "Exit non-zero when any advisory remains residual (files that error always exit non-zero)")
 	cmd.Flags().BoolVar(&noStdlib, "no-stdlib", false, "Skip the Go stdlib staleness check (no epoch bump for toolchain-fixed vulnerabilities). The check is also skipped automatically for files with uncommitted changes.")
 
 	return cmd
 }
+
+// ErrBumpFailed is returned, after every result has been printed, when any
+// file errored - or, with --fail-on-residual, when any advisory remains
+// residual - so the command exits non-zero (cobra prints it once).
+var ErrBumpFailed = errors.New("bump failed")
 
 func runBump(cmd *cobra.Command, args []string) error {
 	// Use the command context which supports cancellation (Ctrl+C)
@@ -71,31 +79,44 @@ func runBump(cmd *cobra.Command, args []string) error {
 	httpClient := httpclient.NewHTTPClientWithTimeout(httpTimeout)
 	analyzer := gobump.NewAnalyzer(httpClient)
 
-	// Process all files using shared processor architecture
 	results := make([]*gobump.GoBumpResult, 0, len(files))
 	for i, file := range files {
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("bump cancelled: %w", err)
+		if ctx.Err() != nil {
+			break
 		}
 
 		slog.Info("processing melange file", "file", file, "index", i+1, "total", len(files)) //nolint:forbidigo // this IS the file attribution - the per-file ctx is seeded inside ProcessFile
 
 		result, err := gobump.ProcessFile(ctx, file, opts, analyzer)
-
 		if err != nil {
 			slog.Error("processing melange file failed", "file", file, "error", err) //nolint:forbidigo // ProcessFile failed before/without seeding a ctx logger
-			// Create error result
-			result = &gobump.GoBumpResult{
-				PackageName: extractPackageNameFromPath(file),
-				FilePath:    file,
-				Error:       err.Error(),
+			if result == nil {
+				// Read/parse failure: no processor, so no partial state.
+				result = &gobump.GoBumpResult{
+					PackageName: strings.TrimSuffix(filepath.Base(file), filepath.Ext(file)),
+					FilePath:    file,
+				}
 			}
+			result.Error = err.Error()
 		}
 		results = append(results, result)
 	}
 
-	// Output results
-	return outputBumpResults(results, outputFormat)
+	// Partial results are printed even on cancellation.
+	if err := outputBumpResults(results, outputFormat); err != nil {
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("bump cancelled after %d of %d file(s): %w", len(results), len(files), err)
+	}
+	summary := summarizeBumpResults(results)
+	switch {
+	case summary.Errors > 0:
+		return fmt.Errorf("%w: %d of %d file(s) errored", ErrBumpFailed, summary.Errors, summary.TotalPackages)
+	case failOnResidual && summary.TotalVulnsResidual > 0:
+		return fmt.Errorf("%w: %d residual advisory(ies) in %d file(s) (--fail-on-residual)", ErrBumpFailed, summary.TotalVulnsResidual, summary.PackagesPartial)
+	}
+	return nil
 }
 
 // buildBumpProcessorOptions maps the bump command's flag-backed package
@@ -127,52 +148,57 @@ func outputBumpResults(results []*gobump.GoBumpResult, format string) error {
 	}
 }
 
-func outputBumpStructured(results []*gobump.GoBumpResult, format string) error {
-	// Build map keyed by filename
-	resultsMap := make(map[string]*gobump.GoBumpResult)
-	for _, result := range results {
-		filename := output.ExtractFilename(result.FilePath)
-		resultsMap[filename] = result
-	}
-
-	// Calculate summary statistics
-	summary := output.GoBumpSummary{
-		TotalPackages: len(results),
-	}
+// summarizeBumpResults is the one aggregation behind both the table footer
+// and the structured summary. An errored file counts only in Errors (its
+// partial counts are incomplete); a file counts as fixed when it fixes at
+// least one advisory (VulnerabilitiesFixed > 0 - see bumpRowStatus).
+func summarizeBumpResults(results []*gobump.GoBumpResult) output.GoBumpSummary {
+	summary := output.GoBumpSummary{TotalPackages: len(results)}
 	for _, r := range results {
-		if r.VulnerabilitiesFound > 0 {
-			summary.PackagesWithVulns++
-			summary.TotalVulnsFound += r.VulnerabilitiesFound
-			if !r.Validated {
-				summary.PackagesUnvalidated++
-			}
-		}
-		if r.VulnerabilitiesFixed > 0 {
-			summary.PackagesFixed++
-			summary.TotalVulnsFixed += r.VulnerabilitiesFixed
-		}
-		if r.VulnerabilitiesResidual > 0 {
-			summary.PackagesPartial++
-			summary.TotalVulnsResidual += r.VulnerabilitiesResidual
-		}
-		summary.TotalVulnsUnreachable += r.VulnerabilitiesUnreachable
-		summary.TotalModulesBumped += r.ModulesBumped
-		if r.Error != "" {
-			summary.Errors++
-		}
 		if distinct := output.DistinctStdlibVulnIDs(r.StdlibBumps); len(distinct) > 0 {
 			summary.PackagesStdlibStale++
 			summary.TotalStdlibVulns += len(distinct)
 		}
+		if r.Error != "" {
+			summary.Errors++
+			continue
+		}
+		if len(r.SkipReasons) > 0 {
+			summary.PackagesSkipped++
+		}
+		summary.TotalModulesBumped += r.ModulesBumped
+		if r.VulnerabilitiesFound == 0 {
+			continue
+		}
+		summary.PackagesWithVulns++
+		summary.TotalVulnsFound += r.VulnerabilitiesFound
+		summary.TotalVulnsFixed += r.VulnerabilitiesFixed
+		summary.TotalVulnsResidual += r.VulnerabilitiesResidual
+		summary.TotalVulnsUnreachable += r.VulnerabilitiesUnreachable
+		if !r.Validated {
+			summary.PackagesUnvalidated++
+		}
+		if r.VulnerabilitiesFixed > 0 {
+			summary.PackagesFixed++
+		}
+		if r.VulnerabilitiesResidual > 0 {
+			summary.PackagesPartial++
+		}
 	}
+	return summary
+}
 
-	// Wrap in response structure
+// outputBumpStructured renders the results keyed by file path (as given on
+// the command line / discovered - unique, unlike basenames) plus the summary.
+func outputBumpStructured(results []*gobump.GoBumpResult, format string) error {
+	resultsMap := make(map[string]*gobump.GoBumpResult, len(results))
+	for _, result := range results {
+		resultsMap[result.FilePath] = result
+	}
 	response := output.GoBumpResponse{
 		Results: resultsMap,
-		Summary: summary,
+		Summary: summarizeBumpResults(results),
 	}
-
-	// Output in requested format
 	if format == "json" {
 		return output.OutputJSON(os.Stdout, response)
 	}
@@ -180,56 +206,18 @@ func outputBumpStructured(results []*gobump.GoBumpResult, format string) error {
 }
 
 func outputBumpTable(results []*gobump.GoBumpResult) error {
-	// Calculate max package name length
 	maxPkgLen := len("PACKAGE")
 	for _, result := range results {
-		if len(result.PackageName) > maxPkgLen {
-			maxPkgLen = len(result.PackageName)
-		}
+		maxPkgLen = max(maxPkgLen, len(result.PackageName))
 	}
-	if maxPkgLen > 60 {
-		maxPkgLen = 60
-	}
+	maxPkgLen = min(maxPkgLen, 60)
 
-	// Create and configure table
 	t := table.New(os.Stdout)
 	t.SetRowLines(false)
 	t.SetBorders(false)
 	t.SetHeaders("PACKAGE", "FOUND", "FIXED", "RESIDUAL", "UNLINKED", "BUMPED", "STDLIB", "OLD EPOCH", "NEW EPOCH", "STATUS")
-
-	// Track statistics
-	totalFiles := len(results)
-	filesWithVulns := 0
-	filesFixed := 0
-	filesStdlibStale := 0
-	totalVulnsFound := 0
-	totalVulnsFixed := 0
-	totalVulnsResidual := 0
-	totalVulnsUnreachable := 0
-	totalModulesBumped := 0
-	errors := 0
-
-	// Add rows
 	for _, result := range results {
 		stdlibVulns := len(output.DistinctStdlibVulnIDs(result.StdlibBumps))
-		if stdlibVulns > 0 {
-			filesStdlibStale++
-		}
-
-		if result.Error != "" {
-			errors++
-		} else if result.VulnerabilitiesFound > 0 {
-			filesWithVulns++
-			totalVulnsFound += result.VulnerabilitiesFound
-			totalVulnsFixed += result.VulnerabilitiesFixed
-			totalVulnsResidual += result.VulnerabilitiesResidual
-			totalVulnsUnreachable += result.VulnerabilitiesUnreachable
-			if dependencyFixApplied(result) {
-				filesFixed++
-			}
-		}
-		totalModulesBumped += result.ModulesBumped
-
 		t.AddRow(
 			truncate(result.PackageName, maxPkgLen),
 			fmt.Sprintf("%d", result.VulnerabilitiesFound),
@@ -243,13 +231,18 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 			bumpRowStatus(result, stdlibVulns),
 		)
 	}
-
-	// Render the table
 	t.Render()
 
-	// Residuals and validation warnings are always shown - a package with
-	// residual advisories must never silently read as clean.
+	// Errors, skips, residuals and validation warnings are always shown - a
+	// package that was not (fully) analyzed or still carries advisories must
+	// never silently read as clean.
 	for _, result := range results {
+		if result.Error != "" {
+			fmt.Printf("\nError for %s: %s\n", result.PackageName, result.Error)
+		}
+		if len(result.SkipReasons) > 0 {
+			fmt.Printf("\nSkipped %s: %s\n", result.PackageName, strings.Join(result.SkipReasons, "; "))
+		}
 		if len(result.Residuals) > 0 {
 			fmt.Printf("\nResidual vulnerabilities for %s (no reachable zero-vulnerability state):\n", result.PackageName)
 			for _, residual := range result.Residuals {
@@ -268,12 +261,11 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 				fmt.Printf("  - %s [%s] %s\n", location, vulns, detail)
 			}
 		}
-		if result.Error == "" && result.VulnerabilitiesFound > 0 && !result.Validated {
+		if result.Error == "" && result.VulnerabilitiesFound > 0 && !result.Validated && (result.FileWasWritten || result.ModulesBumped > 0) {
 			fmt.Printf("\nWARNING: %s deps list NOT validated - resolvability and completeness unproven\n", result.PackageName)
 		}
 	}
 
-	// Show verbose details after the table
 	if verbosity > 0 {
 		for _, result := range results {
 			if len(result.Messages) > 0 {
@@ -282,27 +274,23 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 					fmt.Printf("  - %s\n", message)
 				}
 			}
-
-			if result.Error != "" {
-				fmt.Printf("\nError for %s: %s\n", result.PackageName, result.Error)
-			}
 		}
 	}
 
-	// Summary
-	summary := fmt.Sprintf("Summary: %d files processed, %d with vulnerabilities, %d fixed, %d errors",
-		totalFiles, filesWithVulns, filesFixed, errors)
-
-	if totalVulnsFound > 0 {
-		summary += fmt.Sprintf(" (%d advisories found, %d fixed, %d residual, %d in unlinked modules; %d modules bumped)",
-			totalVulnsFound, totalVulnsFixed, totalVulnsResidual, totalVulnsUnreachable, totalModulesBumped)
+	s := summarizeBumpResults(results)
+	footer := fmt.Sprintf("Summary: %d files processed, %d with vulnerabilities, %d fixed, %d errors",
+		s.TotalPackages, s.PackagesWithVulns, s.PackagesFixed, s.Errors)
+	if s.PackagesSkipped > 0 {
+		footer += fmt.Sprintf(", %d skipped", s.PackagesSkipped)
 	}
-
-	if filesStdlibStale > 0 {
-		summary += fmt.Sprintf("; %d stdlib-stale", filesStdlibStale)
+	if s.TotalVulnsFound > 0 {
+		footer += fmt.Sprintf(" (%d advisories found, %d fixed, %d residual, %d in unlinked modules; %d modules bumped)",
+			s.TotalVulnsFound, s.TotalVulnsFixed, s.TotalVulnsResidual, s.TotalVulnsUnreachable, s.TotalModulesBumped)
 	}
-
-	fmt.Printf("\n%s\n", summary)
+	if s.PackagesStdlibStale > 0 {
+		footer += fmt.Sprintf("; %d stdlib-stale", s.PackagesStdlibStale)
+	}
+	fmt.Printf("\n%s\n", footer)
 
 	if dryRun {
 		fmt.Println("(Dry run - no files were actually modified)")
@@ -311,44 +299,41 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 	return nil
 }
 
-// dependencyFixApplied returns true if the result includes any dependency-level
-// fix attempt: either vulnerabilities were fixed (proven by simulation or
-// approximated by module changes) or modules were bumped (attempted fix).
-// This decouples dependency-fix status from epoch changes that may result
-// solely from stdlib staleness checks.
-func dependencyFixApplied(result *gobump.GoBumpResult) bool {
-	return result.VulnerabilitiesFixed > 0 || result.ModulesBumped > 0
-}
-
-// bumpRowStatus computes the table STATUS cell for one result, mirroring the
-// found/fixed/residual precedence used for dependency vulnerabilities and
-// adding a distinct status for files whose only change is a stdlib-driven
-// epoch bump: zero dependency vulnerabilities found, but the stdlib
-// staleness check proposed one or more fixes and the epoch moved. Files with
-// both dependency fixes and stdlib bumps keep their existing dependency-
-// driven status - the STDLIB column carries that information instead.
+// bumpRowStatus computes the table STATUS cell for one result. "Fixed"
+// means at least one advisory fixed (VulnerabilitiesFixed > 0), the same
+// definition the summary counts:
+//
+//	ERROR          the file failed (partial counts shown)
+//	SKIPPED        not analyzed (see SkipReasons) and nothing found
+//	UNVALIDATED    fixes written but not proven by simulation
+//	PARTIAL        fixed some, residual advisories remain
+//	FIXED          fixed, nothing residual
+//	NO-FIX         nothing fixed, residual advisories remain (simulated or
+//	               not - e.g. no released fix)
+//	UPDATED        file rewritten without fixing anything
+//	UP-TO-DATE     advisories found, all handled by the existing deps list
+//	STDLIB-REBUILD no dependency advisories; epoch bumped for a stdlib fix
+//	NO VULNS       nothing found
 func bumpRowStatus(result *gobump.GoBumpResult, stdlibVulns int) string {
+	fixed := result.VulnerabilitiesFixed > 0
 	switch {
 	case result.Error != "":
 		return "ERROR"
+	case len(result.SkipReasons) > 0 && result.VulnerabilitiesFound == 0:
+		return "SKIPPED"
 	case result.VulnerabilitiesFound > 0:
 		switch {
-		case dependencyFixApplied(result):
-			switch {
-			case !result.Validated:
-				return "UNVALIDATED"
-			case result.VulnerabilitiesResidual > 0:
-				return "PARTIAL"
-			default:
-				return "FIXED"
-			}
+		case fixed && !result.Validated:
+			return "UNVALIDATED"
+		case fixed && result.VulnerabilitiesResidual > 0:
+			return "PARTIAL"
+		case fixed:
+			return "FIXED"
+		case result.VulnerabilitiesResidual > 0:
+			return "NO-FIX"
 		case result.FileWasWritten:
 			return "UPDATED"
 		default:
-			// Vulnerabilities found but no changes needed (pipeline already correct)
-			if result.Validated && result.VulnerabilitiesResidual > 0 {
-				return "PARTIAL"
-			}
 			return "UP-TO-DATE"
 		}
 	case stdlibVulns > 0 && result.EpochChanged:
@@ -358,24 +343,18 @@ func bumpRowStatus(result *gobump.GoBumpResult, stdlibVulns int) string {
 	}
 }
 
-// stdlibColumnValue renders the table STDLIB column: the count of distinct
-// linked fixable stdlib vulnerability IDs (deduped across go-package pin
-// constraints - see output.DistinctStdlibVulnIDs), or "-" when the check
-// didn't run or found nothing to fix.
+// stdlibColumnValue renders the table STDLIB column: "skip" when the check
+// did not run (disabled, not applicable, or skipped - see the messages), "-"
+// when it ran and found nothing to fix, else the count of distinct linked
+// fixable stdlib vulnerability IDs (deduped across go-package pin
+// constraints - see output.DistinctStdlibVulnIDs).
 func stdlibColumnValue(stdlibVulns int, checked bool) string {
-	if !checked || stdlibVulns == 0 {
+	switch {
+	case !checked:
+		return "skip"
+	case stdlibVulns == 0:
 		return "-"
+	default:
+		return fmt.Sprintf("%d", stdlibVulns)
 	}
-	return fmt.Sprintf("%d", stdlibVulns)
-}
-
-func extractPackageNameFromPath(filePath string) string {
-	// Extract package name from file path for error cases
-	parts := strings.Split(filePath, "/")
-	if len(parts) > 0 {
-		filename := parts[len(parts)-1]
-		// Remove .yaml extension if present
-		return strings.TrimSuffix(filename, ".yaml")
-	}
-	return "unknown"
 }

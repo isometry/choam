@@ -42,6 +42,9 @@ type candState struct {
 	residualized bool
 	// dropReason mirrors the DroppedCandidate reason, for backfill wording.
 	dropReason string
+	// shedUnlinked marks a drop by dropUnreachable: judged against the graph
+	// current at the time, which a later adjustment can replace.
+	shedUnlinked bool
 
 	// repair marks a coherence-only pin the compile gate added to keep a
 	// module compatible with a raised dependency (see repairsFor).
@@ -1049,6 +1052,7 @@ func (l *loop) dropUnreachable() bool {
 		// residualized so the rescan backfill never resurrects it.
 		l.drop(c, reason)
 		c.residualized = true
+		c.shedUnlinked = true
 		changed = true
 	}
 	return changed
@@ -2317,7 +2321,10 @@ func (l *loop) gateAdopt(ctx context.Context, g *gateRun, live []*candState, rep
 // rescans, and refreshes the loop's accepted state. An advisory the rescan
 // still finds for a module whose higher rung was rejected is a residual
 // carrying that rejection; any other fix the rescan wants is surfaced as a
-// residual rather than raised (it was never compile-validated).
+// residual rather than raised (it was never compile-validated). The rescan
+// is the authoritative reachability judgement - it is made on the graph that
+// ships - so a fix shed as unlinked under the (since rejected) full set is
+// residual here when the gated graph links the vulnerable code again.
 func (l *loop) gateFinish(ctx context.Context, keep []*candState, rejected map[string]string, result *ModrootResult) (map[string]string, error) {
 	tr, err := l.trialApply(ctx, "gate: adopt accepted set", keep)
 	if err != nil {
@@ -2330,7 +2337,11 @@ func (l *loop) gateFinish(ctx context.Context, keep []*candState, rejected map[s
 	l.adoptTrial(ctx, tr, result)
 	for _, r := range tr.raises {
 		reason, wasRejected := rejected[r.module]
-		if !wasRejected {
+		switch c := l.byModule[r.module]; {
+		case wasRejected:
+		case c != nil && c.dropped && c.shedUnlinked:
+			reason = "vulnerable code linked again after compile-gate adjustments (fix was shed as unlinked under the full bump set); fix not validated"
+		default:
 			reason = "advisory surfaced after compile-gate adjustments; fix not validated"
 		}
 		l.persistentResiduals = append(l.persistentResiduals, Residual{

@@ -321,6 +321,12 @@ func (ix *Index) fetchList(ctx context.Context) (map[string]string, error) {
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("scanning release list: %w", err)
 	}
+	if len(releases) == 0 {
+		// An empty (or all-unparseable) list is a broken response, not "Go
+		// has no releases": treated as not loaded, so it is retried and
+		// never rejects every floor as an unknown release.
+		return nil, errors.New("release list contains no stable releases")
+	}
 
 	return releases, nil
 }

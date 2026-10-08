@@ -74,6 +74,9 @@ type GoBumpResult struct {
 	HighFixed                  int                 `json:"high_fixed" yaml:"high_fixed"`
 	SecurityFixes              []SecurityFix       `json:"security_fixes" yaml:"security_fixes"`
 	ActionsApplied             []BumpAction        `json:"actions_applied" yaml:"actions_applied"`
+	// SkipReasons say why (part of) the package was not analyzed (status
+	// SKIPPED; see GoBumpProcessor.SkipReasons).
+	SkipReasons []string `json:"skip_reasons,omitempty" yaml:"skip_reasons,omitempty"`
 	// StdlibBumps are the Go stdlib staleness findings that (each) justify
 	// an epoch bump; StdlibChecked reports whether the staleness check ran
 	// to completion (false when disabled, inapplicable, or skipped).

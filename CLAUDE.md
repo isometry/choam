@@ -15,7 +15,7 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 **Ecosystem Context:**
 - **Melange**: APK package builder that CHOAM manages
 - **Wolfi**: Container-optimized Linux distribution using CHOAM
-- **OSV database (api.osv.dev)**: Vulnerability data source, queried via the official osv.dev Go bindings
+- **OSV database (api.osv.dev)**: Vulnerability data source, queried by a small choam client (`internal/scan/osv.go`: lenient decoding, ctx-aware retries) over the official osv.dev binding message types
 - **omnibump**: Multi-ecosystem (Go/Rust/Java) dependency-bump tooling backing the `bump` command
 
 ## Architecture
@@ -42,8 +42,8 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `cmd/root.go:58` - `collectMelangeFiles()` YAML discovery
 - `cmd/check.go:14` - `NewCheckCmd()` update detection command
 - `cmd/update.go:15` - `NewUpdateCmd()` apply updates command
-- `cmd/bump.go:16` - `NewBumpCmd()` vulnerability-bump command (`gobump` alias; flags: `--dry-run`, `--format`, `--backup-suffix`, `--no-validate`, `--simulation-timeout`, `--no-stdlib`)
-- `cmd/bump.go:41` - `runBump()` vulnerability scan/apply logic
+- `cmd/bump.go:19` - `NewBumpCmd()` vulnerability-bump command (`gobump` alias; flags: `--dry-run`, `--format`, `--backup-suffix`, `--no-validate`, `--simulation-timeout`, `--no-stdlib`, `--fail-on-residual`)
+- `cmd/bump.go:51` - `runBump()` vulnerability scan/apply logic; exits non-zero (`ErrBumpFailed`) when any file errors; `summarizeBumpResults()` feeds both table and JSON/YAML (results keyed by file path)
 
 ### Core Processing Architecture
 - `internal/processor/processor.go:11` - `Processor` interface definition
@@ -67,7 +67,8 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `internal/git/local.go` - `LastCommitInfo()` last-commit-time/dirty/shallow lookup used by the stdlib staleness idempotency guard
 - `internal/ecosystem/` - per-language `Ecosystem` implementations (`golang/`, `rust/`, `java/`) behind a self-registering plugin registry
 - `internal/ecosystem/fetcher.go` - remote manifest fetching (go.mod/Cargo.lock/pom.xml)
-- `internal/scan/vulnerability.go` - `NewVulnerabilityScanner()` OSV scanner (language-agnostic `ScanPackages`)
+- `internal/scan/vulnerability.go` - `NewVulnerabilityScanner()` OSV scanner (language-agnostic `ScanPackages`; fails closed on incomplete pages or advisory lookups)
+- `internal/scan/osv.go` - minimal api.osv.dev client (querybatch + vulns/{id})
 - `internal/scan/cache.go` - Vulnerability result caching (ecosystem-qualified keys)
 
 ### Service Clients

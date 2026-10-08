@@ -67,6 +67,10 @@ type fakeToolchain struct {
 	linked     []string
 	linkedPkgs []string
 	linkedErr  error
+	// linkedPkgsFn, when set, takes priority over linkedPkgs and computes
+	// the package-level set from the current attempt's applied set (the
+	// import graph changes with versions).
+	linkedPkgsFn func(applied map[string]string) []string
 
 	// depGoVersions models DepGoVersions' module -> go directive map;
 	// depGoVersionsErr makes it fail (the loop must fail open: empty field,
@@ -99,9 +103,13 @@ func (f *fakeToolchain) Linked(ctx context.Context, dir string, _, _ []string) (
 		return nil, nil, f.linkedErr
 	}
 	var packages map[string]struct{}
-	if f.linkedPkgs != nil {
-		packages = make(map[string]struct{}, len(f.linkedPkgs))
-		for _, pkg := range f.linkedPkgs {
+	linkedPkgs := f.linkedPkgs
+	if f.linkedPkgsFn != nil {
+		linkedPkgs = f.linkedPkgsFn(f.applied)
+	}
+	if linkedPkgs != nil {
+		packages = make(map[string]struct{}, len(linkedPkgs))
+		for _, pkg := range linkedPkgs {
 			packages[pkg] = struct{}{}
 		}
 	}
@@ -2526,6 +2534,58 @@ func TestCompileGate_RelaxSeverityOrderAndResidualReason(t *testing.T) {
 		Module: "example.com/a", Version: "v1.1.0",
 		Reason: "breaks compile: example.com/test: main.go:7:2: a.X and b.X conflict",
 	})
+}
+
+// TestCompileGate_RelinkedAfterGateIsResidualNotUnlinked is the
+// jenkins-operator oauth2 shape: o's vulnerable package (o/jws) is linked in
+// the pristine graph and only drops out of the import graph once k is raised
+// (k@v1.1.0 no longer imports it), so the full bump set sheds o's fix as
+// unlinked. The compile gate then rejects k, the final graph links o/jws
+// again, and the final rescan - the one authoritative reachability judgement,
+// made on the graph that ships - finds GO-O applicable. It must be a residual
+// (the shipped artifact links the vulnerable code) whose reason says why the
+// fix was not applied, never an "unlinked" info.
+func TestCompileGate_RelinkedAfterGateIsResidualNotUnlinked(t *testing.T) {
+	jws := scan.VulnerableImport{Path: "example.com/o/jws"}
+	tc := &fakeCompiler{
+		fakeToolchain: &fakeToolchain{
+			base: map[string]string{"example.com/k": "v1.0.0", "example.com/o": "v1.0.0"},
+			linkedPkgsFn: func(applied map[string]string) []string {
+				if semver.Compare(applied["example.com/k"], "v1.1.0") >= 0 {
+					return []string{"example.com/k"}
+				}
+				return []string{"example.com/k", jws.Path}
+			},
+		},
+		compileFn: brokenAbove("example.com/k", "v1.1.0"),
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/k", id: "GO-K", fixed: "v1.1.0"},
+		{module: "example.com/o", id: "GO-O", fixed: "v1.1.0", imports: []scan.VulnerableImport{jws}},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/k", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-K"}},
+			{Module: "example.com/o", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-O"}},
+		},
+		VulnImports: map[string][]string{"GO-O": {jws.Path}},
+		Baseline:    map[string]string{"example.com/k": "v1.0.0", "example.com/o": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Contains(t, result.LinkedPackages, jws.Path, "the final graph links the vulnerable package")
+	var o *Residual
+	for i := range result.Residuals {
+		if result.Residuals[i].Module == "example.com/o" {
+			o = &result.Residuals[i]
+		}
+	}
+	require.NotNil(t, o, "a linked advisory must stay residual: %+v", result.Residuals)
+	assert.Equal(t, []string{"GO-O"}, o.VulnIDs)
+	assert.Contains(t, o.Reason, "linked again after compile-gate adjustments")
+	assert.Contains(t, result.RemainingVulnIDs, "GO-O")
 }
 
 // brokenAbove is a compileFn whose module's own package fails to compile

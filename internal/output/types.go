@@ -33,7 +33,8 @@ type UpdateSummary struct {
 	Manual            int `json:"manual" yaml:"manual"`
 }
 
-// GoBumpResponse wraps gobump command results with summary metadata
+// GoBumpResponse wraps gobump command results (keyed by file path) with
+// summary metadata
 type GoBumpResponse struct {
 	Results map[string]*gobump.GoBumpResult `json:"results" yaml:"results"`
 	Summary GoBumpSummary                   `json:"summary" yaml:"summary"`
@@ -55,6 +56,9 @@ type GoBumpSummary struct {
 	TotalVulnsUnreachable int `json:"total_vulns_unreachable" yaml:"total_vulns_unreachable"`
 	TotalModulesBumped    int `json:"total_modules_bumped" yaml:"total_modules_bumped"`
 	Errors                int `json:"errors" yaml:"errors"`
+	// PackagesSkipped counts files (or parts of files) not analyzed - see
+	// GoBumpResult.SkipReasons.
+	PackagesSkipped int `json:"packages_skipped" yaml:"packages_skipped"`
 
 	// PackagesStdlibStale counts files with at least one distinct fixable
 	// stdlib vulnerability ID (see DistinctStdlibVulnIDs); TotalStdlibVulns

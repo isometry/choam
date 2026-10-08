@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/isometry/choam/internal/processor"
+	"github.com/isometry/choam/internal/scan"
 	"github.com/isometry/choam/internal/simulate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -514,6 +515,60 @@ func TestGoBumpProcessor_ToResult_IntroducedResidualAccounting(t *testing.T) {
 	assert.Equal(t, 3, result.VulnerabilitiesResidual, "deduplicated across residual entries")
 	assert.Equal(t, 2, result.VulnerabilitiesFixed,
 		"found(4) - baseline residual IDs(2); introduced GO-9 must not subtract")
+}
+
+// analysisWith builds a one-modroot analysis carrying vulns.
+func analysisWith(vulns ...scan.Vulnerability) *VulnerabilityAnalysis {
+	return &VulnerabilityAnalysis{
+		VulnerabilitiesFound: len(vulns),
+		ByLanguage: []LanguageAnalysis{{Language: "go", ByModroot: []ModrootAnalysis{
+			{Modroot: ".", ScanResult: &scan.ScanResult{Vulnerabilities: vulns}},
+		}}},
+	}
+}
+
+// TestGoBumpProcessor_ToResult_SeverityFixed: CriticalFixed/HighFixed count
+// the fixed advisories (validated: found - residual - unlinked) by the
+// analysis scan's severity.
+func TestGoBumpProcessor_ToResult_SeverityFixed(t *testing.T) {
+	proc := NewGoBumpProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
+	proc.VulnerabilityAnalysis = analysisWith(
+		scan.Vulnerability{ID: "GO-C1", Module: "a", Severity: "CRITICAL", FixedVersion: "v1"},
+		scan.Vulnerability{ID: "GO-C2", Module: "b", Severity: "CRITICAL", FixedVersion: "v1"},
+		scan.Vulnerability{ID: "GO-H1", Module: "c", Severity: "HIGH", FixedVersion: "v1"},
+		scan.Vulnerability{ID: "GO-H2", Module: "d", Severity: "HIGH", FixedVersion: "v1"},
+		scan.Vulnerability{ID: "GO-L1", Module: "e", Severity: "LOW", FixedVersion: "v1"},
+	)
+	proc.Validated = true
+	proc.AddResiduals([]simulate.Residual{{Module: "b", VulnIDs: []string{"GO-C2"}, Reason: "breaks compile"}})
+	proc.AddUnreachableVulnIDs([]string{"GO-H2"})
+
+	result := proc.ToResult()
+	assert.Equal(t, 3, result.VulnerabilitiesFixed)
+	assert.Equal(t, 1, result.CriticalFixed)
+	assert.Equal(t, 1, result.HighFixed)
+}
+
+// TestGoBumpProcessor_ToResult_UnvalidatedNoFixIsResidual: without a
+// simulation, an advisory with no released fix is residual (so the package
+// reads NO-FIX, never UP-TO-DATE); a validated run relies on its rescan.
+func TestGoBumpProcessor_ToResult_UnvalidatedNoFixIsResidual(t *testing.T) {
+	vulns := []scan.Vulnerability{
+		{ID: "GO-N1", Module: "example.com/nofix", CurrentVersion: "v1.0.0"},
+		{ID: "GO-N2", Module: "example.com/nofix", CurrentVersion: "v1.0.0"},
+		{ID: "GO-F1", Module: "example.com/fix", FixedVersion: "v1.1.0"},
+	}
+	proc := NewGoBumpProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
+	proc.VulnerabilityAnalysis = analysisWith(vulns...)
+
+	result := proc.ToResult()
+	assert.Equal(t, 2, result.VulnerabilitiesResidual)
+	require.Len(t, result.Residuals, 1)
+	assert.Equal(t, simulate.Residual{Module: "example.com/nofix", ResolvedVersion: "v1.0.0", VulnIDs: []string{"GO-N1", "GO-N2"}, Reason: "no released fix"}, result.Residuals[0])
+	assert.Empty(t, proc.Residuals, "ToResult must not mutate the processor")
+
+	proc.Validated = true
+	assert.Zero(t, proc.ToResult().VulnerabilitiesResidual, "validated: the rescan owns residuals")
 }
 
 func TestGoBumpProcessor_Integration(t *testing.T) {

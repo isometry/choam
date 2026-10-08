@@ -19,13 +19,15 @@ func GetGlobalCache() *VulnerabilityCache {
 	return globalVulnerabilityCache
 }
 
-// VulnerabilityCache provides a thread-safe cache for vulnerability scan results
-// to avoid redundant API calls for the same package@version combinations within a single run.
+// VulnerabilityCache provides a thread-safe per-run cache of OSV lookups:
+// batch-query results by package@version, and full advisory records by ID
+// (one advisory typically affects many packages and recurs across files).
 // Cached values are shared pointers returned directly to callers - treat them as
 // read-only; mutating a cached *osvschema.Vulnerability corrupts every other holder.
 type VulnerabilityCache struct {
-	mu      sync.RWMutex
-	entries map[string][]*osvschema.Vulnerability // Key: "ecosystem|package@version"
+	mu         sync.RWMutex
+	entries    map[string][]*osvschema.Vulnerability // Key: "ecosystem|package@version"
+	advisories map[string]*osvschema.Vulnerability   // Key: advisory ID
 }
 
 // cacheKeyFor builds an ecosystem-qualified cache key, preventing collisions
@@ -38,7 +40,8 @@ func cacheKeyFor(ecosystem, name, version string) string {
 // NewVulnerabilityCache creates a new vulnerability cache
 func NewVulnerabilityCache() *VulnerabilityCache {
 	return &VulnerabilityCache{
-		entries: make(map[string][]*osvschema.Vulnerability),
+		entries:    make(map[string][]*osvschema.Vulnerability),
+		advisories: make(map[string]*osvschema.Vulnerability),
 	}
 }
 
@@ -58,6 +61,21 @@ func (c *VulnerabilityCache) Set(key string, vulns []*osvschema.Vulnerability) {
 	c.entries[key] = vulns
 }
 
+// GetAdvisory returns the cached full record for an advisory ID.
+func (c *VulnerabilityCache) GetAdvisory(id string) (*osvschema.Vulnerability, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	record, ok := c.advisories[id]
+	return record, ok
+}
+
+// SetAdvisory caches the full record for an advisory ID.
+func (c *VulnerabilityCache) SetAdvisory(id string, record *osvschema.Vulnerability) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.advisories[id] = record
+}
+
 // Size returns the number of entries in the cache
 func (c *VulnerabilityCache) Size() int {
 	c.mu.RLock()
@@ -70,4 +88,5 @@ func (c *VulnerabilityCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries = make(map[string][]*osvschema.Vulnerability)
+	c.advisories = make(map[string]*osvschema.Vulnerability)
 }

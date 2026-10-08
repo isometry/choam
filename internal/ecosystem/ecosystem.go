@@ -19,8 +19,11 @@ type Ecosystem interface {
 	// Name is the melange with.language: token ("go", "rust", "java").
 	Name() string
 
-	// ManifestFiles are the modroot-relative filenames to fetch for a modroot.
-	ManifestFiles() []string
+	// ManifestFiles are the modroot-relative filenames to fetch for a
+	// modroot: a required file that cannot be fetched fails the file, an
+	// optional one may be absent (a confirmed 404 only - any other fetch
+	// failure still fails the file).
+	ManifestFiles() (required, optional []string)
 
 	// Analyze turns fetched manifest content into a normalized per-modroot
 	// dependency view. files is keyed by the basenames from ManifestFiles().

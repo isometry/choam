@@ -1,7 +1,9 @@
 package gobump
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
@@ -266,11 +268,12 @@ func NewGoBumpPipeline(analyzer *Analyzer, opts ProcessorOptions) *processor.Pip
 			},
 		}),
 
-		// File writing - only writes if there are actual file changes
-		stages.NewFileWriterStage(false, ""),
-
-		// Final validation
+		// Validate the rewritten YAML before anything touches disk.
 		stages.NewValidationStage(false, true),
+
+		// File writing - only writes if there are actual file changes
+		// (atomically; backup of the original with --backup-suffix).
+		stages.NewFileWriterStage(opts.BackupSuffix != "", opts.BackupSuffix),
 	)
 
 	return pipeline
@@ -335,29 +338,7 @@ func stdlibRebuildVersions(bumps []StdlibBump) []string {
 func epochFixedVulnIDs(gp *GoBumpProcessor) []string {
 	ids := make(map[string]struct{})
 	if gp.ActualChangesApplied && len(gp.SecurityFixes) > 0 {
-		if gp.Validated {
-			for id := range analysisSeverities(gp) {
-				ids[id] = struct{}{}
-			}
-			for _, residual := range gp.Residuals {
-				for _, id := range residual.VulnIDs {
-					delete(ids, id)
-				}
-			}
-			for _, id := range gp.UnreachableVulnIDs {
-				delete(ids, id)
-			}
-		} else {
-			for _, fix := range gp.SecurityFixes {
-				for id := range strings.SplitSeq(fix.Vulnerability, ",") {
-					id = strings.TrimSpace(id)
-					if id == "" || strings.ContainsRune(id, ' ') {
-						continue // free-text placeholder, not an advisory ID
-					}
-					ids[id] = struct{}{}
-				}
-			}
-		}
+		ids = gp.fixedVulnIDs()
 	}
 	for _, bump := range gp.StdlibBumps {
 		for _, id := range bump.VulnIDs {
@@ -437,17 +418,21 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoB
 		return &VulnerabilityAnalysis{}, nil
 	}
 
+	// Anything that prevents fetching the source's manifests skips the file
+	// (a distinct SKIPPED status, never clean): no git-checkout step (a
+	// fetch:-based source), an unresolvable repository/tag, or a repository
+	// host manifests cannot be fetched from.
 	repoURL, tag, expectedCommit, err := extractRepositoryFromYAML(gp.GetCurrentYAML(), gp.Config, gp.GetCurrentVersion())
+	if err == nil {
+		err = ecosystem.CheckRepository(repoURL)
+	}
 	if err != nil {
-		logging.From(ctx).Debug("could not extract repository info", "error", err)
-		gp.AddMessage(fmt.Sprintf("Could not extract repository info - skipping: %v", err))
+		gp.Skip(ctx, fmt.Sprintf("cannot fetch dependency manifests: %v", err))
 		return &VulnerabilityAnalysis{}, nil
 	}
-
-	if repoURL == "" {
-		gp.AddMessage("No repository URL found - skipping dependency analysis")
-		return &VulnerabilityAnalysis{}, nil
-	}
+	// Fetch what melange builds: the expected commit when pinned (a tag can
+	// move), else the tag.
+	ref := cmp.Or(expectedCommit, tag)
 
 	languages := make([]string, 0, len(units))
 	for language := range units {
@@ -475,15 +460,15 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoB
 		eco, err := ecosystem.New(language)
 		if err != nil {
 			// A language detected via annotation/build-signal but not (yet)
-			// implemented (e.g. gradle) - surface it, don't fail the run.
-			gp.AddMessage(fmt.Sprintf("%s: %v - skipping", language, err))
+			// implemented (e.g. gradle): skipped, and reported as such.
+			gp.Skip(ctx, fmt.Sprintf("%s: %v", language, err))
 			continue
 		}
 
-		logging.From(ctx).Debug("analyzing language", "repository", repoURL, "tag", tag, "modroots", modroots)
-		gp.AddMessage(fmt.Sprintf("Analyzing %s dependencies from %s @ %s (modroots: %s)", language, repoURL, tag, strings.Join(modroots, ", ")))
+		logging.From(ctx).Debug("analyzing language", "repository", repoURL, "ref", ref, "modroots", modroots)
+		gp.AddMessage(fmt.Sprintf("Analyzing %s dependencies from %s @ %s (modroots: %s)", language, repoURL, ref, strings.Join(modroots, ", ")))
 
-		result, err := v.performAnalysis(ctx, eco, language, repoURL, tag, langUnits, bumpSteps, gp)
+		result, err := v.performAnalysis(ctx, eco, language, repoURL, ref, langUnits, bumpSteps, gp)
 		if err != nil {
 			return nil, fmt.Errorf("performing %s dependency analysis: %w", language, err)
 		}
@@ -526,7 +511,10 @@ type languageResult struct {
 }
 
 // performAnalysis analyzes each module root independently: fetching its
-// manifest files, scanning for vulnerabilities, and determining the desired
+// manifest files at ref (fail closed: any fetch failure other than a
+// confirmed 404 on an optional manifest, and any unanalyzable manifest, is an
+// error for the file - never a silently clean modroot), scanning for
+// vulnerabilities, and determining the desired
 // dependency set for that root by filtering candidate bumps (its existing
 // declared deps plus any new security bumps) against its own manifest. This
 // per-root filtering applies to deps entries only: omnibump go-gets an
@@ -536,7 +524,7 @@ type languageResult struct {
 // replace pin for a module absent from a sub-module's go.mod (AUTO-954; the
 // single-module path always applies replaces unconditionally), because a replace directive, unlike a bare require,
 // survives go mod tidy. That's why replaces pass through unfiltered here.
-func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosystem.Ecosystem, language, repoURL, tag string, langUnits []analysisUnit, bumpSteps []config.BumpStep, gp *GoBumpProcessor) (*languageResult, error) {
+func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosystem.Ecosystem, language, repoURL, ref string, langUnits []analysisUnit, bumpSteps []config.BumpStep, gp *GoBumpProcessor) (*languageResult, error) {
 	fetcher := v.Analyzer.fetcher
 	scanner := v.Analyzer.vulnerabilityScanner
 
@@ -549,7 +537,7 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 	if language == "go" {
 		existingGoVersionByRoot = existingGoVersionsForModroots(modroots, bumpSteps)
 	}
-	manifestFiles := eco.ManifestFiles()
+	required, optional := eco.ManifestFiles()
 
 	result := &languageResult{
 		Vulns: make(map[string]scan.Vulnerability),
@@ -563,21 +551,22 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 		// shadow above.
 		ctx := logging.With(ctx, "modroot", root)
 
-		files := make(map[string][]byte, len(manifestFiles))
-		for _, name := range manifestFiles {
-			content, err := fetcher.FetchFile(ctx, repoURL, tag, modrootPath(root, name))
-			if err != nil {
-				logging.From(ctx).Debug("could not fetch manifest file", "manifest", name, "error", err)
+		files := make(map[string][]byte, len(required)+len(optional))
+		for _, name := range append(slices.Clone(required), optional...) {
+			content, err := fetcher.FetchFile(ctx, repoURL, ref, modrootPath(root, name))
+			if errors.Is(err, ecosystem.ErrNotFound) && slices.Contains(optional, name) {
+				logging.From(ctx).Debug("optional manifest file absent", "manifest", name)
 				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("modroot %s: %w", root, err)
 			}
 			files[name] = content
 		}
 
 		deps, err := eco.Analyze(ctx, files)
 		if err != nil {
-			logging.From(ctx).Debug("could not analyze modroot", "error", err)
-			gp.AddMessage(fmt.Sprintf("modroot %s: could not analyze dependencies (%v) - skipping", root, err))
-			continue
+			return nil, fmt.Errorf("modroot %s: analyzing dependencies: %w", root, err)
 		}
 
 		pkgs := eco.ScanPackages(ctx, deps)
@@ -807,7 +796,9 @@ func (g *GoBumpApplier) applyGoBumpChanges(ctx context.Context, gp *GoBumpProces
 	// Best-effort go-version computation for modroots the simulation didn't
 	// prove (--no-validate, degrade, or per-root skips) - must run before
 	// reconciliation so the value feeds step emission and the pin floor.
-	g.fallbackGoVersions(ctx, gp, analysis)
+	if err := g.fallbackGoVersions(ctx, gp, analysis); err != nil {
+		return err
+	}
 
 	loader := newMelangeLoader()
 
@@ -826,11 +817,11 @@ func (g *GoBumpApplier) applyGoBumpChanges(ctx context.Context, gp *GoBumpProces
 // simulation didn't cover, from the best-effort proxy probe (see
 // fallbackRequiredGoVersion), gated against the pristine baseline exactly
 // like the simulation path. Fail-open throughout: any failure just leaves
-// RequiredGoVersion empty (with a warning), never blocks the apply. When
-// GOPROXY=off (probeDisabled), the probe is skipped entirely - it would
-// only fail every fetch - and each affected modroot gets one message
-// instead.
-func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis) {
+// RequiredGoVersion empty (with a warning), never blocks the apply - except
+// a cancellation, which is returned. When GOPROXY=off (probeDisabled), the
+// probe is skipped entirely - it would only fail every fetch - and each
+// affected modroot gets one message instead.
+func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis) error {
 	for li := range analysis.ByLanguage {
 		lang := &analysis.ByLanguage[li]
 		if lang.Language != "go" {
@@ -849,7 +840,15 @@ func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProces
 				gp.AddMessage(fmt.Sprintf("modroot %s: GOPROXY=off - skipping best-effort Go version probe", m.Modroot))
 				continue
 			}
-			required, err := fallbackRequiredGoVersion(ctx, g.httpClient(), g.goProxyURL, m, g.skipPrivateModule)
+			required, unfetched, err := fallbackRequiredGoVersion(ctx, g.httpClient(), g.goProxyURL, m, g.skipPrivateModule)
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			if err == nil && unfetched > 0 {
+				logging.From(ctx).Warn("best-effort Go version probe incomplete - the required Go version may be higher",
+					"modroot", m.Modroot, "unfetched", unfetched)
+				gp.AddMessage(fmt.Sprintf("modroot %s: best-effort Go version probe incomplete (%d candidate go.mod file(s) could not be fetched) - the required Go version may be higher", m.Modroot, unfetched))
+			}
 			if err != nil {
 				logging.From(ctx).Warn("could not determine required Go version (best-effort probe failed)",
 					"modroot", m.Modroot, "error", err)
@@ -865,6 +864,9 @@ func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProces
 			// - which feeds both the go-version field and the go-package pin
 			// floor - confirm it names a real Go release.
 			valid, offlineErr := validateGoVersionFloor(ctx, g.releaseIndex(), goversion.Minor(required))
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			if offlineErr != nil {
 				logging.From(ctx).Warn("could not validate required Go version against known releases (index unavailable) - proceeding",
 					"modroot", m.Modroot, "version", required, "error", offlineErr)
@@ -884,6 +886,7 @@ func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProces
 				m.Modroot, required, baselineWord(pristineGoBaseline(m))))
 		}
 	}
+	return nil
 }
 
 // reconcileBumpSteps writes the desired per-modroot dependency sets back into
@@ -1443,5 +1446,10 @@ func extractRepositoryFromYAML(yamlContent []byte, cfg *melange.Configuration, l
 		return "", "", "", fmt.Errorf("resolving tag template %q: %w", tag, err)
 	}
 
-	return resolvedRepoURL, resolvedTag, expectedCommit, nil
+	resolvedCommit, err := renderer.RenderString(expectedCommit)
+	if err != nil {
+		return "", "", "", fmt.Errorf("resolving expected-commit template %q: %w", expectedCommit, err)
+	}
+
+	return resolvedRepoURL, resolvedTag, resolvedCommit, nil
 }

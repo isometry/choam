@@ -45,7 +45,9 @@ func init() {
 
 func (e *Ecosystem) Name() string { return "java" }
 
-func (e *Ecosystem) ManifestFiles() []string { return []string{"pom.xml"} }
+func (e *Ecosystem) ManifestFiles() (required, optional []string) {
+	return []string{"pom.xml"}, nil
+}
 
 func (e *Ecosystem) Analyze(ctx context.Context, files map[string][]byte) (*ecosystem.ModuleDeps, error) {
 	pomContent, ok := files["pom.xml"]

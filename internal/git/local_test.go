@@ -1,6 +1,7 @@
 package git
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -231,18 +232,30 @@ func TestRunGitStatus(t *testing.T) {
 	})
 }
 
-// TestRunGitStatus_NotInvoked covers runGitStatus's invoked=false paths: a
-// failing git invocation (non-existent root directory) and a missing git
-// binary (empty PATH). Both must report invoked=false with a nil error so
-// the caller falls back to isDirty.
-func TestRunGitStatus_NotInvoked(t *testing.T) {
+// TestRunGitStatus_Failures: only a missing git binary is a fallback
+// (invoked=false, nil error); a git that runs and fails, or is cancelled,
+// surfaces its error rather than silently switching to go-git.
+func TestRunGitStatus_Failures(t *testing.T) {
 	requireGit(t)
 
-	t.Run("command failure", func(t *testing.T) {
-		dirty, invoked, err := runGitStatus(t.Context(), filepath.Join(t.TempDir(), "does-not-exist"), "melange.yaml")
-		require.NoError(t, err)
-		assert.False(t, invoked)
-		assert.False(t, dirty)
+	t.Run("command failure surfaces", func(t *testing.T) {
+		_, invoked, err := runGitStatus(t.Context(), filepath.Join(t.TempDir(), "does-not-exist"), "melange.yaml")
+		require.Error(t, err)
+		assert.True(t, invoked)
+		assert.Contains(t, err.Error(), "git status")
+	})
+
+	t.Run("cancellation surfaces", func(t *testing.T) {
+		dir, _, _ := newLocalFixtureRepo(t)
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		_, invoked, err := runGitStatus(ctx, dir, "melange.yaml")
+		assert.True(t, invoked)
+		require.ErrorIs(t, err, context.Canceled)
+
+		_, _, invoked, err = runGitLog(ctx, dir, "melange.yaml")
+		assert.True(t, invoked)
+		require.ErrorIs(t, err, context.Canceled)
 	})
 
 	t.Run("missing binary", func(t *testing.T) {
@@ -254,10 +267,9 @@ func TestRunGitStatus_NotInvoked(t *testing.T) {
 	})
 }
 
-// TestFileDirty_FallsBackToIsDirty covers fileDirty's fallback line: when the
-// git CLI cannot be invoked (here: root points at a non-existent directory,
-// so `git -C root status` fails), it must fall back to the go-git isDirty
-// byte-compare against the still-valid repo handle.
+// TestFileDirty_FallsBackToIsDirty covers fileDirty's fallback line: when no
+// git binary is on PATH, it must fall back to the go-git isDirty
+// byte-compare.
 func TestFileDirty_FallsBackToIsDirty(t *testing.T) {
 	requireGit(t)
 	dir, _, _ := newLocalFixtureRepo(t)
@@ -265,16 +277,16 @@ func TestFileDirty_FallsBackToIsDirty(t *testing.T) {
 	repo, err := gogit.PlainOpen(dir)
 	require.NoError(t, err)
 
-	badRoot := filepath.Join(t.TempDir(), "does-not-exist")
 	filePath := filepath.Join(dir, "melange.yaml")
+	t.Setenv("PATH", t.TempDir())
 
-	dirty, err := fileDirty(t.Context(), repo, badRoot, filePath, "melange.yaml")
+	dirty, err := fileDirty(t.Context(), repo, dir, filePath, "melange.yaml")
 	require.NoError(t, err)
 	assert.False(t, dirty, "clean fixture should read clean via the isDirty fallback")
 
 	require.NoError(t, os.WriteFile(filePath, []byte("package:\n  name: fixture-modified\n"), 0o644))
 
-	dirty, err = fileDirty(t.Context(), repo, badRoot, filePath, "melange.yaml")
+	dirty, err = fileDirty(t.Context(), repo, dir, filePath, "melange.yaml")
 	require.NoError(t, err)
 	assert.True(t, dirty, "modified fixture should read dirty via the isDirty fallback")
 }

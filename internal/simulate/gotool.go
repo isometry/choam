@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
@@ -100,6 +101,10 @@ func (t *GoToolchain) runEnvTimeout(parent context.Context, dir string, extraEnv
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, t.goBin, args...)
+	killProcessGroupOnCancel(cmd)
+	// Backstop: stop waiting for stdout/stderr this long after the process
+	// is killed, even if something outside the group still holds a pipe.
+	cmd.WaitDelay = waitDelay
 	cmd.Dir = dir
 	cmd.Env = append(os.Environ(),
 		"GOTOOLCHAIN=auto",
@@ -130,6 +135,24 @@ func (t *GoToolchain) runEnvTimeout(parent context.Context, dir string, extraEnv
 		return nil, err
 	}
 	return stdout.Bytes(), nil
+}
+
+// waitDelay bounds how long a cancelled go command's output pipes are
+// drained after the kill (see exec.Cmd.WaitDelay).
+const waitDelay = 5 * time.Second
+
+// checkModuleArg rejects a module path or version that the go command would
+// parse as a flag (or that is not a module/import path at all) before it is
+// placed on a go command line. Versions may be semver or a query (a commit
+// hash, "latest"); only a leading '-' or whitespace is refused.
+func checkModuleArg(path, version string) error {
+	if err := module.CheckImportPath(path); err != nil {
+		return fmt.Errorf("refusing go command argument: %w", err)
+	}
+	if strings.HasPrefix(version, "-") || strings.ContainsFunc(version, unicode.IsSpace) {
+		return fmt.Errorf("refusing go command argument: malformed version %q for %s", version, path)
+	}
+	return nil
 }
 
 // ErrInfrastructure marks a go tool failure caused by the environment - the
@@ -189,6 +212,10 @@ func (t *GoToolchain) ModTidy(ctx context.Context, dir string) error {
 }
 
 func (t *GoToolchain) Get(ctx context.Context, dir, moduleAtVersion string) error {
+	path, version, _ := strings.Cut(moduleAtVersion, "@")
+	if err := checkModuleArg(path, version); err != nil {
+		return err
+	}
 	_, err := t.run(ctx, dir, "get", moduleAtVersion)
 	return err
 }
@@ -503,6 +530,9 @@ func (t *GoToolchain) modCacheFile(dir, line string) (file, coord string, ok boo
 // ModuleVersions lists the released versions of module (`go list -m
 // -versions`), in ascending semver order.
 func (t *GoToolchain) ModuleVersions(ctx context.Context, dir, modulePath string) ([]string, error) {
+	if err := checkModuleArg(modulePath, ""); err != nil {
+		return nil, err
+	}
 	output, err := t.run(ctx, dir, "list", "-m", "-versions", modulePath)
 	if err != nil {
 		return nil, err
@@ -519,6 +549,9 @@ func (t *GoToolchain) ModuleVersions(ctx context.Context, dir, modulePath string
 // ResolveQuery resolves module@query (e.g. a commit hash) to a concrete
 // version (`go list -m`).
 func (t *GoToolchain) ResolveQuery(ctx context.Context, dir, modulePath, query string) (string, error) {
+	if err := checkModuleArg(modulePath, query); err != nil {
+		return "", err
+	}
 	output, err := t.run(ctx, dir, "list", "-m", "-f", "{{.Version}}", modulePath+"@"+query)
 	if err != nil {
 		return "", err
@@ -577,6 +610,9 @@ func (t *GoToolchain) RequiredBy(ctx context.Context, dir string) (map[string]ma
 // (`go list -m -json` fetches only the .mod/.info, never the zip), memoized
 // per toolchain: module versions are immutable.
 func (t *GoToolchain) ModuleRequires(ctx context.Context, dir, modulePath, version string) (map[string]string, error) {
+	if err := checkModuleArg(modulePath, version); err != nil {
+		return nil, err
+	}
 	key := modulePath + "@" + version
 	t.modRequiresMu.Lock()
 	cached, ok := t.modRequires[key]
@@ -618,6 +654,11 @@ func (t *GoToolchain) ModuleRequires(ctx context.Context, dir, modulePath, versi
 // Replace applies a replace directive with gobump parity: dropreplace first
 // (so a stale directive can't shadow the new one), then the replacement.
 func (t *GoToolchain) Replace(ctx context.Context, dir, oldPath, newPath, version string) error {
+	for _, path := range []string{oldPath, newPath} {
+		if err := checkModuleArg(path, version); err != nil {
+			return err
+		}
+	}
 	if _, err := t.run(ctx, dir, "mod", "edit", "-dropreplace="+oldPath); err != nil {
 		return err
 	}

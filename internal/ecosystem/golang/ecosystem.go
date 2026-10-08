@@ -11,7 +11,6 @@ package golang
 import (
 	"context"
 	"fmt"
-	"strings"
 
 	"github.com/isometry/choam/internal/ecosystem"
 	"github.com/isometry/choam/internal/scan"
@@ -39,9 +38,11 @@ func init() {
 
 func (e *Ecosystem) Name() string { return "go" }
 
-// ManifestFiles returns go.mod and go.sum. go.sum is optional at fetch time
-// (some projects predate its existence) - Analyze tolerates its absence.
-func (e *Ecosystem) ManifestFiles() []string { return []string{"go.mod", "go.sum"} }
+// ManifestFiles returns go.mod (required) and go.sum (optional: a module
+// with no dependencies has none) - Analyze tolerates its absence.
+func (e *Ecosystem) ManifestFiles() (required, optional []string) {
+	return []string{"go.mod"}, []string{"go.sum"}
+}
 
 func (e *Ecosystem) Analyze(_ context.Context, files map[string][]byte) (*ecosystem.ModuleDeps, error) {
 	goModContent, ok := files["go.mod"]
@@ -81,7 +82,7 @@ func (e *Ecosystem) ScanPackages(_ context.Context, deps *ecosystem.ModuleDeps) 
 
 	pkgs := make([]scan.Package, 0, len(info.AllRequirements))
 	for module, version := range info.AllRequirements {
-		if strings.HasPrefix(module, "std") {
+		if module == "std" || module == "cmd" { // stdlib pseudo-modules, never real requirements
 			continue
 		}
 

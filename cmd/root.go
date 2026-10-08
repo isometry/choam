@@ -27,6 +27,7 @@ var (
 	simulationTimeout time.Duration
 	noStdlib          bool
 	noCompile         bool
+	failOnResidual    bool
 )
 
 // NewRootCmd creates the root command

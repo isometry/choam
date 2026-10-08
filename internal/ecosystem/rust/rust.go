@@ -39,7 +39,9 @@ func (e *Ecosystem) Name() string { return "rust" }
 
 // ManifestFiles returns Cargo.lock only: omnibump's RustAnalyzer.Analyze
 // reads Cargo.lock exclusively and never consults Cargo.toml.
-func (e *Ecosystem) ManifestFiles() []string { return []string{"Cargo.lock"} }
+func (e *Ecosystem) ManifestFiles() (required, optional []string) {
+	return []string{"Cargo.lock"}, nil
+}
 
 func (e *Ecosystem) Analyze(ctx context.Context, files map[string][]byte) (*ecosystem.ModuleDeps, error) {
 	lockContent, ok := files["Cargo.lock"]

@@ -21,11 +21,11 @@ func NewPipeline(orchestrator *UpdateOrchestrator) *processor.Pipeline {
 		// Epoch handling - use the common epoch stage with version-change strategy
 		stages.NewEpochStage(&stages.ResetOnVersionChangeStrategy{}),
 
+		// Validate the rewritten YAML before anything touches disk.
+		stages.NewValidationStage(false, true),
+
 		// File writing - only writes if there are actual file changes
 		stages.NewFileWriterStage(false, ""),
-
-		// Final validation
-		stages.NewValidationStage(false, true),
 	)
 
 	return pipeline
