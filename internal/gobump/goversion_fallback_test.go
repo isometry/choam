@@ -4,8 +4,10 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
 	"github.com/stretchr/testify/assert"
@@ -78,9 +80,10 @@ func TestFallbackRequiredGoVersion(t *testing.T) {
 			DesiredDeps:     []string{"example.com/a@v1.2.0", "example.com/b@v2.0.0"},
 			DesiredReplaces: []string{"example.com/old=example.com/new@v3.0.0"},
 		}
-		got, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, nil)
+		got, unfetched, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "1.26", got)
+		assert.Equal(t, 1, unfetched, "the partial fetch is reported")
 	})
 
 	t.Run("go.mod without a go directive contributes nothing", func(t *testing.T) {
@@ -88,7 +91,7 @@ func TestFallbackRequiredGoVersion(t *testing.T) {
 			"/example.com/a/@v/v1.2.0.mod": "module example.com/a\n",
 		})
 		m := &ModrootAnalysis{DesiredDeps: []string{"example.com/a@v1.2.0"}}
-		got, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, nil)
+		got, _, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "", got)
 	})
@@ -98,14 +101,14 @@ func TestFallbackRequiredGoVersion(t *testing.T) {
 			"/github.com/!some!org/dep/@v/v1.0.0.mod": "module github.com/SomeOrg/dep\n\ngo 1.25\n",
 		})
 		m := &ModrootAnalysis{DesiredDeps: []string{"github.com/SomeOrg/dep@v1.0.0"}}
-		got, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, nil)
+		got, _, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "1.25", got)
 	})
 
 	t.Run("no candidates - empty without error", func(t *testing.T) {
 		server := fakeGoProxy(t, nil)
-		got, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, &ModrootAnalysis{}, nil)
+		got, _, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, &ModrootAnalysis{}, nil)
 		require.NoError(t, err)
 		assert.Equal(t, "", got)
 	})
@@ -113,7 +116,7 @@ func TestFallbackRequiredGoVersion(t *testing.T) {
 	t.Run("every fetch failed - error for the caller to warn about", func(t *testing.T) {
 		server := fakeGoProxy(t, nil) // 404s everything
 		m := &ModrootAnalysis{DesiredDeps: []string{"example.com/a@v1.2.0"}}
-		got, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, nil)
+		got, _, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, nil)
 		require.Error(t, err)
 		assert.Equal(t, "", got)
 	})
@@ -123,7 +126,7 @@ func TestFallbackRequiredGoVersion(t *testing.T) {
 		m := &ModrootAnalysis{DesiredDeps: []string{"example.com/a@v1.2.0"}}
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		got, err := fallbackRequiredGoVersion(ctx, server.Client(), server.URL, m, nil)
+		got, _, err := fallbackRequiredGoVersion(ctx, server.Client(), server.URL, m, nil)
 
 		require.Error(t, err)
 		assert.ErrorIs(t, err, context.Canceled)
@@ -151,7 +154,7 @@ func TestFallbackRequiredGoVersion(t *testing.T) {
 			return strings.HasPrefix(modulePath, "example.com/private/")
 		}
 
-		got, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, skip)
+		got, _, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, skip)
 		require.NoError(t, err)
 		assert.Equal(t, "1.25", got)
 		assert.NotContains(t, hitPaths, "/example.com/private/secret/@v/v2.0.0.mod",
@@ -172,7 +175,7 @@ func TestFallbackRequiredGoVersion(t *testing.T) {
 		}}
 		skip := func(modulePath string) bool { return true }
 
-		got, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, skip)
+		got, _, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, skip)
 		require.Error(t, err)
 		assert.Equal(t, "", got)
 		assert.Contains(t, err.Error(), "2 private modules skipped")
@@ -220,7 +223,7 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 		gp := newTestProcessor(t, singleGoBumpYAML)
 		analysis := fallbackAnalysis(t, "1.22")
 
-		newApplier().fallbackGoVersions(t.Context(), gp, analysis)
+		require.NoError(t, newApplier().fallbackGoVersions(t.Context(), gp, analysis))
 
 		assert.Equal(t, "1.26", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 		var messaged bool
@@ -232,11 +235,22 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 		assert.True(t, messaged, "expected a best-effort message, got %v", gp.GetMessages())
 	})
 
+	t.Run("cancellation is returned, not warned past", func(t *testing.T) {
+		gp := newTestProcessor(t, singleGoBumpYAML)
+		analysis := fallbackAnalysis(t, "1.22")
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+
+		err := newApplier().fallbackGoVersions(ctx, gp, analysis)
+		require.ErrorIs(t, err, context.Canceled)
+		assert.Empty(t, analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
+	})
+
 	t.Run("gated against the baseline", func(t *testing.T) {
 		gp := newTestProcessor(t, singleGoBumpYAML)
 		analysis := fallbackAnalysis(t, "1.26") // baseline already covers the candidates
 
-		newApplier().fallbackGoVersions(t.Context(), gp, analysis)
+		require.NoError(t, newApplier().fallbackGoVersions(t.Context(), gp, analysis))
 		assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 	})
 
@@ -245,7 +259,7 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 		analysis := fallbackAnalysis(t, "1.22")
 		analysis.ByLanguage[0].ByModroot[0].Simulated = true
 
-		newApplier().fallbackGoVersions(t.Context(), gp, analysis)
+		require.NoError(t, newApplier().fallbackGoVersions(t.Context(), gp, analysis))
 		assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 	})
 
@@ -260,7 +274,7 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 		gp := newTestProcessor(t, singleGoBumpYAML)
 		analysis := fallbackAnalysis(t, "1.22")
 
-		applier.fallbackGoVersions(t.Context(), gp, analysis)
+		require.NoError(t, applier.fallbackGoVersions(t.Context(), gp, analysis))
 		assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 		var warned bool
 		for _, msg := range gp.GetMessages() {
@@ -276,7 +290,7 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 		analysis := fallbackAnalysis(t, "1.22")
 		analysis.ByLanguage[0].Language = "rust"
 
-		newApplier().fallbackGoVersions(t.Context(), gp, analysis)
+		require.NoError(t, newApplier().fallbackGoVersions(t.Context(), gp, analysis))
 		assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 	})
 
@@ -297,7 +311,7 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 			gp := newTestProcessor(t, singleGoBumpYAML)
 			analysis := fallbackAnalysis(t, "1.22")
 
-			applier.fallbackGoVersions(t.Context(), gp, analysis)
+			require.NoError(t, applier.fallbackGoVersions(t.Context(), gp, analysis))
 
 			assert.Equal(t, "1.26", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 			for _, msg := range gp.GetMessages() {
@@ -321,7 +335,7 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 			gp := newTestProcessor(t, singleGoBumpYAML)
 			analysis := fallbackAnalysis(t, "1.22")
 
-			applier.fallbackGoVersions(t.Context(), gp, analysis)
+			require.NoError(t, applier.fallbackGoVersions(t.Context(), gp, analysis))
 
 			assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion,
 				"an unknown Go release must never become a floor")
@@ -354,7 +368,7 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 			gp := newTestProcessor(t, singleGoBumpYAML)
 			analysis := fallbackAnalysis(t, "1.22")
 
-			applier.fallbackGoVersions(t.Context(), gp, analysis)
+			require.NoError(t, applier.fallbackGoVersions(t.Context(), gp, analysis))
 
 			assert.Equal(t, "1.26", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion,
 				"an unreachable release index must fail open and keep the probed result")
@@ -382,7 +396,7 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 		gp := newTestProcessor(t, singleGoBumpYAML)
 		analysis := fallbackAnalysis(t, "1.22")
 
-		applier.fallbackGoVersions(t.Context(), gp, analysis)
+		require.NoError(t, applier.fallbackGoVersions(t.Context(), gp, analysis))
 		assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 		var messaged bool
 		for _, msg := range gp.GetMessages() {
@@ -403,7 +417,7 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 		gp := newTestProcessor(t, singleGoBumpYAML)
 		analysis := fallbackAnalysis(t, "1.22") // candidate: example.com/a@v1.2.0
 
-		applier.fallbackGoVersions(t.Context(), gp, analysis)
+		require.NoError(t, applier.fallbackGoVersions(t.Context(), gp, analysis))
 		assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 		var warned bool
 		for _, msg := range gp.GetMessages() {
@@ -492,8 +506,37 @@ func TestGoBumpApplier_PublicFallbackSkipsGOPRIVATEUnion(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	m := &ModrootAnalysis{DesiredDeps: []string{"secret.corp/private@v1.0.0"}}
-	got, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, applier.skipPrivateModule)
+	got, _, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, applier.skipPrivateModule)
 	require.Error(t, err) // the only candidate is private, so nothing was fetched.
 	assert.Equal(t, "", got)
 	assert.Empty(t, hitPaths, "GOPRIVATE-matched module must never reach the public proxy fallback")
+}
+
+// TestGoBumpApplier_FallbackTimeoutIsVisible: the best-effort probe's budget
+// expiring (a slow proxy, a loaded machine) must never change what is
+// written silently: no Go version floor is set, the deps are untouched, and
+// the user is told the probe failed.
+func TestGoBumpApplier_FallbackTimeoutIsVisible(t *testing.T) {
+	t.Setenv("GOPROXY", "")
+	t.Setenv("GOPRIVATE", "")
+	t.Setenv("GONOPROXY", "")
+	saved := fallbackGoVersionBudget
+	fallbackGoVersionBudget = 50 * time.Millisecond
+	t.Cleanup(func() { fallbackGoVersionBudget = saved })
+
+	hang := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+	t.Cleanup(hang.Close)
+	applier := NewGoBumpApplier(nil)
+	applier.goProxyURL = hang.URL
+
+	gp := newTestProcessor(t, singleGoBumpYAML)
+	analysis := fallbackAnalysis(t, "1.22")
+	require.NoError(t, applier.fallbackGoVersions(t.Context(), gp, analysis))
+
+	m := analysis.ByLanguage[0].ByModroot[0]
+	assert.Empty(t, m.RequiredGoVersion)
+	assert.Equal(t, []string{"example.com/a@v1.2.0"}, m.DesiredDeps)
+	assert.True(t, slices.ContainsFunc(gp.GetMessages(), func(msg string) bool {
+		return strings.Contains(msg, "could not determine required Go version")
+	}), "expected a visible probe-failure message, got %v", gp.GetMessages())
 }

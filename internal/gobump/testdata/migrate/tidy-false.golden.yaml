@@ -1,0 +1,22 @@
+package:
+  name: example
+  version: "1.0.0"
+  epoch: 0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      tidy: false # toolchain pinned; skip the -go tidy
+      deps: |-
+        golang.org/x/net@v0.56.0
+      language: go
+
+  - uses: go/build
+    with:
+      go-package: go-1.26
+      packages: .

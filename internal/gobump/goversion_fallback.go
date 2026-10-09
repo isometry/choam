@@ -23,8 +23,8 @@ const defaultGoProxyURL = "https://proxy.golang.org"
 
 // fallbackGoVersionBudget bounds one modroot's whole fallback probe - it is
 // best-effort by design (see fallbackRequiredGoVersion) and must never stall
-// the apply phase.
-const fallbackGoVersionBudget = 30 * time.Second
+// the apply phase. A variable only so tests can exercise the timeout.
+var fallbackGoVersionBudget = 30 * time.Second
 
 // maxGoModBytes caps how much of a proxy .mod response is read; real go.mod
 // files are tiny, so anything beyond this is not one.
@@ -43,11 +43,13 @@ const maxGoModBytes = 1 << 20
 // debug log, and an error is returned only when nothing at all could be
 // fetched (the caller warns and proceeds without a value) - the error notes
 // how many candidates were skipped as private so an all-private modroot is
-// reported honestly rather than silently omitting the raise.
-func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBaseURL string, m *ModrootAnalysis, skip func(modulePath string) bool) (string, error) {
+// reported honestly rather than silently omitting the raise. unfetched counts
+// the non-private candidates that could not be fetched, so a partial result
+// (a floor that may be too low) is warned about rather than trusted silently.
+func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBaseURL string, m *ModrootAnalysis, skip func(modulePath string) bool) (maxGo string, unfetched int, err error) {
 	candidates := fallbackCandidates(m)
 	if len(candidates) == 0 {
-		return "", nil
+		return "", 0, nil
 	}
 
 	// parentCtx is checked (not the budget-bounded ctx below) so that this
@@ -58,7 +60,6 @@ func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBa
 	ctx, cancel := context.WithTimeout(ctx, fallbackGoVersionBudget)
 	defer cancel()
 
-	var maxGo string
 	fetched := 0
 	skippedPrivate := 0
 	for _, candidate := range candidates {
@@ -71,10 +72,11 @@ func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBa
 		goDirective, err := fetchModGoDirective(ctx, client, proxyBaseURL, candidate.module, candidate.version)
 		if err != nil {
 			if cerr := parentCtx.Err(); cerr != nil {
-				return "", cerr
+				return "", 0, cerr
 			}
 			logging.From(ctx).Debug("go-version fallback: could not fetch candidate go.mod - skipping",
 				"modroot", m.Modroot, "module", candidate.module, "version", candidate.version, "error", err)
+			unfetched++
 			continue
 		}
 		fetched++
@@ -83,11 +85,11 @@ func fallbackRequiredGoVersion(ctx context.Context, client *http.Client, proxyBa
 
 	if fetched == 0 {
 		if skippedPrivate > 0 {
-			return "", fmt.Errorf("none of the %d candidate go.mod files could be fetched (%d private modules skipped)", len(candidates), skippedPrivate)
+			return "", unfetched, fmt.Errorf("none of the %d candidate go.mod files could be fetched (%d private modules skipped)", len(candidates), skippedPrivate)
 		}
-		return "", fmt.Errorf("none of the %d candidate go.mod files could be fetched", len(candidates))
+		return "", unfetched, fmt.Errorf("none of the %d candidate go.mod files could be fetched", len(candidates))
 	}
-	return maxGo, nil
+	return maxGo, unfetched, nil
 }
 
 // moduleVersion is one fallback candidate coordinate.

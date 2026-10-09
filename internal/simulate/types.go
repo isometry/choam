@@ -1,6 +1,7 @@
 // Package simulate validates a proposed set of Go module bumps by doing what
-// the melange build's go/bump step will do, ahead of time: clone the upstream
-// source at the exact tag, apply the bumps with the real go toolchain, then
+// the melange build's bump step will do, ahead of time: clone the upstream
+// source at the exact tag, apply the bumps with the step's own semantics
+// (gobump for `uses: go/bump`, omnibump for `uses: bump` - see Engine), then
 // OSV-rescan the resolved module graph and raise versions until a fixpoint.
 // The deps list that survives is proven to (a) resolve cleanly and (b) leave
 // no known-fixable vulnerability behind; anything unreachable is reported as
@@ -9,9 +10,11 @@ package simulate
 
 import (
 	"context"
+	"slices"
 	"time"
 
 	"github.com/isometry/choam/internal/scan"
+	"golang.org/x/mod/semver"
 )
 
 // Toolchain abstracts the go tool operations the simulation needs. The real
@@ -42,17 +45,70 @@ type Toolchain interface {
 	// local filesystem target is reported with Version == "".
 	Replaces(ctx context.Context, dir string) (map[string]ReplaceTarget, error)
 	// Linked returns the module paths AND package import paths in the
-	// transitive non-test import graph of the given build patterns (empty
-	// means ./...) - the modules the linker records in the binary's
-	// buildinfo, i.e. what actually ships, plus the package-level detail
-	// for checking advisories' vulnerable import paths. Errors make
+	// transitive non-test import graph of the target (see BuildTarget),
+	// unioned over its arches - the modules the linker records in the
+	// binary's buildinfo, i.e. what actually ships, plus the package-level
+	// detail for checking advisories' vulnerable import paths. Errors make
 	// reachability filtering fail OPEN (treat everything as linked).
-	Linked(ctx context.Context, dir string, patterns []string) (modules, packages map[string]struct{}, err error)
+	Linked(ctx context.Context, dir string, target BuildTarget) (modules, packages map[string]struct{}, err error)
 	// LinkedStd returns the set of standard-library import paths in the
-	// transitive non-test import graph of the given build patterns (empty
-	// means ./...), evaluated for GOOS=linux (same walk semantics as
-	// Linked, inverted filter).
-	LinkedStd(ctx context.Context, dir string, patterns []string) (map[string]struct{}, error)
+	// transitive non-test import graph of the target (same arch union and
+	// walk semantics as Linked, inverted filter).
+	LinkedStd(ctx context.Context, dir string, target BuildTarget) (map[string]struct{}, error)
+}
+
+// Compiler is the optional compile-gate seam: a Toolchain that also
+// implements it enables the post-convergence compile gate (see
+// loop.compileGate), unless Options.NoCompile is set. *GoToolchain
+// implements it.
+type Compiler interface {
+	// Compile compiles (without linking) the transitive non-test import
+	// graph of the target for GOOS=linux and GOARCH=arch, reporting
+	// per-package failures. An error return means the go tool itself could
+	// not run, not that packages failed to compile.
+	Compile(ctx context.Context, dir string, target BuildTarget, arch string) (*CompileReport, error)
+	// ModuleVersions lists module's released versions, ascending.
+	ModuleVersions(ctx context.Context, dir, module string) ([]string, error)
+	// ModuleRequires returns the require entries of module@version's own
+	// go.mod.
+	ModuleRequires(ctx context.Context, dir, module, version string) (map[string]string, error)
+}
+
+// BuildTarget is what the melange build compiles for one modroot: build
+// package patterns (empty means ./...), tags, the GOARCHes the package is
+// built for (empty means amd64 and arm64; see TargetArches) and the build
+// environment.
+type BuildTarget struct {
+	Patterns []string
+	Tags     []string
+	Arches   []string
+	Env      BuildEnv
+}
+
+// BuildEnv is the part of the melange build environment that changes which
+// files are built (see targetBuildEnv).
+type BuildEnv struct {
+	// CGO is the spec's CGO_ENABLED: "0" or "1", "" when unset or not
+	// understood (the melange default then applies: enabled).
+	CGO string
+	// GOExperiment is the GOEXPERIMENT the build runs with ("" for none).
+	GOExperiment string
+}
+
+// CompileReport is the outcome of one Compiler.Compile.
+type CompileReport struct {
+	// Failed maps each package that failed to compile to its first error
+	// lines ("# pkg" header stripped).
+	Failed map[string][]string
+	// Modules maps every non-standard package in the graph to its module
+	// path (replacement applied); "" for main-module packages.
+	Modules map[string]string
+	// Imports holds the direct imports of each failed package, for repair
+	// and relaxation attribution.
+	Imports map[string][]string
+	// FileModules maps module-cache file paths named in error lines
+	// (<GOMODCACHE>/<mod>@<ver>/...) back to "module@version".
+	FileModules map[string]string
 }
 
 // ReplaceTarget is the right-hand side of a go.mod replace directive.
@@ -68,21 +124,30 @@ type Scanner interface {
 }
 
 // Candidate is one proposed module@version bump. FromCVE marks candidates
-// backed by an OSV advisory: they are defended (retried at @latest, reported
-// as residuals when unreachable), whereas coherence-only candidates
-// (carried-forward pins) are the first to be sacrificed when the
+// backed by an OSV advisory: they are defended (stepped down their fix
+// ladder, reported as residuals when unreachable), whereas coherence-only
+// candidates (carried-forward pins) are the first to be sacrificed when the
 // module graph won't resolve.
 type Candidate struct {
 	Module  string
 	Version string
 	FromCVE bool
 	VulnIDs []string
+	// Severity is the most severe advisory level the candidate addresses
+	// (scan.SeverityRank vocabulary; empty when unknown).
+	Severity string
 
-	// Replace marks a candidate applied as a go.mod replace directive
-	// (survives `go mod tidy`, unlike a plain require pin) rather than a
-	// `go get`. ReplaceOld is the directive's left-hand side; empty means a
-	// self-replace (ReplaceOld == Module). User-authored YAML replaces enter
-	// as replace seeds; the loop also promotes tidy-unsustainable CVE pins.
+	// Rungs is the candidate's fix ladder, highest first: one rung per
+	// distinct advisory fix version (plus an existing YAML version), each
+	// with the advisories it first fixes. The compile gate relaxes a
+	// candidate whose version breaks the build one rung down. Empty means
+	// the single rung {Version, VulnIDs, Severity}.
+	Rungs []Rung
+
+	// Replace marks a user-authored YAML replace (a replace seed), applied
+	// as a go.mod replace directive rather than a `go get`; the loop never
+	// creates replace directives of its own. ReplaceOld is the directive's
+	// left-hand side; empty means a self-replace (ReplaceOld == Module).
 	Replace    bool
 	ReplaceOld string
 }
@@ -96,11 +161,92 @@ func (c Candidate) OldPath() string {
 	return c.Module
 }
 
+// Rung is one step of a candidate's fix ladder: a target version and the
+// advisories (with their most severe level) first fixed at it.
+type Rung struct {
+	Version  string
+	VulnIDs  []string
+	Severity string
+}
+
+// fixRungs returns c's ladder (normalized: see mergeRungs), defaulting to its
+// single implicit rung.
+func (c Candidate) fixRungs() []Rung {
+	if len(c.Rungs) > 0 {
+		return mergeRungs(c.Rungs, nil)
+	}
+	return []Rung{{Version: c.Version, VulnIDs: c.VulnIDs, Severity: c.Severity}}
+}
+
+// FixRungs builds module's fix ladder from scan findings: one rung per
+// distinct fixed version among module's advisories (restricted to ids when
+// non-empty), plus a bare rung for each of also not already present
+// (existing pins), highest first.
+func FixRungs(vulns []scan.Vulnerability, module string, ids []string, also ...string) []Rung {
+	var rungs []Rung
+	for _, v := range vulns {
+		if v.Module != module || v.FixedVersion == "" || (len(ids) > 0 && !slices.Contains(ids, v.ID)) {
+			continue
+		}
+		rungs = append(rungs, Rung{Version: v.FixedVersion, VulnIDs: []string{v.ID}, Severity: v.Severity})
+	}
+	for _, version := range also {
+		rungs = append(rungs, Rung{Version: version})
+	}
+	return mergeRungs(rungs, nil)
+}
+
+// mergeRungs unions two ladders by version (advisories merged, most severe
+// level kept), dropping non-semver versions, highest first. Versions equal
+// under semver are one rung (v2.8.2 and v2.8.2+incompatible), spelled as
+// scan.PreferVersion picks; the result never depends on input order.
+func mergeRungs(a, b []Rung) []Rung {
+	byVersion := make(map[string]*Rung)
+	for _, r := range slices.Concat(a, b) {
+		if !semver.IsValid(r.Version) {
+			continue
+		}
+		key := semver.Canonical(r.Version)
+		existing, ok := byVersion[key]
+		if !ok {
+			byVersion[key] = &Rung{Version: r.Version, VulnIDs: r.VulnIDs, Severity: r.Severity}
+			continue
+		}
+		existing.Version = scan.PreferVersion(existing.Version, r.Version)
+		existing.VulnIDs = mergeIDs(existing.VulnIDs, r.VulnIDs)
+		existing.Severity = mergeSeverity(existing.Severity, r.Severity)
+	}
+	merged := make([]Rung, 0, len(byVersion))
+	for _, key := range sortedKeys(byVersion) {
+		merged = append(merged, *byVersion[key])
+	}
+	slices.SortFunc(merged, func(x, y Rung) int { return semver.Compare(y.Version, x.Version) })
+	return merged
+}
+
 // DroppedCandidate records a candidate removed during simulation and why.
 type DroppedCandidate struct {
 	Module  string `json:"module" yaml:"module"`
 	Version string `json:"version" yaml:"version"`
 	Reason  string `json:"reason" yaml:"reason"`
+	// Redundant marks an entry removed because it did no work: it matched or
+	// regressed upstream, or the final tidied go.mod is identical without it.
+	Redundant bool `json:"redundant,omitempty" yaml:"redundant,omitempty"`
+	// Hygiene marks a scanner-hygiene bump that was not proposed because it
+	// is not free (see HygieneModule); Reason says why.
+	Hygiene bool `json:"hygiene,omitempty" yaml:"hygiene,omitempty"`
+}
+
+// HygieneModule is a scanner-hygiene bump: a module linked into the
+// artifact whose advisories' vulnerable packages are not, raised anyway
+// because the bump is free - it changes nothing in the final go.mod but
+// this module's own version, needs no newer Go, compiles and introduces no
+// advisory. Module-level scanners (grype) flag the module version; this is
+// not a security fix and is never counted as one.
+type HygieneModule struct {
+	Module  string   `json:"module" yaml:"module"`
+	Version string   `json:"version" yaml:"version"`
+	VulnIDs []string `json:"vuln_ids" yaml:"vuln_ids"`
 }
 
 // Residual is a vulnerability the simulation could not eliminate, with the
@@ -129,10 +275,9 @@ type ModrootResult struct {
 	// relative to the original manifest.
 	FinalDeps []string `json:"final_deps" yaml:"final_deps"`
 
-	// FinalReplaces are the replace directives ("old=new@version", gobump
-	// grammar) proven to apply cleanly: user-authored seeds plus pins the
-	// loop promoted because go mod tidy would not sustain them as plain
-	// requires. Note a replace pins its module exactly - future graph
+	// FinalReplaces are the user-authored replace directives ("old=new@version",
+	// gobump grammar) proven to apply cleanly, raised where an advisory
+	// demanded it. Note a replace pins its module exactly - future graph
 	// demands for a higher version are overridden until a later choam run
 	// re-raises the directive.
 	FinalReplaces []string `json:"final_replaces,omitempty" yaml:"final_replaces,omitempty"`
@@ -172,7 +317,8 @@ type ModrootResult struct {
 	// MaxDepGoVersion is the highest go directive across the final resolved
 	// build list's non-main modules (bare form, e.g. "1.25"); empty when
 	// unavailable. The scratch main module's own directive is deliberately
-	// not consulted: the parity tidy rewrites it with -go=<host>.
+	// not consulted: the engine rewrites it (gobump: -go=<host>; omnibump:
+	// lowered to the build's Go).
 	MaxDepGoVersion string `json:"max_dep_go_version,omitempty" yaml:"max_dep_go_version,omitempty"`
 
 	// StdPackages is the stdlib slice of the final artifact import graph
@@ -183,6 +329,21 @@ type ModrootResult struct {
 	// at least one advisory (vs coherence-only pins) - the simulation-time
 	// equivalent of the checker's SecurityBumpModules.
 	CVEBackedModules []string `json:"cve_backed_modules,omitempty" yaml:"cve_backed_modules,omitempty"`
+
+	// HygieneModules are the FinalDeps entries proposed only for scanner
+	// hygiene (see HygieneModule), by module path. A module can be in both
+	// lists: a security fix raised further to clear an unlinked advisory.
+	HygieneModules []HygieneModule `json:"hygiene_modules,omitempty" yaml:"hygiene_modules,omitempty"`
+
+	// HygieneSkipped says why scanner-hygiene bumps were not evaluated
+	// although candidates existed (compile gate off, package reachability
+	// unknown, or no convergence); empty otherwise.
+	HygieneSkipped string `json:"hygiene_skipped,omitempty" yaml:"hygiene_skipped,omitempty"`
+
+	// BaselineTidies answers ModrootRequest.ProbeTidy: the pristine module
+	// tidies under omnibump (so a `tidy: false` may no longer be needed).
+	// Always false when no probe was requested.
+	BaselineTidies bool `json:"baseline_tidies,omitempty" yaml:"baseline_tidies,omitempty"`
 
 	Residuals []Residual         `json:"residuals,omitempty" yaml:"residuals,omitempty"`
 	Dropped   []DroppedCandidate `json:"dropped,omitempty" yaml:"dropped,omitempty"`
@@ -208,6 +369,16 @@ type ModrootRequest struct {
 	// import graphs define artifact reachability; empty falls back to ./...
 	// (over-approximate, never narrower than the artifact).
 	Packages []string
+	// Tags are the go/build steps' build tags (toolchaintags plus tags),
+	// applied by reachability and the compile gate so they judge the files
+	// the build will compile.
+	Tags []string
+	// Arches are the GOARCHes the package is built for (see BuildTarget):
+	// reachability is their union; the compile gate runs on the first and
+	// the final set is compiled once more on each of the others.
+	Arches []string
+	// Env is the build environment the spec sets (see BuildEnv).
+	Env BuildEnv
 	// VulnImports maps each seed advisory ID to the import paths its
 	// vulnerable code lives in (from the analysis scan's OSV metadata; see
 	// scan.Vulnerability.VulnerableImports). Seed candidates whose
@@ -220,6 +391,20 @@ type ModrootRequest struct {
 	// are reported and counted separately. Nil disables introduced-vuln
 	// classification (fail open).
 	BaselineVulnIDs map[string]struct{}
+	// Engine is the bump step's apply semantics (see Engine).
+	Engine Engine
+	// NoTidy mirrors a `tidy: false` bump step: the engine runs no go mod
+	// tidy at all.
+	NoTidy bool
+	// GoVersion is the build's Go version (bare, e.g. "1.25.9"); omnibump
+	// lowers the go directive to it, never raises it. "" means the host go
+	// (EngineOmnibump only).
+	GoVersion string
+	// ProbeTidy asks, for a NoTidy EngineOmnibump request, whether the
+	// pristine module would tidy under omnibump anyway (DoUpdate with tidy
+	// on and no entries); the answer is ModrootResult.BaselineTidies. It is
+	// informational only - the simulation itself still honours NoTidy.
+	ProbeTidy bool
 }
 
 // Options tunes the simulation.
@@ -230,6 +415,8 @@ type Options struct {
 	CommandTimeout time.Duration
 	// Budget bounds the whole per-package simulation (default 10m).
 	Budget time.Duration
+	// NoCompile disables the compile gate (see Compiler).
+	NoCompile bool
 }
 
 // WithDefaults fills unset options.

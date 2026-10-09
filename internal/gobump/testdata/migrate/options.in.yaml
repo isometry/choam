@@ -1,0 +1,25 @@
+package:
+  name: example
+  version: "1.0.0"
+  epoch: 0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  - name: Bump vulnerable dependencies
+    if: ${{build.arch}} == 'x86_64'
+    uses: go/bump
+    with:
+      modroot: sub
+      tidy-compat: "1.22"
+      show-diff: true
+      deps: |-
+        golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      modroot: sub
+      packages: .

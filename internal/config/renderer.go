@@ -2,7 +2,6 @@ package config
 
 import (
 	"fmt"
-	"maps"
 	"strconv"
 
 	"chainguard.dev/melange/pkg/cond"
@@ -150,35 +149,4 @@ func (r *Renderer) RenderString(template string) (string, error) {
 	}
 
 	return result, nil
-}
-
-// GetVariableMap returns a copy of the complete variable map
-func (r *Renderer) GetVariableMap() map[string]string {
-	result := make(map[string]string, len(r.variableMap))
-	maps.Copy(result, r.variableMap)
-	return result
-}
-
-// GetVariable gets the value of a specific variable
-func (r *Renderer) GetVariable(key string) (string, bool) {
-	// Try direct key
-	if value, exists := r.variableMap[key]; exists {
-		return value, true
-	}
-
-	// Try with ${{}} wrapper
-	wrappedKey := fmt.Sprintf("${{%s}}", key)
-	if value, exists := r.variableMap[wrappedKey]; exists {
-		return value, true
-	}
-
-	return "", false
-}
-
-// RenderConfig creates a new configuration with all variables resolved
-// This is useful when you need a fully rendered config for processing
-func (r *Renderer) RenderConfig() (*melange.Configuration, error) {
-	// For now, we'll focus on RenderString as it's the primary need
-	// Full config rendering would be more complex and may not be immediately needed
-	return nil, fmt.Errorf("full config rendering not implemented yet - use RenderString for specific fields")
 }

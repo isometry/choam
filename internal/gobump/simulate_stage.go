@@ -2,20 +2,19 @@ package gobump
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
-	"time"
 
-	omnibumpgolang "github.com/chainguard-dev/omnibump/pkg/languages/golang"
 	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
 	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/processor"
 	"github.com/isometry/choam/internal/scan"
 	"github.com/isometry/choam/internal/simulate"
-	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
 )
 
@@ -23,6 +22,27 @@ import (
 // simulate.Simulator, injectable for tests.
 type bumpSimulator interface {
 	Simulate(ctx context.Context, repoURL, tag, expectedCommit string, reqs []simulate.ModrootRequest) (map[string]*simulate.ModrootResult, error)
+}
+
+// compileCgoNote reports the compile gate's cgo limitation for modroot m:
+// the spec sets CGO_ENABLED=1, but the host cannot compile linux cgo for
+// some target arch, so the gate type-checks it with CGO_ENABLED=0
+// (reachability still uses 1: see simulate.BuildEnv). "" when not limited.
+func compileCgoNote(m ModrootAnalysis, compile bool) string {
+	if !compile || m.BuildEnv.CGO != "1" {
+		return ""
+	}
+	var limited []string
+	for _, arch := range simulate.TargetArches(m.BuildArches) {
+		if simulate.CompileCgoLimited(arch, m.BuildEnv) {
+			limited = append(limited, arch)
+		}
+	}
+	if len(limited) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("modroot %s: compile gate ran with CGO_ENABLED=0 for GOARCH=%s (the spec sets CGO_ENABLED=1, but this host cannot compile linux cgo) - cgo files count as linked but are not compile-checked",
+		m.Modroot, strings.Join(limited, ","))
 }
 
 // SimulationStage validates the Go bump candidate sets computed by the
@@ -42,11 +62,6 @@ type SimulationStage struct {
 	// degrades at Apply time (with a message) instead of failing pipeline
 	// construction; tests override it.
 	newSimulator func(ctx context.Context, opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error)
-
-	// detectCoUpdates reproduces melange gobump's build-time co-update
-	// advisory (see declareCoUpdates); a func field so tests can inject a
-	// fake without live proxy.golang.org access.
-	detectCoUpdates func(ctx context.Context, packagesToUpdate map[string]string, modFile *modfile.File) map[string]omnibumpgolang.MissingDependency
 }
 
 func NewSimulationStage(analyzer *Analyzer, opts ProcessorOptions) *SimulationStage {
@@ -55,24 +70,17 @@ func NewSimulationStage(analyzer *Analyzer, opts ProcessorOptions) *SimulationSt
 			StageName:        "bump_simulation",
 			StageDescription: "Validate Go bump candidates against a source checkout",
 		},
-		Analyzer:        analyzer,
-		Options:         opts,
-		newSimulator:    defaultSimulator,
-		detectCoUpdates: defaultDetectCoUpdates,
+		Analyzer:     analyzer,
+		Options:      opts,
+		newSimulator: defaultSimulator,
 	}
 }
 
-// defaultDetectCoUpdates wraps omnibump's DetectCoUpdates - the exact
-// function melange's bump pipeline runs at build time - discarding its
-// API-compat alert map (a heuristic "verify manually" tier, not actionable
-// here).
-func defaultDetectCoUpdates(ctx context.Context, packagesToUpdate map[string]string, modFile *modfile.File) map[string]omnibumpgolang.MissingDependency {
-	missing, _ := omnibumpgolang.DetectCoUpdates(ctx, packagesToUpdate, modFile)
-	return missing
-}
-
 func defaultSimulator(ctx context.Context, opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error) {
-	simOpts := simulate.Options{Budget: opts.SimulationTimeout}.WithDefaults()
+	simOpts := simulate.Options{
+		Budget:    opts.SimulationTimeout,
+		NoCompile: !opts.Compile,
+	}.WithDefaults()
 	toolchain, err := simulate.NewToolchain(ctx, simOpts.CommandTimeout)
 	if err != nil {
 		return nil, err
@@ -127,15 +135,34 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 
 		goEco := ecogolang.New()
 		reqs := make([]simulate.ModrootRequest, 0, len(lang.ByModroot))
+		omnibumpRoots := 0
 		for _, m := range lang.ByModroot {
+			if m.BumpEngine == simulate.EngineOmnibump {
+				omnibumpRoots++
+			}
+			if note := compileCgoNote(m, s.Options.Compile); note != "" {
+				gp.AddMessage(note)
+			}
 			reqs = append(reqs, simulate.ModrootRequest{
 				Modroot:         m.Modroot,
 				Seeds:           seedCandidates(m),
 				Baseline:        goEco.EffectiveVersions(ctx, m.Deps),
 				Packages:        m.BuildPackages,
+				Tags:            m.BuildTags,
+				Arches:          m.BuildArches,
+				Env:             m.BuildEnv,
 				VulnImports:     vulnImportPaths(m.ScanResult),
 				BaselineVulnIDs: baselineVulnIDs(m.ScanResult),
+				Engine:          m.BumpEngine,
+				NoTidy:          m.BumpNoTidy,
+				ProbeTidy:       m.BumpMigrating && m.BumpNoTidy,
+				GoVersion:       s.buildGoVersion(ctx, m.GoPackageMinor),
 			})
+		}
+		if omnibumpRoots > 0 {
+			version := simulate.OmnibumpVersion()
+			logging.From(ctx).Debug("simulating uses: bump steps with omnibump", "omnibump", version, "modroots", omnibumpRoots)
+			gp.AddMessage(fmt.Sprintf("simulation: uses: bump applied with omnibump %s", version))
 		}
 
 		results, err := sim.Simulate(ctx, analysis.RepoURL, analysis.Tag, analysis.ExpectedCommit, reqs)
@@ -143,18 +170,30 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			if cerr := ctx.Err(); cerr != nil {
 				return cerr
 			}
+			if s.failClosed(err) {
+				// The simulation could not prove the candidate set (compile
+				// gate, or a go tool infrastructure failure): writing it (or
+				// the raw pre-simulation set) could break the build, so fail
+				// the file and leave its deps untouched.
+				return fmt.Errorf("bump simulation could not validate the deps (file left unchanged): %w", err)
+			}
 			s.degrade(ctx, gp, err)
 			return nil
 		}
 
 		reach := newReachabilityDiff()
+		// Scanner-hygiene bumps proposed in any modroot, by module (OSV
+		// naming included), for the unreachable-advisory messages below.
+		hygieneProposed := make(map[string]bool)
 		// stdUnion accumulates the linked-stdlib packages across every
 		// modroot in this language; stdComplete tracks whether every one of
 		// them actually contributed a validated set. A skipped modroot or a
 		// failed-open stdlib walk in ANY modroot must invalidate the whole
 		// union - see below.
 		stdUnion := map[string]struct{}{}
-		stdComplete := true
+		// A versioned go/install builds another module version, whose
+		// stdlib slice no checkout shows.
+		stdComplete := len(scanBuildSteps(ctx, gp.Config).versionedInstalls) == 0
 		for mi := range lang.ByModroot {
 			m := &lang.ByModroot[mi]
 			// Shadowed for the rest of this iteration - see the
@@ -176,6 +215,8 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			m.SimulationConverged = result.Converged
 			m.Residuals = result.Residuals
 			m.Dropped = result.Dropped
+			m.BaselineTidies = result.BaselineTidies
+			m.HygieneModules = result.HygieneModules
 			gp.AddResiduals(result.Residuals)
 			unlinkedHere := reach.observe(*m, result.Linked, result.LinkedPackages, true, degradedUnlinkedSet(result))
 
@@ -192,8 +233,6 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			} else {
 				stdComplete = false
 			}
-
-			s.declareCoUpdates(ctx, gp, m, result)
 
 			// The proven graph's Go language requirement, gated against the
 			// module's own pristine baseline: only a genuine raise is recorded
@@ -213,8 +252,28 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 				m.Modroot, convergedWord(result.Converged), result.Iterations,
 				len(result.FinalDeps), len(result.FinalReplaces), len(result.Dropped), len(result.RemainingVulnIDs), unlinkedHere))
 			for _, dropped := range result.Dropped {
+				if dropped.Redundant {
+					gp.AddMessage(fmt.Sprintf("modroot %s: removed redundant %s@%s (%s)",
+						m.Modroot, dropped.Module, dropped.Version, strings.TrimPrefix(dropped.Reason, "redundant: ")))
+				}
+				switch {
+				case dropped.Hygiene && strings.HasPrefix(dropped.Reason, "shed: "):
+					gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s - no bump proposed",
+						m.Modroot, strings.TrimPrefix(dropped.Reason, "shed: ")))
+				case dropped.Hygiene:
+					gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s@%s %s - no bump proposed",
+						m.Modroot, dropped.Module, dropped.Version, strings.TrimPrefix(dropped.Reason, "scanner hygiene: ")))
+				}
 				logging.From(ctx).Info("bump candidate dropped by simulation",
 					"module", dropped.Module, "version", dropped.Version, "reason", dropped.Reason)
+			}
+			for _, h := range result.HygieneModules {
+				hygieneProposed[h.Module], hygieneProposed[trimMajorSuffix(h.Module)] = true, true
+				gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s@%s proposed for scanners (%s; vulnerable package not linked, not a security fix)",
+					m.Modroot, h.Module, h.Version, strings.Join(h.VulnIDs, ", ")))
+			}
+			if result.HygieneSkipped != "" {
+				gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: scanner-hygiene bumps not evaluated: %s", m.Modroot, result.HygieneSkipped))
 			}
 			for _, residual := range result.Residuals {
 				logging.From(ctx).Warn("residual vulnerability after simulation",
@@ -245,6 +304,9 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 		for _, module := range unreachableModules {
 			var msg string
 			switch {
+			case module.moduleLinked && hygieneProposed[module.name]:
+				msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - scanner hygiene bump proposed, not a security fix",
+					module.name, strings.Join(module.vulnIDs, ", "))
 			case module.moduleLinked:
 				// Precise, package-only: the module IS in the artifact, the
 				// vulnerable packages are not.
@@ -272,118 +334,31 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 	return nil
 }
 
-// coUpdateBudget bounds each declareCoUpdates round - DetectCoUpdates
-// prefetches dependency go.mod files from proxy.golang.org and can be slow
-// on huge module graphs; failing open just means the build-time advisory
-// reappears.
-const coUpdateBudget = 2 * time.Minute
-
-// declareCoUpdates makes the written deps list satisfy melange gobump's
-// build-time co-update advisory. It runs omnibump's own DetectCoUpdates -
-// the exact check the build will run - with the PROVEN final deps against
-// the pristine go.mod, and appends the recommendations that are already
-// true in the validated graph as explicit, coherence-only deps entries.
-// Gates keep this a pure declaration step with zero resolution impact:
-//   - sustained: the final tidied go.mod must require the module at >= the
-//     recommended version (a pin above that is unproven and would fail
-//     gobump's post-tidy verification);
-//   - linked: an unlinked pin would be re-dropped by the NEXT run's
-//     reachability pruning, churning the YAML forever - skip those (the
-//     build-time advisory persists for them, rarely);
-//   - absent: never duplicate a coordinate already in the list.
-//
-// Appending can itself trigger new group recommendations at build time
-// (e.g. otel -> otel/trace -> otel/metric), so the check iterates to a
-// small fixpoint. Recommendations the proven graph did NOT satisfy (a
-// lagging family member MVS didn't raise, cross-major suggestions) are
-// skipped by the sustained gate - bumping those for real would need
-// another simulation round. Best-effort throughout: any failure leaves the
-// deps list unchanged. Appended entries are absent from
-// SecurityBumpModules, so accounting never credits them as security fixes.
-// The build image may run a different omnibump version than the omnibump
-// v0.23.1 CHOAM links (the parity target), so silence is parity-by-
-// same-function, not a guarantee.
-func (s *SimulationStage) declareCoUpdates(ctx context.Context, gp *GoBumpProcessor, m *ModrootAnalysis, result *simulate.ModrootResult) {
-	if len(result.FinalDeps) == 0 || len(result.Requires) == 0 {
-		return
+// buildGoVersion is the Go version the build's bump step runs with, for the
+// omnibump engine's go-directive lowering: the latest release of the minor
+// the modroot's go/build steps pin via go-package. "" (the host go) when
+// nothing is pinned or the release index cannot answer.
+func (s *SimulationStage) buildGoVersion(ctx context.Context, minor string) string {
+	if minor == "" || s.Analyzer == nil || s.Analyzer.goReleases == nil {
+		return ""
 	}
-	modFile := ecogolang.ModFileOf(m.Deps)
-	if modFile == nil {
-		return
+	version, err := s.Analyzer.goReleases.LatestAvailable(ctx, minor)
+	if err != nil {
+		logging.From(ctx).Debug("could not resolve the pinned Go minor's latest release - simulating with the host go",
+			"go_minor", minor, "error", err)
+		return ""
 	}
-
-	ctx, cancel := context.WithTimeout(ctx, coUpdateBudget)
-	defer cancel()
-
-	const maxRounds = 3
-	for range maxRounds {
-		// Build-time omnibump's update list spans deps AND replaces, so the
-		// parity check must too ("old=new@version" contributes new@version).
-		packagesToUpdate := make(map[string]string, len(m.DesiredDeps)+len(m.DesiredReplaces))
-		for _, dep := range m.DesiredDeps {
-			if module, version, ok := splitCoordVersion(dep); ok {
-				packagesToUpdate[module] = version
-			}
-		}
-		for _, replace := range m.DesiredReplaces {
-			coord, version, ok := splitCoordVersion(replace)
-			if !ok {
-				continue
-			}
-			if _, newPath, found := strings.Cut(coord, "="); found {
-				packagesToUpdate[newPath] = version
-			}
-		}
-		if len(packagesToUpdate) == 0 {
-			return
-		}
-
-		missing := s.safeDetectCoUpdates(ctx, packagesToUpdate, modFile)
-
-		appended := false
-		for module, rec := range missing {
-			if _, present := packagesToUpdate[module]; present {
-				continue
-			}
-			sustainedVersion, required := result.Requires[module]
-			if !required || semver.Compare(sustainedVersion, rec.RequiredVersion) < 0 {
-				logging.From(ctx).Debug("co-update recommendation not satisfied by the validated graph - skipping",
-					"module", module, "recommended", rec.RequiredVersion, "reason", rec.Reason)
-				continue
-			}
-			if result.Linked != nil {
-				if _, linked := result.Linked[module]; !linked {
-					logging.From(ctx).Debug("co-update recommendation for unlinked module - skipping",
-						"module", module, "recommended", rec.RequiredVersion)
-					continue
-				}
-			}
-
-			entry := module + "@" + sustainedVersion
-			m.DesiredDeps = append(m.DesiredDeps, entry)
-			appended = true
-			gp.AddMessage(fmt.Sprintf("declared co-update: %s (required alongside the validated bumps; already satisfied by the proven graph)", entry))
-			logging.From(ctx).Info("declared co-update", "module", module,
-				"version", sustainedVersion, "reason", rec.Reason)
-		}
-
-		if !appended {
-			return
-		}
-	}
+	return version
 }
 
-// safeDetectCoUpdates guards the injected detector (omnibump internals or a
-// test double) so a panic or late failure never breaks the run - worst case
-// the build-time advisory reappears.
-func (s *SimulationStage) safeDetectCoUpdates(ctx context.Context, packagesToUpdate map[string]string, modFile *modfile.File) (missing map[string]omnibumpgolang.MissingDependency) {
-	defer func() {
-		if r := recover(); r != nil {
-			logging.From(ctx).Debug("co-update declaration panicked - skipping", "recover", r)
-			missing = nil
-		}
-	}()
-	return s.detectCoUpdates(ctx, packagesToUpdate, modFile)
+// failClosed reports whether a simulation error must fail the file instead
+// of degrading to the unvalidated candidate set: a compile-gate failure, an
+// infrastructure failure of the go tool (network, proxy, per-command
+// timeout - no verdict could be reached), or a timeout while the gate is
+// enabled (the set was never proven to compile).
+func (s *SimulationStage) failClosed(err error) bool {
+	return errors.Is(err, simulate.ErrCompileGate) || errors.Is(err, simulate.ErrInfrastructure) ||
+		(s.Options.Compile && errors.Is(err, context.DeadlineExceeded))
 }
 
 // degrade falls back to the unvalidated pre-simulation candidate set,
@@ -404,9 +379,17 @@ func (s *SimulationStage) degrade(ctx context.Context, gp *GoBumpProcessor, err 
 // seed for an already-replace-claimed module into the replace channel.
 func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 	bumpByModule := make(map[string]*simulateBumpInfo)
+	var vulns []scan.Vulnerability
 	if m.ScanResult != nil {
+		vulns = m.ScanResult.Vulnerabilities
 		for _, bump := range m.ScanResult.SecurityBumps {
-			bumpByModule[bump.Name] = &simulateBumpInfo{vulnIDs: bump.VulnIDs}
+			bumpByModule[bump.Name] = &simulateBumpInfo{name: bump.Name, current: bump.CurrentVersion, vulnIDs: bump.VulnIDs, severity: bump.Severity}
+		}
+	}
+	existingVersions := make(map[string][]string)
+	for _, dep := range m.ExistingDeps {
+		if module, version, ok := splitCoordVersion(dep); ok {
+			existingVersions[module] = append(existingVersions[module], version)
 		}
 	}
 	infoFor := func(module string) *simulateBumpInfo {
@@ -436,6 +419,7 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 		if info := infoFor(newPath); info != nil {
 			candidate.FromCVE = true
 			candidate.VulnIDs = info.vulnIDs
+			candidate.Severity = info.severity
 		}
 		seeds = append(seeds, candidate)
 	}
@@ -449,6 +433,20 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 		if info := infoFor(module); info != nil {
 			candidate.FromCVE = true
 			candidate.VulnIDs = info.vulnIDs
+			candidate.Severity = info.severity
+			// The fix ladder keeps every advisory's own fix version and the
+			// existing YAML pin, which FilterBumps merged into one (the
+			// highest) version: the compile gate relaxes down these rungs.
+			// A single rung is implied by the candidate itself.
+			also := []string{version}
+			for _, existing := range existingVersions[module] {
+				if semver.Compare(existing, info.current) > 0 {
+					also = append(also, existing) // a pin at/below the vulnerable baseline is no rung
+				}
+			}
+			if rungs := simulate.FixRungs(vulns, info.name, info.vulnIDs, also...); len(rungs) > 1 {
+				candidate.Rungs = rungs
+			}
 		}
 		seeds = append(seeds, candidate)
 	}
@@ -456,7 +454,10 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 }
 
 type simulateBumpInfo struct {
-	vulnIDs []string
+	name     string // OSV module name (no /vN suffix)
+	current  string // vulnerable version the analysis scanned
+	vulnIDs  []string
+	severity string
 }
 
 // rebuildLanguageActions recomputes one language's bump actions from its
@@ -469,8 +470,9 @@ func rebuildLanguageActions(analysis *VulnerabilityAnalysis, lang *LanguageAnaly
 		}
 	}
 	for _, m := range lang.ByModroot {
-		// Replaces-only changes (a promotion with unchanged deps) must also
-		// produce an action, or the applier never writes them.
+		// Replaces-only changes (a raised or retired user replace with
+		// unchanged deps) must also produce an action, or the applier never
+		// writes them.
 		if haveDepsChanged(m.ExistingDeps, m.DesiredDeps) || haveDepsChanged(m.ExistingReplaces, m.DesiredReplaces) {
 			kept = append(kept, BumpAction{
 				Action:       "needs_bump",
@@ -682,7 +684,7 @@ func (r *reachabilityDiff) finalize() ([]string, []unreachableModule) {
 		sort.Strings(module.vulnIDs)
 		modules = append(modules, module)
 	}
-	sort.Slice(modules, func(i, j int) bool { return modules[i].name < modules[j].name })
+	slices.SortFunc(modules, func(a, b unreachableModule) int { return strings.Compare(a.name, b.name) })
 
 	return ids, modules
 }

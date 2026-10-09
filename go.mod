@@ -6,14 +6,15 @@ require (
 	chainguard.dev/melange v0.59.0
 	github.com/Masterminds/semver/v3 v3.5.0
 	github.com/aquasecurity/table v1.11.0
-	github.com/chainguard-dev/omnibump v0.23.2
+	github.com/chainguard-dev/clog v1.8.1
+	github.com/chainguard-dev/omnibump v0.23.4
 	github.com/go-git/go-git/v5 v5.19.2
 	github.com/goccy/go-yaml v1.19.2
 	github.com/google/go-github/v81 v81.0.0
 	github.com/ossf/osv-schema/bindings/go v0.0.0-20260806060209-f3f826310aec
 	github.com/spf13/cobra v1.10.2
-	github.com/stretchr/testify v1.11.1
-	golang.org/x/mod v0.40.0
+	github.com/stretchr/testify v1.12.1
+	golang.org/x/mod v0.41.0
 	golang.org/x/oauth2 v0.36.0
 	google.golang.org/protobuf v1.36.12
 	osv.dev/bindings/go v0.0.0-20260814063909-455afb28dc82
@@ -33,13 +34,11 @@ require (
 	github.com/ProtonMail/go-crypto v1.4.1 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
-	github.com/chainguard-dev/clog v1.8.1 // indirect
 	github.com/chainguard-dev/gopom v0.0.0-20260618152953-bf852e1c3220 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/cloudflare/circl v1.6.5 // indirect
 	github.com/common-nighthawk/go-figure v0.0.0-20210622060536-734e95fb86be // indirect
 	github.com/cyphar/filepath-securejoin v0.7.0 // indirect
-	github.com/davecgh/go-spew v1.1.2-0.20180830191138-d8f796af33cc // indirect
 	github.com/emirpasic/gods v1.18.1 // indirect
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/ghodss/yaml v1.0.0 // indirect
@@ -79,7 +78,6 @@ require (
 	github.com/pavlo-v-chernykh/keystore-go/v4 v4.5.0 // indirect
 	github.com/pjbgf/sha1cd v0.6.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
-	github.com/pmezard/go-difflib v1.0.1-0.20181226105442-5d4384ee4fb2 // indirect
 	github.com/prometheus/client_golang v1.24.1 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.1 // indirect
@@ -99,6 +97,7 @@ require (
 	go.opentelemetry.io/otel/metric v1.45.0 // indirect
 	go.opentelemetry.io/otel/trace v1.45.0 // indirect
 	go.step.sm/crypto v0.87.0 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/crypto v0.55.0 // indirect
 	golang.org/x/exp v0.0.0-20260813180055-c1d0aacb2297 // indirect
 	golang.org/x/net v0.58.0 // indirect
@@ -116,6 +115,6 @@ require (
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	k8s.io/apimachinery v0.36.3 // indirect
+	k8s.io/apimachinery v0.37.0 // indirect
 	sigs.k8s.io/release-utils v0.12.4 // indirect
 )

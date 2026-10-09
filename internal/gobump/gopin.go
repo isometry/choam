@@ -1,10 +1,12 @@
 package gobump
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 
 	melange "chainguard.dev/melange/pkg/config"
@@ -53,29 +55,14 @@ func parseGoPackagePin(value string) (base, minor string, ok bool) {
 // for steps with uses: go/build or go/install, returning one pin per step
 // (including steps without a go-package, as unpinned entries). with.go-package
 // values may carry melange template expressions, so they're resolved through
-// the same renderer other build-step fields get (see unitsFromBuildSteps); a
+// the same renderer other build-step fields get (see scanBuildSteps); a
 // value that fails to render is kept raw. A rendered value that isn't a go
 // toolchain package name (parseGoPackagePin ok=false) is also treated as
 // unpinned, but its Package string is preserved so callers can warn about it.
 func goToolchainPins(ctx context.Context, cfg *melange.Configuration) []GoToolchainPin {
 	var pins []GoToolchainPin
 
-	renderer, err := config.NewRenderer(cfg)
-	if err != nil {
-		logging.From(ctx).Debug("could not build template renderer for go-toolchain-pin discovery", "error", err)
-		renderer = nil
-	}
-	render := func(value string) string {
-		if renderer == nil || !strings.Contains(value, "${{") {
-			return value
-		}
-		rendered, err := renderer.RenderString(value)
-		if err != nil {
-			logging.From(ctx).Debug("could not render go-package field", "value", value, "error", err)
-			return value
-		}
-		return rendered
-	}
+	render := newLenientRenderer(ctx, cfg).value
 
 	collect := func(steps []melange.Pipeline) {
 		for _, step := range steps {
@@ -392,11 +379,9 @@ func distinctMinorConstraints(pins []GoToolchainPin) []string {
 		seen[pin.Minor] = struct{}{}
 	}
 
-	minors := make([]string, 0, len(seen))
-	for minor := range seen {
-		minors = append(minors, minor)
-	}
-	sort.Slice(minors, func(i, j int) bool { return goversion.Compare(minors[i], minors[j]) < 0 })
+	minors := slices.SortedFunc(maps.Keys(seen), func(a, b string) int {
+		return cmp.Or(goversion.Compare(a, b), strings.Compare(a, b))
+	})
 
 	if unpinned {
 		return append([]string{""}, minors...)

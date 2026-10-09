@@ -1,0 +1,22 @@
+package:
+  name: example
+  version: "1.0.0"
+  epoch: 0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      go-version: 1.24.13
+      deps: |-
+        golang.org/x/net@v0.55.0
+
+  - uses: go/build
+    with:
+      go-package: go-1.24
+      packages: .
+      output: example

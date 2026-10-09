@@ -3,6 +3,7 @@ package gobump
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -396,13 +397,17 @@ pipeline:
       packages: ./cmd/app
 `
 
-// blockedTransport fails every HTTP request: pipeline-level tests must never
-// touch the network (the vulnerability check's manifest fetches fail fast
-// and degrade, exactly like an offline run).
-type blockedTransport struct{}
+// sourceTransport stands in for the network in pipeline-level tests: it
+// serves a dependency-free go.mod for any repository and 404s everything
+// else (go.sum included - optional, so a confirmed 404 is fine; the
+// vulnerability check fails closed on any other fetch failure).
+type sourceTransport struct{}
 
-func (blockedTransport) RoundTrip(*http.Request) (*http.Response, error) {
-	return nil, errors.New("network disabled in tests")
+func (sourceTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.URL.Host == "raw.githubusercontent.com" && strings.HasSuffix(req.URL.Path, "/go.mod") {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader("module example.com/app\n\ngo 1.22\n")), Request: req}, nil
+	}
+	return &http.Response{StatusCode: http.StatusNotFound, Body: io.NopCloser(strings.NewReader(`{"message":"Not Found"}`)), Header: http.Header{"Content-Type": {"application/json"}}, Request: req}, nil
 }
 
 // buildStdlibPipeline writes yamlContent to disk, builds the REAL production
@@ -425,7 +430,7 @@ func buildStdlibPipeline(t *testing.T, yamlContent string, opts ProcessorOptions
 	gp.SetCurrentYAML([]byte(yamlContent))
 	gp.SetOptions(processor.ProcessorOptions{DryRun: opts.DryRun, BackupSuffix: opts.BackupSuffix, TempDir: opts.TempDir})
 
-	analyzer := NewAnalyzer(&http.Client{Transport: blockedTransport{}, Timeout: time.Second})
+	analyzer := NewAnalyzer(&http.Client{Transport: sourceTransport{}, Timeout: time.Second})
 	pipeline := NewGoBumpPipeline(analyzer, opts)
 
 	var seamed bool
@@ -590,6 +595,13 @@ func TestEpochTrigger_Gates(t *testing.T) {
 			gp.MarkActualChangesApplied()
 			gp.SecurityFixes = []SecurityFix{{Module: "m"}}
 		}, true},
+		{"hygiene bumps without applied changes", func(gp *GoBumpProcessor) {
+			gp.HygieneBumps = []SecurityFix{{Module: "m"}}
+		}, false},
+		{"applied changes with hygiene bumps only", func(gp *GoBumpProcessor) {
+			gp.MarkActualChangesApplied()
+			gp.HygieneBumps = []SecurityFix{{Module: "m"}}
+		}, true},
 	}
 
 	for _, tt := range tests {
@@ -601,4 +613,43 @@ func TestEpochTrigger_Gates(t *testing.T) {
 			assert.Equal(t, tt.wantRun, shouldRun)
 		})
 	}
+}
+
+// TestPipeline_BackupSuffixAndDryRun: --backup-suffix reaches the bump
+// pipeline's writer, and a dry run (with the same suffix) writes neither the
+// file nor a backup nor any stray temp file next to it.
+func TestPipeline_BackupSuffixAndDryRun(t *testing.T) {
+	listDir := func(t *testing.T, dir string) []string {
+		entries, err := os.ReadDir(dir)
+		require.NoError(t, err)
+		var names []string
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		return names
+	}
+
+	t.Run("real run writes a backup of the original", func(t *testing.T) {
+		opts := ProcessorOptions{StdlibCheck: true, BackupSuffix: ".orig", TempDir: t.TempDir()}
+		pipeline, gp, filePath := buildStdlibPipeline(t, stdlibPipelineYAML, opts)
+		require.NoError(t, pipeline.Execute(t.Context(), gp))
+
+		backup, err := os.ReadFile(filePath + ".orig")
+		require.NoError(t, err)
+		assert.Equal(t, stdlibPipelineYAML, string(backup))
+		assert.ElementsMatch(t, []string{"example.yaml", "example.yaml.orig"}, listDir(t, filepath.Dir(filePath)))
+	})
+
+	t.Run("dry run is side-effect free", func(t *testing.T) {
+		opts := ProcessorOptions{StdlibCheck: true, DryRun: true, BackupSuffix: ".orig", TempDir: t.TempDir()}
+		pipeline, gp, filePath := buildStdlibPipeline(t, stdlibPipelineYAML, opts)
+		require.NoError(t, pipeline.Execute(t.Context(), gp))
+
+		assert.True(t, gp.IsEpochChanged(), "the intent is still recorded")
+		onDisk, err := os.ReadFile(filePath)
+		require.NoError(t, err)
+		assert.Equal(t, stdlibPipelineYAML, string(onDisk))
+		assert.Equal(t, []string{"example.yaml"}, listDir(t, filepath.Dir(filePath)))
+		assert.Empty(t, listDir(t, opts.TempDir), "no temp files left behind")
+	})
 }

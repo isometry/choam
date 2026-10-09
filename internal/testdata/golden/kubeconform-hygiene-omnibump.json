@@ -1,0 +1,25 @@
+{
+  "converged": true,
+  "final_deps": [
+    "golang.org/x/text@v0.21.0"
+  ],
+  "final_replaces": null,
+  "cve_backed_modules": null,
+  "resolved": {
+    "golang.org/x/sys": "v0.1.0",
+    "golang.org/x/text": "v0.21.0"
+  },
+  "residuals": [],
+  "dropped": [],
+  "remaining_vuln_ids": null,
+  "hygiene_modules": [
+    {
+      "module": "golang.org/x/text",
+      "version": "v0.21.0",
+      "vuln_ids": [
+        "GO-TEST-NORM",
+        "GO-TEST-PRECIS"
+      ]
+    }
+  ]
+}

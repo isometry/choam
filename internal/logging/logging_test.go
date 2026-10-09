@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+
+	"github.com/chainguard-dev/clog"
 )
 
 func TestFrom_NoLoggerOnContext_ReturnsDefault(t *testing.T) {
@@ -117,5 +119,24 @@ func TestForFile(t *testing.T) {
 	ForFile("pkg.yaml").Warn("could not parse")
 	if !strings.Contains(buf.String(), "file=pkg.yaml") {
 		t.Errorf("ForFile logger missing file attribute: %s", buf.String())
+	}
+}
+
+func TestLibrary_RoutesClogIntoContextLoggerAtDebug(t *testing.T) {
+	var buf bytes.Buffer
+	debug := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})).With("file", "pkg.yaml")
+	clog.FromContext(Library(Into(context.Background(), debug), "omnibump")).Infof("Updating %s", "x")
+	out := buf.String()
+	for _, want := range []string{"level=DEBUG", "file=pkg.yaml", "source=omnibump", `msg="Updating x"`} {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %q in output, got: %s", want, out)
+		}
+	}
+
+	buf.Reset()
+	info := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	clog.FromContext(Library(Into(context.Background(), info), "omnibump")).Warnf("noisy")
+	if buf.Len() != 0 {
+		t.Errorf("library output must be gated to -vv (Debug), got: %s", buf.String())
 	}
 }

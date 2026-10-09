@@ -15,7 +15,7 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 **Ecosystem Context:**
 - **Melange**: APK package builder that CHOAM manages
 - **Wolfi**: Container-optimized Linux distribution using CHOAM
-- **OSV database (api.osv.dev)**: Vulnerability data source, queried via the official osv.dev Go bindings
+- **OSV database (api.osv.dev)**: Vulnerability data source, queried by a small choam client (`internal/scan/osv.go`: lenient decoding, ctx-aware retries) over the official osv.dev binding message types
 - **omnibump**: Multi-ecosystem (Go/Rust/Java) dependency-bump tooling backing the `bump` command
 
 ## Architecture
@@ -42,8 +42,8 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `cmd/root.go:58` - `collectMelangeFiles()` YAML discovery
 - `cmd/check.go:14` - `NewCheckCmd()` update detection command
 - `cmd/update.go:15` - `NewUpdateCmd()` apply updates command
-- `cmd/bump.go:16` - `NewBumpCmd()` vulnerability-bump command (`gobump` alias; flags: `--dry-run`, `--format`, `--backup-suffix`, `--no-validate`, `--simulation-timeout`, `--no-stdlib`)
-- `cmd/bump.go:41` - `runBump()` vulnerability scan/apply logic
+- `cmd/bump.go:19` - `NewBumpCmd()` vulnerability-bump command (`gobump` alias; flags: `--dry-run`, `--format`, `--backup-suffix`, `--no-validate`, `--simulation-timeout`, `--no-stdlib`, `--fail-on-residual`)
+- `cmd/bump.go:51` - `runBump()` vulnerability scan/apply logic; exits non-zero (`ErrBumpFailed`) when any file errors; `summarizeBumpResults()` feeds both table and JSON/YAML (results keyed by file path)
 
 ### Core Processing Architecture
 - `internal/processor/processor.go:11` - `Processor` interface definition
@@ -56,6 +56,12 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `internal/gobump/processor.go` - `NewGoBumpProcessor()` constructor
 - `internal/gobump/stages.go` - language-agnostic orchestrator (discovery, analysis, reconcile)
 - `internal/gobump/simulate_stage.go` + `internal/simulate/` - bump simulation (proves candidate sets resolve and cover advisories with a real go toolchain)
+- `internal/simulate/hygiene.go` - scanner-hygiene ("bump when free") pass: a linked module whose advisories' vulnerable packages are not linked is raised anyway only when free (final go.mod changes by that module alone, no newer dependency Go, compiles, rescan clean); reported as `hygiene_bumps`/HYGIENE column, never as a security fix
+- `internal/gobump/discovery.go` - analysis units from `go/build`, `go/install` (unversioned only; `go/install pkg@version` ignores the checkout's go.mod, so it is reported, not bumped), `cargo/build`, bump steps and annotations; derives the build target the simulation evaluates: GOARCHes from `package.target-architecture` (empty/`all` = amd64+arm64) and the spec's build environment (`CGO_ENABLED` step > package > melange default 1; GOEXPERIMENT from go/build's `experiments` input; GOFLAGS `-tags` only for build-step-less roots) - whatever is not mirrored is reported as a `build:` message
+- `internal/simulate/gotool.go` `targetBuildEnv()` - the single source of GOOS/GOARCH/CGO_ENABLED/GOEXPERIMENT for `Linked`, `LinkedStd` and `Compile`: reachability is the union over the target arches (concurrent `go list -deps`, which needs no C toolchain, so it always uses the spec's CGO); `Compile` (gate and hygiene trials) runs on the first arch with host-capability CGO fallback, and the final set is compiled once more on each other arch (a new failure there fails closed)
+- `internal/simulate/engine.go` - apply engines: `uses: bump` steps (and new steps) simulate with the linked omnibump's `golang.DoUpdate` behind its CLI's raw-go.mod filter; `uses: go/bump` steps keep the gobump model (both honour `tidy: false`)
+- `internal/simulate/loop.go` `minimise()` - effect-based redundancy removal on the final set: an entry is dropped when it matches/regresses upstream or the engine's final go.mod is identical without it (written deps carry only entries that do work; no co-update declaration)
+- `internal/gobump/migrate.go` - automatic `uses: go/bump` -> `uses: bump` migration planning and editing (drops `go-version`, adds `go-package` pins; skipped for `work: true`/unvalidated steps)
 - `internal/gobump/gopin.go` - `go-package` toolchain pin parsing and raising on `go/build`/`go/install` steps
 - `internal/gobump/goversion_fallback.go` - best-effort `go-version` proxy fallback used under `--no-validate`
 - `internal/gobump/stdlib.go` + `internal/gobump/stdlib_stage.go` - Go stdlib staleness check and epoch-bump trigger (`--no-stdlib` to disable)
@@ -64,7 +70,8 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `internal/git/local.go` - `LastCommitInfo()` last-commit-time/dirty/shallow lookup used by the stdlib staleness idempotency guard
 - `internal/ecosystem/` - per-language `Ecosystem` implementations (`golang/`, `rust/`, `java/`) behind a self-registering plugin registry
 - `internal/ecosystem/fetcher.go` - remote manifest fetching (go.mod/Cargo.lock/pom.xml)
-- `internal/scan/vulnerability.go` - `NewVulnerabilityScanner()` OSV scanner (language-agnostic `ScanPackages`)
+- `internal/scan/vulnerability.go` - `NewVulnerabilityScanner()` OSV scanner (language-agnostic `ScanPackages`; fails closed on incomplete pages or advisory lookups)
+- `internal/scan/osv.go` - minimal api.osv.dev client (querybatch + vulns/{id})
 - `internal/scan/cache.go` - Vulnerability result caching (ecosystem-qualified keys)
 
 ### Service Clients
@@ -241,7 +248,11 @@ make fmt && make lint && make test
 - Security is highest priority
 - OSV database integration via `internal/scan/vulnerability.go`
 - Minimal fix strategy to reduce update impact
-- Epoch management tied to actual fixes
+- Epoch management tied to actual fixes (security fixes, scanner-hygiene bumps or stdlib rebuilds)
+- A module's security target is the highest fix among its LINKED advisories;
+  advisories in unlinked packages of a linked module are info (UNLINKED) and
+  at most a scanner-hygiene bump (`internal/simulate/hygiene.go`), never a
+  security fix: no go-package pin raise, no module added, shed when not free
 
 **Logging (`internal/logging`):**
 - `ctx context.Context` is the first parameter on every function that logs,

@@ -2,10 +2,10 @@ package gobump
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"slices"
 	"strings"
 	"testing"
 
@@ -112,7 +112,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		steps, err := loader.FindBumpSteps([]byte(certManagerLikeYAML))
 		require.NoError(t, err)
 
-		units := discoverAnalysisUnits(t.Context(), &melange.Configuration{}, steps)
+		units, _ := discoverAnalysisUnits(t.Context(), &melange.Configuration{}, steps, nil)
 		require.Contains(t, units, "go")
 		assert.ElementsMatch(t, []string{"cmd/a", "cmd/b", ".", "test/e2e"}, roots(units["go"]))
 	})
@@ -124,7 +124,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "go/build", With: map[string]string{"modroot": "cmd/foo"}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Equal(t, []string{"cmd/foo"}, roots(units["go"]))
 	})
 
@@ -132,7 +132,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		cfg := &melange.Configuration{
 			Pipeline: []melange.Pipeline{{Uses: "go/build"}},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Equal(t, []string{"."}, roots(units["go"]))
 	})
 
@@ -140,7 +140,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		cfg := &melange.Configuration{
 			Pipeline: []melange.Pipeline{{Uses: "cargo/build", With: map[string]string{"modroot": "."}}},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Equal(t, []string{"."}, roots(units["rust"]))
 	})
 
@@ -153,7 +153,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Equal(t, []string{"cmd/sub"}, roots(units["go"]))
 	})
 
@@ -168,7 +168,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.ElementsMatch(t, []string{"cmd/a", "cmd/b"}, roots(units["go"]))
 	})
 
@@ -178,7 +178,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				"choam/bump-rust": "cmd/foo, cmd/bar",
 			}},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.ElementsMatch(t, []string{"cmd/foo", "cmd/bar"}, roots(units["rust"]))
 	})
 
@@ -186,7 +186,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		cfg := &melange.Configuration{
 			Package: melange.Package{Annotations: map[string]string{"choam/bump-java": ""}},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Equal(t, []string{"."}, roots(units["java"]))
 	})
 
@@ -198,8 +198,32 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				"choam/bump-go": "cmd/annotated",
 			}},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, bumpSteps)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, bumpSteps, nil)
 		assert.ElementsMatch(t, []string{"cmd/existing", "cmd/build", "cmd/annotated"}, roots(units["go"]))
+	})
+
+	t.Run("engine, tidy and go-package pin per modroot", func(t *testing.T) {
+		bumpSteps := []config.BumpStep{
+			{Action: "go/bump", Modroots: []string{"cmd/legacy"}},
+			{Action: "bump", Language: "go", Modroots: []string{"cmd/untidy"}, NoTidy: true},
+			{Action: "bump", Language: "go", Modroots: []string{"cmd/legacy"}}, // first covering step wins
+		}
+		cfg := &melange.Configuration{Pipeline: []melange.Pipeline{
+			{Uses: "go/build", With: map[string]string{"modroot": "cmd/new", "go-package": "go-1.26"}},
+			{Uses: "go/build", With: map[string]string{"modroot": "cmd/new", "go-package": "go-fips-1.25"}},
+		}}
+		byRoot := make(map[string]analysisUnit)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, bumpSteps, nil)
+		for _, unit := range units["go"] {
+			byRoot[unit.Modroot] = unit
+		}
+		assert.Equal(t, simulate.EngineGobump, byRoot["cmd/legacy"].Engine)
+		assert.Equal(t, simulate.EngineOmnibump, byRoot["cmd/untidy"].Engine)
+		assert.True(t, byRoot["cmd/untidy"].NoTidy)
+		assert.Equal(t, simulate.EngineOmnibump, byRoot["cmd/new"].Engine, "a root without a step gets choam's default `uses: bump`")
+		assert.False(t, byRoot["cmd/new"].NoTidy)
+		assert.Equal(t, "1.25", byRoot["cmd/new"].GoMinor, "the lowest pinned go minor")
+		assert.Equal(t, "", byRoot["cmd/legacy"].GoMinor)
 	})
 
 	t.Run("multiple languages coexist without conflict", func(t *testing.T) {
@@ -209,7 +233,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "cargo/build", With: map[string]string{"modroot": "cli"}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Equal(t, []string{"."}, roots(units["go"]))
 		assert.Equal(t, []string{"cli"}, roots(units["rust"]))
 	})
@@ -218,7 +242,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		cfg := &melange.Configuration{
 			Pipeline: []melange.Pipeline{{Uses: "git-checkout"}, {Runs: "make build"}},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Empty(t, units)
 	})
 
@@ -226,11 +250,11 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		cfg := &melange.Configuration{
 			Pipeline: []melange.Pipeline{{Uses: "maven/pombump"}}, // not a build step with modroot
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.NotContains(t, units, "java")
 
 		cfg.Package.Annotations = map[string]string{"choam/bump-java": "."}
-		units = discoverAnalysisUnits(t.Context(), cfg, nil)
+		units, _ = discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Equal(t, []string{"."}, roots(units["java"]))
 	})
 
@@ -240,7 +264,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "go/build", With: map[string]string{"modroot": ".", "packages": "./cmd/terraform ."}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		require.Len(t, units["go"], 1)
 		assert.Equal(t, ".", units["go"][0].Modroot)
 		assert.ElementsMatch(t, []string{".", "./cmd/terraform"}, units["go"][0].Packages)
@@ -253,7 +277,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "go/build", With: map[string]string{"packages": "./cmd/b ./cmd/a"}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		require.Len(t, units["go"], 1)
 		assert.Equal(t, []string{"./cmd/a", "./cmd/b"}, units["go"][0].Packages)
 	})
@@ -265,16 +289,40 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "go/build", With: map[string]string{"packages": "./cmd/${{package.name}}"}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		require.Len(t, units["go"], 1)
 		assert.Equal(t, []string{"./cmd/example"}, units["go"][0].Packages)
 	})
 
 	t.Run("bump-step-only modroot has empty packages", func(t *testing.T) {
 		bumpSteps := []config.BumpStep{{Language: "go", Modroots: []string{"cmd/only"}}}
-		units := discoverAnalysisUnits(t.Context(), &melange.Configuration{}, bumpSteps)
+		units, _ := discoverAnalysisUnits(t.Context(), &melange.Configuration{}, bumpSteps, nil)
 		require.Len(t, units["go"], 1)
 		assert.Empty(t, units["go"][0].Packages)
+		assert.Empty(t, units["go"][0].Tags)
+	})
+
+	t.Run("go/build tags: toolchaintags default plus tags, unioned", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{
+				{Uses: "go/build", With: map[string]string{"tags": "foo, bar"}},
+				{Uses: "go/build", With: map[string]string{"toolchaintags": "netgo", "tags": "baz"}},
+			},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		require.Len(t, units["go"], 1)
+		assert.Equal(t, []string{"bar", "baz", "foo", "netgo", "osusergo"}, units["go"][0].Tags)
+	})
+
+	t.Run("go/build empty toolchaintags override drops the default", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{
+				{Uses: "go/build", With: map[string]string{"toolchaintags": ""}},
+			},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		require.Len(t, units["go"], 1)
+		assert.Empty(t, units["go"][0].Tags)
 	})
 }
 
@@ -406,8 +454,8 @@ func (f fakeRawGitHubTransport) RoundTrip(req *http.Request) (*http.Response, er
 // replaces entry for that same absent module flows into DesiredReplaces
 // untouched (performAnalysis never filters replaces - see
 // ModrootAnalysis.DesiredReplaces). This is exactly the asymmetry omnibump
-// v0.23.1 (AUTO-954) requires: a bare require would be pruned back out by go
-// mod tidy, but a replace directive survives it.
+// requires (AUTO-954): a bare require would be pruned back out by go mod
+// tidy, but a replace directive survives it.
 func TestPerformAnalysis_ReplacesPassThroughDepsFiltered(t *testing.T) {
 	goModContent := []byte("module example.com/thing\n\ngo 1.21\n")
 	httpClient := &http.Client{Transport: fakeRawGitHubTransport{goMod: goModContent}}
@@ -502,21 +550,9 @@ func TestCoalesceModroots(t *testing.T) {
 	assert.Equal(t, []string{"a@v1", "b@v1", "c@v1"}, groups[1].Deps)
 }
 
-func TestSameRootSetAndAllRootsShareDeps(t *testing.T) {
+func TestSameRootSet(t *testing.T) {
 	assert.True(t, sameRootSet([]string{"a", "b", "c"}, []string{"c", "a", "b"}))
 	assert.False(t, sameRootSet([]string{"a", "b"}, []string{"a", "b", "c"}))
-
-	shared := []ModrootAnalysis{
-		{Modroot: "a", DesiredDeps: []string{"x@v1"}},
-		{Modroot: "b", DesiredDeps: []string{"x@v1"}},
-	}
-	assert.True(t, allRootsShareDeps(shared))
-
-	diverged := []ModrootAnalysis{
-		{Modroot: "a", DesiredDeps: []string{"x@v1"}},
-		{Modroot: "b", DesiredDeps: []string{"y@v1"}},
-	}
-	assert.False(t, allRootsShareDeps(diverged))
 }
 
 // TestReconcileBumpSteps_FastPathUpdatesInPlace covers the common case: a
@@ -597,11 +633,14 @@ func TestReconcileBumpSteps_CoUpdateNotCreditedAsSecurityFix(t *testing.T) {
 	assert.Equal(t, "golang.org/x/net", gp.SecurityFixes[0].Module)
 }
 
-// TestReconcileBumpSteps_GeneralPathCoalescesDivergentRoots covers the
-// cert-manager case: modroots whose desired dependency sets diverge must end
-// up in separate "bump" steps rather than being merged into one (which would
-// let omnibump inject a dependency into a modroot that never had it).
-func TestReconcileBumpSteps_GeneralPathCoalescesDivergentRoots(t *testing.T) {
+// TestReconcileBumpSteps_DivergentRootsSplitInPlace covers the cert-manager
+// case: modroots whose desired dependency sets diverge must end up in
+// separate steps rather than being merged into one (which would let omnibump
+// inject a dependency into a modroot that never had it). Existing steps are
+// edited in place and never merged: each root belongs to the first step
+// covering it, a step whose own roots diverge is split into copies of itself
+// directly after it, and a root shared with a later step leaves that step.
+func TestReconcileBumpSteps_DivergentRootsSplitInPlace(t *testing.T) {
 	gp := newTestProcessor(t, certManagerLikeYAML)
 	loader := config.NewLoader()
 	applier := NewGoBumpApplier(nil)
@@ -610,9 +649,6 @@ func TestReconcileBumpSteps_GeneralPathCoalescesDivergentRoots(t *testing.T) {
 		ByLanguage: []LanguageAnalysis{{
 			Language: "go",
 			ByModroot: []ModrootAnalysis{
-				// cmd/a and test/e2e end up wanting the identical set despite
-				// never having shared a step in the original file - they should
-				// coalesce into one step.
 				{Modroot: "cmd/a", ExistingDeps: []string{"github.com/foo/bar@v1.1.1", "golang.org/x/net@v0.55.0"},
 					DesiredDeps: []string{"github.com/foo/bar@v1.1.1", "golang.org/x/net@v0.56.0"}},
 				{Modroot: "test/e2e", ExistingDeps: []string{"github.com/foo/baz@v2.2.2", "golang.org/x/net@v0.55.0"},
@@ -633,28 +669,21 @@ func TestReconcileBumpSteps_GeneralPathCoalescesDivergentRoots(t *testing.T) {
 
 	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
 	require.NoError(t, err)
-	require.Len(t, steps, 2)
+	require.Len(t, steps, 3)
 
-	for _, step := range steps {
-		assert.Equal(t, "bump", step.Action) // rebuilt steps use the modern action
-	}
+	// Step 1 keeps its action and position, now covering only cmd/a; its
+	// copy follows it for the fuller set; step 2 keeps only test/e2e.
+	assert.Equal(t, "go/bump", steps[0].Action)
+	assert.Equal(t, []string{"cmd/a"}, steps[0].Modroots)
+	assert.Equal(t, []string{"github.com/foo/bar@v1.1.1", "golang.org/x/net@v0.56.0"}, steps[0].Deps)
 
-	var cmdAGroup, dotGroup *config.BumpStep
-	for i := range steps {
-		if slices.Contains(steps[i].Deps, "github.com/foo/baz@v2.2.2") {
-			dotGroup = &steps[i]
-		} else {
-			cmdAGroup = &steps[i]
-		}
-	}
-	require.NotNil(t, cmdAGroup)
-	require.NotNil(t, dotGroup)
+	assert.Equal(t, "go/bump", steps[1].Action)
+	assert.Equal(t, []string{"cmd/b", "."}, steps[1].Modroots)
+	assert.Equal(t, []string{"github.com/foo/bar@v1.1.1", "golang.org/x/net@v0.56.0", "github.com/foo/baz@v2.2.2"}, steps[1].Deps)
 
-	assert.ElementsMatch(t, []string{"cmd/a", "test/e2e"}, cmdAGroup.Modroots)
-	assert.Equal(t, []string{"github.com/foo/bar@v1.1.1", "golang.org/x/net@v0.56.0"}, cmdAGroup.Deps)
-
-	assert.ElementsMatch(t, []string{"cmd/b", "."}, dotGroup.Modroots)
-	assert.Contains(t, dotGroup.Deps, "github.com/foo/baz@v2.2.2")
+	assert.Equal(t, "bump", steps[2].Action)
+	assert.Equal(t, []string{"test/e2e"}, steps[2].Modroots)
+	assert.Equal(t, []string{"github.com/foo/bar@v1.1.1", "golang.org/x/net@v0.56.0"}, steps[2].Deps)
 }
 
 // TestReconcileBumpSteps_InsertsWhenNoStepExists covers a plain Go project
@@ -780,7 +809,7 @@ func TestReconcileBumpSteps_FastPathWritesReplaces(t *testing.T) {
 	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
 	require.NoError(t, err)
 	require.Len(t, steps, 1)
-	assert.Equal(t, "go/bump", steps[0].Action) // fast path preserves the step
+	assert.Equal(t, "go/bump", steps[0].Action) // edited in place
 	assert.Equal(t, []string{"golang.org/x/net@v0.56.0"}, steps[0].Deps)
 	assert.Equal(t, []string{"github.com/aws/aws-sdk-go=github.com/aws/aws-sdk-go@v1.34.0"}, steps[0].Replaces)
 
@@ -792,9 +821,10 @@ func TestReconcileBumpSteps_FastPathWritesReplaces(t *testing.T) {
 	assert.Contains(t, modules, "github.com/aws/aws-sdk-go")
 }
 
-func TestReconcileBumpSteps_GeneralPathCoalescesByReplaces(t *testing.T) {
-	// Two roots with identical deps but divergent replaces must land in
-	// separate steps.
+func TestReconcileBumpSteps_NewStepsCoalesceByReplaces(t *testing.T) {
+	// Two roots no step covers, with identical deps but divergent replaces,
+	// must land in separate new steps; the existing step (covering a root
+	// that was not analyzed) is left exactly as it was.
 	gp := newTestProcessor(t, singleGoBumpYAML)
 	loader := config.NewLoader()
 	applier := NewGoBumpApplier(nil)
@@ -819,10 +849,12 @@ func TestReconcileBumpSteps_GeneralPathCoalescesByReplaces(t *testing.T) {
 
 	err := applier.reconcileBumpSteps(t.Context(), gp, analysis, loader)
 	require.NoError(t, err)
+	assert.True(t, strings.HasSuffix(string(gp.GetCurrentYAML()), singleGoBumpYAML[strings.Index(singleGoBumpYAML, "  - uses: go/build"):]),
+		"the existing steps are untouched")
 
 	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
 	require.NoError(t, err)
-	require.Len(t, steps, 2)
+	require.Len(t, steps, 3)
 
 	byRoot := make(map[string]config.BumpStep)
 	for _, step := range steps {
@@ -832,14 +864,14 @@ func TestReconcileBumpSteps_GeneralPathCoalescesByReplaces(t *testing.T) {
 	}
 	assert.Equal(t, []string{"github.com/aws/aws-sdk-go=github.com/aws/aws-sdk-go@v1.34.0"}, byRoot["cmd/a"].Replaces)
 	assert.Empty(t, byRoot["cmd/b"].Replaces)
+	assert.NotEqual(t, byRoot["cmd/a"].Index, byRoot["cmd/b"].Index)
+	assert.Equal(t, []string{"golang.org/x/net@v0.55.0"}, byRoot["."].Deps)
 }
 
-// TestReconcileBumpSteps_PreservesBlankLineConvention covers both blank-line
-// bugs together on the remove-then-reinsert (general) path: the convention
-// must be detected from the ORIGINAL content (before the language's steps are
-// stripped, after which a lone git-checkout has nothing to detect from), and
-// EVERY inserted step must get its separator, not just the first (three
-// divergent modroot groups force three consecutive "bump" insertions).
+// TestReconcileBumpSteps_PreservesBlankLineConvention: every step choam adds
+// - a split copy or a new step - follows the file's blank-line convention.
+// Step 1 splits three ways (cmd/a, cmd/b and the unanalyzed "." which keeps
+// its existing deps); step 2 keeps test/e2e.
 func TestReconcileBumpSteps_PreservesBlankLineConvention(t *testing.T) {
 	gp := newTestProcessor(t, certManagerLikeYAML)
 	loader := config.NewLoader()
@@ -865,33 +897,38 @@ func TestReconcileBumpSteps_PreservesBlankLineConvention(t *testing.T) {
 
 	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
 	require.NoError(t, err)
-	require.Len(t, steps, 3, "three divergent groups must produce three steps")
+	require.Len(t, steps, 4)
+	assert.Equal(t, []string{"cmd/a"}, steps[0].Modroots)
+	assert.Equal(t, []string{"cmd/b"}, steps[1].Modroots)
+	assert.Equal(t, []string{"."}, steps[2].Modroots)
+	assert.Equal(t, []string{"github.com/foo/bar@v1.1.1", "golang.org/x/net@v0.55.0"}, steps[2].Deps, "an unanalyzed root keeps its deps")
+	assert.Equal(t, []string{"test/e2e"}, steps[3].Modroots)
 
 	lines := strings.Split(string(gp.GetCurrentYAML()), "\n")
 	bumpSteps := 0
 	for i, line := range lines {
-		if strings.HasPrefix(line, "  - uses: bump") {
+		if strings.HasPrefix(line, "  - uses: bump") || strings.HasPrefix(line, "  - uses: go/bump") {
 			bumpSteps++
 			require.Greater(t, i, 0)
 			assert.Equal(t, "", strings.TrimSpace(lines[i-1]),
-				"inserted bump step at line %d must be preceded by a blank line", i+1)
+				"bump step at line %d must be preceded by a blank line", i+1)
 		}
 	}
-	assert.Equal(t, 3, bumpSteps)
+	assert.Equal(t, 4, bumpSteps)
 }
 
 func TestExistingGoVersionsForModroots(t *testing.T) {
 	steps := []config.BumpStep{
 		{Index: 1, Action: "go/bump", Modroots: []string{".", "cmd/a"}, GoVersion: "1.24"},
-		{Index: 2, Action: "bump", Modroots: []string{"."}, GoVersion: "1.26"},
-		{Index: 3, Action: "bump", Language: "rust", Modroots: []string{"."}, GoVersion: "1.99"},        // non-go step ignored
-		{Index: 4, Action: "bump", Modroots: []string{"cmd/b"}, GoVersion: "${{vars.go}}"},              // unorderable value ignored
-		{Index: 5, Action: "bump", Language: "go", Modroots: []string{"cmd/b"}, GoVersion: ""},          // no value
-		{Index: 6, Action: "bump", Language: "go", Modroots: []string{"test/e2e"}, GoVersion: "1.25.2"}, // patch-level value kept as-is
+		{Index: 2, Action: "go/bump", Modroots: []string{"."}, GoVersion: "1.26"},
+		{Index: 3, Action: "bump", Language: "go", Modroots: []string{"."}, GoVersion: "1.99"}, // bump has no go-version input: ignored
+		{Index: 4, Action: "go/bump", Modroots: []string{"cmd/b"}, GoVersion: "${{vars.go}}"},  // unorderable value ignored
+		{Index: 5, Action: "go/bump", Modroots: []string{"cmd/b"}, GoVersion: ""},              // no value
+		{Index: 6, Action: "go/bump", Modroots: []string{"test/e2e"}, GoVersion: "1.25.2"},     // patch-level value kept as-is
 	}
 
 	got := existingGoVersionsForModroots([]string{".", "cmd/a", "cmd/b", "test/e2e"}, steps)
-	assert.Equal(t, "1.26", got["."], "max across covering go steps")
+	assert.Equal(t, "1.26", got["."], "max across covering go/bump steps")
 	assert.Equal(t, "1.24", got["cmd/a"])
 	assert.Equal(t, "", got["cmd/b"])
 	assert.Equal(t, "1.25.2", got["test/e2e"])
@@ -902,21 +939,21 @@ func TestEffectiveGoVersionHelpers(t *testing.T) {
 	assert.Equal(t, "1.27", effectiveGoVersion(ModrootAnalysis{ExistingGoVersion: "1.26", RequiredGoVersion: "1.27"}))
 	assert.Equal(t, "", effectiveGoVersion(ModrootAnalysis{}))
 
-	assert.Equal(t, "1.26", maxEffectiveGoVersion([]ModrootAnalysis{
+	assert.Equal(t, "1.26", maxEffectiveGoVersion([]*ModrootAnalysis{
 		{Modroot: "a", RequiredGoVersion: "1.26"},
 		{Modroot: "b", ExistingGoVersion: "1.26"},
 	}), "shared roots: max equals the common value")
-	assert.Equal(t, "1.26", maxEffectiveGoVersion([]ModrootAnalysis{
+	assert.Equal(t, "1.26", maxEffectiveGoVersion([]*ModrootAnalysis{
 		{Modroot: "a", RequiredGoVersion: "1.26"},
 		{Modroot: "b"},
 	}), "divergent roots: max is the highest, not the empty one")
 	assert.Equal(t, "", maxEffectiveGoVersion(nil))
 }
 
-// TestCoalesceModroots_SplitsByGoVersion: identical desired deps with
-// divergent effective go-versions must land in separate groups; empty
-// go-versions group together as before.
-func TestCoalesceModroots_SplitsByGoVersion(t *testing.T) {
+// TestCoalesceModroots_IgnoresGoVersion: freshly written steps are
+// `uses: bump`, which has no go-version input, so divergent go-versions never
+// split a group.
+func TestCoalesceModroots_IgnoresGoVersion(t *testing.T) {
 	byModroot := []ModrootAnalysis{
 		{Modroot: "cmd/a", DesiredDeps: []string{"a@v1"}, RequiredGoVersion: "1.26"},
 		{Modroot: "cmd/b", DesiredDeps: []string{"a@v1"}},
@@ -924,14 +961,63 @@ func TestCoalesceModroots_SplitsByGoVersion(t *testing.T) {
 	}
 
 	groups := coalesceModroots(byModroot)
-	require.Len(t, groups, 2)
-	assert.Equal(t, []string{"cmd/a", "cmd/c"}, groups[0].Modroots)
-	assert.Equal(t, "1.26", groups[0].GoVersion)
-	assert.Equal(t, []string{"cmd/b"}, groups[1].Modroots)
-	assert.Equal(t, "", groups[1].GoVersion)
+	require.Len(t, groups, 1)
+	assert.Equal(t, []string{"cmd/a", "cmd/b", "cmd/c"}, groups[0].Modroots)
 }
 
-// TestReconcileBumpSteps_FastPathEmitsGoVersion: the fast path upserts
+// TestReconcileBumpSteps_BumpStepNeverCarriesGoVersion: a `uses: bump` step
+// (whose pipeline has no go-version input) never gains go-version from a
+// required Go raise, and a stale one is removed when choam rewrites the step;
+// a go/bump step keeps today's behaviour (see the FastPath* tests).
+func TestReconcileBumpSteps_BumpStepNeverCarriesGoVersion(t *testing.T) {
+	const bumpYAML = `package:
+  name: example
+  version: "1.0.0"
+  epoch: 0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  # keep me
+  - uses: bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.55.0
+%s`
+	for name, goVersionLine := range map[string]string{"absent": "", "stale": "      go-version: \"1.24\"\n"} {
+		t.Run(name, func(t *testing.T) {
+			gp := newTestProcessor(t, fmt.Sprintf(bumpYAML, goVersionLine))
+			loader := config.NewLoader()
+			steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
+			require.NoError(t, err)
+			analysis := &VulnerabilityAnalysis{
+				ByLanguage: []LanguageAnalysis{{
+					Language: "go",
+					ByModroot: []ModrootAnalysis{{
+						Modroot:           ".",
+						ExistingDeps:      []string{"golang.org/x/net@v0.55.0"},
+						DesiredDeps:       []string{"golang.org/x/net@v0.56.0"},
+						ExistingGoVersion: existingGoVersionsForModroots([]string{"."}, steps)["."],
+						RequiredGoVersion: "1.26",
+					}},
+				}},
+				BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"."}}},
+			}
+
+			require.NoError(t, NewGoBumpApplier(nil).reconcileBumpSteps(t.Context(), gp, analysis, loader))
+
+			content := string(gp.GetCurrentYAML())
+			assert.Contains(t, content, "golang.org/x/net@v0.56.0")
+			assert.Contains(t, content, "# keep me", "the step is edited in place")
+			assert.NotContains(t, content, "go-version")
+		})
+	}
+}
+
+// TestReconcileBumpSteps_FastPathEmitsGoVersion: the in-place edit upserts
 // go-version into the existing step when the analysis demands a raise, and
 // re-running the applier on the already-updated YAML is byte-stable.
 func TestReconcileBumpSteps_FastPathEmitsGoVersion(t *testing.T) {
@@ -963,7 +1049,7 @@ func TestReconcileBumpSteps_FastPathEmitsGoVersion(t *testing.T) {
 	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
 	require.NoError(t, err)
 	require.Len(t, steps, 1)
-	assert.Equal(t, "go/bump", steps[0].Action, "fast path preserves the step")
+	assert.Equal(t, "go/bump", steps[0].Action, "the step is edited in place")
 	assert.Equal(t, "1.26", steps[0].GoVersion)
 
 	// Second run, as a real re-run would see it: existing deps/go-version now
@@ -1042,8 +1128,8 @@ pipeline:
 }
 
 // TestReconcileBumpSteps_FastPathDivergentGoVersionsWriteMax: divergent
-// per-root effective go-versions must NOT force the rebuild path - go-version
-// is a floor, so the fast path writes the max across all covered roots into
+// per-root effective go-versions must NOT split the step - go-version is a
+// floor, so the in-place edit writes the max across all covered roots into
 // the single existing step in place, preserving its comments. Falling back
 // to rebuild here would destroy user comments, violating the
 // comment-preservation invariant.
@@ -1097,7 +1183,7 @@ pipeline:
 
 	firstPass := string(gp.GetCurrentYAML())
 	assert.Contains(t, firstPass, `go-version: "1.26"`, "single step must satisfy the most demanding root")
-	assert.Contains(t, firstPass, "# keep me", "fast path must preserve comments, not rebuild")
+	assert.Contains(t, firstPass, "# keep me", "the in-place edit must preserve comments")
 
 	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
 	require.NoError(t, err)
@@ -1132,7 +1218,7 @@ pipeline:
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{".", "cmd/a"}}},
 	}
 	require.NoError(t, applier.reconcileBumpSteps(t.Context(), gp, secondAnalysis, loader))
-	assert.Equal(t, firstPass, string(gp.GetCurrentYAML()), "re-running the fast path on divergent-go-version roots must be byte-stable")
+	assert.Equal(t, firstPass, string(gp.GetCurrentYAML()), "re-running on divergent-go-version roots must be byte-stable")
 }
 
 // TestReconcileBumpSteps_FastPathDivergentGoVersionsNeverLowers: even with
@@ -1253,13 +1339,12 @@ pipeline:
 	assert.True(t, warned, "expected a templated-go-version warning, got %v", gp.GetMessages())
 }
 
-// TestReconcileBumpSteps_GeneralPathTemplatedGoVersionWarned: when the
-// general (strip + re-insert) path rebuilds bump steps, an existing step
-// carrying a templated/unorderable go-version must not be silently dropped -
-// it can't be re-emitted (InsertBumpPipelineStep rejects non plain-version
-// characters), but the rebuild must warn loudly about it.
-func TestReconcileBumpSteps_GeneralPathTemplatedGoVersionWarned(t *testing.T) {
-	const templatedGeneralPathYAML = `package:
+// TestReconcileBumpSteps_SeparateStepsEditedInPlace: two existing go/bump
+// steps whose roots end up wanting identical deps are NOT merged; each is
+// edited in place and keeps its own options (here a templated go-version,
+// which a go/bump step that is not migrated keeps untouched).
+func TestReconcileBumpSteps_SeparateStepsEditedInPlace(t *testing.T) {
+	const twoStepsYAML = `package:
   name: example
   version: "1.0.0"
   epoch: 0
@@ -1285,12 +1370,10 @@ pipeline:
       modroot: |-
         cmd/b
 `
-	gp := newTestProcessor(t, templatedGeneralPathYAML)
+	gp := newTestProcessor(t, twoStepsYAML)
 	loader := config.NewLoader()
 	applier := NewGoBumpApplier(nil)
 
-	// Two existing go bump steps force the general (rebuild) path even
-	// though both roots end up wanting identical deps and no go-version.
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
 			Language: "go",
@@ -1304,28 +1387,13 @@ pipeline:
 
 	require.NoError(t, applier.reconcileBumpSteps(t.Context(), gp, analysis, loader))
 
-	content := string(gp.GetCurrentYAML())
-	assert.NotContains(t, content, "go-version", "the templated go-version cannot be re-emitted through the rebuild")
-
-	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
-	require.NoError(t, err)
-	for _, step := range steps {
-		assert.Equal(t, "", step.GoVersion)
-	}
-
-	var warned bool
-	for _, msg := range gp.GetMessages() {
-		if strings.Contains(msg, "not a plain version") && strings.Contains(msg, "${{vars.go-ver}}") && strings.Contains(msg, "could not be preserved") {
-			warned = true
-		}
-	}
-	assert.True(t, warned, "expected a templated-go-version-dropped warning, got %v", gp.GetMessages())
+	assert.Equal(t, strings.ReplaceAll(twoStepsYAML, "v0.55.0", "v0.56.0"), string(gp.GetCurrentYAML()))
 }
 
-// TestReconcileBumpSteps_GeneralPathSplitsByGoVersion: two roots wanting the
-// same deps but different effective go-versions must end up in separate
-// steps, each with its own (or no) go-version.
-func TestReconcileBumpSteps_GeneralPathSplitsByGoVersion(t *testing.T) {
+// TestReconcileBumpSteps_GeneralPathNeverWritesGoVersion: two roots wanting
+// the same deps share one fresh `uses: bump` step whatever their effective
+// go-versions - that pipeline has no go-version input.
+func TestReconcileBumpSteps_GeneralPathNeverWritesGoVersion(t *testing.T) {
 	gp := newTestProcessor(t, noBumpStepYAML)
 	loader := config.NewLoader()
 	applier := NewGoBumpApplier(nil)
@@ -1345,21 +1413,13 @@ func TestReconcileBumpSteps_GeneralPathSplitsByGoVersion(t *testing.T) {
 
 	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
 	require.NoError(t, err)
-	require.Len(t, steps, 2)
+	require.Len(t, steps, 1)
+	assert.ElementsMatch(t, []string{"cmd/a", "cmd/b"}, steps[0].Modroots)
+	assert.Equal(t, "", steps[0].GoVersion)
+	assert.NotContains(t, string(gp.GetCurrentYAML()), "go-version")
 
-	byRoot := make(map[string]config.BumpStep)
-	for _, step := range steps {
-		for _, root := range step.Modroots {
-			byRoot[root] = step
-		}
-	}
-	assert.Equal(t, "1.26", byRoot["cmd/a"].GoVersion)
-	assert.Equal(t, "", byRoot["cmd/b"].GoVersion)
-	assert.Contains(t, string(gp.GetCurrentYAML()), `go-version: "1.26"`)
-
-	// Second run, as a re-run would see it: the split steps now exist, and
-	// cmd/a's ExistingGoVersion comes from its own step. The general path
-	// removes and re-inserts identical steps - must be byte-stable.
+	// Second run, as a re-run would see it: nothing changes - must be
+	// byte-stable.
 	firstPass := string(gp.GetCurrentYAML())
 	secondAnalysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -1382,7 +1442,7 @@ func TestReconcileBumpSteps_GeneralPathSplitsByGoVersion(t *testing.T) {
 		BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"cmd/a", "cmd/b"}}},
 	}
 	require.NoError(t, applier.reconcileBumpSteps(t.Context(), gp, secondAnalysis, loader))
-	assert.Equal(t, firstPass, string(gp.GetCurrentYAML()), "re-running the general path must be byte-stable")
+	assert.Equal(t, firstPass, string(gp.GetCurrentYAML()), "re-running must be byte-stable")
 }
 
 // TestApplyGoBumpChanges_GoVersionAndPinWiring: the full apply-phase wiring
@@ -1585,4 +1645,73 @@ func TestEpochComment(t *testing.T) {
 		gp := NewGoBumpProcessor("/t.yaml", "pkg", "1.0.0", 1)
 		assert.Empty(t, epochComment(gp))
 	})
+
+	t.Run("security fixes plus hygiene bumps", func(t *testing.T) {
+		gp := NewGoBumpProcessor("/t.yaml", "pkg", "1.0.0", 1)
+		gp.ActualChangesApplied = true
+		gp.Validated = true
+		gp.AddSecurityFix(SecurityFix{Module: "m", Vulnerability: "GHSA-fixed"})
+		gp.AddHygieneBump(SecurityFix{Module: "golang.org/x/text", Vulnerability: "GO-2026-6629, GO-2026-5970"})
+		gp.VulnerabilityAnalysis = analysisWith(
+			scan.Vulnerability{ID: "GHSA-fixed", Severity: "HIGH"},
+			scan.Vulnerability{ID: "GO-2026-5970", Severity: "MEDIUM"},
+			scan.Vulnerability{ID: "GO-2026-6629", Severity: "MEDIUM"},
+		)
+		gp.AddUnreachableVulnIDs([]string{"GO-2026-5970", "GO-2026-6629"})
+		assert.Equal(t, "updated bumps; fixes: GHSA-fixed; hygiene: GO-2026-5970, GO-2026-6629", epochComment(gp))
+	})
+
+	t.Run("hygiene bumps only", func(t *testing.T) {
+		gp := NewGoBumpProcessor("/t.yaml", "pkg", "1.0.0", 1)
+		gp.ActualChangesApplied = true
+		gp.Validated = true
+		gp.AddHygieneBump(SecurityFix{Module: "golang.org/x/text", Vulnerability: "GO-2026-5970"})
+		gp.VulnerabilityAnalysis = analysisWith(scan.Vulnerability{ID: "GO-2026-5970", Severity: "MEDIUM"})
+		gp.AddUnreachableVulnIDs([]string{"GO-2026-5970"})
+		assert.Equal(t, "updated bumps (scanner hygiene); hygiene: GO-2026-5970", epochComment(gp))
+	})
+
+	t.Run("hygiene bumps not applied yield no clause", func(t *testing.T) {
+		gp := NewGoBumpProcessor("/t.yaml", "pkg", "1.0.0", 1)
+		gp.HygieneBumps = []SecurityFix{{Module: "m", Vulnerability: "GO-1"}}
+		assert.Empty(t, epochComment(gp))
+	})
+}
+
+// TestRecordHygieneBumps: only newly written entries the simulation
+// marked as hygiene are recorded - once per module@version across modroots,
+// with the analysis's prior version and severity - and never as security
+// fixes; JSON/YAML carry them under their own keys.
+func TestRecordHygieneBumps(t *testing.T) {
+	hygiene := []simulate.HygieneModule{{Module: "golang.org/x/text", Version: "v0.36.0", VulnIDs: []string{"GO-2026-5970"}}}
+	scanResult := &scan.ScanResult{
+		Vulnerabilities: []scan.Vulnerability{{ID: "GO-2026-5970", Module: "golang.org/x/text", Severity: "MEDIUM"}},
+		SecurityBumps:   []scan.SecurityBump{{Name: "golang.org/x/text", CurrentVersion: "v0.30.0", FixedVersion: "v0.36.0", VulnIDs: []string{"GO-2026-5970"}}},
+	}
+	modroot := func(root string, existing []string) ModrootAnalysis {
+		return ModrootAnalysis{Modroot: root, ScanResult: scanResult, ExistingDeps: existing,
+			DesiredDeps: []string{"golang.org/x/text@v0.36.0", "example.com/sec@v1.1.0"}, HygieneModules: hygiene}
+	}
+	gp := NewGoBumpProcessor("/t.yaml", "pkg", "1.0.0", 1)
+	gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{ByLanguage: []LanguageAnalysis{{Language: "go",
+		ByModroot: []ModrootAnalysis{modroot(".", nil), modroot("sub", nil), modroot("same", []string{"golang.org/x/text@v0.36.0"})}}}}
+
+	recordHygieneBumps(gp, gp.VulnerabilityAnalysis.ByLanguage[0])
+	require.Len(t, gp.HygieneBumps, 1)
+	assert.Equal(t, SecurityFix{Module: "golang.org/x/text", Vulnerability: "GO-2026-5970", OldVersion: "v0.30.0", NewVersion: "v0.36.0", Severity: "MEDIUM"},
+		gp.HygieneBumps[0])
+	assert.Empty(t, gp.SecurityFixes)
+
+	gp.MarkActualChangesApplied()
+	result := gp.ToResult()
+	assert.Equal(t, 1, result.HygieneModulesBumped)
+	assert.Zero(t, result.ModulesBumped, "BUMPED stays security-only")
+	out, err := json.Marshal(result)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), `"hygiene_bumps":[{"module":"golang.org/x/text"`)
+	assert.Contains(t, string(out), `"hygiene_modules_bumped":1`)
+
+	empty, err := json.Marshal(NewGoBumpProcessor("/t.yaml", "pkg", "1.0.0", 1).ToResult())
+	require.NoError(t, err)
+	assert.NotContains(t, string(empty), "hygiene", "no new keys without hygiene bumps")
 }

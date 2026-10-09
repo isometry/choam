@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/isometry/choam/internal/logging"
+	"github.com/isometry/choam/internal/scan"
 	"github.com/isometry/choam/internal/utils"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
@@ -63,6 +64,10 @@ func (a *analyzer) analyzeBumps(ctx context.Context, deps []string, goModInfo *G
 				logging.From(ctx).Debug("duplicate module - replacing malformed with valid",
 					"module", module,
 					"new_version", bumpVersion)
+			} else if semver.Compare(bumpVersion, existing) == 0 {
+				// Two spellings of one version (v2.8.2, v2.8.2+incompatible):
+				// keep the canonical one whichever came first.
+				latestVersions[module] = scan.PreferVersion(existing, bumpVersion)
 			} else if semver.Compare(bumpVersion, existing) > 0 {
 				// This version is newer
 				logging.From(ctx).Debug("duplicate module detected - keeping newer",
@@ -132,6 +137,9 @@ func (a *analyzer) analyzeBumps(ctx context.Context, deps []string, goModInfo *G
 				"reason", "module not found or incompatible major version")
 			continue
 		}
+
+		// OSV fix versions omit +incompatible; the module path decides it.
+		bumpVersion = scan.CanonicalModuleVersion(normalizedModule, bumpVersion)
 
 		// Get the version from go.mod using normalized path
 		goModVersion := goModInfo.AllRequirements[normalizedModule]
@@ -321,8 +329,9 @@ func (a *analyzer) normalizeModulePath(ctx context.Context, module, version stri
 			"bump_major", bumpMajor,
 			"existing_major", existingMajor)
 
-		// v0 and v1 are compatible (v0→v1 doesn't require import path changes)
-		// v2+ requires /vN suffix and major version must match exactly
+		// Only an exact major match is a compatible raise: v0 -> v1 needs no
+		// import path change, but it is still a major (breaking) change -
+		// v0 promises no compatibility. v2+ additionally needs /vN.
 		if bumpMajor == existingMajor {
 			// Major versions match exactly
 			logging.From(ctx).Debug("major versions match - compatible",
@@ -331,22 +340,13 @@ func (a *analyzer) normalizeModulePath(ctx context.Context, module, version stri
 				"result", "found")
 			return module, true
 		}
-		if (bumpMajor == "v0" || bumpMajor == "v1") && (existingMajor == "v0" || existingMajor == "v1") {
-			// v0↔v1 transitions don't require path changes
-			logging.From(ctx).Debug("v0↔v1 transition - compatible",
-				"module", module,
-				"bump_major", bumpMajor,
-				"existing_major", existingMajor,
-				"result", "found")
-			return module, true
-		}
-		// Major versions don't match and require import path changes (/v2, /v3, etc.)
-		// This is not compatible with simple go/bump updates
+		// A major version change (v0 -> v1 included) is not a compatible
+		// raise a deps entry can express.
 		logging.From(ctx).Debug("major version incompatibility detected",
 			"module", module,
 			"bump_major", bumpMajor,
 			"existing_major", existingMajor,
-			"reason", "major version upgrade requires import path changes",
+			"reason", "major version change",
 			"result", "not_found")
 		return module, false
 	}
@@ -386,13 +386,6 @@ func (a *analyzer) normalizeModulePath(ctx context.Context, module, version stri
 					"result", "found")
 				return module, true
 			}
-			// v0 and v1 are compatible
-			if (bumpMajor == "v0" || bumpMajor == "v1") && (existingMajor == "v0" || existingMajor == "v1") {
-				logging.From(ctx).Debug("v0↔v1 transition with suffix",
-					"module", module,
-					"result", "found")
-				return module, true
-			}
 			logging.From(ctx).Debug("major version mismatch with suffix",
 				"module", module,
 				"result", "not_found")
@@ -420,13 +413,6 @@ func (a *analyzer) normalizeModulePath(ctx context.Context, module, version stri
 
 		if bumpMajor == existingMajor {
 			logging.From(ctx).Debug("major versions match with corrected path",
-				"corrected_path", correctedPath,
-				"result", "found")
-			return correctedPath, true
-		}
-		// v0 and v1 are compatible
-		if (bumpMajor == "v0" || bumpMajor == "v1") && (existingMajor == "v0" || existingMajor == "v1") {
-			logging.From(ctx).Debug("v0↔v1 transition with corrected path",
 				"corrected_path", correctedPath,
 				"result", "found")
 			return correctedPath, true

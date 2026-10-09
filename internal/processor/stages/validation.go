@@ -37,8 +37,9 @@ func (v *ValidationStage) ShouldRun(ctx context.Context, p processor.Processor) 
 func (v *ValidationStage) Apply(ctx context.Context, p processor.Processor) error {
 	logger := logging.From(ctx)
 
+	tempDir := p.GetOptions().TempDir
 	if v.ValidateOriginal {
-		if err := v.validateYAML(ctx, p.GetOriginalYAML(), "original"); err != nil {
+		if err := v.validateYAML(ctx, tempDir, p.GetOriginalYAML(), "original"); err != nil {
 			logger.Error("Original YAML validation failed", "error", err)
 			return fmt.Errorf("original YAML validation failed: %w", err)
 		}
@@ -46,7 +47,7 @@ func (v *ValidationStage) Apply(ctx context.Context, p processor.Processor) erro
 	}
 
 	if v.ValidateCurrent {
-		if err := v.validateYAML(ctx, p.GetCurrentYAML(), "current"); err != nil {
+		if err := v.validateYAML(ctx, tempDir, p.GetCurrentYAML(), "current"); err != nil {
 			logger.Error("Current YAML validation failed", "error", err)
 			return fmt.Errorf("current YAML validation failed: %w", err)
 		}
@@ -57,19 +58,24 @@ func (v *ValidationStage) Apply(ctx context.Context, p processor.Processor) erro
 	return nil
 }
 
-func (v *ValidationStage) validateYAML(ctx context.Context, yamlContent []byte, label string) error {
+// validateYAML parses yamlContent as a melange configuration via a temp file
+// in tempDir (the system default when empty).
+func (v *ValidationStage) validateYAML(ctx context.Context, tempDir string, yamlContent []byte, label string) error {
 	if len(yamlContent) == 0 {
 		return fmt.Errorf("%s YAML is empty", label)
 	}
 
-	// Try to parse as melange configuration
-	tempFile, err := os.CreateTemp("", "validation_*.yaml")
+	tempFile, err := os.CreateTemp(tempDir, "validation_*.yaml")
 	if err != nil {
 		return fmt.Errorf("creating temp file: %w", err)
 	}
 	defer func() { _ = os.Remove(tempFile.Name()) }()
 
-	if err := os.WriteFile(tempFile.Name(), yamlContent, 0644); err != nil {
+	_, err = tempFile.Write(yamlContent)
+	if closeErr := tempFile.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
 		return fmt.Errorf("writing temp file: %w", err)
 	}
 

@@ -19,8 +19,11 @@ type Ecosystem interface {
 	// Name is the melange with.language: token ("go", "rust", "java").
 	Name() string
 
-	// ManifestFiles are the modroot-relative filenames to fetch for a modroot.
-	ManifestFiles() []string
+	// ManifestFiles are the modroot-relative filenames to fetch for a
+	// modroot: a required file that cannot be fetched fails the file, an
+	// optional one may be absent (a confirmed 404 only - any other fetch
+	// failure still fails the file).
+	ManifestFiles() (required, optional []string)
 
 	// Analyze turns fetched manifest content into a normalized per-modroot
 	// dependency view. files is keyed by the basenames from ManifestFiles().
@@ -37,11 +40,13 @@ type Ecosystem interface {
 	// FilterBumps merges a modroot's existing declared melange deps with
 	// fresh OSV security bumps and returns the desired melange deps for
 	// that modroot, rendered in this language's grammar, deduplicated and
-	// with no-ops/downgrades/missing entries removed. ctx bounds any
-	// network access an implementation may need and carries this modroot's
-	// logger (see internal/logging); current implementations are offline
-	// and use ctx only for logging.
-	FilterBumps(ctx context.Context, existing []string, bumps []scan.SecurityBump, deps *ModuleDeps) []string
+	// with no-ops/downgrades/missing entries removed. Fixes it refuses to
+	// apply (e.g. a semver-incompatible jump) are returned as held bumps,
+	// reported as residuals. ctx bounds any network access an
+	// implementation may need and carries this modroot's logger (see
+	// internal/logging); current implementations are offline and use ctx
+	// only for logging.
+	FilterBumps(ctx context.Context, existing []string, bumps []scan.SecurityBump, deps *ModuleDeps) ([]string, []HeldBump)
 
 	// BumpCoords maps each OSV security bump to the coordinate this
 	// ecosystem's rendered dep grammar uses for it - the segment before the
@@ -57,6 +62,12 @@ type Ecosystem interface {
 }
 
 // ModuleDeps is a normalized dependency view for one modroot.
+// HeldBump is an advisory fix FilterBumps refused to write, and why.
+type HeldBump struct {
+	Bump   scan.SecurityBump
+	Reason string
+}
+
 type ModuleDeps struct {
 	// Deps lists every dependency this ecosystem found for the modroot.
 	Deps []Dep

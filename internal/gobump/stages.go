@@ -1,7 +1,9 @@
 package gobump
 
 import (
+	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"net/http"
@@ -20,6 +22,7 @@ import (
 	"github.com/isometry/choam/internal/processor"
 	"github.com/isometry/choam/internal/processor/stages"
 	"github.com/isometry/choam/internal/scan"
+	"github.com/isometry/choam/internal/simulate"
 )
 
 // Analyzer holds the shared, ecosystem-agnostic infrastructure - remote
@@ -248,12 +251,15 @@ func NewGoBumpPipeline(analyzer *Analyzer, opts ProcessorOptions) *processor.Pip
 		stages.NewEpochStage(&stages.BumpOnSecurityFixStrategy{
 			CheckFunc: func(p processor.Processor) bool {
 				if gp, ok := p.(*GoBumpProcessor); ok {
-					// Dependency fixes only count when actual changes were
-					// applied AND security fixes exist (the critical fix). A
-					// stdlib staleness finding justifies a bump on its own -
-					// the epoch bump itself is what triggers the fixing
-					// rebuild, with zero dependency changes.
-					return (gp.ActualChangesApplied && len(gp.SecurityFixes) > 0) || len(gp.StdlibBumps) > 0
+					// Dependency changes only count when actual changes were
+					// applied AND they include security fixes (the critical
+					// fix) or scanner-hygiene bumps (the rebuild is what
+					// clears the scanner finding). A stdlib staleness finding
+					// justifies a bump on its own - the epoch bump itself is
+					// what triggers the fixing rebuild, with zero dependency
+					// changes.
+					return (gp.ActualChangesApplied && (len(gp.SecurityFixes) > 0 || len(gp.HygieneBumps) > 0)) ||
+						len(gp.StdlibBumps) > 0
 				}
 				return false
 			},
@@ -265,11 +271,12 @@ func NewGoBumpPipeline(analyzer *Analyzer, opts ProcessorOptions) *processor.Pip
 			},
 		}),
 
-		// File writing - only writes if there are actual file changes
-		stages.NewFileWriterStage(false, ""),
-
-		// Final validation
+		// Validate the rewritten YAML before anything touches disk.
 		stages.NewValidationStage(false, true),
+
+		// File writing - only writes if there are actual file changes
+		// (atomically; backup of the original with --backup-suffix).
+		stages.NewFileWriterStage(opts.BackupSuffix != "", opts.BackupSuffix),
 	)
 
 	return pipeline
@@ -282,13 +289,20 @@ const epochCommentMaxIDs = 5
 
 // epochComment composes the inline intent comment the epoch stage writes on
 // the epoch line: which action(s) triggered the rebuild ("updated bumps",
-// "rebuild with go<V>") and the advisories it fixes, most critical first.
-// The clause conditions mirror the epoch CheckFunc exactly, so the comment
-// always states why the epoch actually bumped.
+// "updated bumps (scanner hygiene)" when only hygiene entries changed,
+// "rebuild with go<V>"), the advisories it fixes and those its hygiene
+// bumps clear for scanners, most critical first. The clause conditions
+// mirror the epoch CheckFunc exactly, so the comment always states why the
+// epoch actually bumped.
 func epochComment(gp *GoBumpProcessor) string {
+	security := gp.ActualChangesApplied && len(gp.SecurityFixes) > 0
+	hygiene := gp.ActualChangesApplied && len(gp.HygieneBumps) > 0
 	var clauses []string
-	if gp.ActualChangesApplied && len(gp.SecurityFixes) > 0 {
+	switch {
+	case security:
 		clauses = append(clauses, "updated bumps")
+	case hygiene:
+		clauses = append(clauses, "updated bumps (scanner hygiene)")
 	}
 	if versions := stdlibRebuildVersions(gp.StdlibBumps); len(versions) > 0 {
 		clauses = append(clauses, "rebuild with "+strings.Join(versions, ", "))
@@ -298,8 +312,14 @@ func epochComment(gp *GoBumpProcessor) string {
 	}
 
 	comment := strings.Join(clauses, ", ")
-	if list := renderFixList(epochFixedVulnIDs(gp), analysisSeverities(gp)); list != "" {
+	severities := analysisSeverities(gp)
+	if list := renderFixList(epochFixedVulnIDs(gp), severities); list != "" {
 		comment += "; fixes: " + list
+	}
+	if hygiene {
+		if list := renderFixList(slices.Sorted(maps.Keys(fixVulnIDs(gp.HygieneBumps))), severities); list != "" {
+			comment += "; hygiene: " + list
+		}
 	}
 	return comment
 }
@@ -334,36 +354,14 @@ func stdlibRebuildVersions(bumps []StdlibBump) []string {
 func epochFixedVulnIDs(gp *GoBumpProcessor) []string {
 	ids := make(map[string]struct{})
 	if gp.ActualChangesApplied && len(gp.SecurityFixes) > 0 {
-		if gp.Validated {
-			for id := range analysisSeverities(gp) {
-				ids[id] = struct{}{}
-			}
-			for _, residual := range gp.Residuals {
-				for _, id := range residual.VulnIDs {
-					delete(ids, id)
-				}
-			}
-			for _, id := range gp.UnreachableVulnIDs {
-				delete(ids, id)
-			}
-		} else {
-			for _, fix := range gp.SecurityFixes {
-				for id := range strings.SplitSeq(fix.Vulnerability, ",") {
-					id = strings.TrimSpace(id)
-					if id == "" || strings.ContainsRune(id, ' ') {
-						continue // free-text placeholder, not an advisory ID
-					}
-					ids[id] = struct{}{}
-				}
-			}
-		}
+		ids = gp.fixedVulnIDs()
 	}
 	for _, bump := range gp.StdlibBumps {
 		for _, id := range bump.VulnIDs {
 			ids[id] = struct{}{}
 		}
 	}
-	return slices.Collect(maps.Keys(ids))
+	return slices.Sorted(maps.Keys(ids))
 }
 
 // analysisSeverities maps every advisory ID the analysis scan found to its
@@ -396,12 +394,8 @@ func renderFixList(ids []string, severities map[string]string) string {
 	if len(ids) == 0 {
 		return ""
 	}
-	sort.Slice(ids, func(i, j int) bool {
-		ri, rj := scan.SeverityRank(severities[ids[i]]), scan.SeverityRank(severities[ids[j]])
-		if ri != rj {
-			return ri < rj
-		}
-		return ids[i] < ids[j]
+	slices.SortFunc(ids, func(a, b string) int {
+		return cmp.Or(cmp.Compare(scan.SeverityRank(severities[a]), scan.SeverityRank(severities[b])), strings.Compare(a, b))
 	})
 	if len(ids) > epochCommentMaxIDs {
 		return fmt.Sprintf("%s, +%d more",
@@ -423,24 +417,37 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoB
 		return nil, fmt.Errorf("finding bump pipelines: %w", err)
 	}
 
-	units := discoverAnalysisUnits(ctx, gp.Config, bumpSteps)
+	// Migration is decided before simulation so the simulated engine is the
+	// one the written step will run (see planMigration).
+	var releases *gorelease.Index
+	if v.Analyzer != nil {
+		releases = v.Analyzer.goReleases
+	}
+	units, notes := discoverAnalysisUnits(ctx, gp.Config, bumpSteps, planMigrations(ctx, gp.GetCurrentYAML(), bumpSteps, releases))
+	for _, note := range notes {
+		gp.AddMessage("build: " + note)
+	}
 	if len(units) == 0 {
 		logging.From(ctx).Debug("not a bumpable project")
 		gp.AddMessage("Not a bumpable project - skipping dependency analysis")
 		return &VulnerabilityAnalysis{}, nil
 	}
 
+	// Anything that prevents fetching the source's manifests skips the file
+	// (a distinct SKIPPED status, never clean): no git-checkout step (a
+	// fetch:-based source), an unresolvable repository/tag, or a repository
+	// host manifests cannot be fetched from.
 	repoURL, tag, expectedCommit, err := extractRepositoryFromYAML(gp.GetCurrentYAML(), gp.Config, gp.GetCurrentVersion())
+	if err == nil {
+		err = ecosystem.CheckRepository(repoURL)
+	}
 	if err != nil {
-		logging.From(ctx).Debug("could not extract repository info", "error", err)
-		gp.AddMessage(fmt.Sprintf("Could not extract repository info - skipping: %v", err))
+		gp.Skip(ctx, fmt.Sprintf("cannot fetch dependency manifests: %v", err))
 		return &VulnerabilityAnalysis{}, nil
 	}
-
-	if repoURL == "" {
-		gp.AddMessage("No repository URL found - skipping dependency analysis")
-		return &VulnerabilityAnalysis{}, nil
-	}
+	// Fetch what melange builds: the expected commit when pinned (a tag can
+	// move), else the tag.
+	ref := cmp.Or(expectedCommit, tag)
 
 	languages := make([]string, 0, len(units))
 	for language := range units {
@@ -468,15 +475,15 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoB
 		eco, err := ecosystem.New(language)
 		if err != nil {
 			// A language detected via annotation/build-signal but not (yet)
-			// implemented (e.g. gradle) - surface it, don't fail the run.
-			gp.AddMessage(fmt.Sprintf("%s: %v - skipping", language, err))
+			// implemented (e.g. gradle): skipped, and reported as such.
+			gp.Skip(ctx, fmt.Sprintf("%s: %v", language, err))
 			continue
 		}
 
-		logging.From(ctx).Debug("analyzing language", "repository", repoURL, "tag", tag, "modroots", modroots)
-		gp.AddMessage(fmt.Sprintf("Analyzing %s dependencies from %s @ %s (modroots: %s)", language, repoURL, tag, strings.Join(modroots, ", ")))
+		logging.From(ctx).Debug("analyzing language", "repository", repoURL, "ref", ref, "modroots", modroots)
+		gp.AddMessage(fmt.Sprintf("Analyzing %s dependencies from %s @ %s (modroots: %s)", language, repoURL, ref, strings.Join(modroots, ", ")))
 
-		result, err := v.performAnalysis(ctx, eco, language, repoURL, tag, langUnits, bumpSteps, gp)
+		result, err := v.performAnalysis(ctx, eco, language, repoURL, ref, langUnits, bumpSteps, gp)
 		if err != nil {
 			return nil, fmt.Errorf("performing %s dependency analysis: %w", language, err)
 		}
@@ -519,32 +526,33 @@ type languageResult struct {
 }
 
 // performAnalysis analyzes each module root independently: fetching its
-// manifest files, scanning for vulnerabilities, and determining the desired
+// manifest files at ref (fail closed: any fetch failure other than a
+// confirmed 404 on an optional manifest, and any unanalyzable manifest, is an
+// error for the file - never a silently clean modroot), scanning for
+// vulnerabilities, and determining the desired
 // dependency set for that root by filtering candidate bumps (its existing
 // declared deps plus any new security bumps) against its own manifest. This
 // per-root filtering applies to deps entries only: omnibump go-gets an
 // absent dep, and the final tidy prunes it back out (warn-skipped), so a
 // deps entry must never be declared for a root that doesn't actually depend
-// on it. Replaces entries are exempt - since omnibump v0.23.1 (AUTO-954) the
-// workspace path re-adds a replace pin for a module absent from a
-// sub-module's go.mod (the single-module path always applied replaces
-// unconditionally), because a replace directive, unlike a bare require,
+// on it. Replaces entries are exempt - omnibump's workspace path re-adds a
+// replace pin for a module absent from a sub-module's go.mod (AUTO-954; the
+// single-module path always applies replaces unconditionally), because a replace directive, unlike a bare require,
 // survives go mod tidy. That's why replaces pass through unfiltered here.
-func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosystem.Ecosystem, language, repoURL, tag string, langUnits []analysisUnit, bumpSteps []config.BumpStep, gp *GoBumpProcessor) (*languageResult, error) {
+func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosystem.Ecosystem, language, repoURL, ref string, langUnits []analysisUnit, bumpSteps []config.BumpStep, gp *GoBumpProcessor) (*languageResult, error) {
 	fetcher := v.Analyzer.fetcher
 	scanner := v.Analyzer.vulnerabilityScanner
 
 	modroots := unitRoots(langUnits)
 	existingDepsByRoot := existingDepsForModroots(modroots, bumpSteps)
 	existingReplacesByRoot := existingReplacesForModroots(modroots, bumpSteps)
-	// go-version is a Go-only pipeline input - other languages' analyses must
-	// never carry one (the coalesce key includes it; a stray value would
-	// split their groups).
+	// go-version is a Go-only (go/bump) pipeline input - other languages'
+	// analyses never carry one.
 	existingGoVersionByRoot := make(map[string]string)
 	if language == "go" {
 		existingGoVersionByRoot = existingGoVersionsForModroots(modroots, bumpSteps)
 	}
-	manifestFiles := eco.ManifestFiles()
+	required, optional := eco.ManifestFiles()
 
 	result := &languageResult{
 		Vulns: make(map[string]scan.Vulnerability),
@@ -558,21 +566,22 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 		// shadow above.
 		ctx := logging.With(ctx, "modroot", root)
 
-		files := make(map[string][]byte, len(manifestFiles))
-		for _, name := range manifestFiles {
-			content, err := fetcher.FetchFile(ctx, repoURL, tag, modrootPath(root, name))
-			if err != nil {
-				logging.From(ctx).Debug("could not fetch manifest file", "manifest", name, "error", err)
+		files := make(map[string][]byte, len(required)+len(optional))
+		for _, name := range append(slices.Clone(required), optional...) {
+			content, err := fetcher.FetchFile(ctx, repoURL, ref, modrootPath(root, name))
+			if errors.Is(err, ecosystem.ErrNotFound) && slices.Contains(optional, name) {
+				logging.From(ctx).Debug("optional manifest file absent", "manifest", name)
 				continue
+			}
+			if err != nil {
+				return nil, fmt.Errorf("modroot %s: %w", root, err)
 			}
 			files[name] = content
 		}
 
 		deps, err := eco.Analyze(ctx, files)
 		if err != nil {
-			logging.From(ctx).Debug("could not analyze modroot", "error", err)
-			gp.AddMessage(fmt.Sprintf("modroot %s: could not analyze dependencies (%v) - skipping", root, err))
-			continue
+			return nil, fmt.Errorf("modroot %s: analyzing dependencies: %w", root, err)
 		}
 
 		pkgs := eco.ScanPackages(ctx, deps)
@@ -590,7 +599,19 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 
 		existingDeps := existingDepsByRoot[root]
 		existingReplaces := existingReplacesByRoot[root]
-		desiredDeps := eco.FilterBumps(ctx, existingDeps, scanResult.SecurityBumps, deps)
+		desiredDeps, held := eco.FilterBumps(ctx, existingDeps, scanResult.SecurityBumps, deps)
+		heldResiduals := make([]simulate.Residual, 0, len(held))
+		for _, h := range held {
+			heldResiduals = append(heldResiduals, simulate.Residual{
+				Module:          h.Bump.Name,
+				ResolvedVersion: h.Bump.CurrentVersion,
+				FixedVersion:    h.Bump.FixedVersion,
+				VulnIDs:         h.Bump.VulnIDs,
+				Reason:          h.Reason,
+			})
+			logging.From(ctx).Warn("fix held back", "module", h.Bump.Name, "fix", h.Bump.FixedVersion, "reason", h.Reason)
+		}
+		gp.AddResiduals(heldResiduals)
 
 		for _, bump := range scanResult.SecurityBumps {
 			result.RawBumps = append(result.RawBumps, fmt.Sprintf("%s@%s", bump.Name, bump.FixedVersion))
@@ -607,20 +628,29 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 		sort.Strings(securityBumpModules)
 
 		result.Analysis.ByModroot = append(result.Analysis.ByModroot, ModrootAnalysis{
-			Modroot:       root,
-			BuildPackages: unit.Packages,
-			Deps:          deps,
-			ScanResult:    scanResult,
-			ExistingDeps:  existingDeps,
-			DesiredDeps:   desiredDeps,
+			Modroot:        root,
+			BuildPackages:  unit.Packages,
+			BuildTags:      unit.Tags,
+			BuildArches:    unit.Arches,
+			BuildEnv:       unit.Env,
+			BumpEngine:     unit.Engine,
+			BumpMigrating:  unit.Migrating,
+			BumpNoTidy:     unit.NoTidy,
+			GoPackageMinor: unit.GoMinor,
+			Deps:           deps,
+			ScanResult:     scanResult,
+			ExistingDeps:   existingDeps,
+			DesiredDeps:    desiredDeps,
 			// Analysis never invents replaces - it carries existing ones
-			// forward; only the simulation promotes pins into this channel.
-			// This also keeps the --no-validate degrade path a pass-through.
+			// forward (the simulation may raise or retire them, never add
+			// any). This also keeps the --no-validate degrade path a
+			// pass-through.
 			ExistingReplaces:     existingReplaces,
 			DesiredReplaces:      existingReplaces,
 			ExistingGoVersion:    existingGoVersionByRoot[root],
 			SecurityBumpModules:  securityBumpModules,
 			SecurityBumpsByCoord: bumpCoords,
+			Residuals:            heldResiduals,
 		})
 
 		if haveDepsChanged(existingDeps, desiredDeps) {
@@ -651,21 +681,20 @@ func existingReplacesForModroots(modroots []string, bumpSteps []config.BumpStep)
 }
 
 // existingGoVersionsForModroots returns, for each modroot, the highest
-// with.go-version carried by any existing go-language bump/go-bump step that
-// covers it ("" when none). It mirrors existingDepsForModroots' matching
-// semantics (a step covers a root when its modroot list contains it), but is
-// additionally filtered to go-language steps - go-version is meaningless
-// elsewhere. Values goversion can't order (templated expressions) are ignored
-// here; the fast-path reconciler warns about them instead of editing.
+// with.go-version carried by any existing go/bump step that covers it (""
+// when none). It mirrors existingDepsForModroots' matching semantics (a step
+// covers a root when its modroot list contains it), but only go/bump steps
+// count: go-version is a gobump input, and the `uses: bump` pipeline has no
+// such input (omnibump never sees it). Values goversion can't order
+// (templated expressions) are ignored here; the reconciler warns about them
+// instead of editing (see fastPathGoVersion). Only go/bump steps that are not
+// migrated to `uses: bump` keep and raise their go-version.
 func existingGoVersionsForModroots(modroots []string, bumpSteps []config.BumpStep) map[string]string {
 	result := make(map[string]string, len(modroots))
 	for _, root := range modroots {
 		var highest string
 		for _, step := range bumpSteps {
-			if step.GoVersion == "" || !slices.Contains(step.Modroots, root) {
-				continue
-			}
-			if stepLanguage := step.Language; stepLanguage != "" && stepLanguage != "go" {
+			if step.Action != "go/bump" || step.GoVersion == "" || !slices.Contains(step.Modroots, root) {
 				continue
 			}
 			highest = goversion.Max(highest, step.GoVersion)
@@ -784,7 +813,9 @@ func (g *GoBumpApplier) applyGoBumpChanges(ctx context.Context, gp *GoBumpProces
 	// Best-effort go-version computation for modroots the simulation didn't
 	// prove (--no-validate, degrade, or per-root skips) - must run before
 	// reconciliation so the value feeds step emission and the pin floor.
-	g.fallbackGoVersions(ctx, gp, analysis)
+	if err := g.fallbackGoVersions(ctx, gp, analysis); err != nil {
+		return err
+	}
 
 	loader := newMelangeLoader()
 
@@ -803,11 +834,11 @@ func (g *GoBumpApplier) applyGoBumpChanges(ctx context.Context, gp *GoBumpProces
 // simulation didn't cover, from the best-effort proxy probe (see
 // fallbackRequiredGoVersion), gated against the pristine baseline exactly
 // like the simulation path. Fail-open throughout: any failure just leaves
-// RequiredGoVersion empty (with a warning), never blocks the apply. When
-// GOPROXY=off (probeDisabled), the probe is skipped entirely - it would
-// only fail every fetch - and each affected modroot gets one message
-// instead.
-func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis) {
+// RequiredGoVersion empty (with a warning), never blocks the apply - except
+// a cancellation, which is returned. When GOPROXY=off (probeDisabled), the
+// probe is skipped entirely - it would only fail every fetch - and each
+// affected modroot gets one message instead.
+func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis) error {
 	for li := range analysis.ByLanguage {
 		lang := &analysis.ByLanguage[li]
 		if lang.Language != "go" {
@@ -826,7 +857,15 @@ func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProces
 				gp.AddMessage(fmt.Sprintf("modroot %s: GOPROXY=off - skipping best-effort Go version probe", m.Modroot))
 				continue
 			}
-			required, err := fallbackRequiredGoVersion(ctx, g.httpClient(), g.goProxyURL, m, g.skipPrivateModule)
+			required, unfetched, err := fallbackRequiredGoVersion(ctx, g.httpClient(), g.goProxyURL, m, g.skipPrivateModule)
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			if err == nil && unfetched > 0 {
+				logging.From(ctx).Warn("best-effort Go version probe incomplete - the required Go version may be higher",
+					"modroot", m.Modroot, "unfetched", unfetched)
+				gp.AddMessage(fmt.Sprintf("modroot %s: best-effort Go version probe incomplete (%d candidate go.mod file(s) could not be fetched) - the required Go version may be higher", m.Modroot, unfetched))
+			}
 			if err != nil {
 				logging.From(ctx).Warn("could not determine required Go version (best-effort probe failed)",
 					"modroot", m.Modroot, "error", err)
@@ -842,6 +881,9 @@ func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProces
 			// - which feeds both the go-version field and the go-package pin
 			// floor - confirm it names a real Go release.
 			valid, offlineErr := validateGoVersionFloor(ctx, g.releaseIndex(), goversion.Minor(required))
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
 			if offlineErr != nil {
 				logging.From(ctx).Warn("could not validate required Go version against known releases (index unavailable) - proceeding",
 					"modroot", m.Modroot, "version", required, "error", offlineErr)
@@ -861,22 +903,12 @@ func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProces
 				m.Modroot, required, baselineWord(pristineGoBaseline(m))))
 		}
 	}
+	return nil
 }
 
 // reconcileBumpSteps writes the desired per-modroot dependency sets back into
-// the package's bump/go-bump pipeline steps.
-//
-// Fast path: when a single existing step already covers exactly the analyzed
-// modroot set and every one of those roots desires an identical dependency
-// set, its deps are updated in place, preserving its action (bump or
-// go/bump), modroot list, and language.
-//
-// General path: otherwise, all existing bump/go-bump steps are removed and
-// replaced with freshly coalesced "bump" steps - one per distinct desired
-// dependency set, each covering every modroot that shares it, with an
-// explicit with.language. This is what produces cert-manager-style
-// multi-step output when modroots genuinely diverge, while collapsing to a
-// single step when they agree.
+// the package's bump/go-bump pipeline steps, one language at a time (see
+// reconcileLanguageBumpSteps).
 func (g *GoBumpApplier) reconcileBumpSteps(ctx context.Context, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis, loader *config.Loader) error {
 	for _, langAnalysis := range analysis.ByLanguage {
 		if len(langAnalysis.ByModroot) == 0 {
@@ -889,32 +921,35 @@ func (g *GoBumpApplier) reconcileBumpSteps(ctx context.Context, gp *GoBumpProces
 	return nil
 }
 
+// stepEdit is one existing bump step's reconciliation: the modroots it owns
+// (it is the first step covering them) grouped by identical desired
+// deps/replaces.
+type stepEdit struct {
+	step    config.BumpStep
+	groups  []modrootGroup
+	owned   []*ModrootAnalysis
+	changed bool
+}
+
 // reconcileLanguageBumpSteps writes one language's desired per-modroot
 // dependency sets back into its own bump/go-bump pipeline steps, leaving
-// every other language's steps untouched (existing steps are filtered to
-// this language before any fast-path/rebuild decision is made).
+// every other language's steps untouched.
 //
-// Fast path: when a single existing step of this language already covers
-// exactly its analyzed modroot set and every one of those roots desires an
-// identical dependency set and replace set, its deps/replaces are updated in
-// place, preserving its action (bump or go/bump), modroot list, and
-// language. Per-root effective go-versions are NOT required to match to take
-// this path: go-version is a floor (never-lowered downstream by
-// fastPathGoVersion), so the single step is simply raised to the highest
-// effective go-version across all covered roots (maxEffectiveGoVersion),
-// which safely satisfies the most demanding root even when roots diverge.
-// Forcing a rebuild over a go-version mismatch alone would destroy the
-// step's comments for no safety benefit.
-//
-// General path: otherwise, all of this language's existing steps are
-// removed and replaced with freshly coalesced "bump" steps - one per
-// distinct desired dependency set (deps, replaces, AND effective
-// go-version), each covering every modroot that shares it, with an explicit
-// with.language. This is what produces cert-manager-style multi-step output
-// when modroots genuinely diverge, while collapsing to a single step when
-// they agree.
+// Existing steps are edited IN PLACE: each keeps its position, its comments
+// and every `with:` option choam does not manage (tidy, tidy-compat, work,
+// show-diff, name, if, ...); only deps/replaces (and, for a migrated go/bump
+// step, uses/language/go-version - see migrateStep) change. A step is only
+// touched when its own content changes. Each analyzed modroot belongs to the
+// first step covering it; a multi-modroot step whose roots now diverge keeps
+// the first group and gets a clone (same options) per further group directly
+// after it; roots left with nothing to declare leave the step's modroot list,
+// and a step left with nothing at all is removed. Existing steps are never
+// merged. Modroots no step covers get fresh `uses: bump` steps (coalesced by
+// identical sets) after the first git-checkout. Deps are written in the
+// order the simulation applied them (see simulate.ModrootResult.FinalDeps).
 func (g *GoBumpApplier) reconcileLanguageBumpSteps(ctx context.Context, gp *GoBumpProcessor, langAnalysis LanguageAnalysis, loader *config.Loader) error {
-	allSteps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
+	yamlContent := gp.GetCurrentYAML()
+	allSteps, err := loader.FindBumpSteps(yamlContent)
 	if err != nil {
 		return fmt.Errorf("finding existing bump steps: %w", err)
 	}
@@ -930,106 +965,227 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(ctx context.Context, gp *GoBu
 		}
 	}
 
-	if len(existingSteps) == 1 &&
-		sameRootSet(existingSteps[0].Modroots, allModroots(langAnalysis.ByModroot)) &&
-		allRootsShareDeps(langAnalysis.ByModroot) &&
-		allRootsShareReplaces(langAnalysis.ByModroot) {
-		step := existingSteps[0]
-		desired := desiredDepsForSingleGroup(langAnalysis.ByModroot)
-		desiredReplaces := desiredReplacesForSingleGroup(langAnalysis.ByModroot)
-		goVersion := g.fastPathGoVersion(gp, step, maxEffectiveGoVersion(langAnalysis.ByModroot))
-
-		updated, err := loader.UpdateGoBumpStep(gp.GetCurrentYAML(), step.Index, desired, desiredReplaces, goVersion)
-		if err != nil {
-			return fmt.Errorf("updating %s pipeline[%d]: %w", step.Action, step.Index, err)
+	byRoot := make(map[string]*ModrootAnalysis, len(langAnalysis.ByModroot))
+	for i := range langAnalysis.ByModroot {
+		byRoot[langAnalysis.ByModroot[i].Modroot] = &langAnalysis.ByModroot[i]
+	}
+	owner := make(map[string]int)
+	for i, step := range existingSteps {
+		for _, root := range step.Modroots {
+			if _, ok := owner[root]; !ok {
+				owner[root] = i
+			}
 		}
+	}
 
-		gp.SetCurrentYAML(updated)
-		gp.MarkActualChangesApplied()
-		gp.AddMessage(fmt.Sprintf("Updated %s pipeline[%d] with %d dependencies and %d replaces", step.Action, step.Index, len(desired), len(desiredReplaces)))
-		g.recordSecurityFixes(gp, langAnalysis, addedAcrossRoots(langAnalysis.ByModroot))
+	edits := make([]stepEdit, 0, len(existingSteps))
+	for i, step := range existingSteps {
+		edit := stepEdit{step: step}
+		analyzed := false
+		for _, root := range step.Modroots {
+			if owner[root] != i {
+				continue
+			}
+			m, ok := byRoot[root]
+			if !ok {
+				// Not analyzed (its manifest could not be fetched or
+				// parsed): it keeps exactly what the step declares today.
+				m = &ModrootAnalysis{Modroot: root, ExistingDeps: step.Deps, DesiredDeps: step.Deps,
+					ExistingReplaces: step.Replaces, DesiredReplaces: step.Replaces}
+			} else {
+				analyzed = true
+			}
+			edit.owned = append(edit.owned, m)
+		}
+		if !analyzed {
+			continue
+		}
+		ownedAnalyses := make([]ModrootAnalysis, len(edit.owned))
+		for j, m := range edit.owned {
+			ownedAnalyses[j] = *m
+		}
+		edit.groups = coalesceModroots(ownedAnalyses)
+		switch len(edit.groups) {
+		case 0:
+			edit.changed = len(step.Deps) > 0 || len(step.Replaces) > 0
+		case 1:
+			group := edit.groups[0]
+			edit.changed = !sameRootSet(group.Modroots, step.Modroots) ||
+				haveDepsChanged(step.Deps, group.Deps) || haveDepsChanged(step.Replaces, group.Replaces)
+		default:
+			edit.changed = true
+		}
+		edits = append(edits, edit)
+	}
+
+	// Edit from the last step backwards: removals and clones only shift the
+	// indices of steps already handled.
+	slices.SortFunc(edits, func(a, b stepEdit) int { return cmp.Compare(b.step.Index, a.step.Index) })
+	hasBlankLines := loader.HasBlankLinesBetweenPipelineSteps(yamlContent)
+	changed := false
+	for _, edit := range edits {
+		if !edit.changed {
+			continue
+		}
+		updated, err := g.rewriteStep(ctx, gp, yamlContent, edit, hasBlankLines)
+		if err != nil {
+			return err
+		}
+		yamlContent = updated
+		changed = true
+	}
+
+	var unowned []ModrootAnalysis
+	for _, m := range langAnalysis.ByModroot {
+		if _, ok := owner[m.Modroot]; !ok {
+			unowned = append(unowned, m)
+		}
+	}
+	if groups := coalesceModroots(unowned); len(groups) > 0 {
+		gitCheckoutIndices, err := loader.FindPipelinesByUse(yamlContent, "git-checkout")
+		if err != nil {
+			return fmt.Errorf("finding git-checkout pipeline: %w", err)
+		}
+		insertPos := 0
+		if len(gitCheckoutIndices) > 0 {
+			insertPos = gitCheckoutIndices[0] + 1
+		}
+		for _, group := range groups {
+			spec := config.BumpStepSpec{
+				Action:   "bump",
+				Language: langAnalysis.Language,
+				Modroots: group.Modroots,
+				Deps:     group.Deps,
+				Replaces: group.Replaces,
+			}
+			updated, err := loader.InsertBumpPipelineStep(yamlContent, insertPos, spec, hasBlankLines)
+			if err != nil {
+				return fmt.Errorf("inserting bump step: %w", err)
+			}
+			yamlContent = updated
+			gp.AddMessage(fmt.Sprintf("Added %s bump step pipeline[%d] for modroot(s) %s with %d dependencies and %d replaces",
+				langAnalysis.Language, insertPos, strings.Join(group.Modroots, ", "), len(group.Deps), len(group.Replaces)))
+			insertPos++
+			changed = true
+		}
+	}
+
+	if !changed {
 		return nil
 	}
-
-	// A step carrying a templated/unorderable go-version cannot be preserved
-	// through this rebuild: InsertBumpPipelineStep only accepts plain version
-	// characters ([0-9A-Za-z._+-]), so the raw templated value can never be
-	// re-emitted (existingGoVersionsForModroots above already silently drops
-	// it from the effective-go-version computation). Warn loudly instead of
-	// letting it vanish.
-	for _, step := range existingSteps {
-		if step.GoVersion != "" && !goversion.IsValid(step.GoVersion) {
-			msg := fmt.Sprintf("%s pipeline[%d] go-version %q is not a plain version (templated?) and could not be preserved across the bump pipeline rebuild (modroots: %s) - reapply it manually",
-				step.Action, step.Index, step.GoVersion, strings.Join(step.Modroots, ", "))
-			gp.AddMessage(msg)
-			logging.From(ctx).Warn("go-version could not be preserved across bump pipeline rebuild",
-				"action", step.Action, "index", step.Index, "go_version", step.GoVersion, "modroots", step.Modroots)
-		}
-	}
-
-	groups := coalesceModroots(langAnalysis.ByModroot)
-
-	indices := make([]int, len(existingSteps))
-	for i, step := range existingSteps {
-		indices[i] = step.Index
-	}
-	sort.Sort(sort.Reverse(sort.IntSlice(indices)))
-
-	yamlContent := gp.GetCurrentYAML()
-
-	// Capture the file's step-separation convention BEFORE stripping steps -
-	// a pipeline reduced to a lone git-checkout has nothing left to detect it from.
-	hasBlankLines := loader.HasBlankLinesBetweenPipelineSteps(yamlContent)
-
-	for _, idx := range indices {
-		updated, err := loader.RemovePipelineStep(yamlContent, idx)
-		if err != nil {
-			return fmt.Errorf("removing bump step[%d]: %w", idx, err)
-		}
-		yamlContent = updated
-	}
-
-	gitCheckoutIndices, err := loader.FindPipelinesByUse(yamlContent, "git-checkout")
-	if err != nil {
-		return fmt.Errorf("finding git-checkout pipeline: %w", err)
-	}
-	insertPos := 0
-	if len(gitCheckoutIndices) > 0 {
-		insertPos = gitCheckoutIndices[0] + 1
-	}
-
-	for _, group := range groups {
-		spec := config.BumpStepSpec{
-			Action:    "bump",
-			Language:  langAnalysis.Language,
-			GoVersion: group.GoVersion,
-			Modroots:  group.Modroots,
-			Deps:      group.Deps,
-			Replaces:  group.Replaces,
-		}
-		updated, err := loader.InsertBumpPipelineStep(yamlContent, insertPos, spec, hasBlankLines)
-		if err != nil {
-			return fmt.Errorf("inserting bump step: %w", err)
-		}
-		yamlContent = updated
-		insertPos++
-	}
-
 	gp.SetCurrentYAML(yamlContent)
 	gp.MarkActualChangesApplied()
-	gp.AddMessage(fmt.Sprintf("Rebuilt %s bump pipeline into %d step(s) across %d modroot(s)", langAnalysis.Language, len(groups), len(langAnalysis.ByModroot)))
 	g.recordSecurityFixes(gp, langAnalysis, addedAcrossRoots(langAnalysis.ByModroot))
-
+	recordHygieneBumps(gp, langAnalysis)
 	return nil
 }
 
-// fastPathGoVersion decides the go-version argument for a fast-path in-place
-// update of step: the group's effective value when it genuinely raises the
-// step's current one, "" (leave the field untouched, byte-for-byte) when the
-// step already carries an equal-or-higher value - so re-running the applier
-// on already-updated YAML never churns it, and an existing value is NEVER
-// lowered. A step value goversion can't order (templated expression) is
-// warned about, never overwritten.
+// rewriteStep applies one changed stepEdit in place (see
+// reconcileLanguageBumpSteps): removal when nothing is left, else the first
+// group's deps/replaces/modroot on the step itself - migrating a go/bump
+// step when it can (see migrationFor) - and one clone per further group.
+func (g *GoBumpApplier) rewriteStep(ctx context.Context, gp *GoBumpProcessor, yamlContent []byte, edit stepEdit, hasBlankLines bool) ([]byte, error) {
+	loader := config.NewLoader()
+	step := edit.step
+	if len(edit.groups) == 0 {
+		updated, err := loader.RemovePipelineStep(yamlContent, step.Index)
+		if err != nil {
+			return nil, fmt.Errorf("removing %s pipeline[%d]: %w", step.Action, step.Index, err)
+		}
+		gp.AddMessage(fmt.Sprintf("Removed %s pipeline[%d]: no dependencies or replaces left to declare", step.Action, step.Index))
+		return updated, nil
+	}
+
+	migrate, plan := g.migrationFor(ctx, gp, yamlContent, edit)
+	first := edit.groups[0]
+	var goVersion string
+	if step.Action == "go/bump" && !migrate {
+		goVersion = g.fastPathGoVersion(gp, step, maxEffectiveGoVersion(edit.owned))
+	}
+	updated, err := loader.UpdateGoBumpStep(yamlContent, step.Index, first.Deps, first.Replaces, goVersion)
+	if err != nil {
+		return nil, fmt.Errorf("updating %s pipeline[%d]: %w", step.Action, step.Index, err)
+	}
+	if !sameRootSet(first.Modroots, step.Modroots) {
+		if updated, err = loader.SetBumpModroots(updated, step.Index, first.Modroots); err != nil {
+			return nil, fmt.Errorf("updating modroot of %s pipeline[%d]: %w", step.Action, step.Index, err)
+		}
+	}
+	switch {
+	case migrate:
+		if updated, err = migrateStep(gp, updated, step, plan); err != nil {
+			return nil, fmt.Errorf("migrating go/bump pipeline[%d]: %w", step.Index, err)
+		}
+		if step.NoTidy && anyBaselineTidies(edit.owned) {
+			gp.AddMessage(fmt.Sprintf("pipeline[%d]: tidy: false may no longer be needed (omnibump tidies without -go; the upstream module tidies under omnibump) - left as written", step.Index))
+		}
+	case step.Action != "go/bump" && step.GoVersion != "":
+		// The bump pipeline has no go-version input: drop a stale one.
+		if updated, err = loader.RemovePipelineWithFieldLines(updated, step.Index, "go-version"); err != nil {
+			return nil, fmt.Errorf("removing go-version from %s pipeline[%d]: %w", step.Action, step.Index, err)
+		}
+	}
+	gp.AddMessage(fmt.Sprintf("Updated %s pipeline[%d] in place with %d dependencies and %d replaces", step.Action, step.Index, len(first.Deps), len(first.Replaces)))
+
+	// Further groups: clones of the rewritten step, in group order.
+	for gi := len(edit.groups) - 1; gi >= 1; gi-- {
+		group := edit.groups[gi]
+		if updated, err = loader.ClonePipelineStepAfter(updated, step.Index, hasBlankLines); err != nil {
+			return nil, fmt.Errorf("splitting pipeline[%d]: %w", step.Index, err)
+		}
+		clone := step.Index + 1
+		if updated, err = loader.UpdateGoBumpStep(updated, clone, group.Deps, group.Replaces, ""); err != nil {
+			return nil, fmt.Errorf("updating split of pipeline[%d]: %w", step.Index, err)
+		}
+		if updated, err = loader.SetBumpModroots(updated, clone, group.Modroots); err != nil {
+			return nil, fmt.Errorf("updating modroot of split of pipeline[%d]: %w", step.Index, err)
+		}
+		gp.AddMessage(fmt.Sprintf("Split pipeline[%d]: modroot(s) %s now diverge, written to a copy of the step with %d dependencies and %d replaces",
+			step.Index, strings.Join(group.Modroots, ", "), len(group.Deps), len(group.Replaces)))
+	}
+	return updated, nil
+}
+
+// migrationFor decides whether a go/bump step being rewritten migrates to
+// `uses: bump`: its plan allows it (see planMigration) AND every modroot it
+// owns was simulated with the omnibump engine - so what is written is what
+// was validated. A step that does not migrate gets a message saying why.
+func (g *GoBumpApplier) migrationFor(ctx context.Context, gp *GoBumpProcessor, yamlContent []byte, edit stepEdit) (bool, migrationPlan) {
+	step := edit.step
+	if step.Action != "go/bump" {
+		return false, migrationPlan{}
+	}
+	plan := planMigration(ctx, yamlContent, step, g.releaseIndex())
+	if !plan.ok {
+		gp.AddMessage(fmt.Sprintf("go/bump pipeline[%d] not migrated to uses: bump: %s", step.Index, plan.reason))
+		return false, plan
+	}
+	for _, m := range edit.owned {
+		if !m.Simulated || m.BumpEngine != simulate.EngineOmnibump {
+			gp.AddMessage(fmt.Sprintf("go/bump pipeline[%d] not migrated to uses: bump: modroot %s was not validated with the omnibump engine", step.Index, m.Modroot))
+			return false, plan
+		}
+	}
+	return true, plan
+}
+
+// anyBaselineTidies reports whether any of the modroots tidies under omnibump.
+func anyBaselineTidies(roots []*ModrootAnalysis) bool {
+	for _, m := range roots {
+		if m.BaselineTidies {
+			return true
+		}
+	}
+	return false
+}
+
+// fastPathGoVersion decides the go-version argument for the in-place update
+// of a go/bump step that is not migrated: the group's effective value when
+// it genuinely raises the step's current one, "" (leave the field untouched,
+// byte-for-byte) when the step already carries an equal-or-higher value - so
+// re-running the applier on already-updated YAML never churns it, and an
+// existing value is NEVER lowered. A step value goversion can't order
+// (templated expression) is warned about, never overwritten.
 func (g *GoBumpApplier) fastPathGoVersion(gp *GoBumpProcessor, step config.BumpStep, effective string) string {
 	if effective == "" {
 		return ""
@@ -1049,20 +1205,18 @@ func (g *GoBumpApplier) fastPathGoVersion(gp *GoBumpProcessor, step config.BumpS
 }
 
 // modrootGroup is a set of modroots that share identical desired dependency
-// and replace sets and (for Go) an identical effective go-version.
+// and replace sets.
 type modrootGroup struct {
-	Modroots  []string
-	Deps      []string
-	Replaces  []string
-	GoVersion string // effective go-version shared by the group; "" for none (and always for non-Go languages)
+	Modroots []string
+	Deps     []string
+	Replaces []string
 }
 
 // coalesceModroots groups modroots that end up with identical desired
-// dependency AND replace sets AND effective go-version into a single step, in
-// first-seen order. Roots with neither desired deps nor replaces are omitted
-// entirely. The go-version key component is only ever non-empty for Go
-// modroots (RequiredGoVersion/ExistingGoVersion are Go-only fields), so other
-// languages' grouping is unaffected; empty values group together as before.
+// dependency AND replace sets (compared as sets) into a single step, in
+// first-seen order. A group's lists keep its first modroot's order (the
+// order the simulation applied them in). Roots with neither desired deps nor
+// replaces are omitted entirely.
 func coalesceModroots(byModroot []ModrootAnalysis) []modrootGroup {
 	var order []string
 	byKey := make(map[string]*modrootGroup)
@@ -1071,11 +1225,10 @@ func coalesceModroots(byModroot []ModrootAnalysis) []modrootGroup {
 		if len(m.DesiredDeps) == 0 && len(m.DesiredReplaces) == 0 {
 			continue
 		}
-		goVersion := effectiveGoVersion(m)
-		key := groupKey(m.DesiredDeps) + "\x00" + groupKey(m.DesiredReplaces) + "\x00" + goVersion
+		key := groupKey(m.DesiredDeps) + "\x00" + groupKey(m.DesiredReplaces)
 		group, ok := byKey[key]
 		if !ok {
-			group = &modrootGroup{Deps: sortedCopy(m.DesiredDeps), Replaces: sortedCopy(m.DesiredReplaces), GoVersion: goVersion}
+			group = &modrootGroup{Deps: slices.Clone(m.DesiredDeps), Replaces: slices.Clone(m.DesiredReplaces)}
 			byKey[key] = group
 			order = append(order, key)
 		}
@@ -1109,46 +1262,9 @@ func sameRootSet(a, b []string) bool {
 	return slices.Equal(sortedCopy(a), sortedCopy(b))
 }
 
-func allModroots(byModroot []ModrootAnalysis) []string {
-	roots := make([]string, len(byModroot))
-	for i, m := range byModroot {
-		roots[i] = m.Modroot
-	}
-	return roots
-}
-
-// allRootsShareDeps reports whether every analyzed modroot desires an identical dependency set.
-func allRootsShareDeps(byModroot []ModrootAnalysis) bool {
-	if len(byModroot) <= 1 {
-		return true
-	}
-	key := groupKey(byModroot[0].DesiredDeps)
-	for _, m := range byModroot[1:] {
-		if groupKey(m.DesiredDeps) != key {
-			return false
-		}
-	}
-	return true
-}
-
-// allRootsShareReplaces reports whether every analyzed modroot desires an
-// identical replace-directive set.
-func allRootsShareReplaces(byModroot []ModrootAnalysis) bool {
-	if len(byModroot) <= 1 {
-		return true
-	}
-	key := groupKey(byModroot[0].DesiredReplaces)
-	for _, m := range byModroot[1:] {
-		if groupKey(m.DesiredReplaces) != key {
-			return false
-		}
-	}
-	return true
-}
-
-// effectiveGoVersion is the go-version a modroot's bump step should end up
-// carrying: the max of what its existing steps already declare and what the
-// proven/probed candidate set requires. Max never picks the lower of two
+// effectiveGoVersion is the go-version a modroot's go/bump step should end
+// up carrying: the max of what its existing steps already declare and what
+// the proven/probed candidate set requires. Max never picks the lower of two
 // valid values, so an existing value is never lowered. "" for non-Go
 // modroots (both fields are Go-only) and when neither side has a value.
 func effectiveGoVersion(m ModrootAnalysis) string {
@@ -1156,36 +1272,16 @@ func effectiveGoVersion(m ModrootAnalysis) string {
 }
 
 // maxEffectiveGoVersion returns the highest effective go-version
-// (effectiveGoVersion) across all analyzed modroots, "" if none has one. Used
-// by the fast path, whose single step must satisfy every covered root at
-// once: go-version is a floor, not an exact requirement, so raising to the
-// maximum is always safe even when roots' effective versions diverge -
-// fastPathGoVersion still enforces never-lower against the step's current
-// value on top of this.
-func maxEffectiveGoVersion(byModroot []ModrootAnalysis) string {
+// (effectiveGoVersion) across the given modroots, "" if none has one: a step
+// covering several roots must satisfy all of them, and go-version is a floor,
+// so raising to the maximum is always safe - fastPathGoVersion still
+// enforces never-lower against the step's current value on top of this.
+func maxEffectiveGoVersion(roots []*ModrootAnalysis) string {
 	var max string
-	for _, m := range byModroot {
-		max = goversion.Max(max, effectiveGoVersion(m))
+	for _, m := range roots {
+		max = goversion.Max(max, effectiveGoVersion(*m))
 	}
 	return max
-}
-
-// desiredDepsForSingleGroup returns the desired deps shared by every
-// analyzed modroot (only valid when allRootsShareDeps is true).
-func desiredDepsForSingleGroup(byModroot []ModrootAnalysis) []string {
-	if len(byModroot) == 0 {
-		return nil
-	}
-	return byModroot[0].DesiredDeps
-}
-
-// desiredReplacesForSingleGroup returns the desired replaces shared by every
-// analyzed modroot (only valid when allRootsShareReplaces is true).
-func desiredReplacesForSingleGroup(byModroot []ModrootAnalysis) []string {
-	if len(byModroot) == 0 {
-		return nil
-	}
-	return byModroot[0].DesiredReplaces
 }
 
 // addedAcrossRoots returns the deduplicated union, across all modroots, of
@@ -1224,8 +1320,8 @@ func addedAcrossRoots(byModroot []ModrootAnalysis) []string {
 			}
 		}
 
-		// A new/changed replace directive that fixes a CVE counts as a
-		// security fix too - promotions must feed epoch accounting. The
+		// A changed replace directive that fixes a CVE counts as a
+		// security fix too - raised replaces must feed epoch accounting. The
 		// module coordinate is the directive's new path ("old=new@version").
 		for _, replace := range newlyAddedDeps(m.ExistingReplaces, m.DesiredReplaces) {
 			coord, version, ok := splitCoordVersion(replace)
@@ -1254,30 +1350,7 @@ func addedAcrossRoots(byModroot []ModrootAnalysis) []string {
 // reflects the count. Advisory IDs and prior versions come from the scan's
 // SecurityBumps when available.
 func (g *GoBumpApplier) recordSecurityFixes(gp *GoBumpProcessor, langAnalysis LanguageAnalysis, dependencies []string) {
-	type bumpDetail struct {
-		vulnIDs    []string
-		oldVersion string
-	}
-	byModule := make(map[string]bumpDetail)
-	for _, m := range langAnalysis.ByModroot {
-		// Rendered-coordinate mapping first (see Ecosystem.BumpCoords) -
-		// this is what actually matches splitCoordVersion output for Maven
-		// ("groupId@artifactId") and v2+-normalized Go module paths.
-		for coord, bump := range m.SecurityBumpsByCoord {
-			byModule[coord] = bumpDetail{vulnIDs: bump.VulnIDs, oldVersion: bump.CurrentVersion}
-		}
-		if m.ScanResult == nil {
-			continue
-		}
-		// Legacy OSV-name fallback, for coordinates the map lacks (hand-built
-		// fixtures, or entries the simulation added after analysis).
-		for _, bump := range m.ScanResult.SecurityBumps {
-			if _, ok := byModule[bump.Name]; !ok {
-				byModule[bump.Name] = bumpDetail{vulnIDs: bump.VulnIDs, oldVersion: bump.CurrentVersion}
-			}
-		}
-	}
-
+	detailFor := bumpDetails(langAnalysis)
 	for _, dep := range dependencies {
 		module, version, ok := splitCoordVersion(dep)
 		if !ok {
@@ -1285,27 +1358,99 @@ func (g *GoBumpApplier) recordSecurityFixes(gp *GoBumpProcessor, langAnalysis La
 			version = "unknown"
 		}
 
-		detail, found := byModule[module]
-		if !found {
-			// OSV names v2+ Go modules without the /vN path suffix.
-			detail = byModule[trimMajorSuffix(module)]
-		}
+		detail := detailFor(module)
 		vulnerability := "security vulnerability"
 		if len(detail.vulnIDs) > 0 {
 			vulnerability = strings.Join(detail.vulnIDs, ", ")
-		}
-		oldVersion := "vulnerable"
-		if detail.oldVersion != "" {
-			oldVersion = detail.oldVersion
 		}
 
 		gp.AddSecurityFix(SecurityFix{
 			Module:        module,
 			Vulnerability: vulnerability,
-			OldVersion:    oldVersion,
+			OldVersion:    detail.oldVersionOr("vulnerable"),
 			NewVersion:    version,
 			Severity:      "varies",
 		})
+	}
+}
+
+// bumpDetail is the analysis scan's record of one module's bump: its
+// advisory IDs and the vulnerable version it was found at.
+type bumpDetail struct {
+	vulnIDs    []string
+	oldVersion string
+}
+
+func (d bumpDetail) oldVersionOr(fallback string) string {
+	if d.oldVersion == "" {
+		return fallback
+	}
+	return d.oldVersion
+}
+
+// bumpDetails returns a lookup of a language's analysis bumps by module:
+// rendered coordinates first (see Ecosystem.BumpCoords - this is what
+// matches splitCoordVersion output for Maven "groupId@artifactId" and
+// v2+-normalized Go module paths), then OSV names for coordinates the map
+// lacks (hand-built fixtures, or entries the simulation added after
+// analysis), then the module without its /vN suffix (OSV names v2+ Go
+// modules without it).
+func bumpDetails(langAnalysis LanguageAnalysis) func(module string) bumpDetail {
+	byModule := make(map[string]bumpDetail)
+	for _, m := range langAnalysis.ByModroot {
+		for coord, bump := range m.SecurityBumpsByCoord {
+			byModule[coord] = bumpDetail{vulnIDs: bump.VulnIDs, oldVersion: bump.CurrentVersion}
+		}
+		if m.ScanResult == nil {
+			continue
+		}
+		for _, bump := range m.ScanResult.SecurityBumps {
+			if _, ok := byModule[bump.Name]; !ok {
+				byModule[bump.Name] = bumpDetail{vulnIDs: bump.VulnIDs, oldVersion: bump.CurrentVersion}
+			}
+		}
+	}
+	return func(module string) bumpDetail {
+		if detail, ok := byModule[module]; ok {
+			return detail
+		}
+		return byModule[trimMajorSuffix(module)]
+	}
+}
+
+// recordHygieneBumps records the scanner-hygiene entries (see
+// ModrootAnalysis.HygieneModules) this write adds or changes, once per
+// module@version across modroots - apart from the security fixes, so they
+// are never counted as one.
+func recordHygieneBumps(gp *GoBumpProcessor, langAnalysis LanguageAnalysis) {
+	detailFor := bumpDetails(langAnalysis)
+	severities := analysisSeverities(gp)
+	seen := make(map[string]struct{})
+	for _, m := range langAnalysis.ByModroot {
+		hygiene := make(map[string]simulate.HygieneModule, len(m.HygieneModules))
+		for _, h := range m.HygieneModules {
+			hygiene[h.Module+"@"+h.Version] = h
+		}
+		for _, dep := range newlyAddedDeps(m.ExistingDeps, m.DesiredDeps) {
+			h, ok := hygiene[dep]
+			if _, dup := seen[dep]; !ok || dup {
+				continue
+			}
+			seen[dep] = struct{}{}
+			severity := ""
+			for _, id := range h.VulnIDs {
+				if sev := severities[id]; sev != "" && (severity == "" || scan.SeverityRank(sev) < scan.SeverityRank(severity)) {
+					severity = sev
+				}
+			}
+			gp.AddHygieneBump(SecurityFix{
+				Module:        h.Module,
+				Vulnerability: strings.Join(h.VulnIDs, ", "),
+				OldVersion:    detailFor(h.Module).oldVersionOr("flagged"),
+				NewVersion:    h.Version,
+				Severity:      cmp.Or(severity, "varies"),
+			})
+		}
 	}
 }
 
@@ -1368,5 +1513,10 @@ func extractRepositoryFromYAML(yamlContent []byte, cfg *melange.Configuration, l
 		return "", "", "", fmt.Errorf("resolving tag template %q: %w", tag, err)
 	}
 
-	return resolvedRepoURL, resolvedTag, expectedCommit, nil
+	resolvedCommit, err := renderer.RenderString(expectedCommit)
+	if err != nil {
+		return "", "", "", fmt.Errorf("resolving expected-commit template %q: %w", expectedCommit, err)
+	}
+
+	return resolvedRepoURL, resolvedTag, resolvedCommit, nil
 }

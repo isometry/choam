@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 
@@ -45,7 +47,9 @@ func init() {
 
 func (e *Ecosystem) Name() string { return "java" }
 
-func (e *Ecosystem) ManifestFiles() []string { return []string{"pom.xml"} }
+func (e *Ecosystem) ManifestFiles() (required, optional []string) {
+	return []string{"pom.xml"}, nil
+}
 
 func (e *Ecosystem) Analyze(ctx context.Context, files map[string][]byte) (*ecosystem.ModuleDeps, error) {
 	pomContent, ok := files["pom.xml"]
@@ -63,7 +67,8 @@ func (e *Ecosystem) Analyze(ctx context.Context, files map[string][]byte) (*ecos
 	result := remote.FileAnalyses[0].Analysis
 
 	deps := make([]ecosystem.Dep, 0, len(result.Dependencies))
-	for _, info := range result.Dependencies {
+	for _, key := range slices.Sorted(maps.Keys(result.Dependencies)) {
+		info := result.Dependencies[key]
 		version := info.Version
 		if info.UsesProperty {
 			resolved, ok := result.Properties[info.PropertyName]
@@ -128,9 +133,12 @@ func (e *Ecosystem) BumpCoords(_ context.Context, bumps []scan.SecurityBump, dep
 // FilterBumps keeps a candidate bump only when its groupId:artifactId
 // coordinate is present in this modroot's pom.xml and the candidate version
 // is newer than what's currently declared, per Maven's (non-semver) version
-// ordering. Rendered entries use the "groupId@artifactId@version" grammar
-// the melange bump pipeline expects for Maven.
-func (e *Ecosystem) FilterBumps(_ context.Context, existing []string, bumps []scan.SecurityBump, deps *ecosystem.ModuleDeps) []string {
+// ordering. An existing entry above an advisory's fix is kept (never
+// lowered), and a fix in another major version than the declared one (the
+// first numeric segment) is held back, never written. Rendered entries use
+// the "groupId@artifactId@version" grammar the melange bump pipeline expects
+// for Maven.
+func (e *Ecosystem) FilterBumps(_ context.Context, existing []string, bumps []scan.SecurityBump, deps *ecosystem.ModuleDeps) ([]string, []ecosystem.HeldBump) {
 	type coordInfo struct {
 		groupID, artifactID, version string
 	}
@@ -147,7 +155,20 @@ func (e *Ecosystem) FilterBumps(_ context.Context, existing []string, bumps []sc
 		}
 		candidateVersions[parts[0]+":"+parts[1]] = parts[2]
 	}
+	var held []ecosystem.HeldBump
 	for _, bump := range bumps {
+		info, present := byCoord[bump.Name]
+		if !present {
+			continue
+		}
+		if mavenMajor(bump.FixedVersion) != mavenMajor(info.version) {
+			held = append(held, ecosystem.HeldBump{Bump: bump, Reason: fmt.Sprintf(
+				"fix %s is a major version upgrade from declared %s", bump.FixedVersion, info.version)})
+			continue
+		}
+		if current, ok := candidateVersions[bump.Name]; ok && scan.CompareMavenVersions(current, bump.FixedVersion) >= 0 {
+			continue // an existing pin at or above the fix is kept
+		}
 		candidateVersions[bump.Name] = bump.FixedVersion
 	}
 
@@ -164,5 +185,12 @@ func (e *Ecosystem) FilterBumps(_ context.Context, existing []string, bumps []sc
 	}
 
 	sort.Strings(result)
-	return result
+	return result, held
+}
+
+// mavenMajor is a Maven version's first segment (its major version).
+func mavenMajor(version string) string {
+	major, _, _ := strings.Cut(version, ".")
+	major, _, _ = strings.Cut(major, "-")
+	return major
 }

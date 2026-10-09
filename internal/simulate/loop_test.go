@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"maps"
 	"os"
@@ -11,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/scan"
@@ -27,8 +29,7 @@ import (
 // before it).
 type fakeToolchain struct {
 	base     map[string]string                                             // module -> version before any gets
-	latest   map[string]string                                             // module -> version resolved by @latest
-	failGets map[string]error                                              // "module@version" (or "module@latest") -> error
+	failGets map[string]error                                              // "module@version" -> error
 	getErr   func(moduleAtVersion string, applied map[string]string) error // dynamic get failures
 	tidyErr  func(applied map[string]string) error                         // invoked on attempt-closing tidy only
 	pruned   map[string]bool                                               // modules `go mod tidy` removes from the graph
@@ -66,6 +67,10 @@ type fakeToolchain struct {
 	linked     []string
 	linkedPkgs []string
 	linkedErr  error
+	// linkedPkgsFn, when set, takes priority over linkedPkgs and computes
+	// the package-level set from the current attempt's applied set (the
+	// import graph changes with versions).
+	linkedPkgsFn func(applied map[string]string) []string
 
 	// depGoVersions models DepGoVersions' module -> go directive map;
 	// depGoVersionsErr makes it fail (the loop must fail open: empty field,
@@ -93,14 +98,18 @@ type fakeToolchain struct {
 	editLog  []string
 }
 
-func (f *fakeToolchain) Linked(ctx context.Context, dir string, _ []string) (map[string]struct{}, map[string]struct{}, error) {
+func (f *fakeToolchain) Linked(ctx context.Context, dir string, _ BuildTarget) (map[string]struct{}, map[string]struct{}, error) {
 	if f.linkedErr != nil {
 		return nil, nil, f.linkedErr
 	}
 	var packages map[string]struct{}
-	if f.linkedPkgs != nil {
-		packages = make(map[string]struct{}, len(f.linkedPkgs))
-		for _, pkg := range f.linkedPkgs {
+	linkedPkgs := f.linkedPkgs
+	if f.linkedPkgsFn != nil {
+		linkedPkgs = f.linkedPkgsFn(f.applied)
+	}
+	if linkedPkgs != nil {
+		packages = make(map[string]struct{}, len(linkedPkgs))
+		for _, pkg := range linkedPkgs {
 			packages[pkg] = struct{}{}
 		}
 	}
@@ -136,7 +145,7 @@ func (f *fakeToolchain) DepGoVersions(_ context.Context, _ string) (map[string]s
 	return f.depGoVersions, nil
 }
 
-func (f *fakeToolchain) LinkedStd(_ context.Context, _ string, _ []string) (map[string]struct{}, error) {
+func (f *fakeToolchain) LinkedStd(_ context.Context, _ string, _ BuildTarget) (map[string]struct{}, error) {
 	linkedStd, linkedStdErr := f.linkedStd, f.linkedStdErr
 	if f.linkedStdFn != nil {
 		linkedStd, linkedStdErr = f.linkedStdFn(f.applied)
@@ -204,13 +213,6 @@ func (f *fakeToolchain) Get(_ context.Context, _ string, moduleAtVersion string)
 	}
 	idx := strings.LastIndex(moduleAtVersion, "@")
 	module, version := moduleAtVersion[:idx], moduleAtVersion[idx+1:]
-	if version == latestQuery {
-		version = f.latest[module]
-		if version == "" {
-			f.lastCall = "getfail"
-			return errors.New("no versions available")
-		}
-	}
 	f.lastCall = "get"
 	f.applied[module] = version
 	maps.Copy(f.applied, f.getEffects[moduleAtVersion])
@@ -278,9 +280,11 @@ func (f *fakeToolchain) Requirements(_ context.Context, _ string) (map[string]st
 // fakeAdvisory affects versions in [introduced, fixed); empty introduced
 // means "always"; empty fixed means "no released fix". imports optionally
 // models the advisory's vulnerable-package metadata
-// (scan.Vulnerability.VulnerableImports).
+// (scan.Vulnerability.VulnerableImports); severity, when set, is carried
+// onto the vulnerability and (most severe wins) its module's bump.
 type fakeAdvisory struct {
 	module, id, introduced, fixed string
+	severity                      string
 	imports                       []scan.VulnerableImport
 }
 
@@ -307,7 +311,7 @@ func (f *fakeScanner) ScanPackages(_ context.Context, pkgs []scan.Package) (*sca
 			result.Vulnerabilities = append(result.Vulnerabilities, scan.Vulnerability{
 				ID: adv.id, Module: pkg.Name, Ecosystem: "Go",
 				CurrentVersion: pkg.Version, FixedVersion: adv.fixed,
-				VulnerableImports: adv.imports,
+				Severity: adv.severity, VulnerableImports: adv.imports,
 			})
 			if adv.fixed == "" {
 				continue
@@ -321,10 +325,11 @@ func (f *fakeScanner) ScanPackages(_ context.Context, pkgs []scan.Package) (*sca
 				bump.FixedVersion = adv.fixed
 			}
 			bump.VulnIDs = append(bump.VulnIDs, adv.id)
+			bump.Severity = mergeSeverity(bump.Severity, adv.severity)
 		}
 	}
-	for _, bump := range bumps {
-		result.SecurityBumps = append(result.SecurityBumps, *bump)
+	for _, name := range sortedKeys(bumps) {
+		result.SecurityBumps = append(result.SecurityBumps, *bumps[name])
 	}
 	return result, nil
 }
@@ -487,16 +492,12 @@ func TestRunLoop_DropsUnresolvableCoUpdate(t *testing.T) {
 }
 
 func TestRunLoop_CVECandidateUnresolvable(t *testing.T) {
-	// A CVE-backed fix that fails at its exact version is retried at
-	// @latest; when that also fails it is PROMOTED to a replace directive
-	// (edits need no get-time resolution). Only when the replace also fails
-	// to sustain does it become a residual - here the promotion succeeds.
+	// A CVE-backed fix that fails to fetch at its exact version is never
+	// retried at @latest nor promoted to a replace: with no lower fix rung it
+	// becomes a residual carrying the fetch error.
 	tc := &fakeToolchain{
-		base: map[string]string{"example.com/broken": "v1.0.0"},
-		failGets: map[string]error{
-			"example.com/broken@v1.2.0": errors.New("410 gone"),
-			"example.com/broken@latest": errors.New("410 gone"),
-		},
+		base:     map[string]string{"example.com/broken": "v1.0.0"},
+		failGets: map[string]error{"example.com/broken@v1.2.0": errors.New("410 gone")},
 	}
 	sc := &fakeScanner{advisories: []fakeAdvisory{
 		{module: "example.com/broken", id: "GO-BROKEN-1", fixed: "v1.2.0"},
@@ -513,9 +514,99 @@ func TestRunLoop_CVECandidateUnresolvable(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, result.Converged)
 	assert.Empty(t, result.FinalDeps)
-	assert.Equal(t, []string{"example.com/broken=example.com/broken@v1.2.0"}, result.FinalReplaces)
-	assert.Empty(t, result.Residuals, "the promoted replace rescues the fix")
-	assert.Empty(t, result.RemainingVulnIDs)
+	assert.Empty(t, result.FinalReplaces)
+	require.Len(t, result.Residuals, 1)
+	assert.Equal(t, "v1.2.0", result.Residuals[0].FixedVersion)
+	assert.Contains(t, result.Residuals[0].Reason, "fix unresolvable: 410 gone")
+	assert.NotContains(t, tc.getLog, "example.com/broken@latest")
+	assert.Empty(t, tc.editLog, "no replace directive is ever created")
+}
+
+func TestRunLoop_UnresolvableFixStepsDownOneRung(t *testing.T) {
+	// The fix ladder: v1.3.0 (GO-B) cannot be fetched, so the candidate
+	// steps down to v1.2.0 (GO-A); only GO-B becomes a residual, and the
+	// rescan never re-raises to the rejected version.
+	tc := &fakeToolchain{
+		base:     map[string]string{"example.com/lib": "v1.0.0"},
+		failGets: map[string]error{"example.com/lib@v1.3.0": errors.New("unknown revision v1.3.0")},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/lib", id: "GO-A", fixed: "v1.2.0"},
+		{module: "example.com/lib", id: "GO-B", fixed: "v1.3.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{{
+			Module: "example.com/lib", Version: "v1.3.0", FromCVE: true, VulnIDs: []string{"GO-A", "GO-B"},
+			Rungs: []Rung{{Version: "v1.3.0", VulnIDs: []string{"GO-B"}}, {Version: "v1.2.0", VulnIDs: []string{"GO-A"}}},
+		}},
+		Baseline: map[string]string{"example.com/lib": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Equal(t, []string{"example.com/lib@v1.2.0"}, result.FinalDeps)
+	require.Len(t, result.Residuals, 1)
+	assert.Equal(t, []string{"GO-B"}, result.Residuals[0].VulnIDs)
+	assert.Equal(t, "v1.3.0", result.Residuals[0].FixedVersion)
+	assert.Contains(t, result.Residuals[0].Reason, "fix unresolvable")
+	assert.Equal(t, []string{"GO-B"}, result.RemainingVulnIDs)
+	assert.NotContains(t, tc.getLog, "example.com/lib@v1.3.0", "the rejected rung is never fetched successfully")
+}
+
+func TestRunLoop_InfrastructureFailureFailsClosed(t *testing.T) {
+	// A transient go tool failure (network, proxy 5xx, per-command timeout)
+	// is not a verdict on the candidate: the simulation fails with
+	// ErrInfrastructure instead of shedding or residualising anything.
+	for _, cause := range []error{
+		errors.New("go: example.com/lib@v1.2.0: Get \"https://proxy.golang.org/example.com/lib/@v/v1.2.0.mod\": dial tcp: lookup proxy.golang.org: i/o timeout"),
+		errors.New("go: example.com/lib@v1.2.0: reading https://proxy.golang.org/example.com/lib/@v/v1.2.0.info: 502 Bad Gateway"),
+		fmt.Errorf("%w: timed out after 2m0s: go get: signal: killed", ErrInfrastructure),
+	} {
+		t.Run(cause.Error()[:20], func(t *testing.T) {
+			tc := &fakeToolchain{
+				base:     map[string]string{"example.com/lib": "v1.0.0"},
+				failGets: map[string]error{"example.com/lib@v1.2.0": cause},
+			}
+			sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/lib", id: "GO-A", fixed: "v1.2.0"}}}
+			result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+				Modroot:  ".",
+				Seeds:    []Candidate{{Module: "example.com/lib", Version: "v1.2.0", FromCVE: true, VulnIDs: []string{"GO-A"}}},
+				Baseline: map[string]string{"example.com/lib": "v1.0.0"},
+			}, Options{})
+			require.ErrorIs(t, err, ErrInfrastructure)
+			assert.Nil(t, result)
+		})
+	}
+}
+
+func TestAsInfra(t *testing.T) {
+	cases := []struct {
+		msg   string
+		infra bool
+	}{
+		{`go: example.com/a@v1.2.0: Get "https://proxy.golang.org/...": dial tcp 142.250.1.1:443: connect: connection refused`, true},
+		{`go: example.com/a@v1.2.0: Get "https://proxy.golang.org/...": net/http: TLS handshake timeout`, true},
+		{`go: reading https://proxy.golang.org/example.com/a/@v/list: 503 Service Unavailable`, true},
+		{`go: reading https://proxy.golang.org/example.com/a/@v/v1.2.0.zip: 500 Internal Server Error`, true},
+		{`go: example.com/a@v1.2.0: read tcp 10.0.0.1:5000->1.2.3.4:443: read: connection reset by peer`, true},
+		{`go: example.com/a@v1.2.0: Get "https://proxy.golang.org/...": dial tcp: lookup proxy.golang.org: no such host`, true},
+		{`go: example.com/a@v1.2.0: reading https://proxy.golang.org/example.com/a/@v/v1.2.0.info: 404 Not Found`, false},
+		{`go: example.com/a@v1.9.9: invalid version: unknown revision v1.9.9`, false},
+		{`go: example.com/app imports example.com/a/b: ambiguous import: found package example.com/a/b in multiple modules`, false},
+		{`go: example.com/a@v1.2.0 requires example.com/b@v2.0.0: reading example.com/b/go.mod at revision v2.0.0: 410 Gone`, false},
+	}
+	for _, tc := range cases {
+		err := asInfra(errors.New(tc.msg))
+		assert.Equal(t, tc.infra, err != nil, tc.msg)
+		if tc.infra {
+			assert.ErrorIs(t, err, ErrInfrastructure)
+		}
+	}
+	assert.NoError(t, asInfra(nil))
+	wrapped := fmt.Errorf("%w: timed out", ErrInfrastructure)
+	assert.Same(t, wrapped, asInfra(wrapped))
 }
 
 func TestRunLoop_NoFixResidual(t *testing.T) {
@@ -550,6 +641,36 @@ func TestRunLoop_MajorPathChangeResidual(t *testing.T) {
 	assert.Empty(t, result.FinalDeps)
 }
 
+func TestMajorChange(t *testing.T) {
+	cases := []struct {
+		module, fixed, resolved string
+		major                   bool
+	}{
+		{"example.com/a", "v1.2.0", "v1.1.0", false},
+		{"example.com/a", "v0.9.0", "v0.8.0", false},
+		{"example.com/a", "v1.0.0", "v0.9.0", true}, // v0 -> v1 is a major change
+		{"example.com/a", "v2.0.1", "v1.2.0", true},
+		{"example.com/a/v2", "v2.3.0", "v2.1.0", false},
+		{"example.com/a/v2", "v2.0.0", "v1.9.0", false}, // path already encodes v2
+		{"gopkg.in/yaml.v3", "v3.0.1", "v3.0.0", false},
+		{"github.com/docker/docker", "v25.0.0+incompatible", "v20.10.0+incompatible", true},
+		{"example.com/a", "v1.0.0", "", false}, // not in the graph: nothing to cross
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.major, majorChange(tc.module, tc.fixed, tc.resolved), "%s %s -> %s", tc.module, tc.resolved, tc.fixed)
+	}
+}
+
+func TestRunLoop_V0ToV1FixIsResidual(t *testing.T) {
+	tc := &fakeToolchain{base: map[string]string{"example.com/young": "v0.9.0"}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/young", id: "GO-Y", fixed: "v1.0.1"}}}
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{Modroot: "."}, Options{})
+	require.NoError(t, err)
+	require.Len(t, result.Residuals, 1)
+	assert.Equal(t, "fix requires a major version change (v0.9.0 -> v1.0.1)", result.Residuals[0].Reason)
+	assert.Empty(t, result.FinalDeps)
+}
+
 func TestRunLoop_BaselineNoopsDropped(t *testing.T) {
 	tc := &fakeToolchain{base: map[string]string{
 		"example.com/aaa": "v2.2.0",
@@ -572,7 +693,8 @@ func TestRunLoop_BaselineNoopsDropped(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"example.com/bbb@v0.5.0"}, result.FinalDeps)
 	require.Len(t, result.Dropped, 1)
-	assert.Contains(t, result.Dropped[0].Reason, "no-op")
+	assert.Contains(t, result.Dropped[0].Reason, "redundant: matches or regresses upstream")
+	assert.True(t, result.Dropped[0].Redundant)
 }
 
 func TestRunLoop_ConfirmationDropsRedundantPins(t *testing.T) {
@@ -603,7 +725,7 @@ func TestRunLoop_ConfirmationDropsRedundantPins(t *testing.T) {
 	assert.Equal(t, []string{"example.com/vuln@v2.0.0"}, result.FinalDeps)
 	require.Len(t, result.Dropped, 1)
 	assert.Equal(t, "example.com/pin", result.Dropped[0].Module)
-	assert.Contains(t, result.Dropped[0].Reason, "redundant")
+	assert.Contains(t, result.Dropped[0].Reason, "not needed")
 }
 
 func TestRunLoop_ConfirmationKeepsProtectivePins(t *testing.T) {
@@ -752,22 +874,87 @@ const genprotoAmbiguityErr = `go mod tidy: exit status 1: 	google.golang.org/grp
 	google.golang.org/genproto v0.0.0-20221024183307-1bc688fe9f3e (/home/u/go/pkg/mod/google.golang.org/genproto@v0.0.0-20221024183307-1bc688fe9f3e/googleapis/rpc/status)
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260226221140-a57be14db171 (/home/u/go/pkg/mod/google.golang.org/genproto/googleapis/rpc@v0.0.0-20260226221140-a57be14db171/status)`
 
-func TestAmbiguousImportModules(t *testing.T) {
-	assert.Equal(t, []string{"google.golang.org/genproto"}, ambiguousImportModules(genprotoAmbiguityErr))
-	assert.Empty(t, ambiguousImportModules("go mod tidy: some unrelated failure"))
+func TestAmbiguousImports(t *testing.T) {
+	assert.Equal(t, []ambiguity{{
+		monolith: "google.golang.org/genproto", from: "v0.0.0-20221024183307-1bc688fe9f3e",
+		split: "google.golang.org/genproto/googleapis/rpc", splitVersion: "v0.0.0-20260226221140-a57be14db171",
+	}}, ambiguousImports(genprotoAmbiguityErr))
+	assert.Empty(t, ambiguousImports("go mod tidy: some unrelated failure"))
+}
+
+// fakeLister adds the version lookups the ambiguous-import remedy walks with
+// (versionLister) to a fakeToolchain.
+type fakeLister struct {
+	*fakeToolchain
+	queries  map[string]string            // "module@query" -> resolved version
+	versions map[string][]string          // module -> released versions, ascending
+	requires map[string]map[string]string // "module@version" -> its go.mod requires
+	err      error                        // every lookup fails with it
+}
+
+func (f *fakeLister) ResolveQuery(_ context.Context, _, module, query string) (string, error) {
+	if f.err != nil {
+		return "", f.err
+	}
+	if v, ok := f.queries[module+"@"+query]; ok {
+		return v, nil
+	}
+	return "", errors.New("unknown revision " + query)
+}
+
+func (f *fakeLister) ModuleVersions(_ context.Context, _, module string) ([]string, error) {
+	return f.versions[module], f.err
+}
+
+func (f *fakeLister) ModuleRequires(_ context.Context, _, module, version string) (map[string]string, error) {
+	return f.requires[module+"@"+version], f.err
+}
+
+func TestAmbiguityRemedy(t *testing.T) {
+	split := ambiguity{monolith: "example.com/m", from: "v1.0.0", split: "example.com/m/sub", splitVersion: "v1.1.0"}
+	lister := &fakeLister{
+		fakeToolchain: &fakeToolchain{},
+		queries:       map[string]string{"google.golang.org/genproto@a57be14db171": "v0.0.0-20260226221140-a57be14db171"},
+		versions:      map[string][]string{"example.com/m": {"v0.9.0", "v1.0.0", "v1.1.0-rc.1", "v1.1.0", "v1.2.0", "v1.3.0", "v2.0.0"}},
+		requires:      map[string]map[string]string{"example.com/m@v1.2.0": {"example.com/m/sub": "v1.0.0"}},
+	}
+	l := &loop{tc: lister, req: ModrootRequest{Modroot: "."}}
+
+	// Pseudo-version split module: the monolith at the split module's commit.
+	assert.Equal(t, "v0.0.0-20260226221140-a57be14db171", l.ambiguityRemedy(t.Context(), ambiguousImports(genprotoAmbiguityErr)[0]))
+	// Tagged split module: the first release requiring it (the carve-out),
+	// skipping pre-releases, never crossing a major.
+	assert.Equal(t, "v1.2.0", l.ambiguityRemedy(t.Context(), split))
+	// No release requires it: the next release (a recurrence advances again).
+	lister.requires = nil
+	assert.Equal(t, "v1.1.0", l.ambiguityRemedy(t.Context(), split))
+	// Nothing above the current version in the same major.
+	assert.Empty(t, l.ambiguityRemedy(t.Context(), ambiguity{monolith: "example.com/m", from: "v1.3.0", split: "example.com/m/sub", splitVersion: "v1.1.0"}))
+	// A toolchain without version lookups finds nothing.
+	assert.Empty(t, (&loop{tc: &fakeToolchain{}}).ambiguityRemedy(t.Context(), split))
+	// An infrastructure failure is recorded, never a silent "no remedy".
+	lister.err = errors.New("dial tcp: lookup proxy.golang.org: no such host")
+	assert.Empty(t, l.ambiguityRemedy(t.Context(), split))
+	assert.ErrorIs(t, l.infraErr, ErrInfrastructure)
+}
+
+// genprotoLister serves the genproto monolith at genprotoAmbiguityErr's
+// split-module commit.
+func genprotoLister(tc *fakeToolchain) *fakeLister {
+	return &fakeLister{fakeToolchain: tc, queries: map[string]string{
+		"google.golang.org/genproto@a57be14db171": "v0.0.0-20260226221140-a57be14db171",
+	}}
 }
 
 func TestRunLoop_RepairsAmbiguousImport(t *testing.T) {
 	// Bumping grpc trips the genproto monolith-vs-split ambiguity on tidy;
-	// the loop must advance the monolith past the split point and keep the
+	// the loop must advance the monolith to the split module's commit (the
+	// minimal version without the package - never @latest) and keep the
 	// CVE-backed grpc bump.
 	tc := &fakeToolchain{
 		base: map[string]string{
 			"google.golang.org/grpc":     "v1.40.0",
 			"google.golang.org/genproto": "v0.0.0-20221024183307-1bc688fe9f3e",
-		},
-		latest: map[string]string{
-			"google.golang.org/genproto": "v0.0.0-20260226221140-a57be14db171",
 		},
 	}
 	tc.tidyErr = func(applied map[string]string) error {
@@ -780,7 +967,7 @@ func TestRunLoop_RepairsAmbiguousImport(t *testing.T) {
 		{module: "google.golang.org/grpc", id: "GO-GRPC-1", fixed: "v1.56.3"},
 	}}
 
-	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+	result, err := RunLoop(t.Context(), genprotoLister(tc), sc, newTestModuleDir(t), ModrootRequest{
 		Modroot: ".",
 		Seeds: []Candidate{
 			{Module: "google.golang.org/grpc", Version: "v1.56.3", FromCVE: true, VulnIDs: []string{"GO-GRPC-1"}},
@@ -809,9 +996,6 @@ func TestRunLoop_RepairsAmbiguousImportAtGetTime(t *testing.T) {
 			"google.golang.org/grpc":     "v1.40.0",
 			"google.golang.org/genproto": "v0.0.0-20221024183307-1bc688fe9f3e",
 		},
-		latest: map[string]string{
-			"google.golang.org/genproto": "v0.0.0-20260226221140-a57be14db171",
-		},
 	}
 	tc.getErr = func(moduleAtVersion string, applied map[string]string) error {
 		if moduleAtVersion == "google.golang.org/grpc@v1.79.3" && applied["google.golang.org/genproto"] == "" {
@@ -823,7 +1007,7 @@ func TestRunLoop_RepairsAmbiguousImportAtGetTime(t *testing.T) {
 		{module: "google.golang.org/grpc", id: "GO-GRPC-1", fixed: "v1.79.3"},
 	}}
 
-	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+	result, err := RunLoop(t.Context(), genprotoLister(tc), sc, newTestModuleDir(t), ModrootRequest{
 		Modroot: ".",
 		Seeds: []Candidate{
 			{Module: "google.golang.org/grpc", Version: "v1.79.3", FromCVE: true, VulnIDs: []string{"GO-GRPC-1"}},
@@ -915,11 +1099,10 @@ func TestRunLoop_DropsTidyPrunedModules(t *testing.T) {
 	assert.Empty(t, result.Residuals)
 }
 
-func TestRunLoop_PromotesRevertedCVEPinToReplace(t *testing.T) {
+func TestRunLoop_RevertedCVEPinIsResidual(t *testing.T) {
 	// The x/crypto case: `go get` accepts the pin but the final tidy
-	// reverts it below the requested version. A CVE-backed pin must be
-	// PROMOTED to a replace directive (which survives tidy) instead of
-	// being shed as a residual.
+	// reverts it below the requested version. The pin is shed and its
+	// advisory is a residual - never promoted to a replace directive.
 	tc := &fakeToolchain{
 		base:   map[string]string{"golang.org/x/crypto": "v0.51.0", "example.com/kept": "v1.0.0"},
 		capped: map[string]string{"golang.org/x/crypto": "v0.51.0"},
@@ -941,15 +1124,16 @@ func TestRunLoop_PromotesRevertedCVEPinToReplace(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, result.Converged)
 	assert.Equal(t, []string{"example.com/kept@v1.1.0"}, result.FinalDeps)
-	assert.Equal(t, []string{"golang.org/x/crypto=golang.org/x/crypto@v0.52.0"}, result.FinalReplaces)
-	assert.ElementsMatch(t, []string{"golang.org/x/crypto", "example.com/kept"}, result.CVEBackedModules)
-	assert.Empty(t, result.Residuals, "the promoted fix must not be a residual")
-	assert.Contains(t, tc.editLog, "golang.org/x/crypto=golang.org/x/crypto@v0.52.0")
+	assert.Empty(t, result.FinalReplaces)
+	assert.Equal(t, []string{"example.com/kept"}, result.CVEBackedModules)
+	require.Len(t, result.Residuals, 1)
+	assert.Equal(t, "golang.org/x/crypto", result.Residuals[0].Module)
+	assert.Equal(t, "fix not sustained: go mod tidy reverts the pin to v0.51.0", result.Residuals[0].Reason)
+	assert.Empty(t, tc.editLog, "no replace directive is ever created")
 }
 
 func TestRunLoop_RevertedCoherencePinStillShed(t *testing.T) {
-	// A tidy-reverted pin with no CVE backing is not worth a replace
-	// directive - unchanged shed behavior.
+	// A tidy-reverted pin with no CVE backing is shed with no residual.
 	tc := &fakeToolchain{
 		base:   map[string]string{"example.com/pin": "v1.0.0", "example.com/kept": "v1.0.0"},
 		capped: map[string]string{"example.com/pin": "v1.0.0"},
@@ -1047,10 +1231,9 @@ func TestRunLoop_SeedReplacePreservedAndRaised(t *testing.T) {
 // a module in NO require line (purely transitive - never a direct or
 // indirect require, only reachable through the module graph) must still
 // survive checkReplaceCandidate and land in FinalReplaces. Unlike a deps
-// entry, a replace directive is never checked against Requirements for a
-// seed (only a PROMOTED replace is - see TestRunLoop_PrunedPromotedReplace-
-// BackfillsResidual for that contrast case); it only has to survive tidy.
-// This mirrors omnibump v0.23.1's AUTO-954: absentReplacePins re-adds
+// entry, a replace directive is never checked against Requirements; it
+// only has to survive tidy.
+// This mirrors omnibump's AUTO-954 (current release): absentReplacePins re-adds
 // replace-type deps missing from a sub-module's go.mod because the
 // directive (unlike a bare require) survives go mod tidy.
 func TestRunLoop_SeedReplaceForModuleAbsentFromGoModSurvives(t *testing.T) {
@@ -1070,7 +1253,6 @@ func TestRunLoop_SeedReplaceForModuleAbsentFromGoModSurvives(t *testing.T) {
 		Seeds: []Candidate{
 			{Module: "example.com/transitive", Version: "v2.0.0", Replace: true, ReplaceOld: "example.com/transitive"},
 		},
-		Baseline: map[string]string{"example.com/transitive": "v2.0.0"},
 	}, Options{})
 
 	require.NoError(t, err)
@@ -1111,16 +1293,18 @@ func TestRunLoop_DepsSeedSupersededByReplaceSeed(t *testing.T) {
 	assert.Contains(t, result.Dropped[0].Reason, "superseded by replaces entry")
 }
 
-func TestRunLoop_DepsSeedRoutedThroughPristinePin(t *testing.T) {
-	// A CVE fix for a module the upstream go.mod already replace-pins must
-	// update the directive (a get cannot out-vote it).
+func TestRunLoop_UpstreamReplacePinIsHoldBackResidual(t *testing.T) {
+	// A CVE fix for a module the upstream go.mod replace-pins is held back:
+	// the build's bump step cannot move it and choam never writes a replace
+	// of its own, so the advisory is a residual naming the hold-back - no
+	// get, no edit.
 	tc := &fakeToolchain{
 		base: map[string]string{"example.com/mod": "v1.0.0"},
 		pristineReplaces: map[string]ReplaceTarget{
 			"example.com/mod": {Path: "example.com/mod", Version: "v1.1.0"},
 		},
 	}
-	sc := &fakeScanner{}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/mod", id: "GO-MOD-1", fixed: "v1.5.0"}}}
 
 	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
 		Modroot: ".",
@@ -1133,8 +1317,13 @@ func TestRunLoop_DepsSeedRoutedThroughPristinePin(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, result.Converged)
 	assert.Empty(t, result.FinalDeps)
-	assert.Equal(t, []string{"example.com/mod=example.com/mod@v1.5.0"}, result.FinalReplaces)
+	assert.Empty(t, result.FinalReplaces)
+	require.Len(t, result.Residuals, 1)
+	assert.Equal(t, "upstream go.mod replace-pins example.com/mod (hold-back)", result.Residuals[0].Reason)
+	assert.Equal(t, "v1.1.0", result.Residuals[0].ResolvedVersion)
+	assert.Equal(t, []string{"GO-MOD-1"}, result.RemainingVulnIDs)
 	assert.Empty(t, tc.getLog, "no go get for a replace-pinned module")
+	assert.Empty(t, tc.editLog, "no replace directive is ever created")
 }
 
 func TestRunLoop_LocalPathReplacePinIsResidual(t *testing.T) {
@@ -1166,45 +1355,9 @@ func TestRunLoop_LocalPathReplacePinIsResidual(t *testing.T) {
 	assert.Equal(t, []string{"GO-VEND-1"}, result.RemainingVulnIDs)
 }
 
-func TestRunLoop_PromotedReplaceShedWhenTidyFails(t *testing.T) {
-	// Promotion is an attempt, not a guarantee: a promoted replace whose
-	// pinned version breaks the final tidy is shed with a residual.
-	tc := &fakeToolchain{
-		base:   map[string]string{"example.com/hard": "v1.0.0", "example.com/kept": "v1.0.0"},
-		capped: map[string]string{"example.com/hard": "v1.0.0"},
-	}
-	tc.tidyErr = func(applied map[string]string) error {
-		if _, pinned := tc.replaced["example.com/hard"]; pinned {
-			return errors.New("go: example.com/hard: incompatible module graph")
-		}
-		return nil
-	}
-	sc := &fakeScanner{}
-
-	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
-		Modroot: ".",
-		Seeds: []Candidate{
-			{Module: "example.com/hard", Version: "v1.5.0", FromCVE: true, VulnIDs: []string{"GO-HARD-1"}},
-			{Module: "example.com/kept", Version: "v1.1.0", FromCVE: true},
-		},
-		Baseline: map[string]string{
-			"example.com/hard": "v1.0.0",
-			"example.com/kept": "v1.0.0",
-		},
-	}, Options{})
-
-	require.NoError(t, err)
-	assert.True(t, result.Converged)
-	assert.Equal(t, []string{"example.com/kept@v1.1.0"}, result.FinalDeps)
-	assert.Empty(t, result.FinalReplaces)
-	require.NotEmpty(t, result.Residuals)
-	assert.Equal(t, "example.com/hard", result.Residuals[0].Module)
-	assert.Equal(t, []string{"GO-HARD-1"}, result.RemainingVulnIDs)
-}
-
 func TestRunLoop_ConfirmMinimalSetKeepsReplaces(t *testing.T) {
-	// The confirmation pass must re-apply replace directives (a promoted
-	// fix) while dropping redundant coherence pins.
+	// The confirmation pass must re-apply (user-authored) replace directives
+	// while dropping redundant coherence pins.
 	tc := &fakeToolchain{
 		base: map[string]string{
 			"golang.org/x/crypto": "v0.51.0",
@@ -1217,7 +1370,7 @@ func TestRunLoop_ConfirmMinimalSetKeepsReplaces(t *testing.T) {
 	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
 		Modroot: ".",
 		Seeds: []Candidate{
-			{Module: "golang.org/x/crypto", Version: "v0.52.0", FromCVE: true, VulnIDs: []string{"GO-CRYPTO-1"}},
+			{Module: "golang.org/x/crypto", Version: "v0.52.0", FromCVE: true, VulnIDs: []string{"GO-CRYPTO-1"}, Replace: true},
 			{Module: "example.com/pin", Version: "v1.5.0"}, // coherence-only, satisfied without it
 		},
 		Baseline: map[string]string{
@@ -1233,43 +1386,11 @@ func TestRunLoop_ConfirmMinimalSetKeepsReplaces(t *testing.T) {
 	for _, dropped := range result.Dropped {
 		if dropped.Module == "example.com/pin" {
 			pinDropped = true
-			assert.Contains(t, dropped.Reason, "redundant")
+			assert.Contains(t, dropped.Reason, "not needed")
 		}
 	}
 	assert.True(t, pinDropped, "coherence pin must be dropped as redundant")
 	assert.Empty(t, result.Residuals)
-}
-
-func TestRunLoop_PromotedReplaceBaselineNoop(t *testing.T) {
-	// A promotion whose target the baseline (upstream replace directives
-	// applied) already satisfies is a no-op and must not be emitted -
-	// mirroring gobump's warn+skip on an existing newer replace.
-	tc := &fakeToolchain{
-		base:   map[string]string{"example.com/mod": "v1.0.0"},
-		capped: map[string]string{"example.com/mod": "v1.0.0"},
-	}
-	sc := &fakeScanner{}
-
-	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
-		Modroot: ".",
-		Seeds: []Candidate{
-			{Module: "example.com/mod", Version: "v1.5.0", FromCVE: true, VulnIDs: []string{"GO-MOD-1"}},
-		},
-		// Baseline already at the target (e.g. an upstream replace pins it).
-		Baseline: map[string]string{"example.com/mod": "v1.5.0"},
-	}, Options{})
-
-	require.NoError(t, err)
-	assert.True(t, result.Converged)
-	assert.Empty(t, result.FinalDeps)
-	assert.Empty(t, result.FinalReplaces)
-	var noop bool
-	for _, dropped := range result.Dropped {
-		if strings.Contains(dropped.Reason, "no-op") {
-			noop = true
-		}
-	}
-	assert.True(t, noop, "promotion at baseline must be dropped as a no-op")
 }
 
 // TestRunLoop_UnreachableSeedDroppedNoResidual: a CVE-backed seed whose
@@ -1558,7 +1679,7 @@ func TestRunLoop_PackageGateFailsOpen(t *testing.T) {
 // transitively raises timestamp-authority past its own candidate version, so
 // the timestamp-authority get - which a real go toolchain would execute as a
 // DOWNGRADE dragging sigstore-go back to a vulnerable version - must be
-// skipped (gobump parity) and the superseded entry dropped from FinalDeps
+// skipped (gobump parity) and the implied entry dropped from FinalDeps
 // entirely, with both advisory sets counted as fixed.
 func TestRunLoop_SkipGuardPreventsDowngrade(t *testing.T) {
 	const (
@@ -1588,8 +1709,9 @@ func TestRunLoop_SkipGuardPreventsDowngrade(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.True(t, result.Converged)
-	assert.NotContains(t, tc.getLog, tsa+"@v2.1.0", "the downgrade get must be skipped")
-	assert.Equal(t, []string{sigstoreGo + "@v1.2.0"}, result.FinalDeps, "superseded entry must not be written")
+	// (The minimisation trial without sigstore-go does get tsa@v2.1.0; that
+	// trial's go.mod differs, so it proves nothing about the main apply.)
+	assert.Equal(t, []string{sigstoreGo + "@v1.2.0"}, result.FinalDeps, "implied entry must not be written")
 	assert.Equal(t, []string{sigstoreGo}, result.CVEBackedModules)
 	assert.Equal(t, "v2.1.2", result.Resolved[tsa], "transitively carried above its own candidate")
 	assert.Empty(t, result.Residuals, "both advisories are fixed by the surviving entry")
@@ -1601,13 +1723,13 @@ func TestRunLoop_SkipGuardPreventsDowngrade(t *testing.T) {
 		}
 	}
 	require.Len(t, reasons, 1)
-	assert.Contains(t, reasons[0], "superseded")
-	assert.Contains(t, reasons[0], "v2.1.2")
+	assert.Contains(t, reasons[0], "redundant: implied by")
 }
 
 // TestRunLoop_SkipGuardEqualVersionStillGets: the guard is strict-exceed
 // (gobump parity) - a require raised to exactly the candidate version still
-// gets, and an exactly-satisfied entry is not a supersession suspect.
+// gets; the entry is then implied by a (go.mod identical without it) and
+// removed as redundant.
 func TestRunLoop_SkipGuardEqualVersionStillGets(t *testing.T) {
 	tc := &fakeToolchain{
 		base: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"},
@@ -1632,42 +1754,15 @@ func TestRunLoop_SkipGuardEqualVersionStillGets(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, result.Converged)
 	assert.Contains(t, tc.getLog, "example.com/b@v2.0.0", "equal require must still get")
-	assert.ElementsMatch(t, []string{"example.com/a@v2.0.0", "example.com/b@v2.0.0"}, result.FinalDeps)
-	assert.Equal(t, 1, sc.scans, "no suspects - no supersession trial")
-}
-
-// TestRunLoop_SkipGuardLatestNeverSkipped: an @latest fallback bypasses the
-// guard entirely - "latest" is not comparable to a require version.
-func TestRunLoop_SkipGuardLatestNeverSkipped(t *testing.T) {
-	tc := &fakeToolchain{
-		base:     map[string]string{"example.com/mod": "v2.5.0"},
-		latest:   map[string]string{"example.com/mod": "v3.1.0"},
-		failGets: map[string]error{"example.com/mod@v3.0.0": errors.New("unknown revision")},
-	}
-	sc := &fakeScanner{advisories: []fakeAdvisory{
-		{module: "example.com/mod", id: "GO-M-1", fixed: "v3.0.0"},
-	}}
-
-	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
-		Modroot: ".",
-		Seeds: []Candidate{
-			{Module: "example.com/mod", Version: "v3.0.0", FromCVE: true, VulnIDs: []string{"GO-M-1"}},
-		},
-		Baseline: map[string]string{"example.com/mod": "v2.5.0"},
-	}, Options{})
-
-	require.NoError(t, err)
-	assert.True(t, result.Converged)
-	assert.Contains(t, tc.getLog, "example.com/mod@latest")
-	assert.Equal(t, []string{"example.com/mod@v3.1.0"}, result.FinalDeps)
+	assert.Equal(t, []string{"example.com/a@v2.0.0"}, result.FinalDeps)
 	assert.Empty(t, result.Residuals)
 }
 
-// TestRunLoop_SupersessionTrialRejectedKeepsEntry: a suspect whose explicit
-// get had load-bearing side effects (its closure fixed a third, non-candidate
-// module) is kept - the trial without it re-exposes that module's advisory as
-// a raise, rejecting the reduced set.
-func TestRunLoop_SupersessionTrialRejectedKeepsEntry(t *testing.T) {
+// TestRunLoop_LoadBearingRaisedEntryKept: an entry whose module another
+// entry's closure raises past it, but whose own get had load-bearing side
+// effects (its closure fixed a third, non-candidate module), is kept - the
+// final go.mod differs without it.
+func TestRunLoop_LoadBearingRaisedEntryKept(t *testing.T) {
 	tc := &fakeToolchain{
 		base: map[string]string{
 			"example.com/a": "v1.0.0",
@@ -1688,7 +1783,7 @@ func TestRunLoop_SupersessionTrialRejectedKeepsEntry(t *testing.T) {
 	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
 		Modroot: ".",
 		// b first: its get executes (and fixes d) before a's closure raises b
-		// past its own candidate version, making b a supersession suspect.
+		// past its own candidate version.
 		Seeds: []Candidate{
 			{Module: "example.com/b", Version: "v1.4.0", FromCVE: true, VulnIDs: []string{"GO-B-1"}},
 			{Module: "example.com/a", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-A-1"}},
@@ -1701,7 +1796,7 @@ func TestRunLoop_SupersessionTrialRejectedKeepsEntry(t *testing.T) {
 	assert.ElementsMatch(t, []string{"example.com/a@v2.0.0", "example.com/b@v1.4.0"}, result.FinalDeps,
 		"the suspect is load-bearing and must be kept")
 	for _, d := range result.Dropped {
-		assert.NotContains(t, d.Reason, "superseded")
+		assert.False(t, d.Redundant, "%s dropped: %s", d.Module, d.Reason)
 	}
 	assert.Empty(t, result.Residuals)
 	assert.Equal(t, "v2.0.0", result.Resolved["example.com/d"])
@@ -1740,41 +1835,6 @@ func TestRunLoop_AbandonedFixResidualNotSilentlyVanished(t *testing.T) {
 	assert.Contains(t, residual.Reason, "pruned by go mod tidy")
 	assert.Contains(t, residual.Reason, "advisory persists at v1.0.0")
 	assert.Contains(t, result.RemainingVulnIDs, "GO-G-1")
-}
-
-// TestRunLoop_PrunedPromotedReplaceBackfillsResidual: same invariant through
-// checkReplaceCandidate's residual-free "replaced module no longer required"
-// path - the promoted replace's module still resolves vulnerable.
-func TestRunLoop_PrunedPromotedReplaceBackfillsResidual(t *testing.T) {
-	tc := &fakeToolchain{
-		base:   map[string]string{"example.com/phantom": "v1.0.0"},
-		pruned: map[string]bool{"example.com/phantom": true},
-		failGets: map[string]error{
-			"example.com/phantom@v1.5.0": errors.New("unknown revision"),
-			"example.com/phantom@latest": errors.New("proxy unavailable"),
-		},
-	}
-	sc := &fakeScanner{advisories: []fakeAdvisory{
-		{module: "example.com/phantom", id: "GO-P-1", fixed: "v1.5.0"},
-	}}
-
-	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
-		Modroot: ".",
-		Seeds: []Candidate{
-			{Module: "example.com/phantom", Version: "v1.5.0", FromCVE: true, VulnIDs: []string{"GO-P-1"}},
-		},
-		Baseline: map[string]string{"example.com/phantom": "v1.0.0"},
-	}, Options{})
-
-	require.NoError(t, err)
-	assert.True(t, result.Converged)
-	assert.Empty(t, result.FinalDeps)
-	assert.Empty(t, result.FinalReplaces)
-	require.Len(t, result.Residuals, 1)
-	residual := result.Residuals[0]
-	assert.Contains(t, residual.Reason, "fix abandoned")
-	assert.Contains(t, residual.Reason, "replaced module no longer required")
-	assert.Contains(t, result.RemainingVulnIDs, "GO-P-1")
 }
 
 // TestRunLoop_IntroducedFixableAdvisoryRaisedAndFixed: an advisory that
@@ -1983,8 +2043,8 @@ func TestRunLoop_DegradedReachability_OldGoDirectiveDisablesSignal(t *testing.T)
 // path; the resolved graph and the advisory both name the NEW (replacement)
 // path. degradedUnlinked must fail open through the replace identity - the
 // module is genuinely required (under its old name) and must neither land
-// in UnrequiredModules nor get an info-classification; the fix proceeds
-// normally via the replace channel.
+// in UnrequiredModules nor get an info-classification; the advisory is
+// reported as the upstream replace's hold-back residual.
 func TestRunLoop_DegradedReachability_ReplaceResolvedNotUnrequired(t *testing.T) {
 	tc := &fakeToolchain{
 		base: map[string]string{"example.com/old": "v1.0.0"},
@@ -1994,22 +2054,22 @@ func TestRunLoop_DegradedReachability_ReplaceResolvedNotUnrequired(t *testing.T)
 		linkedErr: errors.New("go list -deps: build constraints exclude all Go files"),
 	}
 	sc := &fakeScanner{advisories: []fakeAdvisory{
-		{module: "example.com/new", id: "GO-NEW-1", fixed: "v2.0.0"},
+		{module: "example.com/new", id: "GO-NEW-1", fixed: "v1.5.0"},
 	}}
 
 	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
 		Modroot: ".",
 		Seeds: []Candidate{
-			{Module: "example.com/new", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-NEW-1"}},
+			{Module: "example.com/new", Version: "v1.5.0", FromCVE: true, VulnIDs: []string{"GO-NEW-1"}},
 		},
 		Baseline: map[string]string{"example.com/new": "v1.0.0"},
 	}, Options{})
 
 	require.NoError(t, err)
 	assert.True(t, result.Converged)
-	assert.Equal(t, []string{"example.com/old=example.com/new@v2.0.0"}, result.FinalReplaces,
-		"the fix must proceed via the replace channel")
-	assert.Empty(t, result.Residuals)
+	assert.Empty(t, result.FinalReplaces)
+	require.Len(t, result.Residuals, 1)
+	assert.Equal(t, "upstream go.mod replace-pins example.com/old (hold-back)", result.Residuals[0].Reason)
 
 	require.NotNil(t, result.UnrequiredModules)
 	assert.NotContains(t, result.UnrequiredModules, "example.com/new",
@@ -2177,7 +2237,7 @@ func TestRunLoop_DegradedReachability_TrialUsesTrialRequirements(t *testing.T) {
 
 	require.Len(t, result.Dropped, 1, "the trial-filtered rescan must confirm pin redundant")
 	assert.Equal(t, "example.com/pin", result.Dropped[0].Module)
-	assert.Contains(t, result.Dropped[0].Reason, "redundant")
+	assert.Contains(t, result.Dropped[0].Reason, "not needed")
 
 	assert.Empty(t, result.FinalDeps, "pin must not survive: confirmed redundant")
 	assert.Empty(t, result.Residuals,
@@ -2219,4 +2279,820 @@ func TestRunLoop_DegradedReachability_SelfReplaceKeyFailsOpen(t *testing.T) {
 	require.NotNil(t, result.UnrequiredModules)
 	assert.NotContains(t, result.UnrequiredModules, "example.com/selfpin",
 		"a module present as a replace KEY must fail open, not be classified unrequired")
+}
+
+// fakeCompiler adds the optional Compiler seam to fakeToolchain, enabling
+// the compile gate: compileFn derives the report from the module graph the
+// current apply produced; versions/requires model `go list -m -versions`
+// and per-version go.mod require blocks ("module@version" keys).
+type fakeCompiler struct {
+	*fakeToolchain
+	compileFn func(resolved map[string]string) *CompileReport
+	versions  map[string][]string
+	requires  map[string]map[string]string
+	// compiles counts primary-arch compiles; archCompiles every arch's
+	// (the loop compiles the arches concurrently, hence mu).
+	compiles     int
+	archCompiles map[string]int
+	mu           sync.Mutex
+}
+
+func (f *fakeCompiler) Compile(ctx context.Context, dir string, target BuildTarget, arch string) (*CompileReport, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if arch == TargetArches(target.Arches)[0] {
+		f.compiles++
+	}
+	if f.archCompiles == nil {
+		f.archCompiles = make(map[string]int)
+	}
+	f.archCompiles[arch]++
+	lastCall := f.lastCall
+	resolved, err := f.ListModules(ctx, dir)
+	f.lastCall = lastCall
+	if err != nil {
+		return nil, err
+	}
+	if f.compileFn == nil {
+		return &CompileReport{}, nil
+	}
+	return f.compileFn(resolved), nil
+}
+
+func (f *fakeCompiler) ModuleVersions(_ context.Context, _, module string) ([]string, error) {
+	return f.versions[module], nil
+}
+
+// RequiredBy derives `go mod graph` requirers from requires: every
+// resolved module@version with a requires entry.
+func (f *fakeCompiler) RequiredBy(ctx context.Context, dir string) (map[string]map[string]string, error) {
+	lastCall := f.lastCall
+	resolved, err := f.ListModules(ctx, dir)
+	f.lastCall = lastCall
+	if err != nil {
+		return nil, err
+	}
+	requiredBy := make(map[string]map[string]string)
+	for module, version := range resolved {
+		for dep, need := range f.requires[module+"@"+version] {
+			if requiredBy[dep] == nil {
+				requiredBy[dep] = make(map[string]string)
+			}
+			requiredBy[dep][module] = need
+		}
+	}
+	return requiredBy, nil
+}
+
+func (f *fakeCompiler) ModuleRequires(_ context.Context, _, module, version string) (map[string]string, error) {
+	requires, ok := f.requires[module+"@"+version]
+	if !ok {
+		return nil, errors.New("unknown module version")
+	}
+	return requires, nil
+}
+
+// otelLikeCompiler models the opentofu break: example.com/exporter (an
+// otlploghttp stand-in) compiles only against an example.com/api (otel/log)
+// at or below what its own go.mod requires - raising api to v0.21.0 removes
+// API exporter < v0.21.0 uses, while MVS happily resolves the graph.
+func otelLikeCompiler(tc *fakeToolchain, exporterVersions []string) *fakeCompiler {
+	requires := map[string]map[string]string{"example.com/api@v0.21.0": {}}
+	for _, v := range []string{"v0.18.0", "v0.19.0", "v0.20.0", "v0.21.0", "v0.22.0"} {
+		requires["example.com/exporter@"+v] = map[string]string{"example.com/api": v}
+	}
+	requires["example.com/exporter@v0.18.0"] = map[string]string{"example.com/api": "v0.19.0"}
+	return &fakeCompiler{
+		fakeToolchain: tc,
+		versions:      map[string][]string{"example.com/exporter": exporterVersions},
+		requires:      requires,
+		compileFn: func(resolved map[string]string) *CompileReport {
+			report := &CompileReport{
+				Failed: map[string][]string{},
+				Modules: map[string]string{
+					"example.com/test":          "",
+					"example.com/exporter/otlp": "example.com/exporter",
+					"example.com/api/log":       "example.com/api",
+				},
+				Imports: map[string][]string{"example.com/exporter/otlp": {"example.com/api/log"}},
+			}
+			if semver.Compare(resolved["example.com/api"], "v0.21.0") >= 0 &&
+				semver.Compare(resolved["example.com/exporter"], "v0.21.0") < 0 {
+				report.Failed["example.com/exporter/otlp"] = []string{
+					"/modcache/example.com/exporter@" + resolved["example.com/exporter"] + "/log.go:5:17: undefined: api.KeyValue",
+				}
+			}
+			return report
+		},
+	}
+}
+
+func TestCompileGate_FullSetPasses(t *testing.T) {
+	tc := &fakeCompiler{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot:  ".",
+		Seeds:    []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
+		Baseline: map[string]string{"example.com/x": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/x@v1.1.0"}, result.FinalDeps)
+	assert.Empty(t, result.Residuals)
+	assert.Equal(t, 2, tc.compiles, "one baseline compile plus one full-set compile")
+}
+
+func TestCompileGate_NoCompileSkipsGate(t *testing.T) {
+	tc := &fakeCompiler{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds:   []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
+	}, Options{NoCompile: true})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/x@v1.1.0"}, result.FinalDeps)
+	assert.Zero(t, tc.compiles)
+}
+
+func TestCompileGate_BaselineFailuresExcluded(t *testing.T) {
+	// A package already broken in the pristine checkout (host noise, e.g.
+	// a missing C library) must not count against the bump.
+	tc := &fakeCompiler{
+		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}},
+		compileFn: func(map[string]string) *CompileReport {
+			return &CompileReport{
+				Failed:  map[string][]string{"example.com/test/cgo": {"cgo.go:3:8: could not import C"}},
+				Modules: map[string]string{"example.com/test/cgo": "", "example.com/x": "example.com/x"},
+				Imports: map[string][]string{"example.com/test/cgo": {"example.com/x"}},
+			}
+		},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot:  ".",
+		Seeds:    []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
+		Baseline: map[string]string{"example.com/x": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/x@v1.1.0"}, result.FinalDeps)
+	assert.Empty(t, result.Residuals)
+	assert.Empty(t, result.Dropped)
+	assert.Equal(t, 2, tc.compiles, "baseline failure excluded: the full set passes first time")
+}
+
+func TestCompileGate_CoherenceRemedy(t *testing.T) {
+	// The opentofu reference failure: the api fix tidies cleanly but breaks
+	// the lagging exporter; the gate raises exporter to the MINIMAL version
+	// whose go.mod requires the raised api (v0.21.0, not v0.22.0).
+	tc := otelLikeCompiler(&fakeToolchain{base: map[string]string{
+		"example.com/api":      "v0.19.0",
+		"example.com/exporter": "v0.19.0",
+	}}, []string{"v0.19.0", "v0.20.0", "v0.21.0", "v0.22.0"})
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/api", id: "GO-1", fixed: "v0.21.0"}}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/api", Version: "v0.21.0", FromCVE: true, VulnIDs: []string{"GO-1"}, Severity: "HIGH"},
+		},
+		Baseline: map[string]string{"example.com/api": "v0.19.0", "example.com/exporter": "v0.19.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/api@v0.21.0", "example.com/exporter@v0.21.0"}, result.FinalDeps)
+	assert.Equal(t, []string{"example.com/api"}, result.CVEBackedModules, "a coherence raise is not a security fix")
+	assert.Empty(t, result.Residuals)
+	assert.Equal(t, "v0.21.0", result.Resolved["example.com/exporter"])
+	assert.Equal(t, 3, tc.compiles, "baseline, failing full set, coherent set")
+}
+
+func TestCompileGate_ExistingEntryIsAFloor(t *testing.T) {
+	// An existing deps entry (exporter@v0.19.0, itself a fix) must be
+	// raisable by coherence, in place - never frozen, never duplicated.
+	tc := otelLikeCompiler(&fakeToolchain{base: map[string]string{
+		"example.com/api":      "v0.19.0",
+		"example.com/exporter": "v0.18.0",
+	}}, []string{"v0.18.0", "v0.19.0", "v0.20.0", "v0.21.0"})
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/api", id: "GO-1", fixed: "v0.21.0"},
+		{module: "example.com/exporter", id: "GO-2", fixed: "v0.19.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/exporter", Version: "v0.19.0", FromCVE: true, VulnIDs: []string{"GO-2"}},
+			{Module: "example.com/api", Version: "v0.21.0", FromCVE: true, VulnIDs: []string{"GO-1"}},
+		},
+		Baseline: map[string]string{"example.com/api": "v0.19.0", "example.com/exporter": "v0.18.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/exporter@v0.21.0", "example.com/api@v0.21.0"}, result.FinalDeps)
+	assert.ElementsMatch(t, []string{"example.com/exporter", "example.com/api"}, result.CVEBackedModules)
+	assert.Empty(t, result.Residuals)
+}
+
+func TestCompileGate_RelaxSeverityOrderAndResidualReason(t *testing.T) {
+	// a and b each compile alone but not together, and no repair can help
+	// (the conflict is in main-module code). Both are implicated; the LOW
+	// fix is relaxed (dropped: it has one rung) even though the CRITICAL
+	// one was seeded later; the loser is reported as a "breaks compile"
+	// residual.
+	tc := &fakeCompiler{
+		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"}},
+		requires:      map[string]map[string]string{},
+		compileFn: func(resolved map[string]string) *CompileReport {
+			report := &CompileReport{
+				Failed:  map[string][]string{},
+				Modules: map[string]string{"example.com/test": "", "example.com/a": "example.com/a", "example.com/b": "example.com/b"},
+				Imports: map[string][]string{"example.com/test": {"example.com/a", "example.com/b"}},
+			}
+			if resolved["example.com/a"] == "v1.1.0" && resolved["example.com/b"] == "v1.1.0" {
+				report.Failed["example.com/test"] = []string{"/src/test/main.go:7:2: a.X and b.X conflict"}
+			}
+			return report
+		},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/a", id: "GO-A", fixed: "v1.1.0"},
+		{module: "example.com/b", id: "GO-B", fixed: "v1.1.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/a", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-A"}, Severity: "LOW"},
+			{Module: "example.com/b", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-B"}, Severity: "CRITICAL"},
+		},
+		Baseline: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/b@v1.1.0"}, result.FinalDeps)
+	require.Len(t, result.Residuals, 1)
+	residual := result.Residuals[0]
+	assert.Equal(t, "example.com/a", residual.Module)
+	assert.Equal(t, "v1.0.0", residual.ResolvedVersion)
+	assert.Equal(t, "v1.1.0", residual.FixedVersion)
+	assert.Equal(t, []string{"GO-A"}, residual.VulnIDs)
+	assert.Equal(t, "breaks compile: example.com/test: main.go:7:2: a.X and b.X conflict", residual.Reason)
+	assert.Contains(t, result.Dropped, DroppedCandidate{
+		Module: "example.com/a", Version: "v1.1.0",
+		Reason: "breaks compile: example.com/test: main.go:7:2: a.X and b.X conflict",
+	})
+}
+
+// TestCompileGate_RelinkedAfterGateRevivesFix is the jenkins-operator
+// oauth2 shape: o's vulnerable package (o/jws) is linked in the pristine
+// graph and only drops out of the import graph once k is raised (k@v1.1.0 no
+// longer imports it), so the full bump set sheds o's fix as unlinked. The
+// compile gate then rejects k and the final graph links o/jws again. The
+// final rescan - the authoritative reachability judgement, made on the graph
+// that ships - finds GO-O applicable, so o's fix is revived and gated in
+// another round rather than left residual: the outcome must not depend on
+// which higher pins (k) the input carried, or a second run (without them)
+// would write something different.
+func TestCompileGate_RelinkedAfterGateRevivesFix(t *testing.T) {
+	jws := scan.VulnerableImport{Path: "example.com/o/jws"}
+	tc := &fakeCompiler{
+		fakeToolchain: &fakeToolchain{
+			base: map[string]string{"example.com/k": "v1.0.0", "example.com/o": "v1.0.0"},
+			linkedPkgsFn: func(applied map[string]string) []string {
+				if semver.Compare(applied["example.com/k"], "v1.1.0") >= 0 {
+					return []string{"example.com/k"}
+				}
+				return []string{"example.com/k", jws.Path}
+			},
+		},
+		compileFn: brokenAbove("example.com/k", "v1.1.0"),
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/k", id: "GO-K", fixed: "v1.1.0"},
+		{module: "example.com/o", id: "GO-O", fixed: "v1.1.0", imports: []scan.VulnerableImport{jws}},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/k", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-K"}},
+			{Module: "example.com/o", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-O"}},
+		},
+		VulnImports: map[string][]string{"GO-O": {jws.Path}},
+		Baseline:    map[string]string{"example.com/k": "v1.0.0", "example.com/o": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Contains(t, result.LinkedPackages, jws.Path, "the final graph links the vulnerable package")
+	assert.Equal(t, []string{"example.com/o@v1.1.0"}, result.FinalDeps, "o's fix is revived and validated")
+	assert.Equal(t, []string{"GO-K"}, result.RemainingVulnIDs, "only the rejected k fix stays residual")
+	for _, d := range result.Dropped {
+		assert.NotEqual(t, "example.com/o", d.Module, "the stale unlinked drop is withdrawn: %+v", d)
+	}
+}
+
+// brokenAbove is a compileFn whose module's own package fails to compile
+// at or above version.
+func brokenAbove(module, version string) func(map[string]string) *CompileReport {
+	return func(resolved map[string]string) *CompileReport {
+		report := &CompileReport{Failed: map[string][]string{}, Modules: map[string]string{module: module}}
+		if semver.Compare(resolved[module], version) >= 0 {
+			report.Failed[module] = []string{"/modcache/" + module + "@" + resolved[module] + "/x.go:1:2: broken"}
+		}
+		return report
+	}
+}
+
+func TestCompileGate_StepsDownFixRungs(t *testing.T) {
+	// x has three fix rungs; v1.3.0 and v1.2.0 do not compile. The gate
+	// steps down one rung at a time to v1.1.0 (never to baseline), and only
+	// the advisories fixed solely above it remain, citing the rejection.
+	tc := &fakeCompiler{
+		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}},
+		compileFn:     brokenAbove("example.com/x", "v1.2.0"),
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/x", id: "GO-HIGH", fixed: "v1.1.0", severity: "HIGH"},
+		{module: "example.com/x", id: "GO-MED", fixed: "v1.2.0", severity: "MEDIUM"},
+		{module: "example.com/x", id: "GO-LOW", fixed: "v1.3.0", severity: "LOW"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{{
+			Module: "example.com/x", Version: "v1.3.0", FromCVE: true, VulnIDs: []string{"GO-HIGH", "GO-LOW", "GO-MED"}, Severity: "HIGH",
+			Rungs: FixRungs(sc.mustScan(t, "example.com/x", "v1.0.0"), "example.com/x", nil),
+		}},
+		Baseline: map[string]string{"example.com/x": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/x@v1.1.0"}, result.FinalDeps)
+	assert.Equal(t, "v1.1.0", result.Resolved["example.com/x"])
+	require.Len(t, result.Residuals, 1)
+	assert.ElementsMatch(t, []string{"GO-LOW", "GO-MED"}, result.Residuals[0].VulnIDs)
+	assert.Equal(t, "breaks compile: example.com/x: x.go:1:2: broken", result.Residuals[0].Reason)
+	assert.Empty(t, result.Dropped, "relaxed, not dropped")
+	assert.Equal(t, 4, tc.compiles, "baseline plus one trial per rung")
+}
+
+// mustScan returns the fake's findings for module@version.
+func (f *fakeScanner) mustScan(t *testing.T, module, version string) []scan.Vulnerability {
+	t.Helper()
+	result, err := f.ScanPackages(t.Context(), []scan.Package{{Name: module, Version: version, Ecosystem: "Go"}})
+	require.NoError(t, err)
+	f.scans--
+	return result.Vulnerabilities
+}
+
+func TestCompileGate_RelaxesImplicatedBeforeLessSevere(t *testing.T) {
+	// b's own package breaks at its fix; a (LOW, otherwise first to go) is
+	// not implicated and must survive. b has one rung, so it is dropped.
+	tc := &fakeCompiler{
+		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"}},
+		compileFn:     brokenAbove("example.com/b", "v1.1.0"),
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/a", id: "GO-A", fixed: "v1.1.0", severity: "LOW"},
+		{module: "example.com/b", id: "GO-B", fixed: "v1.1.0", severity: "CRITICAL"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/a", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-A"}, Severity: "LOW"},
+			{Module: "example.com/b", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-B"}, Severity: "CRITICAL"},
+		},
+		Baseline: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/a@v1.1.0"}, result.FinalDeps)
+	require.Len(t, result.Residuals, 1)
+	assert.Equal(t, "example.com/b", result.Residuals[0].Module)
+	assert.Equal(t, []string{"GO-B"}, result.Residuals[0].VulnIDs)
+}
+
+func TestCompileGate_RepairsVictimThatIsAlsoImplicated(t *testing.T) {
+	// The otlploghttp shape: the exporter is a CVE candidate whose own fix
+	// version requires api above baseline (so it is implicated in the api
+	// raise) AND the module that breaks. It must be repaired in place to the
+	// coherent version, not skipped or relaxed.
+	tc := otelLikeCompiler(&fakeToolchain{base: map[string]string{
+		"example.com/api":      "v0.18.0",
+		"example.com/exporter": "v0.18.0",
+	}}, []string{"v0.18.0", "v0.19.0", "v0.20.0", "v0.21.0", "v0.22.0"})
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/api", id: "GO-1", fixed: "v0.21.0"},
+		{module: "example.com/exporter", id: "GO-2", fixed: "v0.19.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/exporter", Version: "v0.19.0", FromCVE: true, VulnIDs: []string{"GO-2"}},
+			{Module: "example.com/api", Version: "v0.21.0", FromCVE: true, VulnIDs: []string{"GO-1"}},
+		},
+		Baseline: map[string]string{"example.com/api": "v0.18.0", "example.com/exporter": "v0.18.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/exporter@v0.21.0", "example.com/api@v0.21.0"}, result.FinalDeps)
+	assert.Empty(t, result.Residuals)
+	assert.Empty(t, result.Dropped)
+	assert.Equal(t, 3, tc.compiles, "baseline, failing set, repaired set")
+}
+
+func TestCompileGate_FailsClosed(t *testing.T) {
+	seeds := []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
+	for _, tt := range []struct {
+		name   string
+		failAt int // compile call that fails (1 = baseline)
+	}{{"baseline unavailable", 1}, {"trial tool failure", 2}} {
+		t.Run(tt.name, func(t *testing.T) {
+			tc := &failingCompiler{fakeCompiler: &fakeCompiler{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}, failAt: tt.failAt}
+			_, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{Modroot: ".", Seeds: seeds}, Options{})
+			require.ErrorIs(t, err, ErrCompileGate)
+		})
+	}
+
+}
+
+// failingCompiler fails the failAt-th Compile call as a tool failure.
+type failingCompiler struct {
+	*fakeCompiler
+	failAt int
+}
+
+func (f *failingCompiler) Compile(ctx context.Context, dir string, target BuildTarget, arch string) (*CompileReport, error) {
+	f.mu.Lock()
+	fail := arch == TargetArches(target.Arches)[0] && f.compiles+1 == f.failAt
+	if fail {
+		f.compiles++
+	}
+	f.mu.Unlock()
+	if fail {
+		return nil, errors.New("go list: exit status 2")
+	}
+	return f.fakeCompiler.Compile(ctx, dir, target, arch)
+}
+
+func TestCompileGate_CancellationPropagates(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	tc := &fakeCompiler{
+		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}},
+		compileFn: func(map[string]string) *CompileReport {
+			cancel()
+			return &CompileReport{}
+		},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
+
+	_, err := RunLoop(ctx, tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds:   []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
+	}, Options{})
+
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+// TestLogTrial_RecordShape pins the trial/repair trace records: pins with
+// roles, a capped resolved diff against baseline, failing owners and the
+// first compile errors, repair decisions - and nothing at all (no
+// formatting) when Debug is disabled.
+func TestLogTrial_RecordShape(t *testing.T) {
+	baseline := map[string]string{"example.com/gone": "v1.0.0"}
+	resolved := map[string]string{}
+	for i := range maxTrialLogDiff + 5 {
+		module := "example.com/m" + string(rune('a'+i))
+		baseline[module] = "v1.0.0"
+		resolved[module] = "v1.1.0"
+	}
+	l := &loop{req: ModrootRequest{Modroot: "."}, baselineResolved: baseline}
+	pins := []*candState{
+		{Candidate: Candidate{Module: "example.com/cve", Version: "v1.1.0", FromCVE: true}, seed: true},
+		{Candidate: Candidate{Module: "example.com/seed", Version: "v1.0.0"}, seed: true},
+		{Candidate: Candidate{Module: "example.com/rem", Version: "v0.0.0-20260226221140-a57be14db171"}, remedy: true},
+		{Candidate: Candidate{Module: "example.com/coh", Version: "v0.2.0"}, repair: true},
+		{Candidate: Candidate{Module: "example.com/new", Version: "v2.0.0", Replace: true, ReplaceOld: "example.com/old"}},
+	}
+	st := &trialOutcome{
+		report:   &CompileReport{Modules: map[string]string{"example.com/x/p": "example.com/x", "example.com/app": ""}},
+		resolved: resolved,
+		failures: map[string][]string{
+			"example.com/x/p": {"/cache/example.com/x@v1/p.go:1:2: undefined: Foo"},
+			"example.com/app": {"/src/main.go:3:4: broken"},
+		},
+	}
+
+	trace := &traceCapture{}
+	ctx := logging.Into(t.Context(), slog.New(trace))
+	l.logTrial(ctx, trialLog{purpose: "gate: relaxed", subject: "example.com/cve", pins: pins, resolved: resolved, compiled: st})
+	l.logTrial(ctx, trialLog{purpose: "refine: minimal set", pins: pins[:1], reject: "go: boom\nmore"})
+	l.logTrial(ctx, trialLog{purpose: "refine: minimal set", pins: pins[:1], resolved: resolved, raises: []raise{{module: "example.com/r", version: "v1.2.0"}}, residuals: 2})
+	l.logRepair(ctx, repairLog{module: "example.com/s", from: "v0.1.0", to: "v0.2.0", source: "version walk",
+		outgrown: map[string]string{"example.com/api": "v0.2.0"}})
+	l.logRepair(ctx, repairLog{module: "example.com/s", from: "v0.1.0", skip: "no coherent version"})
+
+	require.Len(t, trace.records, 5)
+	gate := trace.records[0].attrs
+	assert.Equal(t, trialLogMsg, trace.records[0].msg)
+	assert.Equal(t, []string{
+		"example.com/cve@v1.1.0(cve)", "example.com/seed@v1.0.0(seed)", "example.com/rem@v0.0.0-20260226221140-a57be14db171(remedy)",
+		"example.com/coh@v0.2.0(coherence)", "example.com/old=example.com/new@v2.0.0(raise)",
+	}, gate["pins"])
+	assert.Equal(t, "example.com/cve", gate["subject"])
+	diff := gate["resolved_diff"].([]string)
+	require.Len(t, diff, maxTrialLogDiff+1)
+	assert.Equal(t, "example.com/ma v1.0.0->v1.1.0", diff[0])
+	assert.Equal(t, "+6 more", diff[maxTrialLogDiff], "30 raised modules plus one removed, capped")
+	assert.Equal(t, "breaks compile", gate["outcome"])
+	assert.Equal(t, int64(2), gate["failing"])
+	assert.Equal(t, []string{"(main)", "example.com/x"}, gate["failing_owners"])
+	assert.Equal(t, []string{"example.com/app: main.go:3:4: broken", "example.com/x/p: p.go:1:2: undefined: Foo"}, gate["errors"])
+
+	assert.Equal(t, "rejected", trace.records[1].attrs["outcome"])
+	assert.Equal(t, "go: boom", trace.records[1].attrs["reject"])
+	assert.Equal(t, []string{"example.com/r@v1.2.0"}, trace.records[2].attrs["raises"])
+	assert.Equal(t, int64(2), trace.records[2].attrs["residuals"])
+
+	assert.Equal(t, repairLogMsg, trace.records[3].msg)
+	assert.Equal(t, "raise", trace.records[3].attrs["decision"])
+	assert.Equal(t, []string{"example.com/api@v0.2.0"}, trace.records[3].attrs["outgrown"])
+	assert.Equal(t, "v0.2.0", trace.records[3].attrs["to"])
+	assert.Equal(t, "skip", trace.records[4].attrs["decision"])
+	assert.Equal(t, "no coherent version", trace.records[4].attrs["reason"])
+
+	var buf bytes.Buffer
+	quiet := logging.Into(t.Context(), slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	l.logTrial(quiet, trialLog{purpose: "gate: relaxed", pins: pins, resolved: resolved, compiled: st})
+	l.logRepair(quiet, repairLog{module: "example.com/s", skip: "x"})
+	assert.Empty(t, buf.String(), "trace records are Debug-only")
+}
+
+// impliesFixture: a@v2.0.0's closure raises b to v2.0.0 (and, when mutual,
+// b@v2.0.0's raises a); both carry an advisory fixed at v2.0.0.
+func impliesFixture(mutual bool) (*fakeCompiler, *fakeScanner) {
+	effects := map[string]map[string]string{"example.com/a@v2.0.0": {"example.com/b": "v2.0.0"}}
+	requires := map[string]map[string]string{
+		"example.com/a@v2.0.0": {"example.com/b": "v2.0.0"},
+		"example.com/b@v2.0.0": {},
+	}
+	if mutual {
+		effects["example.com/b@v2.0.0"] = map[string]string{"example.com/a": "v2.0.0"}
+		requires["example.com/b@v2.0.0"] = map[string]string{"example.com/a": "v2.0.0"}
+	}
+	tc := &fakeCompiler{
+		fakeToolchain: &fakeToolchain{
+			base:       map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"},
+			getEffects: effects,
+		},
+		requires: requires,
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/a", id: "GO-A-1", fixed: "v2.0.0", severity: "HIGH"},
+		{module: "example.com/b", id: "GO-B-1", fixed: "v2.0.0", severity: "HIGH"},
+	}}
+	return tc, sc
+}
+
+func impliesRequest(seeds ...string) ModrootRequest {
+	req := ModrootRequest{
+		Modroot:  ".",
+		Baseline: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"},
+	}
+	for _, module := range seeds {
+		req.Seeds = append(req.Seeds, Candidate{Module: module, Version: "v2.0.0", FromCVE: true,
+			VulnIDs: []string{"GO-" + strings.ToUpper(module[len(module)-1:]) + "-1"}, Severity: "HIGH"})
+	}
+	return req
+}
+
+// TestMinimise_BelowBaselineRemoved: an entry older than upstream is removed
+// as matching/regressing upstream, without a trial.
+func TestMinimise_BelowBaselineRemoved(t *testing.T) {
+	tc := &fakeToolchain{base: map[string]string{"example.com/old": "v1.2.0", "example.com/x": "v1.0.0"}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-X-1", fixed: "v1.1.0"}}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: "example.com/old", Version: "v1.0.0", FromCVE: true, VulnIDs: []string{"GO-OLD-1"}},
+			{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-X-1"}},
+		},
+		Baseline: map[string]string{"example.com/old": "v1.2.0", "example.com/x": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/x@v1.1.0"}, result.FinalDeps)
+	require.Len(t, result.Dropped, 1)
+	assert.True(t, result.Dropped[0].Redundant)
+	assert.Contains(t, result.Dropped[0].Reason, "go.mod already at newer v1.2.0")
+}
+
+// TestMinimise_ImpliedPinRemoved: b is implied by a (a's go.mod requires it),
+// so it is removed - its advisory stays fixed, the removal names a - and a
+// second run on the output removes nothing and adds nothing.
+func TestMinimise_ImpliedPinRemoved(t *testing.T) {
+	tc, sc := impliesFixture(false)
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest("example.com/a", "example.com/b"), Options{NoCompile: true})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/a@v2.0.0"}, result.FinalDeps)
+	assert.Equal(t, "v2.0.0", result.Resolved["example.com/b"])
+	assert.Empty(t, result.Residuals)
+	require.Len(t, result.Dropped, 1)
+	assert.Equal(t, "example.com/b", result.Dropped[0].Module)
+	assert.True(t, result.Dropped[0].Redundant)
+	assert.Contains(t, result.Dropped[0].Reason, "implied by example.com/a@v2.0.0")
+
+	tc, sc = impliesFixture(false)
+	again, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest("example.com/a"), Options{NoCompile: true})
+	require.NoError(t, err)
+	assert.Equal(t, result.FinalDeps, again.FinalDeps, "idempotent")
+	assert.Empty(t, again.Dropped)
+}
+
+// TestMinimise_MutuallyImplyingKeepsOne: of two entries implying each other
+// exactly one survives, the same one whatever the seed order.
+func TestMinimise_MutuallyImplyingKeepsOne(t *testing.T) {
+	for _, seeds := range [][]string{{"example.com/a", "example.com/b"}, {"example.com/b", "example.com/a"}} {
+		tc, sc := impliesFixture(true)
+		result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest(seeds...), Options{NoCompile: true})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"example.com/b@v2.0.0"}, result.FinalDeps, "seeds %v", seeds)
+		assert.Empty(t, result.Residuals)
+	}
+}
+
+// TestMinimise_EffectiveEntriesKept: entries that each change the final
+// go.mod are kept.
+func TestMinimise_EffectiveEntriesKept(t *testing.T) {
+	tc, sc := impliesFixture(false)
+	tc.getEffects = nil
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest("example.com/a", "example.com/b"), Options{NoCompile: true})
+
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"example.com/a@v2.0.0", "example.com/b@v2.0.0"}, result.FinalDeps)
+	assert.Empty(t, result.Dropped)
+}
+
+// TestMinimise_UserReplaces: user-authored replaces pass through, except a
+// self-replace (old == new) at or below the baseline-resolved version, which
+// pins nothing upstream does not already select and is retired as redundant.
+func TestMinimise_UserReplaces(t *testing.T) {
+	run := func(t *testing.T, seed Candidate) *ModrootResult {
+		tc := &fakeToolchain{base: map[string]string{"example.com/x": "v1.1.0"}, linked: []string{"example.com/x", "example.com/fork"}}
+		result, err := RunLoop(t.Context(), tc, &fakeScanner{}, newTestModuleDir(t), ModrootRequest{
+			Modroot:  ".",
+			Seeds:    []Candidate{seed},
+			Baseline: map[string]string{"example.com/x": "v1.1.0"},
+		}, Options{})
+		require.NoError(t, err)
+		return result
+	}
+	t.Run("self-replace at baseline retired", func(t *testing.T) {
+		result := run(t, Candidate{Module: "example.com/x", Version: "v1.1.0", Replace: true})
+		assert.Empty(t, result.FinalReplaces)
+		require.Len(t, result.Dropped, 1)
+		assert.True(t, result.Dropped[0].Redundant)
+		assert.Contains(t, result.Dropped[0].Reason, "self-replace at or below the baseline-resolved v1.1.0")
+	})
+	t.Run("self-replace above baseline kept", func(t *testing.T) {
+		result := run(t, Candidate{Module: "example.com/x", Version: "v1.2.0", Replace: true})
+		assert.Equal(t, []string{"example.com/x=example.com/x@v1.2.0"}, result.FinalReplaces)
+		assert.Empty(t, result.Dropped)
+	})
+	t.Run("fork redirect kept", func(t *testing.T) {
+		result := run(t, Candidate{Module: "example.com/fork", Version: "v1.0.0", Replace: true, ReplaceOld: "example.com/x"})
+		assert.Equal(t, []string{"example.com/x=example.com/fork@v1.0.0"}, result.FinalReplaces)
+		assert.Empty(t, result.Dropped)
+	})
+}
+
+// TestMinimise_BudgetExhaustionKeepsSet: when the simulation budget runs out
+// during minimisation the remaining entries are kept and the run succeeds.
+func TestMinimise_BudgetExhaustionKeepsSet(t *testing.T) {
+	tc, sc := impliesFixture(false)
+	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+	defer cancel()
+	withoutB := false // this attempt got a but not (yet) b
+	tc.getErr = func(moduleAtVersion string, _ map[string]string) error {
+		withoutB = strings.HasPrefix(moduleAtVersion, "example.com/a@")
+		return nil
+	}
+	tc.tidyErr = func(map[string]string) error {
+		if withoutB {
+			<-ctx.Done() // the trial without the implied entry outlives the budget
+		}
+		return nil
+	}
+	result, err := RunLoop(ctx, tc, sc, newTestModuleDir(t), impliesRequest("example.com/a", "example.com/b"), Options{NoCompile: true})
+
+	require.NoError(t, err)
+	assert.ElementsMatch(t, []string{"example.com/a@v2.0.0", "example.com/b@v2.0.0"}, result.FinalDeps)
+	assert.Empty(t, result.Dropped)
+}
+
+// tidyCounter counts go mod tidy runs. Without tidies the fake never resets
+// its applied set, so it accumulates across attempts (and trials): only
+// tidy counts and the resolved graph are meaningful.
+type tidyCounter struct {
+	*fakeToolchain
+	tidies int
+}
+
+func (c *tidyCounter) Get(ctx context.Context, dir, moduleAtVersion string) error {
+	if c.applied == nil {
+		c.applied = make(map[string]string)
+	}
+	return c.fakeToolchain.Get(ctx, dir, moduleAtVersion)
+}
+
+func (c *tidyCounter) ModTidy(ctx context.Context, dir string) error {
+	c.tidies++
+	return c.fakeToolchain.ModTidy(ctx, dir)
+}
+
+// TestGobumpEngine_NoTidyRunsNoTidy: a `tidy: false` go/bump step
+// (gobump --tidy=false) runs no go mod tidy before or after the gets.
+func TestGobumpEngine_NoTidyRunsNoTidy(t *testing.T) {
+	tc := &tidyCounter{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot:  ".",
+		Seeds:    []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
+		Baseline: map[string]string{"example.com/x": "v1.0.0"},
+		NoTidy:   true,
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, "v1.1.0", result.Resolved["example.com/x"])
+	assert.Zero(t, tc.tidies)
+}
+
+// TestScanFindings_HygieneSplit: a module's security target is the highest
+// fix among its LINKED advisories; unlinked advisories fixed only above it
+// are hygiene targets (never raises or residuals), unless the module's fix
+// is held back.
+func TestScanFindings_HygieneSplit(t *testing.T) {
+	const mod = "example.com/m"
+	linkedImp := []scan.VulnerableImport{{Path: mod + "/used"}}
+	unlinkedImp := []scan.VulnerableImport{{Path: mod + "/unused"}}
+	scanOf := func(advisories ...fakeAdvisory) *scan.ScanResult {
+		result, err := (&fakeScanner{advisories: advisories}).ScanPackages(t.Context(), []scan.Package{{Name: mod, Version: "v1.0.0"}})
+		require.NoError(t, err)
+		return result
+	}
+	newLoop := func() *loop {
+		return &loop{byModule: map[string]*candState{}, linkedPackages: map[string]struct{}{mod + "/used": {}}}
+	}
+	resolved := map[string]string{mod: "v1.0.0"}
+
+	t.Run("mixed", func(t *testing.T) {
+		raises, residuals, hygiene := newLoop().scanFindings(scanOf(
+			fakeAdvisory{module: mod, id: "GO-L", fixed: "v1.1.0", severity: "HIGH", imports: linkedImp},
+			fakeAdvisory{module: mod, id: "GO-U", fixed: "v1.2.0", severity: "LOW", imports: unlinkedImp},
+		), resolved)
+		require.Len(t, raises, 1)
+		assert.Equal(t, "v1.1.0", raises[0].version, "the security target stops at the linked fix")
+		assert.Equal(t, []string{"GO-L"}, raises[0].vulnIDs)
+		assert.Empty(t, residuals)
+		require.Len(t, hygiene, 1)
+		assert.Equal(t, raise{module: mod, version: "v1.2.0", vulnIDs: []string{"GO-U"}, severity: "LOW",
+			rungs: []Rung{{Version: "v1.2.0", VulnIDs: []string{"GO-U"}, Severity: "LOW"}}}, hygiene[0])
+	})
+	t.Run("unlinked fixed by the security target", func(t *testing.T) {
+		raises, _, hygiene := newLoop().scanFindings(scanOf(
+			fakeAdvisory{module: mod, id: "GO-L", fixed: "v1.2.0", severity: "HIGH", imports: linkedImp},
+			fakeAdvisory{module: mod, id: "GO-U", fixed: "v1.1.0", severity: "LOW", imports: unlinkedImp},
+		), resolved)
+		require.Len(t, raises, 1)
+		assert.Equal(t, "v1.2.0", raises[0].version)
+		assert.Empty(t, hygiene)
+	})
+	t.Run("all unlinked", func(t *testing.T) {
+		raises, residuals, hygiene := newLoop().scanFindings(scanOf(
+			fakeAdvisory{module: mod, id: "GO-U", fixed: "v1.2.0", severity: "LOW", imports: unlinkedImp},
+		), resolved)
+		assert.Empty(t, raises)
+		assert.Empty(t, residuals)
+		require.Len(t, hygiene, 1)
+		assert.Equal(t, "v1.2.0", hygiene[0].version)
+	})
+	t.Run("held back", func(t *testing.T) {
+		l := newLoop()
+		l.pristineReplaces = map[string]ReplaceTarget{mod: {Path: mod, Version: "v1.0.0"}}
+		_, _, hygiene := l.scanFindings(scanOf(
+			fakeAdvisory{module: mod, id: "GO-U", fixed: "v1.2.0", severity: "LOW", imports: unlinkedImp},
+		), resolved)
+		assert.Empty(t, hygiene)
+	})
 }

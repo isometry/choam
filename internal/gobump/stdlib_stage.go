@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/isometry/choam/internal/git"
@@ -64,7 +65,7 @@ func NewStdlibStage(analyzer *Analyzer, opts ProcessorOptions) *StdlibStage {
 }
 
 // ShouldRun gates on the option flag and on the package actually building Go
-// code (go/build or go/install steps - see unitsFromBuildSteps): only such
+// code (go/build or go/install steps - see scanBuildSteps): only such
 // packages embed the stdlib in their artifacts. Deliberately independent of
 // vulnerability findings or bump actions - the pipeline runner evaluates
 // each stage's ShouldRun on its own, so this stage runs even when every
@@ -78,7 +79,8 @@ func (s *StdlibStage) ShouldRun(ctx context.Context, p processor.Processor) (boo
 	if !s.Options.StdlibCheck || gp.Config == nil {
 		return false, nil
 	}
-	return len(unitsFromBuildSteps(ctx, gp.Config)["go"]) > 0, nil
+	scan := scanBuildSteps(ctx, gp.Config)
+	return len(scan.units["go"]) > 0 || len(scan.versionedInstalls) > 0, nil
 }
 
 // Apply runs the staleness check. EVERY failure path degrades to a
@@ -186,11 +188,18 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 // checkoutLinkedStd clones the package's source (reusing the vulnerability
 // analysis' git-checkout coordinates) and computes the union of linked
 // stdlib import paths across the package's go build units, exactly as the
-// simulation would have (simulate.Toolchain.LinkedStd, GOOS=linux).
+// simulation would have (simulate.Toolchain.LinkedStd: GOOS=linux, the
+// union over the package's target arches, each step's build environment). A
+// versioned go/install step's artifact is built from another module
+// version, whose stdlib slice is unknown: an error (fail open).
 func (s *StdlibStage) checkoutLinkedStd(ctx context.Context, gp *GoBumpProcessor) (map[string]struct{}, error) {
 	analysis := gp.VulnerabilityAnalysis
 	if analysis == nil || analysis.RepoURL == "" || analysis.Tag == "" {
 		return nil, fmt.Errorf("no source coordinates available (repository/tag unknown)")
+	}
+	scan := scanBuildSteps(ctx, gp.Config)
+	if len(scan.versionedInstalls) > 0 {
+		return nil, fmt.Errorf("go/install %s builds outside the checkout", strings.Join(scan.versionedInstalls, ", "))
 	}
 
 	simOpts := simulate.Options{Budget: s.Options.SimulationTimeout}.WithDefaults()
@@ -228,12 +237,12 @@ func (s *StdlibStage) checkoutLinkedStd(ctx context.Context, gp *GoBumpProcessor
 	}
 
 	union := make(map[string]struct{})
-	for _, unit := range unitsFromBuildSteps(ctx, gp.Config)["go"] {
+	for _, unit := range scan.units["go"] {
 		dir := cloneDir
 		if unit.Modroot != "" && unit.Modroot != "." {
 			dir = filepath.Join(cloneDir, filepath.FromSlash(unit.Modroot))
 		}
-		std, err := toolchain.LinkedStd(ctx, dir, unit.Packages)
+		std, err := toolchain.LinkedStd(ctx, dir, simulate.BuildTarget{Patterns: unit.Packages, Tags: unit.Tags, Arches: unit.Arches, Env: unit.Env})
 		if err != nil {
 			return nil, fmt.Errorf("computing linked stdlib packages for modroot %s: %w", unit.Modroot, err)
 		}

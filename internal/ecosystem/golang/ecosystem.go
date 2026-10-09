@@ -11,7 +11,8 @@ package golang
 import (
 	"context"
 	"fmt"
-	"strings"
+	"maps"
+	"slices"
 
 	"github.com/isometry/choam/internal/ecosystem"
 	"github.com/isometry/choam/internal/scan"
@@ -39,9 +40,11 @@ func init() {
 
 func (e *Ecosystem) Name() string { return "go" }
 
-// ManifestFiles returns go.mod and go.sum. go.sum is optional at fetch time
-// (some projects predate its existence) - Analyze tolerates its absence.
-func (e *Ecosystem) ManifestFiles() []string { return []string{"go.mod", "go.sum"} }
+// ManifestFiles returns go.mod (required) and go.sum (optional: a module
+// with no dependencies has none) - Analyze tolerates its absence.
+func (e *Ecosystem) ManifestFiles() (required, optional []string) {
+	return []string{"go.mod"}, []string{"go.sum"}
+}
 
 func (e *Ecosystem) Analyze(_ context.Context, files map[string][]byte) (*ecosystem.ModuleDeps, error) {
 	goModContent, ok := files["go.mod"]
@@ -55,7 +58,8 @@ func (e *Ecosystem) Analyze(_ context.Context, files map[string][]byte) (*ecosys
 	}
 
 	deps := make([]ecosystem.Dep, 0, len(info.AllRequirements))
-	for module, version := range info.AllRequirements {
+	for _, module := range slices.Sorted(maps.Keys(info.AllRequirements)) {
+		version := info.AllRequirements[module]
 		_, direct := info.Requirements[module]
 		deps = append(deps, ecosystem.Dep{
 			Coord:    module,
@@ -80,8 +84,9 @@ func (e *Ecosystem) ScanPackages(_ context.Context, deps *ecosystem.ModuleDeps) 
 	}
 
 	pkgs := make([]scan.Package, 0, len(info.AllRequirements))
-	for module, version := range info.AllRequirements {
-		if strings.HasPrefix(module, "std") {
+	for _, module := range slices.Sorted(maps.Keys(info.AllRequirements)) {
+		version := info.AllRequirements[module]
+		if module == "std" || module == "cmd" { // stdlib pseudo-modules, never real requirements
 			continue
 		}
 
@@ -173,11 +178,12 @@ func (e *Ecosystem) BumpCoords(ctx context.Context, bumps []scan.SecurityBump, d
 // and removal of no-ops/downgrades/missing modules. Graph coherence (pulling
 // in release-group siblings and transitive requirement gaps) is deliberately
 // NOT handled here - the bump simulation owns it with the real toolchain
-// (go get / go mod tidy / MVS; see internal/simulate).
-func (e *Ecosystem) FilterBumps(ctx context.Context, existing []string, bumps []scan.SecurityBump, deps *ecosystem.ModuleDeps) []string {
+// (go get / go mod tidy / MVS; see internal/simulate), which also reports
+// the fixes it cannot apply, so nothing is held here.
+func (e *Ecosystem) FilterBumps(ctx context.Context, existing []string, bumps []scan.SecurityBump, deps *ecosystem.ModuleDeps) ([]string, []ecosystem.HeldBump) {
 	info, ok := deps.Raw.(*GoModInfo)
 	if !ok || info == nil {
-		return nil
+		return nil, nil
 	}
 
 	candidate := make([]string, 0, len(existing)+len(bumps))
@@ -187,5 +193,5 @@ func (e *Ecosystem) FilterBumps(ctx context.Context, existing []string, bumps []
 	}
 
 	_, filtered := e.analyzer.analyzeBumps(ctx, candidate, info)
-	return filtered
+	return filtered, nil
 }
