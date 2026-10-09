@@ -423,7 +423,10 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoB
 	if v.Analyzer != nil {
 		releases = v.Analyzer.goReleases
 	}
-	units := discoverAnalysisUnits(ctx, gp.Config, bumpSteps, planMigrations(ctx, gp.GetCurrentYAML(), bumpSteps, releases))
+	units, notes := discoverAnalysisUnits(ctx, gp.Config, bumpSteps, planMigrations(ctx, gp.GetCurrentYAML(), bumpSteps, releases))
+	for _, note := range notes {
+		gp.AddMessage("build: " + note)
+	}
 	if len(units) == 0 {
 		logging.From(ctx).Debug("not a bumpable project")
 		gp.AddMessage("Not a bumpable project - skipping dependency analysis")
@@ -628,6 +631,8 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 			Modroot:        root,
 			BuildPackages:  unit.Packages,
 			BuildTags:      unit.Tags,
+			BuildArches:    unit.Arches,
+			BuildEnv:       unit.Env,
 			BumpEngine:     unit.Engine,
 			BumpMigrating:  unit.Migrating,
 			BumpNoTidy:     unit.NoTidy,

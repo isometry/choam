@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/isometry/choam/internal/goversion"
@@ -102,12 +103,13 @@ type loop struct {
 	// and the simulation fails with it.
 	infraErr error
 
-	// Artifact reachability: buildPatterns are the go/build package patterns
-	// (default ./...) whose non-test import graph decides what actually
-	// ships; linked/linkedPackages are the module and package sets from the
-	// last Toolchain.Linked query, nil when unknown (query failed) -
-	// reachability then fails OPEN and no filtering happens.
-	buildPatterns  []string
+	// Artifact reachability: target is what the build compiles (go/build
+	// package patterns, default ./..., tags, arches - normalized, the first
+	// is the compile gate's - and environment) whose non-test import graph
+	// decides what actually ships; linked/linkedPackages are the module and
+	// package sets from the last Toolchain.Linked query, nil when unknown
+	// (query failed) - reachability then fails OPEN and no filtering happens.
+	target         BuildTarget
 	linked         map[string]struct{}
 	linkedPackages map[string]struct{}
 	linkedWarned   bool
@@ -124,11 +126,13 @@ type loop struct {
 	// Compile gate (see compileGate): compiler is nil when the gate is off
 	// (toolchain without Compiler support, or Options.NoCompile).
 	// baselineFailed are the packages already failing to compile in the
-	// pristine checkout (excluded from every verdict); baselineResolved is
-	// the pristine tidied module graph.
-	compiler         Compiler
-	baselineFailed   map[string]struct{}
-	baselineResolved map[string]string
+	// pristine checkout on the primary arch (excluded from every verdict),
+	// archBaselineFailed the same for each other target arch (see
+	// crossArchCompile); baselineResolved is the pristine tidied module graph.
+	compiler           Compiler
+	baselineFailed     map[string]struct{}
+	archBaselineFailed map[string]map[string]struct{}
+	baselineResolved   map[string]string
 	// gateRejected maps a module to why the gate rejected its higher rung,
 	// across gate rounds; revived marks candidates shed as unlinked that a
 	// gate round brought back because the gated graph links them again
@@ -158,17 +162,22 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 
 	var pristineReplaces map[string]ReplaceTarget
 	l := &loop{
-		tc:            tc,
-		sc:            sc,
-		dir:           dir,
-		req:           req,
-		opts:          opts,
-		byModule:      make(map[string]*candState),
-		remedied:      make(map[string]remedyState),
-		buildPatterns: req.Packages,
+		tc:       tc,
+		sc:       sc,
+		dir:      dir,
+		req:      req,
+		opts:     opts,
+		byModule: make(map[string]*candState),
+		remedied: make(map[string]remedyState),
+		target: BuildTarget{
+			Patterns: req.Packages,
+			Tags:     req.Tags,
+			Arches:   TargetArches(req.Arches),
+			Env:      req.Env,
+		},
 	}
-	if len(l.buildPatterns) == 0 {
-		l.buildPatterns = []string{"./..."}
+	if len(l.target.Patterns) == 0 {
+		l.target.Patterns = []string{"./..."}
 	}
 	if compiler, ok := tc.(Compiler); ok && !opts.NoCompile {
 		l.compiler = compiler
@@ -355,6 +364,10 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	// Last: scanner-hygiene bumps, only where they are free against that
 	// final go.mod (see hygienePass).
 	if resolved, err = l.hygienePass(ctx, ref, resolved, result); err != nil {
+		return nil, err
+	}
+
+	if err := l.crossArchCompile(ctx); err != nil {
 		return nil, err
 	}
 
@@ -915,11 +928,11 @@ func (l *loop) dropLatestRaise(err error) bool {
 // OPEN: both sets become nil and no reachability filtering happens (warned
 // once per loop).
 func (l *loop) refreshLinked(ctx context.Context) {
-	linked, linkedPackages, err := l.tc.Linked(ctx, l.dir, l.buildPatterns, l.req.Tags)
+	linked, linkedPackages, err := l.tc.Linked(ctx, l.dir, l.target)
 	if err != nil {
 		if !l.linkedWarned {
 			logging.From(ctx).Warn("artifact reachability unavailable - not filtering",
-				"modroot", l.req.Modroot, "packages", strings.Join(l.buildPatterns, " "), "error", err)
+				"modroot", l.req.Modroot, "packages", strings.Join(l.target.Patterns, " "), "error", err)
 			l.linkedWarned = true
 		}
 		l.linked, l.linkedPackages = nil, nil
@@ -947,11 +960,11 @@ func (l *loop) maxDepGoVersion(ctx context.Context) string {
 // linkedStdPackages computes the stdlib slice of the current artifact import
 // graph. Fail-open: a toolchain error is logged and nil returned.
 func (l *loop) linkedStdPackages(ctx context.Context) map[string]struct{} {
-	std, err := l.tc.LinkedStd(ctx, l.dir, l.buildPatterns, l.req.Tags)
+	std, err := l.tc.LinkedStd(ctx, l.dir, l.target)
 	if err != nil {
 		if !l.linkedStdWarned {
 			logging.From(ctx).Warn("linked stdlib package lookup unavailable",
-				"modroot", l.req.Modroot, "packages", strings.Join(l.buildPatterns, " "), "error", err)
+				"modroot", l.req.Modroot, "packages", strings.Join(l.target.Patterns, " "), "error", err)
 			l.linkedStdWarned = true
 		}
 		return nil
@@ -1076,7 +1089,7 @@ func (l *loop) dropUnreachable() bool {
 		var reason string
 		switch {
 		case !l.isLinked(c.Module):
-			reason = fmt.Sprintf("module not linked into build artifacts (packages: %s)", strings.Join(l.buildPatterns, " "))
+			reason = fmt.Sprintf("module not linked into build artifacts (packages: %s)", strings.Join(l.target.Patterns, " "))
 		case c.FromCVE && !l.seedVulnPackagesLinked(c.VulnIDs):
 			reason = "vulnerable package(s) not linked into build artifacts"
 			// The module ships: scanners still flag its version, so the
@@ -1922,10 +1935,12 @@ func (o *trialOutcome) why() string {
 	return "breaks compile: " + firstCompileError(o.failures)
 }
 
-// compileBaseline compiles the pristine checkout once, after the initial
-// tidy: packages that already fail there (missing C libraries, generated
-// code, host-only noise) are excluded from every later verdict, so only
-// failures a bump introduces count.
+// compileBaseline compiles the pristine checkout once per target arch,
+// after the initial tidy: packages that already fail there (missing C
+// libraries, generated code, host-only noise) are excluded from every later
+// verdict, so only failures a bump introduces count. The arches compile
+// concurrently; the primary arch's failures are baselineFailed, the others'
+// archBaselineFailed (for crossArchCompile).
 func (l *loop) compileBaseline(ctx context.Context) error {
 	if err := l.engine.tidyBaseline(ctx); err != nil {
 		return gateErr(ctx, fmt.Errorf("baseline go mod tidy: %w", err))
@@ -1934,19 +1949,84 @@ func (l *loop) compileBaseline(ctx context.Context) error {
 	if err != nil {
 		return gateErr(ctx, err)
 	}
-	report, err := l.compiler.Compile(ctx, l.dir, l.buildPatterns, l.req.Tags)
+	reports, err := l.compileArches(ctx, l.target.Arches)
 	if err != nil {
 		return gateErr(ctx, fmt.Errorf("baseline: %w", err))
 	}
 	l.baselineResolved = resolved
-	l.baselineFailed = make(map[string]struct{}, len(report.Failed))
-	for pkg := range report.Failed {
-		l.baselineFailed[pkg] = struct{}{}
+	l.archBaselineFailed = make(map[string]map[string]struct{}, len(reports)-1)
+	for i, report := range reports {
+		failed := make(map[string]struct{}, len(report.Failed))
+		for pkg := range report.Failed {
+			failed[pkg] = struct{}{}
+		}
+		arch := l.target.Arches[i]
+		if i == 0 {
+			l.baselineFailed = failed
+		} else {
+			l.archBaselineFailed[arch] = failed
+		}
+		if len(report.Failed) > 0 {
+			logging.From(ctx).Debug("compile gate baseline: packages already failing are excluded",
+				"modroot", l.req.Modroot, "arch", arch, "count", len(report.Failed), "first", firstCompileError(report.Failed))
+		}
 	}
-	if len(report.Failed) > 0 {
-		logging.From(ctx).Debug("compile gate baseline: packages already failing are excluded",
-			"modroot", l.req.Modroot, "count", len(report.Failed), "first", firstCompileError(report.Failed))
+	return nil
+}
+
+// compileArches compiles the checkout for each of arches concurrently,
+// returning the reports in arch order; the error is the first failing
+// arch's in arch order (every compile runs to completion).
+func (l *loop) compileArches(ctx context.Context, arches []string) ([]*CompileReport, error) {
+	reports := make([]*CompileReport, len(arches))
+	errs := make([]error, len(arches))
+	var wg sync.WaitGroup
+	for i, arch := range arches {
+		wg.Go(func() { reports[i], errs[i] = l.compiler.Compile(ctx, l.dir, l.target, arch) })
 	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			return nil, fmt.Errorf("GOARCH=%s: %w", arches[i], err)
+		}
+	}
+	return reports, nil
+}
+
+// crossArchCompile compiles the final set once on each target arch besides
+// the primary one (the gate's and the hygiene trials' arch, which bounds
+// their cost): a failure that arch's baseline did not have fails the
+// simulation closed (ErrCompileGate) - the set was never proven to build
+// there. The checkout is re-applied to the final set first (a trial may
+// have left another state). Nothing to do without the compile gate, with a
+// single arch, or with no entry to write.
+func (l *loop) crossArchCompile(ctx context.Context) error {
+	final := l.inApplyOrder(l.activeCandidates())
+	if l.compiler == nil || len(l.target.Arches) < 2 || len(final) == 0 {
+		return nil
+	}
+	start := time.Now()
+	if fail := l.engine.apply(ctx, final); fail != nil {
+		return gateErr(ctx, fmt.Errorf("re-applying the final set for the cross-arch compile: %w", fail.err))
+	}
+	arches := l.target.Arches[1:]
+	reports, err := l.compileArches(ctx, arches)
+	if err != nil {
+		return gateErr(ctx, err)
+	}
+	for i, report := range reports {
+		failures := make(map[string][]string)
+		for pkg, lines := range report.Failed {
+			if _, known := l.archBaselineFailed[arches[i]][pkg]; !known {
+				failures[pkg] = lines
+			}
+		}
+		if len(failures) > 0 {
+			return gateErr(ctx, fmt.Errorf("the final bump set breaks the GOARCH=%s build: %s", arches[i], firstCompileError(failures)))
+		}
+	}
+	logging.From(ctx).Info("cross-arch compile passed", "modroot", l.req.Modroot, "arches", strings.Join(arches, ","),
+		"duration", time.Since(start).Round(time.Millisecond))
 	return nil
 }
 
@@ -2134,7 +2214,7 @@ func (l *loop) trial(ctx context.Context, purpose, subject string, pins []*candS
 	if err != nil {
 		return nil, gateErr(ctx, err)
 	}
-	report, err := l.compiler.Compile(ctx, l.dir, l.buildPatterns, l.req.Tags)
+	report, err := l.compiler.Compile(ctx, l.dir, l.target, l.target.Arches[0])
 	if err != nil {
 		return nil, gateErr(ctx, err)
 	}

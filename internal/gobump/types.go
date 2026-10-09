@@ -117,6 +117,12 @@ type ModrootAnalysis struct {
 	// the simulation's compile gate. Empty when no go/build step covers it.
 	BuildTags []string `json:"build_tags,omitempty" yaml:"build_tags,omitempty"`
 
+	// BuildArches are the GOARCHes the package is built for (from
+	// package.target-architecture) and BuildEnv the build environment the
+	// spec sets for this modroot (see analysisUnit). Go only.
+	BuildArches []string          `json:"-" yaml:"-"`
+	BuildEnv    simulate.BuildEnv `json:"-" yaml:"-"`
+
 	// BumpEngine is the apply semantics the build's bump step will use for
 	// this modroot once written (see analysisUnit.Engine); BumpMigrating
 	// marks a go/bump step that migrates to `uses: bump` when rewritten;

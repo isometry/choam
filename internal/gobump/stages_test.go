@@ -112,7 +112,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		steps, err := loader.FindBumpSteps([]byte(certManagerLikeYAML))
 		require.NoError(t, err)
 
-		units := discoverAnalysisUnits(t.Context(), &melange.Configuration{}, steps, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), &melange.Configuration{}, steps, nil)
 		require.Contains(t, units, "go")
 		assert.ElementsMatch(t, []string{"cmd/a", "cmd/b", ".", "test/e2e"}, roots(units["go"]))
 	})
@@ -124,7 +124,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "go/build", With: map[string]string{"modroot": "cmd/foo"}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Equal(t, []string{"cmd/foo"}, roots(units["go"]))
 	})
 
@@ -132,7 +132,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		cfg := &melange.Configuration{
 			Pipeline: []melange.Pipeline{{Uses: "go/build"}},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Equal(t, []string{"."}, roots(units["go"]))
 	})
 
@@ -140,7 +140,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		cfg := &melange.Configuration{
 			Pipeline: []melange.Pipeline{{Uses: "cargo/build", With: map[string]string{"modroot": "."}}},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Equal(t, []string{"."}, roots(units["rust"]))
 	})
 
@@ -153,7 +153,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Equal(t, []string{"cmd/sub"}, roots(units["go"]))
 	})
 
@@ -168,7 +168,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.ElementsMatch(t, []string{"cmd/a", "cmd/b"}, roots(units["go"]))
 	})
 
@@ -178,7 +178,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				"choam/bump-rust": "cmd/foo, cmd/bar",
 			}},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.ElementsMatch(t, []string{"cmd/foo", "cmd/bar"}, roots(units["rust"]))
 	})
 
@@ -186,7 +186,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		cfg := &melange.Configuration{
 			Package: melange.Package{Annotations: map[string]string{"choam/bump-java": ""}},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Equal(t, []string{"."}, roots(units["java"]))
 	})
 
@@ -198,7 +198,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				"choam/bump-go": "cmd/annotated",
 			}},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, bumpSteps, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, bumpSteps, nil)
 		assert.ElementsMatch(t, []string{"cmd/existing", "cmd/build", "cmd/annotated"}, roots(units["go"]))
 	})
 
@@ -213,7 +213,8 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 			{Uses: "go/build", With: map[string]string{"modroot": "cmd/new", "go-package": "go-fips-1.25"}},
 		}}
 		byRoot := make(map[string]analysisUnit)
-		for _, unit := range discoverAnalysisUnits(t.Context(), cfg, bumpSteps, nil)["go"] {
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, bumpSteps, nil)
+		for _, unit := range units["go"] {
 			byRoot[unit.Modroot] = unit
 		}
 		assert.Equal(t, simulate.EngineGobump, byRoot["cmd/legacy"].Engine)
@@ -232,7 +233,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "cargo/build", With: map[string]string{"modroot": "cli"}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Equal(t, []string{"."}, roots(units["go"]))
 		assert.Equal(t, []string{"cli"}, roots(units["rust"]))
 	})
@@ -241,7 +242,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		cfg := &melange.Configuration{
 			Pipeline: []melange.Pipeline{{Uses: "git-checkout"}, {Runs: "make build"}},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Empty(t, units)
 	})
 
@@ -249,11 +250,11 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		cfg := &melange.Configuration{
 			Pipeline: []melange.Pipeline{{Uses: "maven/pombump"}}, // not a build step with modroot
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.NotContains(t, units, "java")
 
 		cfg.Package.Annotations = map[string]string{"choam/bump-java": "."}
-		units = discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ = discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		assert.Equal(t, []string{"."}, roots(units["java"]))
 	})
 
@@ -263,7 +264,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "go/build", With: map[string]string{"modroot": ".", "packages": "./cmd/terraform ."}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		require.Len(t, units["go"], 1)
 		assert.Equal(t, ".", units["go"][0].Modroot)
 		assert.ElementsMatch(t, []string{".", "./cmd/terraform"}, units["go"][0].Packages)
@@ -276,7 +277,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "go/build", With: map[string]string{"packages": "./cmd/b ./cmd/a"}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		require.Len(t, units["go"], 1)
 		assert.Equal(t, []string{"./cmd/a", "./cmd/b"}, units["go"][0].Packages)
 	})
@@ -288,14 +289,14 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "go/build", With: map[string]string{"packages": "./cmd/${{package.name}}"}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		require.Len(t, units["go"], 1)
 		assert.Equal(t, []string{"./cmd/example"}, units["go"][0].Packages)
 	})
 
 	t.Run("bump-step-only modroot has empty packages", func(t *testing.T) {
 		bumpSteps := []config.BumpStep{{Language: "go", Modroots: []string{"cmd/only"}}}
-		units := discoverAnalysisUnits(t.Context(), &melange.Configuration{}, bumpSteps, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), &melange.Configuration{}, bumpSteps, nil)
 		require.Len(t, units["go"], 1)
 		assert.Empty(t, units["go"][0].Packages)
 		assert.Empty(t, units["go"][0].Tags)
@@ -308,7 +309,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "go/build", With: map[string]string{"toolchaintags": "netgo", "tags": "baz"}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		require.Len(t, units["go"], 1)
 		assert.Equal(t, []string{"bar", "baz", "foo", "netgo", "osusergo"}, units["go"][0].Tags)
 	})
@@ -319,7 +320,7 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 				{Uses: "go/build", With: map[string]string{"toolchaintags": ""}},
 			},
 		}
-		units := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 		require.Len(t, units["go"], 1)
 		assert.Empty(t, units["go"][0].Tags)
 	})

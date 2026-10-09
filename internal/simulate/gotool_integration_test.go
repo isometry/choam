@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -139,7 +138,7 @@ func TestGoToolchain_LinkedModules(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	linked, linkedPackages, err := toolchain.Linked(t.Context(), dir, nil, nil) // nil -> ./...
+	linked, linkedPackages, err := toolchain.Linked(t.Context(), dir, BuildTarget{}) // nil -> ./...
 	require.NoError(t, err)
 
 	assert.Contains(t, linked, "golang.org/x/text", "main-linked module must be reachable")
@@ -174,54 +173,94 @@ func TestGoToolchain_DepGoVersionsAndLinkedStd(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, versions, "dependency-free module has no non-main modules to report")
 
-	std, err := toolchain.LinkedStd(t.Context(), dir, nil, nil) // nil -> ./...
+	std, err := toolchain.LinkedStd(t.Context(), dir, BuildTarget{}) // nil -> ./...
 	require.NoError(t, err)
 	assert.Contains(t, std, "fmt")
 	assert.Contains(t, std, "os")
 }
 
-// TestGoToolchain_LinkedUsesCompileTarget pins that reachability (Linked,
-// LinkedStd) evaluates the same build target and tags as Compile (see
-// targetBuildEnv): GOARCH=amd64 whatever the host, the go/build tags, and
-// CGO only on a native linux/amd64 host - so the linked set and the compile
-// gate never disagree about which files are built. Stdlib-only fixture, no
-// network.
-func TestGoToolchain_LinkedUsesCompileTarget(t *testing.T) {
+// TestGoToolchain_LinkedUsesTargetBuildEnv pins that reachability (Linked,
+// LinkedStd) evaluates the build target targetBuildEnv describes: the union
+// over the target arches (default amd64 and arm64), the go/build tags, the
+// spec's GOEXPERIMENT, and CGO_ENABLED=1 unless the spec disables it -
+// whatever the host. It also proves `go list -deps` needs no C toolchain for
+// that: a cgo file (import "C") and the package only it imports are listed
+// for a linux target with CC pointing nowhere, on any host. Stdlib-only
+// fixture, no network.
+func TestGoToolchain_LinkedUsesTargetBuildEnv(t *testing.T) {
 	toolchain, err := NewToolchain(t.Context(), time.Minute)
 	if err != nil {
 		t.Skipf("go toolchain unavailable: %v", err)
 	}
+	t.Setenv("CC", "/nonexistent/cc")
 	dir := t.TempDir()
 	files := map[string]string{
 		"go.mod":      "module example.com/targetfixture\n\ngo 1.21\n",
 		"main.go":     "package main\n\nimport \"fmt\"\n\nfunc main() { fmt.Println() }\n",
-		"a_amd64.go":  "package main\n\nimport _ \"net/http\"\n",
-		"b_arm64.go":  "package main\n\nimport _ \"net/rpc\"\n",
+		"a_amd64.go":  "package main\n\nimport _ \"archive/zip\"\n",
+		"b_arm64.go":  "package main\n\nimport _ \"archive/tar\"\n",
 		"c_tagged.go": "//go:build choamtag\n\npackage main\n\nimport _ \"encoding/xml\"\n",
-		"d_cgo.go":    "//go:build cgo\n\npackage main\n\nimport _ \"os/user\"\n",
+		"d_cgo.go":    "//go:build cgo\n\npackage main\n\nimport _ \"net/mail\"\n",
+		"e_c.go":      "package main\n\n// int answer(void) { return 42; }\nimport \"C\"\n\nimport _ \"net/smtp\"\n\nvar _ = C.answer\n",
+		"f_exp.go":    "//go:build goexperiment.boringcrypto\n\npackage main\n\nimport _ \"encoding/csv\"\n",
 	}
 	for name, content := range files {
 		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644))
 	}
+	ctx := t.Context()
 
-	std, err := toolchain.LinkedStd(t.Context(), dir, nil, []string{"choamtag"})
+	std, err := toolchain.LinkedStd(ctx, dir, BuildTarget{Tags: []string{"choamtag"}})
 	require.NoError(t, err)
-	assert.Contains(t, std, "net/http", "GOARCH=amd64 files are built")
-	assert.NotContains(t, std, "net/rpc", "host-arch files are not")
+	assert.Contains(t, std, "archive/zip", "amd64 files are built")
+	assert.Contains(t, std, "archive/tar", "arm64 files are built too: the default target is both arches")
 	assert.Contains(t, std, "encoding/xml", "go/build tags apply")
-	_, cgoLinked := std["os/user"]
-	assert.Equal(t, runtime.GOOS == "linux" && runtime.GOARCH == compileTargetArch, cgoLinked,
-		"cgo files are built exactly when Compile enables CGO")
+	assert.Contains(t, std, "net/mail", "cgo files are built: melange builds with build-base, CGO on")
+	assert.Contains(t, std, "net/smtp", "an import only a cgo (import \"C\") file has is linked, with no C compiler")
+	assert.NotContains(t, std, "encoding/csv", "no GOEXPERIMENT unless the spec sets one")
 
-	untagged, err := toolchain.LinkedStd(t.Context(), dir, nil, nil)
+	amd64, err := toolchain.LinkedStd(ctx, dir, BuildTarget{Arches: []string{"amd64"}})
 	require.NoError(t, err)
-	assert.NotContains(t, untagged, "encoding/xml")
+	assert.Contains(t, amd64, "archive/zip")
+	assert.NotContains(t, amd64, "archive/tar", "an x86_64-only package does not build arm64 files")
+	assert.NotContains(t, amd64, "encoding/xml")
 
-	_, _, err = toolchain.Linked(t.Context(), dir, nil, []string{"choamtag"})
+	arm64, err := toolchain.LinkedStd(ctx, dir, BuildTarget{Arches: []string{"arm64"}})
 	require.NoError(t, err)
-	report, err := toolchain.Compile(t.Context(), dir, nil, []string{"choamtag"})
+	assert.Contains(t, arm64, "archive/tar")
+	assert.NotContains(t, arm64, "archive/zip")
+
+	noCgo, err := toolchain.LinkedStd(ctx, dir, BuildTarget{Env: BuildEnv{CGO: "0"}})
 	require.NoError(t, err)
-	assert.Empty(t, report.Failed)
+	assert.NotContains(t, noCgo, "net/mail", "the spec's CGO_ENABLED=0 is respected")
+	assert.NotContains(t, noCgo, "net/smtp")
+
+	exp, err := toolchain.LinkedStd(ctx, dir, BuildTarget{Env: BuildEnv{GOExperiment: "boringcrypto"}})
+	require.NoError(t, err)
+	assert.Contains(t, exp, "encoding/csv", "the spec's GOEXPERIMENT changes build constraints")
+
+	modules, packages, err := toolchain.Linked(ctx, dir, BuildTarget{Tags: []string{"choamtag"}})
+	require.NoError(t, err)
+	assert.Equal(t, map[string]struct{}{"example.com/targetfixture": {}}, modules, "stdlib-only fixture: only the main module")
+	assert.Equal(t, map[string]struct{}{"example.com/targetfixture": {}}, packages)
+
+	// Compile shares the environment; CGO off keeps it host-independent (a
+	// real cgo compile needs a linux C toolchain).
+	for _, arch := range []string{"amd64", "arm64"} {
+		report, err := toolchain.Compile(ctx, dir, BuildTarget{Tags: []string{"choamtag"}, Env: BuildEnv{CGO: "0"}}, arch)
+		require.NoError(t, err, arch)
+		assert.Empty(t, report.Failed, arch)
+	}
+
+	// Determinism: the arch union does not depend on arch order or timing.
+	for i := range 20 {
+		arches := []string{"amd64", "arm64"}
+		if i%2 == 1 {
+			arches = []string{"arm64", "amd64", "arm64"}
+		}
+		again, err := toolchain.LinkedStd(ctx, dir, BuildTarget{Tags: []string{"choamtag"}, Arches: arches})
+		require.NoError(t, err)
+		assert.Equal(t, std, again, "run %d", i)
+	}
 }
 
 // writeFileProxy builds a file:// GOPROXY serving the given module versions
@@ -350,7 +389,7 @@ func TestGoToolchain_CompileReportsLockstepBreak(t *testing.T) {
 	toolchain, dir := otelLikeFixture(t)
 	ctx := t.Context()
 
-	report, err := toolchain.Compile(ctx, dir, nil, []string{"netgo", "osusergo"})
+	report, err := toolchain.Compile(ctx, dir, BuildTarget{Tags: []string{"netgo", "osusergo"}}, "amd64")
 	require.NoError(t, err)
 	assert.Empty(t, report.Failed, "pristine fixture compiles")
 	assert.Equal(t, "", report.Modules["example.com/app"], "main-module package maps to the empty module")
@@ -359,7 +398,7 @@ func TestGoToolchain_CompileReportsLockstepBreak(t *testing.T) {
 	require.NoError(t, toolchain.Get(ctx, dir, "example.com/api@v0.21.0"))
 	require.NoError(t, toolchain.ModTidy(ctx, dir), "MVS has no upper bounds: the raise tidies cleanly")
 
-	report, err = toolchain.Compile(ctx, dir, nil, nil)
+	report, err = toolchain.Compile(ctx, dir, BuildTarget{}, "amd64")
 	require.NoError(t, err)
 	require.Contains(t, report.Failed, "example.com/exporter")
 	assert.Contains(t, strings.Join(report.Failed["example.com/exporter"], "\n"), "undefined: api.KeyValue")

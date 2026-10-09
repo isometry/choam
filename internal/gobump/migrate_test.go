@@ -46,7 +46,7 @@ func migrationAnalysis(t *testing.T, yamlContent string, bump func(string) strin
 	loader := config.NewLoader()
 	steps, err := loader.FindBumpSteps([]byte(yamlContent))
 	require.NoError(t, err)
-	units := discoverAnalysisUnits(t.Context(), cfg, steps, planMigrations(t.Context(), []byte(yamlContent), steps, nil))
+	units, _ := discoverAnalysisUnits(t.Context(), cfg, steps, planMigrations(t.Context(), []byte(yamlContent), steps, nil))
 
 	roots := unitRoots(units["go"])
 	existingDeps := existingDepsForModroots(roots, steps)

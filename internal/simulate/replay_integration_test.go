@@ -135,7 +135,7 @@ func (f replayFixture) compileFailuresWith(t tb, eng Engine, deps []string) stri
 		}
 		require.NoError(t, f.tc.ModTidy(ctx, dir))
 	}
-	report, err := f.tc.Compile(ctx, dir, nil, replayTags)
+	report, err := f.tc.Compile(ctx, dir, BuildTarget{Tags: replayTags}, "amd64")
 	require.NoError(t, err)
 	if len(report.Failed) == 0 {
 		return ""
@@ -547,7 +547,7 @@ func (c replayCase) runCtx(ctx context.Context, f replayFixture, eng Engine, noT
 }
 
 func replayCases() []replayCase {
-	return append([]replayCase{opentofuCase(), rungFallbackCase(), crossContaminationCase(), redundantPinsCase(), impliedPinCase()},
+	return append([]replayCase{opentofuCase(), rungFallbackCase(), crossContaminationCase(), redundantPinsCase(), impliedPinCase(), buildTargetCase()},
 		hygieneReplayCases()...)
 }
 

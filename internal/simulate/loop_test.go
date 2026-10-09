@@ -98,7 +98,7 @@ type fakeToolchain struct {
 	editLog  []string
 }
 
-func (f *fakeToolchain) Linked(ctx context.Context, dir string, _, _ []string) (map[string]struct{}, map[string]struct{}, error) {
+func (f *fakeToolchain) Linked(ctx context.Context, dir string, _ BuildTarget) (map[string]struct{}, map[string]struct{}, error) {
 	if f.linkedErr != nil {
 		return nil, nil, f.linkedErr
 	}
@@ -145,7 +145,7 @@ func (f *fakeToolchain) DepGoVersions(_ context.Context, _ string) (map[string]s
 	return f.depGoVersions, nil
 }
 
-func (f *fakeToolchain) LinkedStd(_ context.Context, _ string, _, _ []string) (map[string]struct{}, error) {
+func (f *fakeToolchain) LinkedStd(_ context.Context, _ string, _ BuildTarget) (map[string]struct{}, error) {
 	linkedStd, linkedStdErr := f.linkedStd, f.linkedStdErr
 	if f.linkedStdFn != nil {
 		linkedStd, linkedStdErr = f.linkedStdFn(f.applied)
@@ -2290,11 +2290,23 @@ type fakeCompiler struct {
 	compileFn func(resolved map[string]string) *CompileReport
 	versions  map[string][]string
 	requires  map[string]map[string]string
-	compiles  int
+	// compiles counts primary-arch compiles; archCompiles every arch's
+	// (the loop compiles the arches concurrently, hence mu).
+	compiles     int
+	archCompiles map[string]int
+	mu           sync.Mutex
 }
 
-func (f *fakeCompiler) Compile(ctx context.Context, dir string, _, _ []string) (*CompileReport, error) {
-	f.compiles++
+func (f *fakeCompiler) Compile(ctx context.Context, dir string, target BuildTarget, arch string) (*CompileReport, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if arch == TargetArches(target.Arches)[0] {
+		f.compiles++
+	}
+	if f.archCompiles == nil {
+		f.archCompiles = make(map[string]int)
+	}
+	f.archCompiles[arch]++
 	lastCall := f.lastCall
 	resolved, err := f.ListModules(ctx, dir)
 	f.lastCall = lastCall
@@ -2718,12 +2730,17 @@ type failingCompiler struct {
 	failAt int
 }
 
-func (f *failingCompiler) Compile(ctx context.Context, dir string, patterns, tags []string) (*CompileReport, error) {
-	if f.compiles+1 == f.failAt {
+func (f *failingCompiler) Compile(ctx context.Context, dir string, target BuildTarget, arch string) (*CompileReport, error) {
+	f.mu.Lock()
+	fail := arch == TargetArches(target.Arches)[0] && f.compiles+1 == f.failAt
+	if fail {
 		f.compiles++
+	}
+	f.mu.Unlock()
+	if fail {
 		return nil, errors.New("go list: exit status 2")
 	}
-	return f.fakeCompiler.Compile(ctx, dir, patterns, tags)
+	return f.fakeCompiler.Compile(ctx, dir, target, arch)
 }
 
 func TestCompileGate_CancellationPropagates(t *testing.T) {

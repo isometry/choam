@@ -282,7 +282,7 @@ func (l *loop) hygieneTrial(ctx context.Context, purpose string, set []*candStat
 	case goversion.Compare(depGo, maxGo) > 0:
 		return notFree(fmt.Sprintf("raises dependency Go %s->%s", maxGo, depGo))
 	}
-	report, err := l.compiler.Compile(ctx, l.dir, l.buildPatterns, l.req.Tags)
+	report, err := l.compiler.Compile(ctx, l.dir, l.target, l.target.Arches[0])
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr

@@ -34,6 +34,7 @@ type GoToolchain struct {
 	goBin      string
 	goVersion  string // bare version ("1.26.4"), for gobump-parity `go mod tidy -go=`
 	goModCache string // GOMODCACHE, for mapping compile-error paths back to module@version
+	goCache    string // GOCACHE, for recognising a build-cache entry lost mid-compile
 	timeout    time.Duration
 
 	// compileTimeout bounds a Compile invocation, which type-checks the
@@ -68,12 +69,15 @@ func NewToolchain(ctx context.Context, commandTimeout time.Duration) (*GoToolcha
 	// documented residual risk).
 	probeCtx, cancel := context.WithTimeout(ctx, commandTimeout)
 	defer cancel()
-	env, err := exec.CommandContext(probeCtx, goBin, "env", "GOVERSION", "GOMODCACHE").Output()
+	env, err := exec.CommandContext(probeCtx, goBin, "env", "GOVERSION", "GOMODCACHE", "GOCACHE").Output()
 	if err == nil {
 		lines := strings.Split(strings.TrimSpace(string(env)), "\n")
 		t.goVersion = strings.TrimPrefix(strings.TrimSpace(lines[0]), "go")
 		if len(lines) > 1 {
 			t.goModCache = strings.TrimSpace(lines[1])
+		}
+		if len(lines) > 2 {
+			t.goCache = strings.TrimSpace(lines[2])
 		}
 	}
 	return t, nil
@@ -306,81 +310,149 @@ func (t *GoToolchain) DepGoVersions(ctx context.Context, dir string) (map[string
 }
 
 // Linked returns the modules AND packages in the transitive non-test import
-// graph of the given build patterns - exactly what the linker records in the
-// binary's buildinfo (what APK scanners read), plus the package-level detail
-// needed to check an advisory's vulnerable import paths (a module can be
-// linked via one package while the vulnerable package is not - e.g.
-// x/sys/unix linked, x/sys/windows not). Both sets come from ONE go list
-// walk. Deliberate choices:
+// graph of the target's build patterns - exactly what the linker records in
+// the binary's buildinfo (what APK scanners read), plus the package-level
+// detail needed to check an advisory's vulnerable import paths (a module can
+// be linked via one package while the vulnerable package is not - e.g.
+// x/sys/unix linked, x/sys/windows not). Both sets come from ONE go list walk
+// per target arch, unioned: an import linked on any arch the package is
+// built for ships. Deliberate choices:
 //   - Test-only imports are excluded BY DESIGN (no -test flag): they never
 //     ship in the artifact, which is precisely the narrowing this exists for.
-//   - No -e flag: a package-load error fails the whole call so the caller
-//     fails OPEN (no filtering); -e would silently under-report the import
-//     graph and wrongly drop real fixes - the one unacceptable failure mode.
+//   - No -e flag: a package-load error (on any arch) fails the whole call so
+//     the caller fails OPEN (no filtering); -e, or a partial union, would
+//     silently under-report the import graph and wrongly drop real fixes -
+//     the one unacceptable failure mode.
 //   - Replace directives resolve to the replacement path, matching
 //     ListModules' identity space (scan findings name the replacement).
-//   - The build target (GOOS/GOARCH/CGO_ENABLED, see targetBuildEnv) and the
-//     go/build steps' tags are exactly Compile's, so the linked set and the
-//     compile gate judge the same files.
-func (t *GoToolchain) Linked(ctx context.Context, dir string, patterns, tags []string) (modules, packages map[string]struct{}, err error) {
+//   - The build environment and tags are targetBuildEnv's and the target's,
+//     shared with Compile, so the linked set and the compile gate judge the
+//     same files (CGO aside: see targetBuildEnv).
+func (t *GoToolchain) Linked(ctx context.Context, dir string, target BuildTarget) (modules, packages map[string]struct{}, err error) {
 	const tmpl = `{{if and .Module (not .Standard)}}{{.ImportPath}} {{if .Module.Replace}}{{.Module.Replace.Path}}{{else}}{{.Module.Path}}{{end}}{{end}}`
-	output, err := t.runEnv(ctx, dir, targetBuildEnv(), targetListArgs([]string{"list", "-deps", "-f", tmpl}, patterns, tags)...)
+	outputs, err := t.listDeps(ctx, dir, target, tmpl)
 	if err != nil {
 		return nil, nil, err
 	}
 
 	modules = make(map[string]struct{})
 	packages = make(map[string]struct{})
-	for line := range strings.SplitSeq(string(output), "\n") {
-		pkg, module, found := strings.Cut(strings.TrimSpace(line), " ")
-		if !found {
-			continue
+	for _, output := range outputs {
+		for line := range strings.SplitSeq(string(output), "\n") {
+			pkg, module, found := strings.Cut(strings.TrimSpace(line), " ")
+			if !found {
+				continue
+			}
+			packages[pkg] = struct{}{}
+			modules[module] = struct{}{}
 		}
-		packages[pkg] = struct{}{}
-		modules[module] = struct{}{}
 	}
 	return modules, packages, nil
 }
 
 // LinkedStd returns the set of standard-library import paths in the
-// transitive non-test import graph of the given build patterns, evaluated
-// for the same build target and tags as Linked (same walk semantics,
-// inverted filter: standard library packages instead of non-standard ones).
-func (t *GoToolchain) LinkedStd(ctx context.Context, dir string, patterns, tags []string) (map[string]struct{}, error) {
+// transitive non-test import graph of the target's build patterns, with the
+// same arch union and walk semantics as Linked (inverted filter: standard
+// library packages instead of non-standard ones).
+func (t *GoToolchain) LinkedStd(ctx context.Context, dir string, target BuildTarget) (map[string]struct{}, error) {
 	const tmpl = `{{if .Standard}}{{.ImportPath}}{{end}}`
-	output, err := t.runEnv(ctx, dir, targetBuildEnv(), targetListArgs([]string{"list", "-deps", "-f", tmpl}, patterns, tags)...)
+	outputs, err := t.listDeps(ctx, dir, target, tmpl)
 	if err != nil {
 		return nil, err
 	}
 
 	std := make(map[string]struct{})
-	for line := range strings.SplitSeq(string(output), "\n") {
-		pkg := strings.TrimSpace(line)
-		if pkg == "" {
-			continue
+	for _, output := range outputs {
+		for line := range strings.SplitSeq(string(output), "\n") {
+			if pkg := strings.TrimSpace(line); pkg != "" {
+				std[pkg] = struct{}{}
+			}
 		}
-		std[pkg] = struct{}{}
 	}
 	return std, nil
 }
 
-// compileTargetArch is the GOARCH the compile gate type-checks for. The
-// target arch of the melange build is not threaded through yet; amd64 is
-// the common denominator (arch-specific files rarely carry API breaks).
-const compileTargetArch = "amd64"
-
-// targetBuildEnv is the build target every artifact-graph query (Linked,
-// LinkedStd, Compile) evaluates under: GOOS=linux (melange builds linux
-// packages), GOARCH=compileTargetArch, and CGO enabled only when the host
-// can build cgo for the target natively (no linux C toolchain is assumed on
-// other hosts: cross-cgo would fail runtime/cgo and mask every package
-// above it).
-func targetBuildEnv() []string {
-	cgo := "0"
-	if runtime.GOOS == "linux" && runtime.GOARCH == compileTargetArch {
-		cgo = "1"
+// listDeps runs `go list -deps -f tmpl` for every target arch concurrently,
+// returning the outputs in arch order. Every walk runs to completion (a
+// failing arch does not cancel the others), so the error reported is that of
+// the first failing arch in arch order whatever the timing; a cancellation
+// of ctx stops them all.
+func (t *GoToolchain) listDeps(ctx context.Context, dir string, target BuildTarget, tmpl string) ([][]byte, error) {
+	arches := TargetArches(target.Arches)
+	args := targetListArgs([]string{"list", "-deps", "-f", tmpl}, target.Patterns, target.Tags)
+	outputs := make([][]byte, len(arches))
+	errs := make([]error, len(arches))
+	var wg sync.WaitGroup
+	for i, arch := range arches {
+		wg.Go(func() {
+			outputs[i], errs[i] = t.runEnv(ctx, dir, targetBuildEnv(arch, target.Env, false), args...)
+		})
 	}
-	return []string{"GOOS=linux", "GOARCH=" + compileTargetArch, "CGO_ENABLED=" + cgo}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			return nil, fmt.Errorf("GOARCH=%s: %w", arches[i], err)
+		}
+	}
+	return outputs, nil
+}
+
+// defaultArches are the GOARCHes melange builds Wolfi packages for when the
+// spec does not restrict package.target-architecture.
+var defaultArches = []string{"amd64", "arm64"}
+
+// TargetArches normalizes a target-arch list: deduplicated, amd64 then arm64
+// first and any others after in lexical order (so the compile gate's primary
+// arch never depends on input order); empty means defaultArches.
+func TargetArches(arches []string) []string {
+	if len(arches) == 0 {
+		return slices.Clone(defaultArches)
+	}
+	rank := func(arch string) int {
+		if i := slices.Index(defaultArches, arch); i >= 0 {
+			return i
+		}
+		return len(defaultArches)
+	}
+	out := slices.Clone(arches)
+	slices.SortFunc(out, func(a, b string) int { return cmp.Or(cmp.Compare(rank(a), rank(b)), strings.Compare(a, b)) })
+	return slices.Compact(out)
+}
+
+// hostCanCgo reports whether the host can compile cgo for linux/arch
+// natively; no linux cross C toolchain is assumed (cross-cgo would fail
+// runtime/cgo and mask every package above it).
+func hostCanCgo(arch string) bool {
+	return runtime.GOOS == "linux" && runtime.GOARCH == arch
+}
+
+// CompileCgoLimited reports whether the compile gate must type-check arch
+// with CGO disabled although the build enables it (see targetBuildEnv).
+func CompileCgoLimited(arch string, env BuildEnv) bool {
+	return env.CGO != "0" && !hostCanCgo(arch)
+}
+
+// targetBuildEnv is the build environment every artifact-graph query
+// (Linked, LinkedStd and, with compile set, Compile) evaluates arch under -
+// the single source of GOOS/GOARCH/CGO_ENABLED/GOEXPERIMENT:
+//   - GOOS=linux: melange builds linux packages.
+//   - CGO_ENABLED is the spec's (env.CGO) when it sets one, else 1: melange's
+//     go/build and go/install pull in build-base, so a native build has a C
+//     toolchain and the go command enables cgo. Reachability always uses
+//     that value - `go list -deps` only evaluates build constraints (cgo
+//     files, import "C") and never invokes the C compiler, so it needs no C
+//     toolchain even for a cross target. Compile does run cgo, so it falls
+//     back to CGO_ENABLED=0 when the host cannot build cgo for linux/arch
+//     (see hostCanCgo, CompileCgoLimited): the gate then judges the !cgo
+//     files - a documented limitation, reported by the caller.
+//   - GOEXPERIMENT is always set (empty clears the user's own), as the
+//     go/build and go/install pipelines do.
+func targetBuildEnv(arch string, env BuildEnv, compile bool) []string {
+	cgo := "1"
+	if env.CGO == "0" || (compile && !hostCanCgo(arch)) {
+		cgo = "0"
+	}
+	return []string{"GOOS=linux", "GOARCH=" + arch, "CGO_ENABLED=" + cgo, "GOEXPERIMENT=" + env.GOExperiment}
 }
 
 // targetListArgs completes a `go list` invocation with the go/build steps'
@@ -411,19 +483,20 @@ type goListPackage struct {
 }
 
 // Compile type-checks and compiles (without linking) every non-test package
-// in the transitive import graph of patterns, for GOOS=linux, via
+// in the transitive import graph of the target's patterns, via
 // `go list -e -export -deps -json`: -export forces a real compile of each
 // package to export data, and -e records each package's own compile error
 // on its .Error instead of aborting the walk - structured, per-package, no
 // vet noise, no link step. A package whose dependency failed is not compiled
 // at all (only DepsErrors), so failures surface on the deepest broken
 // package - exactly the module that needs blaming. The build target is
-// targetBuildEnv's. The build cache is the user's GOCACHE, shared and
-// incremental across compiles and runs. An error return means the go tool
-// itself failed (not that packages failed to compile).
-func (t *GoToolchain) Compile(ctx context.Context, dir string, patterns, tags []string) (*CompileReport, error) {
-	args := targetListArgs([]string{"list", "-e", "-export", "-deps", "-json=ImportPath,Standard,Module,Imports,Error"}, patterns, tags)
-	output, err := t.runEnvTimeout(ctx, dir, targetBuildEnv(), t.compileTimeout, args...)
+// targetBuildEnv's for arch (one arch per call). The build cache is the
+// user's GOCACHE, shared and incremental across compiles and runs. An error
+// return means the go tool itself failed (not that packages failed to
+// compile).
+func (t *GoToolchain) Compile(ctx context.Context, dir string, target BuildTarget, arch string) (*CompileReport, error) {
+	args := targetListArgs([]string{"list", "-e", "-export", "-deps", "-json=ImportPath,Standard,Module,Imports,Error"}, target.Patterns, target.Tags)
+	output, err := t.runEnvTimeout(ctx, dir, targetBuildEnv(arch, target.Env, true), t.compileTimeout, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -459,6 +532,12 @@ func (t *GoToolchain) Compile(ctx context.Context, dir string, patterns, tags []
 		if pkg.Error == nil {
 			continue
 		}
+		if t.lostCacheEntry(pkg.Error.Err) {
+			// Not a verdict on the graph: another process removed build-cache
+			// entries under this compile (e.g. a concurrent `go clean -cache`).
+			return nil, fmt.Errorf("%w: build cache entry vanished during compile of %s: %s",
+				ErrInfrastructure, pkg.ImportPath, compileErrorLines(pkg.Error.Err)[0])
+		}
 		lines := compileErrorLines(pkg.Error.Err)
 		report.Failed[pkg.ImportPath] = lines
 		report.Imports[pkg.ImportPath] = pkg.Imports
@@ -469,6 +548,14 @@ func (t *GoToolchain) Compile(ctx context.Context, dir string, patterns, tags []
 		}
 	}
 	return report, nil
+}
+
+// lostCacheEntry reports whether a package error is the compiler failing to
+// open an export file in the build cache (GOCACHE) - an entry deleted while
+// the go command relied on it.
+func (t *GoToolchain) lostCacheEntry(errText string) bool {
+	return t.goCache != "" && strings.Contains(errText, "(open "+t.goCache+string(filepath.Separator)) &&
+		strings.Contains(errText, "no such file or directory")
 }
 
 // compileErrorLines extracts the first maxCompileErrorLines diagnostic lines

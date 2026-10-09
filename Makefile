@@ -11,7 +11,7 @@ test:
 # Determinism/idempotency tests, repeated in shuffled order: the unit
 # shuffle tests 20x; the replay idempotency tests (real go toolchain, each
 # already repeating its fixture 5x) once.
-DETERMINISM_TESTS = Deterministic|SecondPassIsNoOp|SecondPassMatches|UnsustainedPinStepsDown|RelinkedAfterGate|FallbackTimeoutIsVisible|EqualVersion|EqualRung|LandsOnCanonicalRung|TotalOrder|SourceLint|IncompatibleFix|IncompatibleSpelling|CanonicalModuleVersion|PreferVersion|HygieneSplit
+DETERMINISM_TESTS = Deterministic|SecondPassIsNoOp|SecondPassMatches|UnsustainedPinStepsDown|RelinkedAfterGate|FallbackTimeoutIsVisible|EqualVersion|EqualRung|LandsOnCanonicalRung|TotalOrder|SourceLint|IncompatibleFix|IncompatibleSpelling|CanonicalModuleVersion|PreferVersion|HygieneSplit|TargetArches
 test-determinism:
 	go test -count=20 -shuffle=on -run '$(DETERMINISM_TESTS)' ./internal/simulate/ ./internal/scan/ ./internal/gobump/ ./internal/ecosystem/golang/
 	go test -count=1 -shuffle=on -run 'TestReplay_Idempotent|TestReplay_OpentofuOtelFamily|TestReplay_HygieneFree' ./internal/simulate/

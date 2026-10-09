@@ -24,6 +24,27 @@ type bumpSimulator interface {
 	Simulate(ctx context.Context, repoURL, tag, expectedCommit string, reqs []simulate.ModrootRequest) (map[string]*simulate.ModrootResult, error)
 }
 
+// compileCgoNote reports the compile gate's cgo limitation for modroot m:
+// the spec sets CGO_ENABLED=1, but the host cannot compile linux cgo for
+// some target arch, so the gate type-checks it with CGO_ENABLED=0
+// (reachability still uses 1: see simulate.BuildEnv). "" when not limited.
+func compileCgoNote(m ModrootAnalysis, compile bool) string {
+	if !compile || m.BuildEnv.CGO != "1" {
+		return ""
+	}
+	var limited []string
+	for _, arch := range simulate.TargetArches(m.BuildArches) {
+		if simulate.CompileCgoLimited(arch, m.BuildEnv) {
+			limited = append(limited, arch)
+		}
+	}
+	if len(limited) == 0 {
+		return ""
+	}
+	return fmt.Sprintf("modroot %s: compile gate ran with CGO_ENABLED=0 for GOARCH=%s (the spec sets CGO_ENABLED=1, but this host cannot compile linux cgo) - cgo files count as linked but are not compile-checked",
+		m.Modroot, strings.Join(limited, ","))
+}
+
 // SimulationStage validates the Go bump candidate sets computed by the
 // vulnerability check before the applier writes them: it clones the source
 // the build will use, applies the candidates with the real go toolchain, and
@@ -119,12 +140,17 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			if m.BumpEngine == simulate.EngineOmnibump {
 				omnibumpRoots++
 			}
+			if note := compileCgoNote(m, s.Options.Compile); note != "" {
+				gp.AddMessage(note)
+			}
 			reqs = append(reqs, simulate.ModrootRequest{
 				Modroot:         m.Modroot,
 				Seeds:           seedCandidates(m),
 				Baseline:        goEco.EffectiveVersions(ctx, m.Deps),
 				Packages:        m.BuildPackages,
 				Tags:            m.BuildTags,
+				Arches:          m.BuildArches,
+				Env:             m.BuildEnv,
 				VulnImports:     vulnImportPaths(m.ScanResult),
 				BaselineVulnIDs: baselineVulnIDs(m.ScanResult),
 				Engine:          m.BumpEngine,
@@ -165,7 +191,9 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 		// failed-open stdlib walk in ANY modroot must invalidate the whole
 		// union - see below.
 		stdUnion := map[string]struct{}{}
-		stdComplete := true
+		// A versioned go/install builds another module version, whose
+		// stdlib slice no checkout shows.
+		stdComplete := len(scanBuildSteps(ctx, gp.Config).versionedInstalls) == 0
 		for mi := range lang.ByModroot {
 			m := &lang.ByModroot[mi]
 			// Shadowed for the rest of this iteration - see the
