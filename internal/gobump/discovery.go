@@ -2,6 +2,7 @@ package gobump
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"strings"
 
@@ -179,7 +180,7 @@ func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bump
 			sort.Strings(unit.Tags)
 			langUnits = append(langUnits, unit)
 		}
-		sort.Slice(langUnits, func(i, j int) bool { return langUnits[i].Modroot < langUnits[j].Modroot })
+		slices.SortStableFunc(langUnits, func(a, b analysisUnit) int { return strings.Compare(a.Modroot, b.Modroot) })
 		result[language] = langUnits
 	}
 	return result

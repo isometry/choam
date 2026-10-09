@@ -3,6 +3,7 @@ package golang
 import (
 	"bytes"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 
@@ -594,15 +595,15 @@ func TestAnalyzer_AnalyzeBumps_PreReleaseVersions(t *testing.T) {
 		{
 			name: "stable version newer than pre-release - same major version",
 			deps: []string{
-				"github.com/test/module@v2.0.0",
+				"github.com/test/module/v2@v2.0.0",
 			},
 			goModInfo: &GoModInfo{
 				AllRequirements: map[string]string{
-					"github.com/test/module": "v2.0.0-beta",
+					"github.com/test/module/v2": "v2.0.0-beta",
 				},
 				Replacements: map[string]*modfile.Replace{},
 			},
-			wantKeep: []string{"github.com/test/module@v2.0.0"},
+			wantKeep: []string{"github.com/test/module/v2@v2.0.0"},
 		},
 		{
 			name: "pre-release version within same major version",
@@ -826,4 +827,39 @@ func containsHelper(s, substr string) bool {
 		}
 	}
 	return false
+}
+
+// TestAnalyzer_IncompatibleSpelling: a module path without /vN can carry a
+// v2+ version only as +incompatible, which OSV fix versions omit; a /vN path
+// never takes it. Two spellings of one version dedupe to the canonical one
+// whichever comes first.
+func TestAnalyzer_IncompatibleSpelling(t *testing.T) {
+	info := &GoModInfo{
+		AllRequirements: map[string]string{
+			"github.com/docker/distribution": "v2.8.1+incompatible",
+			"github.com/foo/bar/v2":          "v2.2.0",
+		},
+		Replacements: map[string]*modfile.Replace{},
+	}
+	tests := []struct {
+		name string
+		deps []string
+		want []string
+	}{
+		{"OSV spelling gains +incompatible", []string{"github.com/docker/distribution@v2.8.2"},
+			[]string{"github.com/docker/distribution@v2.8.2+incompatible"}},
+		{"/vN path unchanged", []string{"github.com/foo/bar/v2@v2.3.0"}, []string{"github.com/foo/bar/v2@v2.3.0"}},
+		{"bare spelling first", []string{"github.com/docker/distribution@v2.8.2", "github.com/docker/distribution@v2.8.2+incompatible"},
+			[]string{"github.com/docker/distribution@v2.8.2+incompatible"}},
+		{"canonical spelling first", []string{"github.com/docker/distribution@v2.8.2+incompatible", "github.com/docker/distribution@v2.8.2"},
+			[]string{"github.com/docker/distribution@v2.8.2+incompatible"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, got := newAnalyzer().analyzeBumps(t.Context(), tt.deps, info)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("analyzeBumps(%v) = %v, want %v", tt.deps, got, tt.want)
+			}
+		})
+	}
 }

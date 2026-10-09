@@ -1,10 +1,12 @@
 package gobump
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"maps"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 
 	melange "chainguard.dev/melange/pkg/config"
@@ -392,11 +394,9 @@ func distinctMinorConstraints(pins []GoToolchainPin) []string {
 		seen[pin.Minor] = struct{}{}
 	}
 
-	minors := make([]string, 0, len(seen))
-	for minor := range seen {
-		minors = append(minors, minor)
-	}
-	sort.Slice(minors, func(i, j int) bool { return goversion.Compare(minors[i], minors[j]) < 0 })
+	minors := slices.SortedFunc(maps.Keys(seen), func(a, b string) int {
+		return cmp.Or(goversion.Compare(a, b), strings.Compare(a, b))
+	})
 
 	if unpinned {
 		return append([]string{""}, minors...)

@@ -1,6 +1,7 @@
 package simulate
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -118,6 +119,12 @@ type loop struct {
 	compiler         Compiler
 	baselineFailed   map[string]struct{}
 	baselineResolved map[string]string
+	// gateRejected maps a module to why the gate rejected its higher rung,
+	// across gate rounds; revived marks candidates shed as unlinked that a
+	// gate round brought back because the gated graph links them again
+	// (each at most once, so the rounds are bounded).
+	gateRejected map[string]string
+	revived      map[string]bool
 }
 
 // raise is a rescan finding that requires moving a module further forward;
@@ -235,7 +242,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 				return nil, err
 			}
 			l.refreshLinked(ctx)
-			if !l.dropUnsustained() && !l.dropUnreachable() {
+			if !l.dropUnsustained(ctx) && !l.dropUnreachable() {
 				break
 			}
 			if err := l.apply(ctx); err != nil {
@@ -315,11 +322,16 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	// bounds, so a raised dependency can still remove API a lagging sibling
 	// compiles against (see compileGate).
 	if l.compiler != nil {
-		gated, err := l.compileGate(ctx, resolved, result)
-		if err != nil {
-			return nil, err
+		for {
+			gated, again, err := l.compileGate(ctx, resolved, result)
+			if err != nil {
+				return nil, err
+			}
+			resolved = gated
+			if !again {
+				break
+			}
 		}
-		resolved = gated
 	}
 
 	// Last, on the final set: remove every redundant entry. The final
@@ -351,7 +363,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 		}
 	}
 	l.classifyIntroduced(ctx, result.Residuals)
-	sort.Slice(result.Residuals, func(i, j int) bool { return result.Residuals[i].Module < result.Residuals[j].Module })
+	slices.SortStableFunc(result.Residuals, compareResiduals)
 	result.RemainingVulnIDs = remainingVulnIDs(result.Residuals)
 
 	return result, nil
@@ -413,8 +425,8 @@ func (l *loop) pristinePinFor(module string) (oldPath string, target ReplaceTarg
 	if target, found := l.pristineReplaces[module]; found {
 		return module, target, true
 	}
-	for old, target := range l.pristineReplaces {
-		if target.Path == module && target.Version != "" {
+	for _, old := range sortedKeys(l.pristineReplaces) {
+		if target := l.pristineReplaces[old]; target.Path == module && target.Version != "" {
 			return old, target, true
 		}
 	}
@@ -439,11 +451,17 @@ func (l *loop) dropLocalReplacePinned(c Candidate, oldPath string) {
 	}
 }
 
+// addCandidate adds c, or merges it into the live candidate for the same
+// module: the higher version wins, and of two spellings of the same version
+// the one scan.PreferVersion picks.
 func (l *loop) addCandidate(c Candidate, seed bool) *candState {
 	if existing, ok := l.byModule[c.Module]; ok && !existing.dropped {
 		existing.Rungs = mergeRungs(existing.fixRungs(), c.fixRungs())
-		if semver.Compare(c.Version, existing.Version) > 0 {
+		switch rel := semver.Compare(c.Version, existing.Version); {
+		case rel > 0:
 			existing.Version = c.Version
+		case rel == 0:
+			existing.Version = scan.PreferVersion(existing.Version, c.Version)
 		}
 		existing.FromCVE = existing.FromCVE || c.FromCVE
 		existing.VulnIDs = mergeIDs(existing.VulnIDs, c.VulnIDs)
@@ -817,8 +835,8 @@ func (l *loop) handleGetFailure(ctx context.Context, c *candState, err error) {
 	l.stepDown(ctx, c, fmt.Sprintf("fix unresolvable: %v", err))
 }
 
-// stepDown moves CVE candidate c, whose current version cannot be fetched,
-// to its next lower fix rung still above the baseline, giving up the
+// stepDown moves CVE candidate c, whose current version cannot be fetched
+// or is not sustained by the tidy, to its next lower fix rung still above the baseline, giving up the
 // advisories only the rejected rungs fix (recorded as residuals with
 // reason); with no rung left it is dropped and every advisory it addressed
 // becomes a residual. c never raises to the rejected version again.
@@ -861,7 +879,7 @@ func (l *loop) stepDown(ctx context.Context, c *candState, reason string) {
 	}
 	c.Version, c.Rungs, c.VulnIDs, c.Severity = below[0].Version, below, kept, severity
 	c.FromCVE = len(kept) > 0
-	logging.From(ctx).Info("fix unresolvable: stepped down one fix rung", "modroot", l.req.Modroot,
+	logging.From(ctx).Info("bump stepped down one fix rung", "modroot", l.req.Modroot,
 		"module", c.Module, "from", rejected, "to", c.Version, "reason", reason)
 }
 
@@ -1107,7 +1125,7 @@ func (l *loop) vulnApplies(v scan.Vulnerability) bool {
 // post-tidy go.mod ("was not found on the go.mod file") or is required at a
 // version below the requested one ("is less than the desired version").
 // Returns true when anything changed (the apply must then be redone).
-func (l *loop) dropUnsustained() bool {
+func (l *loop) dropUnsustained(ctx context.Context) bool {
 	changed := false
 	for _, c := range l.activeCandidates() {
 		if c.Replace {
@@ -1128,16 +1146,15 @@ func (l *loop) dropUnsustained() bool {
 			l.drop(c, "pruned by go mod tidy: not required by the tidied go.mod")
 			changed = true
 		case semver.Compare(requiredVersion, c.Version) < 0:
-			l.drop(c, fmt.Sprintf("go mod tidy reverts the pin to %s", requiredVersion))
-			if c.FromCVE {
-				c.residualized = true
-				l.persistentResiduals = append(l.persistentResiduals, Residual{
-					Module:          c.Module,
-					ResolvedVersion: requiredVersion,
-					FixedVersion:    c.Version,
-					VulnIDs:         c.VulnIDs,
-					Reason:          fmt.Sprintf("fix not sustained: go mod tidy reverts the pin to %s", requiredVersion),
-				})
+			if !c.FromCVE {
+				l.drop(c, fmt.Sprintf("go mod tidy reverts the pin to %s", requiredVersion))
+			} else {
+				// Same policy as an unfetchable fix: fall back to the next
+				// lower fix rung rather than abandon every advisory. A
+				// higher rung is often just an existing YAML pin; dropping
+				// the candidate outright would make the result depend on
+				// whether such a pin was present (non-idempotent).
+				l.stepDown(ctx, c, fmt.Sprintf("fix not sustained: go mod tidy reverts the pin to %s", requiredVersion))
 			}
 			changed = true
 		}
@@ -1329,7 +1346,9 @@ func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]str
 			rungs: FixRungs(scanResult.Vulnerabilities, bump.Name, bump.VulnIDs)})
 	}
 
-	sort.Slice(raises, func(i, j int) bool { return raises[i].module < raises[j].module })
+	slices.SortFunc(raises, func(a, b raise) int {
+		return cmp.Or(strings.Compare(a.module, b.module), strings.Compare(a.version, b.version))
+	})
 	return raises, residuals
 }
 
@@ -1837,28 +1856,31 @@ func (g *gateRun) rung(c *candState) Rung { return g.ladders[c][g.at[c]] }
 // advisory left unfixed by a relaxation becomes a residual carrying the
 // rejected rung's failure. Errors are ErrCompileGate (or a cancellation):
 // the caller must not trust the candidate set.
-func (l *loop) compileGate(ctx context.Context, resolved map[string]string, result *ModrootResult) (map[string]string, error) {
+func (l *loop) compileGate(ctx context.Context, resolved map[string]string, result *ModrootResult) (map[string]string, bool, error) {
 	active := l.inApplyOrder(l.activeCandidates())
 	if len(active) == 0 {
-		return resolved, nil
+		return resolved, false, nil
 	}
 	g := &gateRun{ladders: make(map[*candState][]Rung, len(active)), at: make(map[*candState]int, len(active))}
 	for _, c := range active {
 		g.ladders[c] = l.ladder(c)
 	}
-	rejected := make(map[string]string) // module -> why its higher rung was rejected
+	if l.gateRejected == nil {
+		l.gateRejected = make(map[string]string)
+	}
+	rejected := l.gateRejected // module -> why its higher rung was rejected
 
 	purpose, subject := "gate: converged set", ""
 	for {
 		live := slices.DeleteFunc(slices.Clone(active), func(c *candState) bool { return c.dropped })
 		out, repairs, err := l.repairFixpoint(ctx, g, purpose, subject, live)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if out.passed() {
-			if len(rejected) == 0 && len(repairs) == 0 {
+			if len(rejected) == 0 && len(repairs) == 0 && len(l.revived) == 0 {
 				logging.From(ctx).Debug("compile gate passed", "modroot", l.req.Modroot, "candidates", len(live))
-				return resolved, nil
+				return resolved, false, nil
 			}
 			return l.gateAdopt(ctx, g, live, repairs, rejected, result)
 		}
@@ -1869,7 +1891,7 @@ func (l *loop) compileGate(ctx context.Context, resolved map[string]string, resu
 
 		victim := l.relaxTarget(ctx, g, out, live)
 		if victim == nil {
-			return nil, gateErr(ctx, fmt.Errorf("the build fails with every bump relaxed: %s", out.why()))
+			return nil, false, gateErr(ctx, fmt.Errorf("the build fails with every bump relaxed: %s", out.why()))
 		}
 		reason := out.why()
 		rejected[victim.Module] = reason
@@ -1899,10 +1921,10 @@ func (l *loop) ladder(c *candState) []Rung {
 	}
 	var lower []Rung
 	for _, r := range c.fixRungs() {
-		switch cmp := semver.Compare(r.Version, c.Version); {
-		case cmp == 0:
-			top = r
-		case cmp < 0 && semver.Compare(r.Version, l.baselineResolved[c.Module]) > 0:
+		switch rel := semver.Compare(r.Version, c.Version); {
+		case rel == 0:
+			top = Rung{Version: scan.PreferVersion(top.Version, r.Version), VulnIDs: r.VulnIDs, Severity: r.Severity}
+		case rel < 0 && semver.Compare(r.Version, l.baselineResolved[c.Module]) > 0:
 			lower = append(lower, r)
 		}
 	}
@@ -2301,7 +2323,7 @@ func (l *loop) minCoherentVersion(ctx context.Context, module, from string, rais
 // active rung, raised in place by a repair of its module, plus a
 // coherence-only candidate per repair of an unpinned module - then
 // re-applies and rescans it (see gateFinish).
-func (l *loop) gateAdopt(ctx context.Context, g *gateRun, live []*candState, repairs, rejected map[string]string, result *ModrootResult) (map[string]string, error) {
+func (l *loop) gateAdopt(ctx context.Context, g *gateRun, live []*candState, repairs, rejected map[string]string, result *ModrootResult) (map[string]string, bool, error) {
 	for _, c := range live {
 		c.Version = g.rung(c).Version
 	}
@@ -2318,23 +2340,28 @@ func (l *loop) gateAdopt(ctx context.Context, g *gateRun, live []*candState, rep
 }
 
 // gateFinish adopts the compile gate's accepted set: re-applies it,
-// rescans, and refreshes the loop's accepted state. An advisory the rescan
+// rescans, and refreshes the loop's accepted state. The rescan is the
+// authoritative reachability judgement - it is made on the graph that ships
+// - so a fix shed as unlinked under the (since rejected) full set whose
+// vulnerable code the gated graph links again is revived, and the caller
+// runs the gate once more with it (again=true): the result must not depend
+// on which higher pins the input happened to carry. An advisory the rescan
 // still finds for a module whose higher rung was rejected is a residual
 // carrying that rejection; any other fix the rescan wants is surfaced as a
-// residual rather than raised (it was never compile-validated). The rescan
-// is the authoritative reachability judgement - it is made on the graph that
-// ships - so a fix shed as unlinked under the (since rejected) full set is
-// residual here when the gated graph links the vulnerable code again.
-func (l *loop) gateFinish(ctx context.Context, keep []*candState, rejected map[string]string, result *ModrootResult) (map[string]string, error) {
+// residual rather than raised (it was never compile-validated).
+func (l *loop) gateFinish(ctx context.Context, keep []*candState, rejected map[string]string, result *ModrootResult) (map[string]string, bool, error) {
 	tr, err := l.trialApply(ctx, "gate: adopt accepted set", keep)
 	if err != nil {
-		return nil, gateErr(ctx, fmt.Errorf("re-applying the accepted set: %w", err))
+		return nil, false, gateErr(ctx, fmt.Errorf("re-applying the accepted set: %w", err))
 	}
 	if !l.sustained(tr, keep) {
 		logging.From(ctx).Warn("compile gate: accepted set not fully sustained by the tidied go.mod",
 			"modroot", l.req.Modroot)
 	}
 	l.adoptTrial(ctx, tr, result)
+	if l.reviveRelinked(ctx, tr.raises) {
+		return tr.resolved, true, nil
+	}
 	for _, r := range tr.raises {
 		reason, wasRejected := rejected[r.module]
 		switch c := l.byModule[r.module]; {
@@ -2352,7 +2379,32 @@ func (l *loop) gateFinish(ctx context.Context, keep []*candState, rejected map[s
 			Reason:          reason,
 		})
 	}
-	return tr.resolved, nil
+	return tr.resolved, false, nil
+}
+
+// reviveRelinked brings back every candidate dropUnreachable shed (and not
+// yet revived) that a gated rescan wants raised again, withdrawing its drop
+// record. Reports whether anything was revived.
+func (l *loop) reviveRelinked(ctx context.Context, raises []raise) bool {
+	if l.revived == nil {
+		l.revived = make(map[string]bool)
+	}
+	revivedAny := false
+	for _, r := range raises {
+		c := l.byModule[r.module]
+		if c == nil || !c.dropped || !c.shedUnlinked || l.revived[r.module] {
+			continue
+		}
+		l.dropped = slices.DeleteFunc(l.dropped, func(d DroppedCandidate) bool {
+			return d.Module == c.Module && d.Reason == c.dropReason
+		})
+		c.dropped, c.residualized, c.shedUnlinked, c.dropReason = false, false, false, ""
+		l.revived[r.module] = true
+		revivedAny = true
+		logging.From(ctx).Info("compile gate: vulnerable code linked again - fix revived for another gate round",
+			"modroot", l.req.Modroot, "module", c.Module, "version", c.Version)
+	}
+	return revivedAny
 }
 
 // Trial tracing (Debug level only; see logTrial/logRepair). The message
@@ -2577,7 +2629,7 @@ func packagesFor(resolved map[string]string) []scan.Package {
 	for module, version := range resolved {
 		pkgs = append(pkgs, scan.Package{Name: module, Version: version, Ecosystem: "Go"})
 	}
-	sort.Slice(pkgs, func(i, j int) bool { return pkgs[i].Name < pkgs[j].Name })
+	slices.SortFunc(pkgs, func(a, b scan.Package) int { return strings.Compare(a.Name, b.Name) })
 	return pkgs
 }
 
@@ -2721,6 +2773,18 @@ func remainingVulnIDs(residuals []Residual) []string {
 	}
 	sort.Strings(ids)
 	return ids
+}
+
+// compareResiduals is the total order residuals are reported in.
+func compareResiduals(a, b Residual) int {
+	return cmp.Or(
+		strings.Compare(a.Module, b.Module),
+		semver.Compare(a.FixedVersion, b.FixedVersion),
+		strings.Compare(a.FixedVersion, b.FixedVersion),
+		strings.Compare(a.Reason, b.Reason),
+		slices.Compare(a.VulnIDs, b.VulnIDs),
+		strings.Compare(a.ResolvedVersion, b.ResolvedVersion),
+	)
 }
 
 func mergeIDs(a, b []string) []string {

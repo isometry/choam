@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -632,7 +633,7 @@ func (r *reachabilityDiff) finalize() ([]string, []unreachableModule) {
 		sort.Strings(module.vulnIDs)
 		modules = append(modules, module)
 	}
-	sort.Slice(modules, func(i, j int) bool { return modules[i].name < modules[j].name })
+	slices.SortFunc(modules, func(a, b unreachableModule) int { return strings.Compare(a.name, b.name) })
 
 	return ids, modules
 }

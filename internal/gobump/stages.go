@@ -345,7 +345,7 @@ func epochFixedVulnIDs(gp *GoBumpProcessor) []string {
 			ids[id] = struct{}{}
 		}
 	}
-	return slices.Collect(maps.Keys(ids))
+	return slices.Sorted(maps.Keys(ids))
 }
 
 // analysisSeverities maps every advisory ID the analysis scan found to its
@@ -378,12 +378,8 @@ func renderFixList(ids []string, severities map[string]string) string {
 	if len(ids) == 0 {
 		return ""
 	}
-	sort.Slice(ids, func(i, j int) bool {
-		ri, rj := scan.SeverityRank(severities[ids[i]]), scan.SeverityRank(severities[ids[j]])
-		if ri != rj {
-			return ri < rj
-		}
-		return ids[i] < ids[j]
+	slices.SortFunc(ids, func(a, b string) int {
+		return cmp.Or(cmp.Compare(scan.SeverityRank(severities[a]), scan.SeverityRank(severities[b])), strings.Compare(a, b))
 	})
 	if len(ids) > epochCommentMaxIDs {
 		return fmt.Sprintf("%s, +%d more",
@@ -1003,7 +999,7 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(ctx context.Context, gp *GoBu
 
 	// Edit from the last step backwards: removals and clones only shift the
 	// indices of steps already handled.
-	sort.Slice(edits, func(i, j int) bool { return edits[i].step.Index > edits[j].step.Index })
+	slices.SortFunc(edits, func(a, b stepEdit) int { return cmp.Compare(b.step.Index, a.step.Index) })
 	hasBlankLines := loader.HasBlankLinesBetweenPipelineSteps(yamlContent)
 	changed := false
 	for _, edit := range edits {

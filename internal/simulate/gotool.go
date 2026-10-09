@@ -2,6 +2,7 @@ package simulate
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -12,7 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
-	"sort"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -542,7 +543,7 @@ func (t *GoToolchain) ModuleVersions(ctx context.Context, dir, modulePath string
 		return nil, nil
 	}
 	versions := fields[1:]
-	sort.Slice(versions, func(i, j int) bool { return semver.Compare(versions[i], versions[j]) < 0 })
+	slices.SortFunc(versions, func(a, b string) int { return cmp.Or(semver.Compare(a, b), strings.Compare(a, b)) })
 	return versions, nil
 }
 

@@ -23,8 +23,8 @@ const defaultGoProxyURL = "https://proxy.golang.org"
 
 // fallbackGoVersionBudget bounds one modroot's whole fallback probe - it is
 // best-effort by design (see fallbackRequiredGoVersion) and must never stall
-// the apply phase.
-const fallbackGoVersionBudget = 30 * time.Second
+// the apply phase. A variable only so tests can exercise the timeout.
+var fallbackGoVersionBudget = 30 * time.Second
 
 // maxGoModBytes caps how much of a proxy .mod response is read; real go.mod
 // files are tiny, so anything beyond this is not one.

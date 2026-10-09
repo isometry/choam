@@ -328,8 +328,8 @@ func (f *fakeScanner) ScanPackages(_ context.Context, pkgs []scan.Package) (*sca
 			bump.Severity = mergeSeverity(bump.Severity, adv.severity)
 		}
 	}
-	for _, bump := range bumps {
-		result.SecurityBumps = append(result.SecurityBumps, *bump)
+	for _, name := range sortedKeys(bumps) {
+		result.SecurityBumps = append(result.SecurityBumps, *bumps[name])
 	}
 	return result, nil
 }
@@ -2536,16 +2536,17 @@ func TestCompileGate_RelaxSeverityOrderAndResidualReason(t *testing.T) {
 	})
 }
 
-// TestCompileGate_RelinkedAfterGateIsResidualNotUnlinked is the
-// jenkins-operator oauth2 shape: o's vulnerable package (o/jws) is linked in
-// the pristine graph and only drops out of the import graph once k is raised
-// (k@v1.1.0 no longer imports it), so the full bump set sheds o's fix as
-// unlinked. The compile gate then rejects k, the final graph links o/jws
-// again, and the final rescan - the one authoritative reachability judgement,
-// made on the graph that ships - finds GO-O applicable. It must be a residual
-// (the shipped artifact links the vulnerable code) whose reason says why the
-// fix was not applied, never an "unlinked" info.
-func TestCompileGate_RelinkedAfterGateIsResidualNotUnlinked(t *testing.T) {
+// TestCompileGate_RelinkedAfterGateRevivesFix is the jenkins-operator
+// oauth2 shape: o's vulnerable package (o/jws) is linked in the pristine
+// graph and only drops out of the import graph once k is raised (k@v1.1.0 no
+// longer imports it), so the full bump set sheds o's fix as unlinked. The
+// compile gate then rejects k and the final graph links o/jws again. The
+// final rescan - the authoritative reachability judgement, made on the graph
+// that ships - finds GO-O applicable, so o's fix is revived and gated in
+// another round rather than left residual: the outcome must not depend on
+// which higher pins (k) the input carried, or a second run (without them)
+// would write something different.
+func TestCompileGate_RelinkedAfterGateRevivesFix(t *testing.T) {
 	jws := scan.VulnerableImport{Path: "example.com/o/jws"}
 	tc := &fakeCompiler{
 		fakeToolchain: &fakeToolchain{
@@ -2576,16 +2577,11 @@ func TestCompileGate_RelinkedAfterGateIsResidualNotUnlinked(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Contains(t, result.LinkedPackages, jws.Path, "the final graph links the vulnerable package")
-	var o *Residual
-	for i := range result.Residuals {
-		if result.Residuals[i].Module == "example.com/o" {
-			o = &result.Residuals[i]
-		}
+	assert.Equal(t, []string{"example.com/o@v1.1.0"}, result.FinalDeps, "o's fix is revived and validated")
+	assert.Equal(t, []string{"GO-K"}, result.RemainingVulnIDs, "only the rejected k fix stays residual")
+	for _, d := range result.Dropped {
+		assert.NotEqual(t, "example.com/o", d.Module, "the stale unlinked drop is withdrawn: %+v", d)
 	}
-	require.NotNil(t, o, "a linked advisory must stay residual: %+v", result.Residuals)
-	assert.Equal(t, []string{"GO-O"}, o.VulnIDs)
-	assert.Contains(t, o.Reason, "linked again after compile-gate adjustments")
-	assert.Contains(t, result.RemainingVulnIDs, "GO-O")
 }
 
 // brokenAbove is a compileFn whose module's own package fails to compile

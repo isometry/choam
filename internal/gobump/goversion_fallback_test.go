@@ -4,8 +4,10 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
 	"github.com/stretchr/testify/assert"
@@ -508,4 +510,33 @@ func TestGoBumpApplier_PublicFallbackSkipsGOPRIVATEUnion(t *testing.T) {
 	require.Error(t, err) // the only candidate is private, so nothing was fetched.
 	assert.Equal(t, "", got)
 	assert.Empty(t, hitPaths, "GOPRIVATE-matched module must never reach the public proxy fallback")
+}
+
+// TestGoBumpApplier_FallbackTimeoutIsVisible: the best-effort probe's budget
+// expiring (a slow proxy, a loaded machine) must never change what is
+// written silently: no Go version floor is set, the deps are untouched, and
+// the user is told the probe failed.
+func TestGoBumpApplier_FallbackTimeoutIsVisible(t *testing.T) {
+	t.Setenv("GOPROXY", "")
+	t.Setenv("GOPRIVATE", "")
+	t.Setenv("GONOPROXY", "")
+	saved := fallbackGoVersionBudget
+	fallbackGoVersionBudget = 50 * time.Millisecond
+	t.Cleanup(func() { fallbackGoVersionBudget = saved })
+
+	hang := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
+	t.Cleanup(hang.Close)
+	applier := NewGoBumpApplier(nil)
+	applier.goProxyURL = hang.URL
+
+	gp := newTestProcessor(t, singleGoBumpYAML)
+	analysis := fallbackAnalysis(t, "1.22")
+	require.NoError(t, applier.fallbackGoVersions(t.Context(), gp, analysis))
+
+	m := analysis.ByLanguage[0].ByModroot[0]
+	assert.Empty(t, m.RequiredGoVersion)
+	assert.Equal(t, []string{"example.com/a@v1.2.0"}, m.DesiredDeps)
+	assert.True(t, slices.ContainsFunc(gp.GetMessages(), func(msg string) bool {
+		return strings.Contains(msg, "could not determine required Go version")
+	}), "expected a visible probe-failure message, got %v", gp.GetMessages())
 }

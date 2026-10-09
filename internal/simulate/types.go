@@ -150,10 +150,11 @@ type Rung struct {
 	Severity string
 }
 
-// fixRungs returns c's ladder, defaulting to its single implicit rung.
+// fixRungs returns c's ladder (normalized: see mergeRungs), defaulting to its
+// single implicit rung.
 func (c Candidate) fixRungs() []Rung {
 	if len(c.Rungs) > 0 {
-		return c.Rungs
+		return mergeRungs(c.Rungs, nil)
 	}
 	return []Rung{{Version: c.Version, VulnIDs: c.VulnIDs, Severity: c.Severity}}
 }
@@ -168,32 +169,37 @@ func FixRungs(vulns []scan.Vulnerability, module string, ids []string, also ...s
 		if v.Module != module || v.FixedVersion == "" || (len(ids) > 0 && !slices.Contains(ids, v.ID)) {
 			continue
 		}
-		rungs = mergeRungs(rungs, []Rung{{Version: v.FixedVersion, VulnIDs: []string{v.ID}, Severity: v.Severity}})
+		rungs = append(rungs, Rung{Version: v.FixedVersion, VulnIDs: []string{v.ID}, Severity: v.Severity})
 	}
 	for _, version := range also {
-		rungs = mergeRungs(rungs, []Rung{{Version: version}})
+		rungs = append(rungs, Rung{Version: version})
 	}
-	return rungs
+	return mergeRungs(rungs, nil)
 }
 
 // mergeRungs unions two ladders by version (advisories merged, most severe
-// level kept), dropping non-semver versions, highest first.
+// level kept), dropping non-semver versions, highest first. Versions equal
+// under semver are one rung (v2.8.2 and v2.8.2+incompatible), spelled as
+// scan.PreferVersion picks; the result never depends on input order.
 func mergeRungs(a, b []Rung) []Rung {
 	byVersion := make(map[string]*Rung)
-	var merged []Rung
-	for _, r := range append(append([]Rung{}, a...), b...) {
+	for _, r := range slices.Concat(a, b) {
 		if !semver.IsValid(r.Version) {
 			continue
 		}
-		if existing, ok := byVersion[r.Version]; ok {
-			existing.VulnIDs = mergeIDs(existing.VulnIDs, r.VulnIDs)
-			existing.Severity = mergeSeverity(existing.Severity, r.Severity)
+		key := semver.Canonical(r.Version)
+		existing, ok := byVersion[key]
+		if !ok {
+			byVersion[key] = &Rung{Version: r.Version, VulnIDs: r.VulnIDs, Severity: r.Severity}
 			continue
 		}
-		byVersion[r.Version] = &Rung{Version: r.Version, VulnIDs: r.VulnIDs, Severity: r.Severity}
+		existing.Version = scan.PreferVersion(existing.Version, r.Version)
+		existing.VulnIDs = mergeIDs(existing.VulnIDs, r.VulnIDs)
+		existing.Severity = mergeSeverity(existing.Severity, r.Severity)
 	}
-	for _, r := range byVersion {
-		merged = append(merged, *r)
+	merged := make([]Rung, 0, len(byVersion))
+	for _, key := range sortedKeys(byVersion) {
+		merged = append(merged, *byVersion[key])
 	}
 	slices.SortFunc(merged, func(x, y Rung) int { return semver.Compare(y.Version, x.Version) })
 	return merged

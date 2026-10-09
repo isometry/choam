@@ -1,0 +1,43 @@
+{
+  "converged": true,
+  "final_deps": [
+    "go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp@v0.21.0",
+    "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp@v1.45.0",
+    "google.golang.org/grpc@v1.83.2",
+    "go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc@v0.21.0",
+    "go.opentelemetry.io/otel/exporters/stdout/stdoutlog@v0.21.0"
+  ],
+  "final_replaces": null,
+  "cve_backed_modules": [
+    "go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp",
+    "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp",
+    "google.golang.org/grpc",
+    "go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
+  ],
+  "resolved": {
+    "go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc": "v0.21.0",
+    "go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp": "v0.21.0",
+    "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp": "v1.45.0",
+    "go.opentelemetry.io/otel/exporters/stdout/stdoutlog": "v0.21.0",
+    "go.opentelemetry.io/otel/log": "v0.21.0",
+    "go.opentelemetry.io/otel/sdk": "v1.45.0",
+    "go.opentelemetry.io/otel/sdk/log": "v0.21.0",
+    "google.golang.org/grpc": "v1.83.2"
+  },
+  "residuals": [],
+  "dropped": [
+    {
+      "module": "go.opentelemetry.io/otel/sdk/log",
+      "version": "v0.21.0",
+      "reason": "redundant: implied by go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc@v0.21.0, go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp@v0.21.0, go.opentelemetry.io/otel/exporters/stdout/stdoutlog@v0.21.0 (final go.mod unchanged without it)",
+      "redundant": true
+    },
+    {
+      "module": "go.opentelemetry.io/otel/sdk",
+      "version": "v1.45.0",
+      "reason": "redundant: implied by go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc@v0.21.0, go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploghttp@v0.21.0, go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp@v1.45.0, go.opentelemetry.io/otel/exporters/stdout/stdoutlog@v0.21.0 (final go.mod unchanged without it)",
+      "redundant": true
+    }
+  ],
+  "remaining_vuln_ids": null
+}

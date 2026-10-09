@@ -6,6 +6,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 
@@ -65,7 +67,8 @@ func (e *Ecosystem) Analyze(ctx context.Context, files map[string][]byte) (*ecos
 	result := remote.FileAnalyses[0].Analysis
 
 	deps := make([]ecosystem.Dep, 0, len(result.Dependencies))
-	for _, info := range result.Dependencies {
+	for _, key := range slices.Sorted(maps.Keys(result.Dependencies)) {
+		info := result.Dependencies[key]
 		version := info.Version
 		if info.UsesProperty {
 			resolved, ok := result.Properties[info.PropertyName]

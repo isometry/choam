@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/isometry/choam/internal/logging"
+	"github.com/isometry/choam/internal/scan"
 	"github.com/isometry/choam/internal/utils"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/semver"
@@ -63,6 +64,10 @@ func (a *analyzer) analyzeBumps(ctx context.Context, deps []string, goModInfo *G
 				logging.From(ctx).Debug("duplicate module - replacing malformed with valid",
 					"module", module,
 					"new_version", bumpVersion)
+			} else if semver.Compare(bumpVersion, existing) == 0 {
+				// Two spellings of one version (v2.8.2, v2.8.2+incompatible):
+				// keep the canonical one whichever came first.
+				latestVersions[module] = scan.PreferVersion(existing, bumpVersion)
 			} else if semver.Compare(bumpVersion, existing) > 0 {
 				// This version is newer
 				logging.From(ctx).Debug("duplicate module detected - keeping newer",
@@ -132,6 +137,9 @@ func (a *analyzer) analyzeBumps(ctx context.Context, deps []string, goModInfo *G
 				"reason", "module not found or incompatible major version")
 			continue
 		}
+
+		// OSV fix versions omit +incompatible; the module path decides it.
+		bumpVersion = scan.CanonicalModuleVersion(normalizedModule, bumpVersion)
 
 		// Get the version from go.mod using normalized path
 		goModVersion := goModInfo.AllRequirements[normalizedModule]

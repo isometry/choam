@@ -11,6 +11,8 @@ package golang
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 
 	"github.com/isometry/choam/internal/ecosystem"
 	"github.com/isometry/choam/internal/scan"
@@ -56,7 +58,8 @@ func (e *Ecosystem) Analyze(_ context.Context, files map[string][]byte) (*ecosys
 	}
 
 	deps := make([]ecosystem.Dep, 0, len(info.AllRequirements))
-	for module, version := range info.AllRequirements {
+	for _, module := range slices.Sorted(maps.Keys(info.AllRequirements)) {
+		version := info.AllRequirements[module]
 		_, direct := info.Requirements[module]
 		deps = append(deps, ecosystem.Dep{
 			Coord:    module,
@@ -81,7 +84,8 @@ func (e *Ecosystem) ScanPackages(_ context.Context, deps *ecosystem.ModuleDeps) 
 	}
 
 	pkgs := make([]scan.Package, 0, len(info.AllRequirements))
-	for module, version := range info.AllRequirements {
+	for _, module := range slices.Sorted(maps.Keys(info.AllRequirements)) {
+		version := info.AllRequirements[module]
 		if module == "std" || module == "cmd" { // stdlib pseudo-modules, never real requirements
 			continue
 		}

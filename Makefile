@@ -1,4 +1,4 @@
-.PHONY: build test test-short test-race test-coverage test-coverage-detailed test-package clean install lint fmt deps help
+.PHONY: build test test-determinism test-short test-race test-coverage test-coverage-detailed test-package clean install lint fmt deps help
 
 # Build the binary
 build:
@@ -7,6 +7,14 @@ build:
 # Run all tests
 test:
 	go test -v ./...
+
+# Determinism/idempotency tests, repeated in shuffled order: the unit
+# shuffle tests 20x; the replay idempotency tests (real go toolchain, each
+# already repeating its fixture 5x) once.
+DETERMINISM_TESTS = Deterministic|SecondPassIsNoOp|SecondPassMatches|UnsustainedPinStepsDown|RelinkedAfterGate|FallbackTimeoutIsVisible|EqualVersion|EqualRung|LandsOnCanonicalRung|TotalOrder|SourceLint|IncompatibleFix|IncompatibleSpelling|CanonicalModuleVersion|PreferVersion
+test-determinism:
+	go test -count=20 -shuffle=on -run '$(DETERMINISM_TESTS)' ./internal/simulate/ ./internal/scan/ ./internal/gobump/ ./internal/ecosystem/golang/
+	go test -count=1 -shuffle=on -run 'TestReplay_Idempotent|TestReplay_OpentofuOtelFamily' ./internal/simulate/
 
 # Run tests with short mode (skip slow tests)
 test-short:
@@ -66,6 +74,7 @@ help:
 	@echo "Available targets:"
 	@echo "  build                  Build the choam binary"
 	@echo "  test                   Run all tests"
+	@echo "  test-determinism       Run determinism/idempotency tests repeatedly, shuffled"
 	@echo "  test-short             Run tests with short mode (skip slow tests)"
 	@echo "  test-race              Run tests with race detector"
 	@echo "  test-coverage          Run tests with coverage report"
