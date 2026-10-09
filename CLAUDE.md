@@ -56,6 +56,7 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `internal/gobump/processor.go` - `NewGoBumpProcessor()` constructor
 - `internal/gobump/stages.go` - language-agnostic orchestrator (discovery, analysis, reconcile)
 - `internal/gobump/simulate_stage.go` + `internal/simulate/` - bump simulation (proves candidate sets resolve and cover advisories with a real go toolchain)
+- `internal/simulate/hygiene.go` - scanner-hygiene ("bump when free") pass: a linked module whose advisories' vulnerable packages are not linked is raised anyway only when free (final go.mod changes by that module alone, no newer dependency Go, compiles, rescan clean); reported as `hygiene_bumps`/HYGIENE column, never as a security fix
 - `internal/simulate/engine.go` - apply engines: `uses: bump` steps (and new steps) simulate with the linked omnibump's `golang.DoUpdate` behind its CLI's raw-go.mod filter; `uses: go/bump` steps keep the gobump model (both honour `tidy: false`)
 - `internal/simulate/loop.go` `minimise()` - effect-based redundancy removal on the final set: an entry is dropped when it matches/regresses upstream or the engine's final go.mod is identical without it (written deps carry only entries that do work; no co-update declaration)
 - `internal/gobump/migrate.go` - automatic `uses: go/bump` -> `uses: bump` migration planning and editing (drops `go-version`, adds `go-package` pins; skipped for `work: true`/unvalidated steps)
@@ -245,7 +246,11 @@ make fmt && make lint && make test
 - Security is highest priority
 - OSV database integration via `internal/scan/vulnerability.go`
 - Minimal fix strategy to reduce update impact
-- Epoch management tied to actual fixes
+- Epoch management tied to actual fixes (security fixes, scanner-hygiene bumps or stdlib rebuilds)
+- A module's security target is the highest fix among its LINKED advisories;
+  advisories in unlinked packages of a linked module are info (UNLINKED) and
+  at most a scanner-hygiene bump (`internal/simulate/hygiene.go`), never a
+  security fix: no go-package pin raise, no module added, shed when not free
 
 **Logging (`internal/logging`):**
 - `ctx context.Context` is the first parameter on every function that logs,

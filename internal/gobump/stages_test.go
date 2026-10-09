@@ -2,6 +2,7 @@ package gobump
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -1643,4 +1644,73 @@ func TestEpochComment(t *testing.T) {
 		gp := NewGoBumpProcessor("/t.yaml", "pkg", "1.0.0", 1)
 		assert.Empty(t, epochComment(gp))
 	})
+
+	t.Run("security fixes plus hygiene bumps", func(t *testing.T) {
+		gp := NewGoBumpProcessor("/t.yaml", "pkg", "1.0.0", 1)
+		gp.ActualChangesApplied = true
+		gp.Validated = true
+		gp.AddSecurityFix(SecurityFix{Module: "m", Vulnerability: "GHSA-fixed"})
+		gp.AddHygieneBump(SecurityFix{Module: "golang.org/x/text", Vulnerability: "GO-2026-6629, GO-2026-5970"})
+		gp.VulnerabilityAnalysis = analysisWith(
+			scan.Vulnerability{ID: "GHSA-fixed", Severity: "HIGH"},
+			scan.Vulnerability{ID: "GO-2026-5970", Severity: "MEDIUM"},
+			scan.Vulnerability{ID: "GO-2026-6629", Severity: "MEDIUM"},
+		)
+		gp.AddUnreachableVulnIDs([]string{"GO-2026-5970", "GO-2026-6629"})
+		assert.Equal(t, "updated bumps; fixes: GHSA-fixed; hygiene: GO-2026-5970, GO-2026-6629", epochComment(gp))
+	})
+
+	t.Run("hygiene bumps only", func(t *testing.T) {
+		gp := NewGoBumpProcessor("/t.yaml", "pkg", "1.0.0", 1)
+		gp.ActualChangesApplied = true
+		gp.Validated = true
+		gp.AddHygieneBump(SecurityFix{Module: "golang.org/x/text", Vulnerability: "GO-2026-5970"})
+		gp.VulnerabilityAnalysis = analysisWith(scan.Vulnerability{ID: "GO-2026-5970", Severity: "MEDIUM"})
+		gp.AddUnreachableVulnIDs([]string{"GO-2026-5970"})
+		assert.Equal(t, "updated bumps (scanner hygiene); hygiene: GO-2026-5970", epochComment(gp))
+	})
+
+	t.Run("hygiene bumps not applied yield no clause", func(t *testing.T) {
+		gp := NewGoBumpProcessor("/t.yaml", "pkg", "1.0.0", 1)
+		gp.HygieneBumps = []SecurityFix{{Module: "m", Vulnerability: "GO-1"}}
+		assert.Empty(t, epochComment(gp))
+	})
+}
+
+// TestRecordHygieneBumps: only newly written entries the simulation
+// marked as hygiene are recorded - once per module@version across modroots,
+// with the analysis's prior version and severity - and never as security
+// fixes; JSON/YAML carry them under their own keys.
+func TestRecordHygieneBumps(t *testing.T) {
+	hygiene := []simulate.HygieneModule{{Module: "golang.org/x/text", Version: "v0.36.0", VulnIDs: []string{"GO-2026-5970"}}}
+	scanResult := &scan.ScanResult{
+		Vulnerabilities: []scan.Vulnerability{{ID: "GO-2026-5970", Module: "golang.org/x/text", Severity: "MEDIUM"}},
+		SecurityBumps:   []scan.SecurityBump{{Name: "golang.org/x/text", CurrentVersion: "v0.30.0", FixedVersion: "v0.36.0", VulnIDs: []string{"GO-2026-5970"}}},
+	}
+	modroot := func(root string, existing []string) ModrootAnalysis {
+		return ModrootAnalysis{Modroot: root, ScanResult: scanResult, ExistingDeps: existing,
+			DesiredDeps: []string{"golang.org/x/text@v0.36.0", "example.com/sec@v1.1.0"}, HygieneModules: hygiene}
+	}
+	gp := NewGoBumpProcessor("/t.yaml", "pkg", "1.0.0", 1)
+	gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{ByLanguage: []LanguageAnalysis{{Language: "go",
+		ByModroot: []ModrootAnalysis{modroot(".", nil), modroot("sub", nil), modroot("same", []string{"golang.org/x/text@v0.36.0"})}}}}
+
+	recordHygieneBumps(gp, gp.VulnerabilityAnalysis.ByLanguage[0])
+	require.Len(t, gp.HygieneBumps, 1)
+	assert.Equal(t, SecurityFix{Module: "golang.org/x/text", Vulnerability: "GO-2026-5970", OldVersion: "v0.30.0", NewVersion: "v0.36.0", Severity: "MEDIUM"},
+		gp.HygieneBumps[0])
+	assert.Empty(t, gp.SecurityFixes)
+
+	gp.MarkActualChangesApplied()
+	result := gp.ToResult()
+	assert.Equal(t, 1, result.HygieneModulesBumped)
+	assert.Zero(t, result.ModulesBumped, "BUMPED stays security-only")
+	out, err := json.Marshal(result)
+	require.NoError(t, err)
+	assert.Contains(t, string(out), `"hygiene_bumps":[{"module":"golang.org/x/text"`)
+	assert.Contains(t, string(out), `"hygiene_modules_bumped":1`)
+
+	empty, err := json.Marshal(NewGoBumpProcessor("/t.yaml", "pkg", "1.0.0", 1).ToResult())
+	require.NoError(t, err)
+	assert.NotContains(t, string(empty), "hygiene", "no new keys without hygiene bumps")
 }

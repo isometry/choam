@@ -55,7 +55,10 @@ type GoBumpSummary struct {
 	// linked into any build artifact (informational; not fixed, not residual).
 	TotalVulnsUnreachable int `json:"total_vulns_unreachable" yaml:"total_vulns_unreachable"`
 	TotalModulesBumped    int `json:"total_modules_bumped" yaml:"total_modules_bumped"`
-	Errors                int `json:"errors" yaml:"errors"`
+	// TotalHygieneModulesBumped counts scanner-hygiene entries written (see
+	// GoBumpResult.HygieneBumps) - never part of TotalModulesBumped.
+	TotalHygieneModulesBumped int `json:"total_hygiene_modules_bumped,omitempty" yaml:"total_hygiene_modules_bumped,omitempty"`
+	Errors                    int `json:"errors" yaml:"errors"`
 	// PackagesSkipped counts files (or parts of files) not analyzed - see
 	// GoBumpResult.SkipReasons.
 	PackagesSkipped int `json:"packages_skipped" yaml:"packages_skipped"`

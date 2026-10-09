@@ -3020,3 +3020,62 @@ func TestGobumpEngine_NoTidyRunsNoTidy(t *testing.T) {
 	assert.Equal(t, "v1.1.0", result.Resolved["example.com/x"])
 	assert.Zero(t, tc.tidies)
 }
+
+// TestScanFindings_HygieneSplit: a module's security target is the highest
+// fix among its LINKED advisories; unlinked advisories fixed only above it
+// are hygiene targets (never raises or residuals), unless the module's fix
+// is held back.
+func TestScanFindings_HygieneSplit(t *testing.T) {
+	const mod = "example.com/m"
+	linkedImp := []scan.VulnerableImport{{Path: mod + "/used"}}
+	unlinkedImp := []scan.VulnerableImport{{Path: mod + "/unused"}}
+	scanOf := func(advisories ...fakeAdvisory) *scan.ScanResult {
+		result, err := (&fakeScanner{advisories: advisories}).ScanPackages(t.Context(), []scan.Package{{Name: mod, Version: "v1.0.0"}})
+		require.NoError(t, err)
+		return result
+	}
+	newLoop := func() *loop {
+		return &loop{byModule: map[string]*candState{}, linkedPackages: map[string]struct{}{mod + "/used": {}}}
+	}
+	resolved := map[string]string{mod: "v1.0.0"}
+
+	t.Run("mixed", func(t *testing.T) {
+		raises, residuals, hygiene := newLoop().scanFindings(scanOf(
+			fakeAdvisory{module: mod, id: "GO-L", fixed: "v1.1.0", severity: "HIGH", imports: linkedImp},
+			fakeAdvisory{module: mod, id: "GO-U", fixed: "v1.2.0", severity: "LOW", imports: unlinkedImp},
+		), resolved)
+		require.Len(t, raises, 1)
+		assert.Equal(t, "v1.1.0", raises[0].version, "the security target stops at the linked fix")
+		assert.Equal(t, []string{"GO-L"}, raises[0].vulnIDs)
+		assert.Empty(t, residuals)
+		require.Len(t, hygiene, 1)
+		assert.Equal(t, raise{module: mod, version: "v1.2.0", vulnIDs: []string{"GO-U"}, severity: "LOW",
+			rungs: []Rung{{Version: "v1.2.0", VulnIDs: []string{"GO-U"}, Severity: "LOW"}}}, hygiene[0])
+	})
+	t.Run("unlinked fixed by the security target", func(t *testing.T) {
+		raises, _, hygiene := newLoop().scanFindings(scanOf(
+			fakeAdvisory{module: mod, id: "GO-L", fixed: "v1.2.0", severity: "HIGH", imports: linkedImp},
+			fakeAdvisory{module: mod, id: "GO-U", fixed: "v1.1.0", severity: "LOW", imports: unlinkedImp},
+		), resolved)
+		require.Len(t, raises, 1)
+		assert.Equal(t, "v1.2.0", raises[0].version)
+		assert.Empty(t, hygiene)
+	})
+	t.Run("all unlinked", func(t *testing.T) {
+		raises, residuals, hygiene := newLoop().scanFindings(scanOf(
+			fakeAdvisory{module: mod, id: "GO-U", fixed: "v1.2.0", severity: "LOW", imports: unlinkedImp},
+		), resolved)
+		assert.Empty(t, raises)
+		assert.Empty(t, residuals)
+		require.Len(t, hygiene, 1)
+		assert.Equal(t, "v1.2.0", hygiene[0].version)
+	})
+	t.Run("held back", func(t *testing.T) {
+		l := newLoop()
+		l.pristineReplaces = map[string]ReplaceTarget{mod: {Path: mod, Version: "v1.0.0"}}
+		_, _, hygiene := l.scanFindings(scanOf(
+			fakeAdvisory{module: mod, id: "GO-U", fixed: "v1.2.0", severity: "LOW", imports: unlinkedImp},
+		), resolved)
+		assert.Empty(t, hygiene)
+	})
+}

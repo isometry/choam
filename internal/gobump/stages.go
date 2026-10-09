@@ -251,12 +251,15 @@ func NewGoBumpPipeline(analyzer *Analyzer, opts ProcessorOptions) *processor.Pip
 		stages.NewEpochStage(&stages.BumpOnSecurityFixStrategy{
 			CheckFunc: func(p processor.Processor) bool {
 				if gp, ok := p.(*GoBumpProcessor); ok {
-					// Dependency fixes only count when actual changes were
-					// applied AND security fixes exist (the critical fix). A
-					// stdlib staleness finding justifies a bump on its own -
-					// the epoch bump itself is what triggers the fixing
-					// rebuild, with zero dependency changes.
-					return (gp.ActualChangesApplied && len(gp.SecurityFixes) > 0) || len(gp.StdlibBumps) > 0
+					// Dependency changes only count when actual changes were
+					// applied AND they include security fixes (the critical
+					// fix) or scanner-hygiene bumps (the rebuild is what
+					// clears the scanner finding). A stdlib staleness finding
+					// justifies a bump on its own - the epoch bump itself is
+					// what triggers the fixing rebuild, with zero dependency
+					// changes.
+					return (gp.ActualChangesApplied && (len(gp.SecurityFixes) > 0 || len(gp.HygieneBumps) > 0)) ||
+						len(gp.StdlibBumps) > 0
 				}
 				return false
 			},
@@ -286,13 +289,20 @@ const epochCommentMaxIDs = 5
 
 // epochComment composes the inline intent comment the epoch stage writes on
 // the epoch line: which action(s) triggered the rebuild ("updated bumps",
-// "rebuild with go<V>") and the advisories it fixes, most critical first.
-// The clause conditions mirror the epoch CheckFunc exactly, so the comment
-// always states why the epoch actually bumped.
+// "updated bumps (scanner hygiene)" when only hygiene entries changed,
+// "rebuild with go<V>"), the advisories it fixes and those its hygiene
+// bumps clear for scanners, most critical first. The clause conditions
+// mirror the epoch CheckFunc exactly, so the comment always states why the
+// epoch actually bumped.
 func epochComment(gp *GoBumpProcessor) string {
+	security := gp.ActualChangesApplied && len(gp.SecurityFixes) > 0
+	hygiene := gp.ActualChangesApplied && len(gp.HygieneBumps) > 0
 	var clauses []string
-	if gp.ActualChangesApplied && len(gp.SecurityFixes) > 0 {
+	switch {
+	case security:
 		clauses = append(clauses, "updated bumps")
+	case hygiene:
+		clauses = append(clauses, "updated bumps (scanner hygiene)")
 	}
 	if versions := stdlibRebuildVersions(gp.StdlibBumps); len(versions) > 0 {
 		clauses = append(clauses, "rebuild with "+strings.Join(versions, ", "))
@@ -302,8 +312,14 @@ func epochComment(gp *GoBumpProcessor) string {
 	}
 
 	comment := strings.Join(clauses, ", ")
-	if list := renderFixList(epochFixedVulnIDs(gp), analysisSeverities(gp)); list != "" {
+	severities := analysisSeverities(gp)
+	if list := renderFixList(epochFixedVulnIDs(gp), severities); list != "" {
 		comment += "; fixes: " + list
+	}
+	if hygiene {
+		if list := renderFixList(slices.Sorted(maps.Keys(fixVulnIDs(gp.HygieneBumps))), severities); list != "" {
+			comment += "; hygiene: " + list
+		}
 	}
 	return comment
 }
@@ -1055,6 +1071,7 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(ctx context.Context, gp *GoBu
 	gp.SetCurrentYAML(yamlContent)
 	gp.MarkActualChangesApplied()
 	g.recordSecurityFixes(gp, langAnalysis, addedAcrossRoots(langAnalysis.ByModroot))
+	recordHygieneBumps(gp, langAnalysis)
 	return nil
 }
 
@@ -1328,30 +1345,7 @@ func addedAcrossRoots(byModroot []ModrootAnalysis) []string {
 // reflects the count. Advisory IDs and prior versions come from the scan's
 // SecurityBumps when available.
 func (g *GoBumpApplier) recordSecurityFixes(gp *GoBumpProcessor, langAnalysis LanguageAnalysis, dependencies []string) {
-	type bumpDetail struct {
-		vulnIDs    []string
-		oldVersion string
-	}
-	byModule := make(map[string]bumpDetail)
-	for _, m := range langAnalysis.ByModroot {
-		// Rendered-coordinate mapping first (see Ecosystem.BumpCoords) -
-		// this is what actually matches splitCoordVersion output for Maven
-		// ("groupId@artifactId") and v2+-normalized Go module paths.
-		for coord, bump := range m.SecurityBumpsByCoord {
-			byModule[coord] = bumpDetail{vulnIDs: bump.VulnIDs, oldVersion: bump.CurrentVersion}
-		}
-		if m.ScanResult == nil {
-			continue
-		}
-		// Legacy OSV-name fallback, for coordinates the map lacks (hand-built
-		// fixtures, or entries the simulation added after analysis).
-		for _, bump := range m.ScanResult.SecurityBumps {
-			if _, ok := byModule[bump.Name]; !ok {
-				byModule[bump.Name] = bumpDetail{vulnIDs: bump.VulnIDs, oldVersion: bump.CurrentVersion}
-			}
-		}
-	}
-
+	detailFor := bumpDetails(langAnalysis)
 	for _, dep := range dependencies {
 		module, version, ok := splitCoordVersion(dep)
 		if !ok {
@@ -1359,27 +1353,99 @@ func (g *GoBumpApplier) recordSecurityFixes(gp *GoBumpProcessor, langAnalysis La
 			version = "unknown"
 		}
 
-		detail, found := byModule[module]
-		if !found {
-			// OSV names v2+ Go modules without the /vN path suffix.
-			detail = byModule[trimMajorSuffix(module)]
-		}
+		detail := detailFor(module)
 		vulnerability := "security vulnerability"
 		if len(detail.vulnIDs) > 0 {
 			vulnerability = strings.Join(detail.vulnIDs, ", ")
-		}
-		oldVersion := "vulnerable"
-		if detail.oldVersion != "" {
-			oldVersion = detail.oldVersion
 		}
 
 		gp.AddSecurityFix(SecurityFix{
 			Module:        module,
 			Vulnerability: vulnerability,
-			OldVersion:    oldVersion,
+			OldVersion:    detail.oldVersionOr("vulnerable"),
 			NewVersion:    version,
 			Severity:      "varies",
 		})
+	}
+}
+
+// bumpDetail is the analysis scan's record of one module's bump: its
+// advisory IDs and the vulnerable version it was found at.
+type bumpDetail struct {
+	vulnIDs    []string
+	oldVersion string
+}
+
+func (d bumpDetail) oldVersionOr(fallback string) string {
+	if d.oldVersion == "" {
+		return fallback
+	}
+	return d.oldVersion
+}
+
+// bumpDetails returns a lookup of a language's analysis bumps by module:
+// rendered coordinates first (see Ecosystem.BumpCoords - this is what
+// matches splitCoordVersion output for Maven "groupId@artifactId" and
+// v2+-normalized Go module paths), then OSV names for coordinates the map
+// lacks (hand-built fixtures, or entries the simulation added after
+// analysis), then the module without its /vN suffix (OSV names v2+ Go
+// modules without it).
+func bumpDetails(langAnalysis LanguageAnalysis) func(module string) bumpDetail {
+	byModule := make(map[string]bumpDetail)
+	for _, m := range langAnalysis.ByModroot {
+		for coord, bump := range m.SecurityBumpsByCoord {
+			byModule[coord] = bumpDetail{vulnIDs: bump.VulnIDs, oldVersion: bump.CurrentVersion}
+		}
+		if m.ScanResult == nil {
+			continue
+		}
+		for _, bump := range m.ScanResult.SecurityBumps {
+			if _, ok := byModule[bump.Name]; !ok {
+				byModule[bump.Name] = bumpDetail{vulnIDs: bump.VulnIDs, oldVersion: bump.CurrentVersion}
+			}
+		}
+	}
+	return func(module string) bumpDetail {
+		if detail, ok := byModule[module]; ok {
+			return detail
+		}
+		return byModule[trimMajorSuffix(module)]
+	}
+}
+
+// recordHygieneBumps records the scanner-hygiene entries (see
+// ModrootAnalysis.HygieneModules) this write adds or changes, once per
+// module@version across modroots - apart from the security fixes, so they
+// are never counted as one.
+func recordHygieneBumps(gp *GoBumpProcessor, langAnalysis LanguageAnalysis) {
+	detailFor := bumpDetails(langAnalysis)
+	severities := analysisSeverities(gp)
+	seen := make(map[string]struct{})
+	for _, m := range langAnalysis.ByModroot {
+		hygiene := make(map[string]simulate.HygieneModule, len(m.HygieneModules))
+		for _, h := range m.HygieneModules {
+			hygiene[h.Module+"@"+h.Version] = h
+		}
+		for _, dep := range newlyAddedDeps(m.ExistingDeps, m.DesiredDeps) {
+			h, ok := hygiene[dep]
+			if _, dup := seen[dep]; !ok || dup {
+				continue
+			}
+			seen[dep] = struct{}{}
+			severity := ""
+			for _, id := range h.VulnIDs {
+				if sev := severities[id]; sev != "" && (severity == "" || scan.SeverityRank(sev) < scan.SeverityRank(severity)) {
+					severity = sev
+				}
+			}
+			gp.AddHygieneBump(SecurityFix{
+				Module:        h.Module,
+				Vulnerability: strings.Join(h.VulnIDs, ", "),
+				OldVersion:    detailFor(h.Module).oldVersionOr("flagged"),
+				NewVersion:    h.Version,
+				Severity:      cmp.Or(severity, "varies"),
+			})
+		}
 	}
 }
 

@@ -167,6 +167,7 @@ func summarizeBumpResults(results []*gobump.GoBumpResult) output.GoBumpSummary {
 			summary.PackagesSkipped++
 		}
 		summary.TotalModulesBumped += r.ModulesBumped
+		summary.TotalHygieneModulesBumped += r.HygieneModulesBumped
 		if r.VulnerabilitiesFound == 0 {
 			continue
 		}
@@ -215,7 +216,7 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 	t := table.New(os.Stdout)
 	t.SetRowLines(false)
 	t.SetBorders(false)
-	t.SetHeaders("PACKAGE", "FOUND", "FIXED", "RESIDUAL", "UNLINKED", "BUMPED", "STDLIB", "OLD EPOCH", "NEW EPOCH", "STATUS")
+	t.SetHeaders("PACKAGE", "FOUND", "FIXED", "RESIDUAL", "UNLINKED", "HYGIENE", "BUMPED", "STDLIB", "OLD EPOCH", "NEW EPOCH", "STATUS")
 	for _, result := range results {
 		stdlibVulns := len(output.DistinctStdlibVulnIDs(result.StdlibBumps))
 		t.AddRow(
@@ -224,6 +225,7 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 			fmt.Sprintf("%d", result.VulnerabilitiesFixed),
 			fmt.Sprintf("%d", result.VulnerabilitiesResidual),
 			fmt.Sprintf("%d", result.VulnerabilitiesUnreachable),
+			fmt.Sprintf("%d", result.HygieneModulesBumped),
 			fmt.Sprintf("%d", result.ModulesBumped),
 			stdlibColumnValue(stdlibVulns, result.StdlibChecked),
 			fmt.Sprintf("%d", result.OldEpoch),
@@ -286,6 +288,9 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 	if s.TotalVulnsFound > 0 {
 		footer += fmt.Sprintf(" (%d advisories found, %d fixed, %d residual, %d in unlinked modules; %d modules bumped)",
 			s.TotalVulnsFound, s.TotalVulnsFixed, s.TotalVulnsResidual, s.TotalVulnsUnreachable, s.TotalModulesBumped)
+	}
+	if s.TotalHygieneModulesBumped > 0 {
+		footer += fmt.Sprintf("; %d hygiene bump(s)", s.TotalHygieneModulesBumped)
 	}
 	if s.PackagesStdlibStale > 0 {
 		footer += fmt.Sprintf("; %d stdlib-stale", s.PackagesStdlibStale)

@@ -23,8 +23,8 @@ func TestReplay_Idempotent(t *testing.T) {
 	const runs = 5
 	for _, c := range replayCases() {
 		for _, noTidy := range []bool{false, true} {
-			if noTidy && c.name != "implied-pin" {
-				continue // the only fixture with a tidy: false variant
+			if noTidy && !c.noTidyVariant {
+				continue
 			}
 			name := c.name
 			if noTidy {
@@ -55,6 +55,7 @@ func TestReplay_Idempotent(t *testing.T) {
 					assert.Equal(t, first.FinalReplaces, second.FinalReplaces)
 					assert.Equal(t, first.Residuals, second.Residuals)
 					assert.Equal(t, first.RemainingVulnIDs, second.RemainingVulnIDs)
+					assert.Equal(t, first.HygieneModules, second.HygieneModules, "hygiene bumps are re-derived identically")
 				})
 			})
 		}

@@ -23,6 +23,8 @@ type goldenResult struct {
 	Residuals        []Residual         `json:"residuals"`
 	Dropped          []DroppedCandidate `json:"dropped"`
 	RemainingVulnIDs []string           `json:"remaining_vuln_ids"`
+	HygieneModules   []HygieneModule    `json:"hygiene_modules,omitempty"`
+	HygieneSkipped   string             `json:"hygiene_skipped,omitempty"`
 }
 
 func goldenJSON(t tb, result *ModrootResult) []byte {
@@ -36,6 +38,8 @@ func goldenJSON(t tb, result *ModrootResult) []byte {
 		Residuals:        result.Residuals,
 		Dropped:          result.Dropped,
 		RemainingVulnIDs: result.RemainingVulnIDs,
+		HygieneModules:   result.HygieneModules,
+		HygieneSkipped:   result.HygieneSkipped,
 	}, "", "  ")
 	require.NoError(t, err)
 	return append(out, '\n')

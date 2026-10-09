@@ -667,6 +667,56 @@ func TestSimulationStage_PackageUnreachableClassifiedAsInfo(t *testing.T) {
 	assert.Equal(t, 0, result.VulnerabilitiesFixed)
 }
 
+// TestSimulationStage_HygieneOutcomes: a scanner-hygiene bump the
+// simulation proposed is written (DesiredDeps, HygieneModules) and reported
+// as hygiene, not a security fix - its advisory stays unreachable, so the
+// counts are unchanged; a rejected one is reported as not free.
+func TestSimulationStage_HygieneOutcomes(t *testing.T) {
+	scanResult := &scan.ScanResult{
+		Vulnerabilities: []scan.Vulnerability{
+			{ID: "GO-2026-5970", Module: "golang.org/x/text", CurrentVersion: "v0.30.0", FixedVersion: "v0.36.0",
+				VulnerableImports: []scan.VulnerableImport{{Path: "golang.org/x/text/unicode/norm"}}},
+			{ID: "GO-2026-0001", Module: "golang.org/x/net", CurrentVersion: "v0.40.0", FixedVersion: "v0.45.0",
+				VulnerableImports: []scan.VulnerableImport{{Path: "golang.org/x/net/html"}}},
+		},
+		SecurityBumps: []scan.SecurityBump{
+			{Name: "golang.org/x/text", CurrentVersion: "v0.30.0", FixedVersion: "v0.36.0", VulnIDs: []string{"GO-2026-5970"}},
+			{Name: "golang.org/x/net", CurrentVersion: "v0.40.0", FixedVersion: "v0.45.0", VulnIDs: []string{"GO-2026-0001"}},
+		},
+	}
+	gp := NewGoBumpProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
+	gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{
+		RepoURL: "https://github.com/example/repo", Tag: "v1.0.0",
+		ByLanguage: []LanguageAnalysis{{Language: "go", ByModroot: []ModrootAnalysis{{
+			Modroot: ".", DesiredDeps: []string{"golang.org/x/text@v0.36.0", "golang.org/x/net@v0.45.0"}, ScanResult: scanResult,
+		}}}},
+		VulnerabilitiesFound: 2,
+		BumpActions:          []BumpAction{{Action: "needs_bump", Language: "go", Modroots: []string{"."}}},
+	}
+	fake := &fakeBumpSimulator{results: map[string]*simulate.ModrootResult{".": {
+		Modroot: ".", Converged: true, Iterations: 1,
+		FinalDeps:      []string{"golang.org/x/text@v0.36.0"},
+		HygieneModules: []simulate.HygieneModule{{Module: "golang.org/x/text", Version: "v0.36.0", VulnIDs: []string{"GO-2026-5970"}}},
+		Dropped: []simulate.DroppedCandidate{{Module: "golang.org/x/net", Version: "v0.45.0", Hygiene: true,
+			Reason: "shed: scanner hygiene pin golang.org/x/net@v0.45.0 not free (raises dependency Go 1.24->1.25)"}},
+		Linked:         map[string]struct{}{"golang.org/x/text": {}, "golang.org/x/net": {}},
+		LinkedPackages: map[string]struct{}{"golang.org/x/text/language": {}, "golang.org/x/net/http2": {}},
+	}}}
+	require.NoError(t, newStageWithFake(fake).Apply(t.Context(), gp))
+
+	m := gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0]
+	assert.Equal(t, []string{"golang.org/x/text@v0.36.0"}, m.DesiredDeps)
+	assert.Equal(t, fake.results["."].HygieneModules, m.HygieneModules)
+	assert.Empty(t, m.SecurityBumpModules, "a hygiene bump is never a security fix")
+	assert.ElementsMatch(t, []string{"GO-2026-5970", "GO-2026-0001"}, gp.UnreachableVulnIDs, "advisory counts are unchanged")
+
+	messages := strings.Join(gp.GetMessages(), "\n")
+	assert.Contains(t, messages, "modroot .: hygiene: golang.org/x/text@v0.36.0 proposed for scanners (GO-2026-5970; vulnerable package not linked, not a security fix)")
+	assert.Contains(t, messages, "info: golang.org/x/text (GO-2026-5970) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - scanner hygiene bump proposed, not a security fix")
+	assert.Contains(t, messages, "modroot .: hygiene: scanner hygiene pin golang.org/x/net@v0.45.0 not free (raises dependency Go 1.24->1.25) - no bump proposed")
+	assert.Contains(t, messages, "info: golang.org/x/net (GO-2026-0001) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - no bump proposed")
+}
+
 // newTwoModrootSimulationProcessor builds a VulnerabilityAnalysis with two Go
 // modroots ("." and "sub"), each with its own advisory, for exercising the
 // linked-stdlib union's completeness gating across modroots.

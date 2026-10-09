@@ -73,7 +73,14 @@ type GoBumpResult struct {
 	CriticalFixed              int                 `json:"critical_fixed" yaml:"critical_fixed"`
 	HighFixed                  int                 `json:"high_fixed" yaml:"high_fixed"`
 	SecurityFixes              []SecurityFix       `json:"security_fixes" yaml:"security_fixes"`
-	ActionsApplied             []BumpAction        `json:"actions_applied" yaml:"actions_applied"`
+	// HygieneBumps are the scanner-hygiene entries written (see
+	// simulate.HygieneModule): modules raised only so module-level scanners
+	// stop flagging advisories whose vulnerable packages are not linked.
+	// Never security fixes - their advisories stay unreachable, uncounted by
+	// Fixed; HygieneModulesBumped counts them (ModulesBumped does not).
+	HygieneBumps         []SecurityFix `json:"hygiene_bumps,omitempty" yaml:"hygiene_bumps,omitempty"`
+	HygieneModulesBumped int           `json:"hygiene_modules_bumped,omitempty" yaml:"hygiene_modules_bumped,omitempty"`
+	ActionsApplied       []BumpAction  `json:"actions_applied" yaml:"actions_applied"`
 	// SkipReasons say why (part of) the package was not analyzed (status
 	// SKIPPED; see GoBumpProcessor.SkipReasons).
 	SkipReasons []string `json:"skip_reasons,omitempty" yaml:"skip_reasons,omitempty"`
@@ -175,6 +182,9 @@ type ModrootAnalysis struct {
 	SimulationConverged bool                        `json:"simulation_converged" yaml:"simulation_converged"`
 	Residuals           []simulate.Residual         `json:"residuals,omitempty" yaml:"residuals,omitempty"`
 	Dropped             []simulate.DroppedCandidate `json:"dropped,omitempty" yaml:"dropped,omitempty"`
+	// HygieneModules are the DesiredDeps entries the simulation proposed only
+	// for scanner hygiene (see simulate.HygieneModule).
+	HygieneModules []simulate.HygieneModule `json:"hygiene_modules,omitempty" yaml:"hygiene_modules,omitempty"`
 }
 
 // LanguageAnalysis contains the results of scanning one language's

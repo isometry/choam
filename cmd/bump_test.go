@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/isometry/choam/internal/gobump"
@@ -360,6 +361,28 @@ func TestSummarizeBumpResults(t *testing.T) {
 	assert.Contains(t, table, "Summary: 5 files processed, 3 with vulnerabilities, 2 fixed, 1 errors, 1 skipped (5 advisories found, 3 fixed, 2 residual")
 	assert.Contains(t, table, "Error for c: fetch failed", "errors are shown at default verbosity")
 	assert.Contains(t, table, "Skipped d: unsupported repository", "skip reasons are shown at default verbosity")
+}
+
+// TestBumpOutput_HygieneColumn: hygiene bumps get their own table column
+// (after UNLINKED; BUMPED stays security-only), footer clause and summary
+// key, all absent when there are none.
+func TestBumpOutput_HygieneColumn(t *testing.T) {
+	results := []*gobump.GoBumpResult{
+		{FilePath: "k.yaml", PackageName: "kubeconform", VulnerabilitiesFound: 2, VulnerabilitiesUnreachable: 2, Validated: true,
+			HygieneModulesBumped: 1, HygieneBumps: []gobump.SecurityFix{{Module: "golang.org/x/text", Vulnerability: "GO-2026-5970"}}},
+	}
+	table := captureStdout(t, func() { require.NoError(t, outputBumpTable(results)) })
+	header := strings.Fields(strings.ReplaceAll(strings.SplitN(table, "\n", 2)[0], "│", " "))
+	assert.Equal(t, []string{"PACKAGE", "FOUND", "FIXED", "RESIDUAL", "UNLINKED", "HYGIENE", "BUMPED"}, header[:7])
+	assert.Contains(t, table, "2 in unlinked modules; 0 modules bumped); 1 hygiene bump(s)")
+
+	stdout := captureStdout(t, func() { require.NoError(t, outputBumpStructured(results, "json")) })
+	assert.Contains(t, stdout, `"total_hygiene_modules_bumped": 1`)
+
+	plain := captureStdout(t, func() {
+		require.NoError(t, outputBumpStructured([]*gobump.GoBumpResult{{FilePath: "p.yaml"}}, "json"))
+	})
+	assert.NotContains(t, plain, "hygiene")
 }
 
 // TestOutputBumpStructured_KeyedByFullPath: two files sharing a basename in

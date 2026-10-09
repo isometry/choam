@@ -595,6 +595,13 @@ func TestEpochTrigger_Gates(t *testing.T) {
 			gp.MarkActualChangesApplied()
 			gp.SecurityFixes = []SecurityFix{{Module: "m"}}
 		}, true},
+		{"hygiene bumps without applied changes", func(gp *GoBumpProcessor) {
+			gp.HygieneBumps = []SecurityFix{{Module: "m"}}
+		}, false},
+		{"applied changes with hygiene bumps only", func(gp *GoBumpProcessor) {
+			gp.MarkActualChangesApplied()
+			gp.HygieneBumps = []SecurityFix{{Module: "m"}}
+		}, true},
 	}
 
 	for _, tt := range tests {

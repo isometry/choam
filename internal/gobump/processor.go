@@ -21,6 +21,11 @@ type GoBumpProcessor struct {
 	SecurityFixes         []SecurityFix          `json:"security_fixes"`
 	ActualChangesApplied  bool                   `json:"actual_changes_applied"`
 
+	// HygieneBumps are the scanner-hygiene entries the applier wrote (see
+	// GoBumpResult.HygieneBumps); like SecurityFixes they justify an epoch
+	// bump only together with ActualChangesApplied.
+	HygieneBumps []SecurityFix `json:"hygiene_bumps,omitempty"`
+
 	// Validated is true when the written deps lists were proven by
 	// simulation (see SimulationStage); Residuals aggregates the advisories
 	// simulation could not eliminate, across all modroots.
@@ -87,6 +92,19 @@ func (p *GoBumpProcessor) AddSecurityFix(fix SecurityFix) {
 		NewValue:    fix.NewVersion,
 		Description: fmt.Sprintf("security fix: %s %s -> %s", fix.Module, fix.OldVersion, fix.NewVersion),
 		Reason:      fmt.Sprintf("vulnerability: %s (%s)", fix.Vulnerability, fix.Severity),
+	})
+}
+
+// AddHygieneBump records a scanner-hygiene entry the applier wrote.
+func (p *GoBumpProcessor) AddHygieneBump(fix SecurityFix) {
+	p.HygieneBumps = append(p.HygieneBumps, fix)
+	p.AddChange(processor.Change{
+		Type:        "hygiene",
+		Field:       fix.Module,
+		OldValue:    fix.OldVersion,
+		NewValue:    fix.NewVersion,
+		Description: fmt.Sprintf("scanner hygiene: %s %s -> %s", fix.Module, fix.OldVersion, fix.NewVersion),
+		Reason:      fmt.Sprintf("advisories in unlinked packages: %s (not a security fix)", fix.Vulnerability),
 	})
 }
 
@@ -167,7 +185,14 @@ func (p *GoBumpProcessor) fixedVulnIDs() map[string]struct{} {
 	if !p.HasActualChanges() {
 		return ids
 	}
-	for _, fix := range p.SecurityFixes {
+	return fixVulnIDs(p.SecurityFixes)
+}
+
+// fixVulnIDs collects the advisory IDs recorded on fixes (skipping the
+// free-text placeholder used when no OSV ID was matched).
+func fixVulnIDs(fixes []SecurityFix) map[string]struct{} {
+	ids := make(map[string]struct{})
+	for _, fix := range fixes {
 		for id := range strings.SplitSeq(fix.Vulnerability, ",") {
 			id = strings.TrimSpace(id)
 			if id == "" || strings.ContainsRune(id, ' ') {
@@ -239,9 +264,9 @@ func (p *GoBumpProcessor) ToResult() *GoBumpResult {
 		vulnerabilitiesFound = p.VulnerabilityAnalysis.VulnerabilitiesFound
 	}
 
-	modulesBumped := 0
+	modulesBumped, hygieneBumped := 0, 0
 	if p.HasActualChanges() {
-		modulesBumped = len(p.SecurityFixes)
+		modulesBumped, hygieneBumped = len(p.SecurityFixes), len(p.HygieneBumps)
 	}
 
 	residuals := append(slices.Clone(p.Residuals), p.noFixResiduals()...)
@@ -308,6 +333,8 @@ func (p *GoBumpProcessor) ToResult() *GoBumpResult {
 		StdlibBumps:                p.StdlibBumps,
 		StdlibChecked:              p.StdlibChecked,
 		SecurityFixes:              p.SecurityFixes,
+		HygieneBumps:               p.HygieneBumps,
+		HygieneModulesBumped:       hygieneBumped,
 		ActionsApplied:             actionsApplied,
 		OldEpoch:                   p.OldEpoch,
 		NewEpoch:                   p.NewEpoch,

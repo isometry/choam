@@ -156,6 +156,9 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 		}
 
 		reach := newReachabilityDiff()
+		// Scanner-hygiene bumps proposed in any modroot, by module (OSV
+		// naming included), for the unreachable-advisory messages below.
+		hygieneProposed := make(map[string]bool)
 		// stdUnion accumulates the linked-stdlib packages across every
 		// modroot in this language; stdComplete tracks whether every one of
 		// them actually contributed a validated set. A skipped modroot or a
@@ -185,6 +188,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			m.Residuals = result.Residuals
 			m.Dropped = result.Dropped
 			m.BaselineTidies = result.BaselineTidies
+			m.HygieneModules = result.HygieneModules
 			gp.AddResiduals(result.Residuals)
 			unlinkedHere := reach.observe(*m, result.Linked, result.LinkedPackages, true, degradedUnlinkedSet(result))
 
@@ -224,8 +228,24 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 					gp.AddMessage(fmt.Sprintf("modroot %s: removed redundant %s@%s (%s)",
 						m.Modroot, dropped.Module, dropped.Version, strings.TrimPrefix(dropped.Reason, "redundant: ")))
 				}
+				switch {
+				case dropped.Hygiene && strings.HasPrefix(dropped.Reason, "shed: "):
+					gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s - no bump proposed",
+						m.Modroot, strings.TrimPrefix(dropped.Reason, "shed: ")))
+				case dropped.Hygiene:
+					gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s@%s %s - no bump proposed",
+						m.Modroot, dropped.Module, dropped.Version, strings.TrimPrefix(dropped.Reason, "scanner hygiene: ")))
+				}
 				logging.From(ctx).Info("bump candidate dropped by simulation",
 					"module", dropped.Module, "version", dropped.Version, "reason", dropped.Reason)
+			}
+			for _, h := range result.HygieneModules {
+				hygieneProposed[h.Module], hygieneProposed[trimMajorSuffix(h.Module)] = true, true
+				gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s@%s proposed for scanners (%s; vulnerable package not linked, not a security fix)",
+					m.Modroot, h.Module, h.Version, strings.Join(h.VulnIDs, ", ")))
+			}
+			if result.HygieneSkipped != "" {
+				gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: scanner-hygiene bumps not evaluated: %s", m.Modroot, result.HygieneSkipped))
 			}
 			for _, residual := range result.Residuals {
 				logging.From(ctx).Warn("residual vulnerability after simulation",
@@ -256,6 +276,9 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 		for _, module := range unreachableModules {
 			var msg string
 			switch {
+			case module.moduleLinked && hygieneProposed[module.name]:
+				msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - scanner hygiene bump proposed, not a security fix",
+					module.name, strings.Join(module.vulnIDs, ", "))
 			case module.moduleLinked:
 				// Precise, package-only: the module IS in the artifact, the
 				// vulnerable packages are not.

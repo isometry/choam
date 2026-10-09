@@ -213,6 +213,21 @@ type DroppedCandidate struct {
 	// Redundant marks an entry removed because it did no work: it matched or
 	// regressed upstream, or the final tidied go.mod is identical without it.
 	Redundant bool `json:"redundant,omitempty" yaml:"redundant,omitempty"`
+	// Hygiene marks a scanner-hygiene bump that was not proposed because it
+	// is not free (see HygieneModule); Reason says why.
+	Hygiene bool `json:"hygiene,omitempty" yaml:"hygiene,omitempty"`
+}
+
+// HygieneModule is a scanner-hygiene bump: a module linked into the
+// artifact whose advisories' vulnerable packages are not, raised anyway
+// because the bump is free - it changes nothing in the final go.mod but
+// this module's own version, needs no newer Go, compiles and introduces no
+// advisory. Module-level scanners (grype) flag the module version; this is
+// not a security fix and is never counted as one.
+type HygieneModule struct {
+	Module  string   `json:"module" yaml:"module"`
+	Version string   `json:"version" yaml:"version"`
+	VulnIDs []string `json:"vuln_ids" yaml:"vuln_ids"`
 }
 
 // Residual is a vulnerability the simulation could not eliminate, with the
@@ -295,6 +310,16 @@ type ModrootResult struct {
 	// at least one advisory (vs coherence-only pins) - the simulation-time
 	// equivalent of the checker's SecurityBumpModules.
 	CVEBackedModules []string `json:"cve_backed_modules,omitempty" yaml:"cve_backed_modules,omitempty"`
+
+	// HygieneModules are the FinalDeps entries proposed only for scanner
+	// hygiene (see HygieneModule), by module path. A module can be in both
+	// lists: a security fix raised further to clear an unlinked advisory.
+	HygieneModules []HygieneModule `json:"hygiene_modules,omitempty" yaml:"hygiene_modules,omitempty"`
+
+	// HygieneSkipped says why scanner-hygiene bumps were not evaluated
+	// although candidates existed (compile gate off, package reachability
+	// unknown, or no convergence); empty otherwise.
+	HygieneSkipped string `json:"hygiene_skipped,omitempty" yaml:"hygiene_skipped,omitempty"`
 
 	// BaselineTidies answers ModrootRequest.ProbeTidy: the pristine module
 	// tidies under omnibump (so a `tidy: false` may no longer be needed).

@@ -50,6 +50,16 @@ type candState struct {
 	// repair marks a coherence-only pin the compile gate added to keep a
 	// module compatible with a raised dependency (see repairsFor).
 	repair bool
+
+	// hygieneSeed is the version a seed carried above its linked fixes - its
+	// whole version when shed because no advisory it addresses is linked
+	// (see dropUnreachable), or the part trimmed off a partly linked one
+	// (see trimUnlinkedRungs). The scanner-hygiene pass tries it first, so
+	// an existing pin is kept exactly when it is free (see hygienePass).
+	hygieneSeed string
+	// hygieneIDs are the unlinked advisories a scanner-hygiene bump clears
+	// (see hygienePass); non-empty marks the entry as hygiene.
+	hygieneIDs []string
 }
 
 // drop marks the candidate dropped and records it with the given reason.
@@ -334,10 +344,17 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 		}
 	}
 
-	// Last, on the final set: remove every redundant entry. The final
+	// Then, on the final set: remove every redundant entry. The final
 	// tidied go.mod is unchanged by construction, so resolved and the
 	// capability fields still describe it.
-	if err := l.minimise(ctx); err != nil {
+	ref, err := l.minimise(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// Last: scanner-hygiene bumps, only where they are free against that
+	// final go.mod (see hygienePass).
+	if resolved, err = l.hygienePass(ctx, ref, resolved, result); err != nil {
 		return nil, err
 	}
 
@@ -353,6 +370,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	result.Requires = l.requirements
 	result.UnrequiredModules = l.unrequiredModules(resolved)
 	result.FinalDeps, result.FinalReplaces, result.CVEBackedModules = l.finalOutputs(resolved)
+	result.HygieneModules = l.hygieneModules()
 	result.Dropped = l.dropped
 	result.Residuals = append(append([]Residual{}, l.persistentResiduals...), l.scanResiduals...)
 	for i := range result.Residuals {
@@ -863,11 +881,10 @@ func (l *loop) stepDown(ctx context.Context, c *candState, reason string) {
 		return
 	}
 	var kept []string
-	severity := ""
 	for _, r := range below {
 		kept = mergeIDs(kept, r.VulnIDs)
-		severity = mergeSeverity(severity, r.Severity)
 	}
+	severity := rungSeverity(below)
 	lost := slices.DeleteFunc(slices.Clone(c.VulnIDs), func(id string) bool { return slices.Contains(kept, id) })
 	if len(lost) > 0 {
 		l.persistentResiduals = append(l.persistentResiduals, Residual{
@@ -1062,7 +1079,13 @@ func (l *loop) dropUnreachable() bool {
 			reason = fmt.Sprintf("module not linked into build artifacts (packages: %s)", strings.Join(l.buildPatterns, " "))
 		case c.FromCVE && !l.seedVulnPackagesLinked(c.VulnIDs):
 			reason = "vulnerable package(s) not linked into build artifacts"
+			// The module ships: scanners still flag its version, so the
+			// hygiene pass may keep this pin if it is free.
+			c.hygieneSeed = c.Version
 		default:
+			if c.FromCVE && l.trimUnlinkedRungs(c) {
+				changed = true
+			}
 			continue
 		}
 		// Deliberately residual-free: the advisory affects nothing that
@@ -1074,6 +1097,50 @@ func (l *loop) dropUnreachable() bool {
 		changed = true
 	}
 	return changed
+}
+
+// trimUnlinkedRungs narrows a CVE candidate whose advisories are only partly
+// linked to the linked ones: its target becomes the highest rung fixing a
+// linked advisory, and whatever it carried above that (an unlinked
+// advisory's fix, an existing pin) is left to the scanner-hygiene pass,
+// which keeps it only when free (see hygienePass). The unlinked advisories
+// leave its ladder too, so relaxing it never reports them as residual.
+// Reports whether the candidate's version changed.
+func (l *loop) trimUnlinkedRungs(c *candState) bool {
+	if l.linkedPackages == nil || c.remedy || c.Replace {
+		return false
+	}
+	var linked, unlinked []string
+	for _, id := range c.VulnIDs {
+		if l.seedVulnPackagesLinked([]string{id}) {
+			linked = append(linked, id)
+		} else {
+			unlinked = append(unlinked, id)
+		}
+	}
+	if len(linked) == 0 || len(unlinked) == 0 {
+		return false
+	}
+	rungs := c.fixRungs()
+	top := slices.IndexFunc(rungs, func(r Rung) bool {
+		return slices.ContainsFunc(r.VulnIDs, func(id string) bool { return slices.Contains(linked, id) })
+	})
+	if top < 0 {
+		return false // no rung names a linked advisory: fail open, keep it whole
+	}
+	kept := make([]Rung, 0, len(rungs)-top)
+	for _, r := range rungs[top:] {
+		r.VulnIDs = slices.DeleteFunc(slices.Clone(r.VulnIDs), func(id string) bool { return slices.Contains(unlinked, id) })
+		if len(r.VulnIDs) == 0 {
+			r.Severity = ""
+		}
+		kept = append(kept, r)
+	}
+	if top > 0 {
+		c.hygieneSeed = c.Version
+	}
+	c.Version, c.Rungs, c.VulnIDs, c.Severity = kept[0].Version, kept, linked, rungSeverity(kept)
+	return top > 0
 }
 
 // seedVulnPackagesLinked reports whether any of the given seed advisories'
@@ -1187,7 +1254,7 @@ func (l *loop) checkReplaceCandidate(c *candState) bool {
 // processScan converts a rescan of the resolved graph into raised candidates
 // and recomputed scan residuals. It returns the raises applied this round.
 func (l *loop) processScan(ctx context.Context, scanResult *scan.ScanResult, resolved map[string]string) []raise {
-	raises, residuals := l.scanFindings(scanResult, resolved)
+	raises, residuals, _ := l.scanFindings(scanResult, resolved)
 	l.scanResiduals = residuals
 
 	l.lastRaised = l.lastRaised[:0]
@@ -1274,25 +1341,16 @@ func (l *loop) upstreamHoldBack(module string) string {
 // scanFindings classifies a scan of the resolved graph without mutating loop
 // state: advisories whose fix can be applied become raises; the rest become
 // residuals (no released fix, a fix across a major version that a deps entry
-// cannot express, or a module the upstream go.mod replace-pins).
-func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]string) ([]raise, []Residual) {
-	// Package-level applicability: a finding whose vulnerable packages are
-	// all outside the artifact's import graph is neither raised nor a
-	// residual (the orchestrator reports it as info from the analysis scan).
+// cannot express, or a module the upstream go.mod replace-pins). Advisories
+// whose vulnerable packages are all outside the artifact's import graph are
+// neither: the orchestrator reports them as info from the analysis scan,
+// and those with a compatible fix above the module's security target are
+// returned as hygiene targets (see hygienePass) - so a module's security
+// target is the highest fix among its LINKED advisories only.
+func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]string) ([]raise, []Residual, []raise) {
 	applies := make(map[string]bool, len(scanResult.Vulnerabilities))
 	for _, vuln := range scanResult.Vulnerabilities {
 		applies[vuln.ID] = l.vulnApplies(vuln)
-	}
-	anyApplies := func(vulnIDs []string) bool {
-		if len(vulnIDs) == 0 {
-			return true // no per-vuln data - fail open
-		}
-		for _, id := range vulnIDs {
-			if applicable, known := applies[id]; !known || applicable {
-				return true
-			}
-		}
-		return false
 	}
 
 	noFixByModule := make(map[string]*Residual)
@@ -1318,38 +1376,84 @@ func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]str
 		residuals = append(residuals, *r)
 	}
 
+	var hygiene []raise
 	for _, bump := range scanResult.SecurityBumps {
-		if !anyApplies(bump.VulnIDs) {
-			continue
+		var linked, unlinked []string
+		for _, id := range bump.VulnIDs {
+			if applicable, known := applies[id]; known && !applicable {
+				unlinked = append(unlinked, id)
+			} else {
+				linked = append(linked, id) // unknown fails open
+			}
 		}
 		resolvedVersion := resolved[bump.Name]
-		if resolvedVersion != "" && semver.Compare(bump.FixedVersion, resolvedVersion) <= 0 {
+		target, blocked := "", false
+		if len(linked) > 0 || len(bump.VulnIDs) == 0 {
+			fix := raise{module: bump.Name, version: bump.FixedVersion, vulnIDs: bump.VulnIDs, severity: bump.Severity,
+				rungs: FixRungs(scanResult.Vulnerabilities, bump.Name, bump.VulnIDs)}
+			if len(unlinked) > 0 {
+				if rungs := FixRungs(scanResult.Vulnerabilities, bump.Name, linked); len(rungs) > 0 {
+					fix = raise{module: bump.Name, version: rungs[0].Version, vulnIDs: linked, severity: rungSeverity(rungs), rungs: rungs}
+				}
+			}
+			target = fix.version
+			if resolvedVersion == "" || semver.Compare(fix.version, resolvedVersion) > 0 {
+				reason := ""
+				if majorChange(bump.Name, fix.version, resolvedVersion) {
+					reason = fmt.Sprintf("fix requires a major version change (%s -> %s)", resolvedVersion, fix.version)
+				} else if oldPath := l.upstreamHoldBack(bump.Name); oldPath != "" {
+					reason = holdBackReason(oldPath)
+				}
+				if reason != "" {
+					blocked = true
+					residuals = append(residuals, Residual{
+						Module:          bump.Name,
+						ResolvedVersion: resolvedVersion,
+						FixedVersion:    fix.version,
+						VulnIDs:         fix.vulnIDs,
+						Reason:          reason,
+					})
+				} else {
+					raises = append(raises, fix)
+				}
+			}
+		}
+		if len(unlinked) == 0 || blocked {
 			continue
 		}
-		reason := ""
-		if majorChange(bump.Name, bump.FixedVersion, resolvedVersion) {
-			reason = fmt.Sprintf("fix requires a major version change (%s -> %s)", resolvedVersion, bump.FixedVersion)
-		} else if oldPath := l.upstreamHoldBack(bump.Name); oldPath != "" {
-			reason = holdBackReason(oldPath)
+		// Unlinked advisories fixed only above the security target.
+		var above []Rung
+		for _, r := range FixRungs(scanResult.Vulnerabilities, bump.Name, unlinked) {
+			if target == "" || semver.Compare(r.Version, target) > 0 {
+				above = append(above, r)
+			}
 		}
-		if reason != "" {
-			residuals = append(residuals, Residual{
-				Module:          bump.Name,
-				ResolvedVersion: resolvedVersion,
-				FixedVersion:    bump.FixedVersion,
-				VulnIDs:         bump.VulnIDs,
-				Reason:          reason,
-			})
+		if len(above) == 0 || semver.Compare(above[0].Version, resolvedVersion) <= 0 ||
+			majorChange(bump.Name, above[0].Version, resolvedVersion) || l.upstreamHoldBack(bump.Name) != "" {
 			continue
 		}
-		raises = append(raises, raise{module: bump.Name, version: bump.FixedVersion, vulnIDs: bump.VulnIDs, severity: bump.Severity,
-			rungs: FixRungs(scanResult.Vulnerabilities, bump.Name, bump.VulnIDs)})
+		var ids []string
+		for _, r := range above {
+			ids = mergeIDs(ids, r.VulnIDs)
+		}
+		hygiene = append(hygiene, raise{module: bump.Name, version: above[0].Version, vulnIDs: ids, severity: rungSeverity(above), rungs: above})
 	}
 
-	slices.SortFunc(raises, func(a, b raise) int {
+	byModule := func(a, b raise) int {
 		return cmp.Or(strings.Compare(a.module, b.module), strings.Compare(a.version, b.version))
-	})
-	return raises, residuals
+	}
+	slices.SortFunc(raises, byModule)
+	slices.SortFunc(hygiene, byModule)
+	return raises, residuals, hygiene
+}
+
+// rungSeverity is the most severe level across rungs.
+func rungSeverity(rungs []Rung) string {
+	severity := ""
+	for _, r := range rungs {
+		severity = mergeSeverity(severity, r.Severity)
+	}
+	return severity
 }
 
 // trialResult is the outcome of one restore -> apply(keep) -> rescan round.
@@ -1396,7 +1500,7 @@ func (l *loop) trialApply(ctx context.Context, purpose string, keep []*candState
 	if err != nil {
 		return nil, err
 	}
-	tr.raises, tr.residuals = l.scanFindings(scanResult, tr.resolved)
+	tr.raises, tr.residuals, _ = l.scanFindings(scanResult, tr.resolved)
 	l.logTrial(ctx, trialLog{purpose: purpose, pins: keep, resolved: tr.resolved, raises: tr.raises, residuals: len(tr.residuals)})
 	return tr, nil
 }
@@ -1518,23 +1622,33 @@ func (s *goModState) equal(o *goModState) bool {
 		s.goLines == o.goLines && maps.Equal(s.graph, o.graph)
 }
 
-// finalState applies pins with the step's engine (its own tidy mode: no tidy
-// at all for `tidy: false`) and reads the resulting go.mod. go.mod is read
-// before any go list runs, so nothing but the engine has touched it. ok is
-// false when the apply fails - the set is then not equivalent to anything.
+// finalState applies pins (in the given order) with the step's engine (its
+// own tidy mode: no tidy at all for `tidy: false`) and reads the resulting
+// go.mod (see readGoModState). ok is false when the apply fails - the set is
+// then not equivalent to anything.
 func (l *loop) finalState(ctx context.Context, pins []*candState) (st *goModState, ok bool, err error) {
-	if fail := l.engine.apply(ctx, l.inApplyOrder(pins)); fail != nil {
+	if fail := l.engine.apply(ctx, pins); fail != nil {
 		if ierr := l.recordInfra(fail.err); ierr != nil {
 			return nil, false, ierr
 		}
 		return nil, false, ctx.Err()
 	}
-	st = &goModState{}
-	if st.requires, err = l.tc.Requirements(ctx, l.dir); err != nil {
+	if st, err = l.readGoModState(ctx); err != nil {
 		return nil, false, err
 	}
+	return st, true, nil
+}
+
+// readGoModState reads the checkout's go.mod effect (see goModState). Called
+// right after an engine apply: go.mod is read before any go list runs, so
+// nothing but the engine has touched it.
+func (l *loop) readGoModState(ctx context.Context) (st *goModState, err error) {
+	st = &goModState{}
+	if st.requires, err = l.tc.Requirements(ctx, l.dir); err != nil {
+		return nil, err
+	}
 	if st.replaces, err = l.tc.Replaces(ctx, l.dir); err != nil {
-		return nil, false, err
+		return nil, err
 	}
 	if content, rerr := os.ReadFile(filepath.Join(l.dir, "go.mod")); rerr == nil {
 		if f, perr := modfile.ParseLax("go.mod", content, nil); perr == nil {
@@ -1548,10 +1662,10 @@ func (l *loop) finalState(ctx context.Context, pins []*candState) (st *goModStat
 	}
 	if !l.tidiedGoModern() {
 		if st.graph, err = l.tc.ListModules(ctx, l.dir); err != nil {
-			return nil, false, err
+			return nil, err
 		}
 	}
-	return st, true, nil
+	return st, nil
 }
 
 // minimise removes every redundant entry from the final set (design
@@ -1566,8 +1680,9 @@ func (l *loop) finalState(ctx context.Context, pins []*candState) (st *goModStat
 // does not already select. When the simulation budget runs low the remaining
 // entries are kept (correct, merely not minimal); only a cancellation or an
 // infrastructure failure is returned as an error. The checkout is left
-// holding the final set.
-func (l *loop) minimise(ctx context.Context) error {
+// holding the final set; the returned state is its go.mod (nil when it was
+// never computed: nothing to trial, or the final set no longer applies).
+func (l *loop) minimise(ctx context.Context) (*goModState, error) {
 	var set, order []*candState
 	for _, c := range l.activeCandidates() {
 		switch {
@@ -1587,7 +1702,7 @@ func (l *loop) minimise(ctx context.Context) error {
 		set = append(set, c)
 	}
 	if len(order) == 0 {
-		return nil
+		return nil, nil
 	}
 	slices.SortFunc(order, func(a, b *candState) int {
 		if a.FromCVE != b.FromCVE {
@@ -1623,9 +1738,9 @@ func (l *loop) minimise(ctx context.Context) error {
 		return settle()
 	}
 	start := time.Now()
-	ref, ok, err := l.finalState(ctx, set)
+	ref, ok, err := l.finalState(ctx, l.inApplyOrder(set))
 	if err != nil || !ok {
-		return stop(err, "the final set no longer applies")
+		return nil, stop(err, "the final set no longer applies")
 	}
 	cost := time.Since(start)
 	// Necessary condition, from the final graph's requirement edges: an
@@ -1649,14 +1764,14 @@ func (l *loop) minimise(ctx context.Context) error {
 			continue
 		}
 		if dl, has := ctx.Deadline(); has && time.Until(dl) < 2*cost {
-			return stop(nil, "simulation budget nearly exhausted")
+			return ref, stop(nil, "simulation budget nearly exhausted")
 		}
 		without := slices.DeleteFunc(slices.Clone(set), func(p *candState) bool { return p == c })
 		start := time.Now()
-		st, ok, err := l.finalState(ctx, without)
+		st, ok, err := l.finalState(ctx, l.inApplyOrder(without))
 		cost = max(cost, time.Since(start))
 		if err != nil || ctx.Err() != nil {
-			return stop(err, "trial interrupted")
+			return ref, stop(err, "trial interrupted")
 		}
 		if !ok || !st.equal(ref) {
 			continue
@@ -1668,7 +1783,7 @@ func (l *loop) minimise(ctx context.Context) error {
 		}
 		l.dropRedundant(ctx, c, "implied by "+implied+" (final go.mod unchanged without it)")
 	}
-	return settle()
+	return ref, settle()
 }
 
 // baselineVersion is module's version in the pristine graph: the compile
@@ -2398,7 +2513,7 @@ func (l *loop) reviveRelinked(ctx context.Context, raises []raise) bool {
 		l.dropped = slices.DeleteFunc(l.dropped, func(d DroppedCandidate) bool {
 			return d.Module == c.Module && d.Reason == c.dropReason
 		})
-		c.dropped, c.residualized, c.shedUnlinked, c.dropReason = false, false, false, ""
+		c.dropped, c.residualized, c.shedUnlinked, c.dropReason, c.hygieneSeed = false, false, false, "", ""
 		l.revived[r.module] = true
 		revivedAny = true
 		logging.From(ctx).Info("compile gate: vulnerable code linked again - fix revived for another gate round",
@@ -2435,7 +2550,8 @@ type trialLog struct {
 
 // pinRole names the provenance a pin carries in the loop, for tracing:
 // remedy (ambiguous-import repair), coherence (compile-gate co-update
-// repair), cve (advisory-backed), seed (caller-provided, no advisory), raise.
+// repair), cve (advisory-backed), hygiene (scanner hygiene, see hygienePass),
+// seed (caller-provided, no advisory), raise.
 func pinRole(c *candState) string {
 	switch {
 	case c.remedy:
@@ -2444,6 +2560,8 @@ func pinRole(c *candState) string {
 		return "coherence"
 	case c.FromCVE:
 		return "cve"
+	case len(c.hygieneIDs) > 0:
+		return "hygiene"
 	case c.seed:
 		return "seed"
 	default:
@@ -2655,20 +2773,27 @@ func majorChange(modulePath, fixedVersion, resolvedVersion string) bool {
 // absent from the accepted residual set - i.e. the minimal candidate set
 // regressed some module into a vulnerability the full set had avoided.
 func introducesNewVulns(candidate, accepted []Residual) bool {
+	return len(newVulnIDs(candidate, accepted)) > 0
+}
+
+// newVulnIDs lists, sorted, the candidate residuals' advisories absent from
+// the accepted residual set.
+func newVulnIDs(candidate, accepted []Residual) []string {
 	known := make(map[string]struct{})
 	for _, r := range accepted {
 		for _, id := range r.VulnIDs {
 			known[id] = struct{}{}
 		}
 	}
+	var ids []string
 	for _, r := range candidate {
 		for _, id := range r.VulnIDs {
 			if _, ok := known[id]; !ok {
-				return true
+				ids = mergeIDs(ids, []string{id})
 			}
 		}
 	}
-	return false
+	return ids
 }
 
 // ambiguity is one "ambiguous import" pair to repair: the monolith module

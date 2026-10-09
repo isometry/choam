@@ -527,6 +527,8 @@ type replayCase struct {
 	main    map[string]string
 	sc      func() *fakeScanner
 	req     ModrootRequest
+	// noTidyVariant also runs the idempotency test with `tidy: false`.
+	noTidyVariant bool
 }
 
 func (c replayCase) fixture(t *testing.T) replayFixture {
@@ -545,7 +547,8 @@ func (c replayCase) runCtx(ctx context.Context, f replayFixture, eng Engine, noT
 }
 
 func replayCases() []replayCase {
-	return []replayCase{opentofuCase(), rungFallbackCase(), crossContaminationCase(), redundantPinsCase(), impliedPinCase()}
+	return append([]replayCase{opentofuCase(), rungFallbackCase(), crossContaminationCase(), redundantPinsCase(), impliedPinCase()},
+		hygieneReplayCases()...)
 }
 
 func opentofuCase() replayCase {
@@ -691,7 +694,8 @@ func impliedPinCase() replayCase {
 		return "package " + pkg + "\n\nfunc Name() string { return \"" + pkg + "\" }\n"
 	}
 	return replayCase{
-		name: "implied-pin",
+		name:          "implied-pin",
+		noTidyVariant: true,
 		modules: map[string]map[string]string{
 			"example.com/a@v1.0.0": stubModule("example.com/a", "a.go", src("a"), map[string]string{"example.com/b": "v1.0.0"}),
 			"example.com/a@v1.1.0": stubModule("example.com/a", "a.go", src("a"), map[string]string{"example.com/b": "v1.1.0"}),
