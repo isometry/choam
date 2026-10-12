@@ -204,26 +204,26 @@ func fallbackAnalysis(t *testing.T, goDirective string) *VulnerabilityAnalysis {
 	}
 }
 
-func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
+func TestGoVersionFallbackStage_FallbackGoVersions(t *testing.T) {
 	server := fakeGoProxy(t, map[string]string{
 		"/example.com/a/@v/v1.2.0.mod": "module example.com/a\n\ngo 1.26\n",
 	})
-	newApplier := func() *GoBumpApplier {
+	newStage := func() *GoVersionFallbackStage {
 		// Pin the proxy env hermetically: an inherited ambient GOPROXY/
 		// GOPRIVATE/GONOPROXY must not leak into these tests.
 		t.Setenv("GOPROXY", "")
 		t.Setenv("GOPRIVATE", "")
 		t.Setenv("GONOPROXY", "")
-		applier := NewGoBumpApplier(nil)
-		applier.goProxyURL = server.URL
-		return applier
+		stage := NewGoVersionFallbackStage(nil)
+		stage.goProxyURL = server.URL
+		return stage
 	}
 
 	t.Run("sets RequiredGoVersion when above baseline, labeled best-effort", func(t *testing.T) {
 		gp := newTestProcessor(t, singleGoBumpYAML)
 		analysis := fallbackAnalysis(t, "1.22")
 
-		require.NoError(t, newApplier().fallbackGoVersions(t.Context(), gp, analysis))
+		require.NoError(t, newStage().fallbackGoVersions(t.Context(), gp, analysis))
 
 		assert.Equal(t, "1.26", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 		var messaged bool
@@ -241,7 +241,7 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 
-		err := newApplier().fallbackGoVersions(ctx, gp, analysis)
+		err := newStage().fallbackGoVersions(ctx, gp, analysis)
 		require.ErrorIs(t, err, context.Canceled)
 		assert.Empty(t, analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 	})
@@ -250,7 +250,7 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 		gp := newTestProcessor(t, singleGoBumpYAML)
 		analysis := fallbackAnalysis(t, "1.26") // baseline already covers the candidates
 
-		require.NoError(t, newApplier().fallbackGoVersions(t.Context(), gp, analysis))
+		require.NoError(t, newStage().fallbackGoVersions(t.Context(), gp, analysis))
 		assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 	})
 
@@ -259,7 +259,7 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 		analysis := fallbackAnalysis(t, "1.22")
 		analysis.ByLanguage[0].ByModroot[0].Simulated = true
 
-		require.NoError(t, newApplier().fallbackGoVersions(t.Context(), gp, analysis))
+		require.NoError(t, newStage().fallbackGoVersions(t.Context(), gp, analysis))
 		assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 	})
 
@@ -268,13 +268,13 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 		t.Setenv("GOPRIVATE", "")
 		t.Setenv("GONOPROXY", "")
 		failing := fakeGoProxy(t, nil)
-		applier := NewGoBumpApplier(nil)
-		applier.goProxyURL = failing.URL
+		stage := NewGoVersionFallbackStage(nil)
+		stage.goProxyURL = failing.URL
 
 		gp := newTestProcessor(t, singleGoBumpYAML)
 		analysis := fallbackAnalysis(t, "1.22")
 
-		require.NoError(t, applier.fallbackGoVersions(t.Context(), gp, analysis))
+		require.NoError(t, stage.fallbackGoVersions(t.Context(), gp, analysis))
 		assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 		var warned bool
 		for _, msg := range gp.GetMessages() {
@@ -290,7 +290,7 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 		analysis := fallbackAnalysis(t, "1.22")
 		analysis.ByLanguage[0].Language = "rust"
 
-		require.NoError(t, newApplier().fallbackGoVersions(t.Context(), gp, analysis))
+		require.NoError(t, newStage().fallbackGoVersions(t.Context(), gp, analysis))
 		assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 	})
 
@@ -305,13 +305,13 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 			t.Setenv("GOPROXY", releaseServer.URL) // wires Analyzer.goReleases via gorelease.NewIndex
 
 			analyzer := NewAnalyzer(releaseServer.Client())
-			applier := NewGoBumpApplier(analyzer)
-			applier.goProxyURL = modServer.URL // separate server for the go.mod probe
+			stage := NewGoVersionFallbackStage(analyzer)
+			stage.goProxyURL = modServer.URL // separate server for the go.mod probe
 
 			gp := newTestProcessor(t, singleGoBumpYAML)
 			analysis := fallbackAnalysis(t, "1.22")
 
-			require.NoError(t, applier.fallbackGoVersions(t.Context(), gp, analysis))
+			require.NoError(t, stage.fallbackGoVersions(t.Context(), gp, analysis))
 
 			assert.Equal(t, "1.26", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 			for _, msg := range gp.GetMessages() {
@@ -329,13 +329,13 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 			t.Setenv("GOPROXY", releaseServer.URL)
 
 			analyzer := NewAnalyzer(releaseServer.Client())
-			applier := NewGoBumpApplier(analyzer)
-			applier.goProxyURL = modServer.URL
+			stage := NewGoVersionFallbackStage(analyzer)
+			stage.goProxyURL = modServer.URL
 
 			gp := newTestProcessor(t, singleGoBumpYAML)
 			analysis := fallbackAnalysis(t, "1.22")
 
-			require.NoError(t, applier.fallbackGoVersions(t.Context(), gp, analysis))
+			require.NoError(t, stage.fallbackGoVersions(t.Context(), gp, analysis))
 
 			assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion,
 				"an unknown Go release must never become a floor")
@@ -362,13 +362,13 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 			t.Setenv("GOPROXY", failingIndex.URL)
 
 			analyzer := NewAnalyzer(failingIndex.Client())
-			applier := NewGoBumpApplier(analyzer)
-			applier.goProxyURL = modServer.URL
+			stage := NewGoVersionFallbackStage(analyzer)
+			stage.goProxyURL = modServer.URL
 
 			gp := newTestProcessor(t, singleGoBumpYAML)
 			analysis := fallbackAnalysis(t, "1.22")
 
-			require.NoError(t, applier.fallbackGoVersions(t.Context(), gp, analysis))
+			require.NoError(t, stage.fallbackGoVersions(t.Context(), gp, analysis))
 
 			assert.Equal(t, "1.26", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion,
 				"an unreachable release index must fail open and keep the probed result")
@@ -386,17 +386,17 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 		t.Setenv("GOPROXY", "off")
 		t.Setenv("GOPRIVATE", "")
 		t.Setenv("GONOPROXY", "")
-		applier := NewGoBumpApplier(nil)
-		require.True(t, applier.probeDisabled)
+		stage := NewGoVersionFallbackStage(nil)
+		require.True(t, stage.probeDisabled)
 		// Point goProxyURL at the shared fixture too: if the probe were not
 		// actually skipped, it would succeed against this server and defeat
 		// the assertion below.
-		applier.goProxyURL = server.URL
+		stage.goProxyURL = server.URL
 
 		gp := newTestProcessor(t, singleGoBumpYAML)
 		analysis := fallbackAnalysis(t, "1.22")
 
-		require.NoError(t, applier.fallbackGoVersions(t.Context(), gp, analysis))
+		require.NoError(t, stage.fallbackGoVersions(t.Context(), gp, analysis))
 		assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 		var messaged bool
 		for _, msg := range gp.GetMessages() {
@@ -411,13 +411,13 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 		t.Setenv("GOPROXY", "")
 		t.Setenv("GOPRIVATE", "example.com/*")
 		t.Setenv("GONOPROXY", "")
-		applier := NewGoBumpApplier(nil)
-		applier.goProxyURL = server.URL // never hit: the only candidate is private
+		stage := NewGoVersionFallbackStage(nil)
+		stage.goProxyURL = server.URL // never hit: the only candidate is private
 
 		gp := newTestProcessor(t, singleGoBumpYAML)
 		analysis := fallbackAnalysis(t, "1.22") // candidate: example.com/a@v1.2.0
 
-		require.NoError(t, applier.fallbackGoVersions(t.Context(), gp, analysis))
+		require.NoError(t, stage.fallbackGoVersions(t.Context(), gp, analysis))
 		assert.Equal(t, "", analysis.ByLanguage[0].ByModroot[0].RequiredGoVersion)
 		var warned bool
 		for _, msg := range gp.GetMessages() {
@@ -429,24 +429,24 @@ func TestGoBumpApplier_FallbackGoVersions(t *testing.T) {
 	})
 }
 
-// TestGoBumpApplier_ReleaseIndex covers the releaseIndex() accessor: nil-safe
-// like httpClient() when no Analyzer is wired, and otherwise sourced from
+// TestAnalyzer_ReleaseIndex covers the releaseIndex() accessor: nil-safe
+// like client() when no Analyzer is wired, and otherwise sourced from
 // Analyzer.goReleases - the per-run gorelease.Index both validation sites
 // consult.
-func TestGoBumpApplier_ReleaseIndex(t *testing.T) {
+func TestAnalyzer_ReleaseIndex(t *testing.T) {
 	t.Run("nil Analyzer - nil index", func(t *testing.T) {
-		applier := &GoBumpApplier{}
-		assert.Nil(t, applier.releaseIndex())
+		var analyzer *Analyzer
+		assert.Nil(t, analyzer.releaseIndex())
+		assert.Same(t, http.DefaultClient, analyzer.client())
 	})
 
 	t.Run("wired from Analyzer.goReleases", func(t *testing.T) {
 		analyzer := NewAnalyzer(nil)
-		applier := &GoBumpApplier{Analyzer: analyzer}
-		assert.Same(t, analyzer.goReleases, applier.releaseIndex())
+		assert.Same(t, analyzer.goReleases, analyzer.releaseIndex())
 	})
 }
 
-func TestNewGoBumpApplier_GOPROXYWiring(t *testing.T) {
+func TestNewGoVersionFallbackStage_GOPROXYWiring(t *testing.T) {
 	tests := []struct {
 		name              string
 		goproxy           string
@@ -462,41 +462,41 @@ func TestNewGoBumpApplier_GOPROXYWiring(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv("GOPROXY", tt.goproxy)
-			applier := NewGoBumpApplier(nil)
-			assert.Equal(t, tt.wantGoProxyURL, applier.goProxyURL)
-			assert.Equal(t, tt.wantProbeDisabled, applier.probeDisabled)
+			stage := NewGoVersionFallbackStage(nil)
+			assert.Equal(t, tt.wantGoProxyURL, stage.goProxyURL)
+			assert.Equal(t, tt.wantProbeDisabled, stage.probeDisabled)
 		})
 	}
 }
 
-func TestNewGoBumpApplier_GOPRIVATEWiring(t *testing.T) {
+func TestNewGoVersionFallbackStage_GOPRIVATEWiring(t *testing.T) {
 	t.Setenv("GOPROXY", "")
 	t.Setenv("GOPRIVATE", "example.com/private/*")
 	t.Setenv("GONOPROXY", "")
 
-	applier := NewGoBumpApplier(nil)
-	assert.Equal(t, "example.com/private/*", applier.goPrivate)
-	assert.Equal(t, "", applier.goNoProxy)
-	assert.True(t, applier.skipPrivateModule("example.com/private/foo"))
-	assert.False(t, applier.skipPrivateModule("example.com/public/foo"))
+	stage := NewGoVersionFallbackStage(nil)
+	assert.Equal(t, "example.com/private/*", stage.goPrivate)
+	assert.Equal(t, "", stage.goNoProxy)
+	assert.True(t, stage.skipPrivateModule("example.com/private/foo"))
+	assert.False(t, stage.skipPrivateModule("example.com/public/foo"))
 }
 
-// TestGoBumpApplier_PublicFallbackSkipsGOPRIVATEUnion covers the residual
+// TestGoVersionFallbackStage_PublicFallbackSkipsGOPRIVATEUnion covers the residual
 // private-name-leak fix: GOPROXY=direct is unusable as a probe base URL, so
-// the applier falls back to the public proxy.golang.org (goProxyIsPublic
+// the stage falls back to the public proxy.golang.org (goProxyIsPublic
 // becomes true). Go's own GONOPROXY-precedence rule would, applied naively,
 // consult only GONOPROXY's pattern ("other/*") here and let a GOPRIVATE-only
 // module's name/version leak to that public proxy. skipPrivateModule must
 // instead skip the UNION of GOPRIVATE and GONOPROXY whenever the probe is
 // public, so the GOPRIVATE-matched candidate below is skipped and the fake
 // proxy never receives a request for it.
-func TestGoBumpApplier_PublicFallbackSkipsGOPRIVATEUnion(t *testing.T) {
+func TestGoVersionFallbackStage_PublicFallbackSkipsGOPRIVATEUnion(t *testing.T) {
 	t.Setenv("GOPROXY", "direct")
 	t.Setenv("GOPRIVATE", "secret.corp/*")
 	t.Setenv("GONOPROXY", "other/*")
 
-	applier := NewGoBumpApplier(nil)
-	require.True(t, applier.goProxyIsPublic, "GOPROXY=direct falls back to the public proxy")
+	stage := NewGoVersionFallbackStage(nil)
+	require.True(t, stage.goProxyIsPublic, "GOPROXY=direct falls back to the public proxy")
 
 	var hitPaths []string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -506,17 +506,17 @@ func TestGoBumpApplier_PublicFallbackSkipsGOPRIVATEUnion(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	m := &ModrootAnalysis{DesiredDeps: []string{"secret.corp/private@v1.0.0"}}
-	got, _, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, applier.skipPrivateModule)
+	got, _, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, stage.skipPrivateModule)
 	require.Error(t, err) // the only candidate is private, so nothing was fetched.
 	assert.Equal(t, "", got)
 	assert.Empty(t, hitPaths, "GOPRIVATE-matched module must never reach the public proxy fallback")
 }
 
-// TestGoBumpApplier_FallbackTimeoutIsVisible: the best-effort probe's budget
+// TestGoVersionFallbackStage_FallbackTimeoutIsVisible: the best-effort probe's budget
 // expiring (a slow proxy, a loaded machine) must never change what is
 // written silently: no Go version floor is set, the deps are untouched, and
 // the user is told the probe failed.
-func TestGoBumpApplier_FallbackTimeoutIsVisible(t *testing.T) {
+func TestGoVersionFallbackStage_FallbackTimeoutIsVisible(t *testing.T) {
 	t.Setenv("GOPROXY", "")
 	t.Setenv("GOPRIVATE", "")
 	t.Setenv("GONOPROXY", "")
@@ -526,12 +526,12 @@ func TestGoBumpApplier_FallbackTimeoutIsVisible(t *testing.T) {
 
 	hang := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) { <-r.Context().Done() }))
 	t.Cleanup(hang.Close)
-	applier := NewGoBumpApplier(nil)
-	applier.goProxyURL = hang.URL
+	stage := NewGoVersionFallbackStage(nil)
+	stage.goProxyURL = hang.URL
 
 	gp := newTestProcessor(t, singleGoBumpYAML)
 	analysis := fallbackAnalysis(t, "1.22")
-	require.NoError(t, applier.fallbackGoVersions(t.Context(), gp, analysis))
+	require.NoError(t, stage.fallbackGoVersions(t.Context(), gp, analysis))
 
 	m := analysis.ByLanguage[0].ByModroot[0]
 	assert.Empty(t, m.RequiredGoVersion)

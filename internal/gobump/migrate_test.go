@@ -88,7 +88,7 @@ func runApplier(t *testing.T, yamlContent string, analysis *VulnerabilityAnalysi
 	t.Helper()
 	gp := newTestProcessor(t, yamlContent)
 	gp.Config = cfg
-	require.NoError(t, NewGoBumpApplier(nil).applyGoBumpChanges(t.Context(), gp, analysis))
+	require.NoError(t, runApplyPhase(t, gp, analysis))
 	return gp
 }
 

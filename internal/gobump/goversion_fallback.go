@@ -19,7 +19,7 @@ import (
 
 // defaultGoProxyURL is the module proxy the best-effort go-version fallback
 // fetches candidate go.mod files from (overridden in tests via
-// GoBumpApplier.goProxyURL).
+// GoVersionFallbackStage.goProxyURL).
 const defaultGoProxyURL = "https://proxy.golang.org"
 
 // fallbackGoVersionBudget bounds one modroot's whole fallback probe - it is
@@ -173,7 +173,7 @@ func fetchModGoDirective(ctx context.Context, client *http.Client, proxyBaseURL,
 
 // validateGoVersionFloor decides whether minor (a bare Go minor series, e.g.
 // "1.26") should be trusted as a go-version floor, consulting the shared
-// per-run gorelease.Index (see GoBumpApplier.releaseIndex). It implements the
+// per-run gorelease.Index (see Analyzer.releaseIndex). It implements the
 // fail-open policy shared by both validation sites - the fallback probe
 // result here in fallbackGoVersions, and the go-package pin floor write in
 // reconcileGoPackagePins:

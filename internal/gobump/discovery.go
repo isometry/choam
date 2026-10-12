@@ -13,7 +13,6 @@ import (
 	melange "chainguard.dev/melange/pkg/config"
 	"github.com/isometry/choam/internal/config"
 	"github.com/isometry/choam/internal/ecosystem"
-	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/simulate"
 )
@@ -86,14 +85,14 @@ const defaultToolchainTags = "netgo,osusergo"
 // with.packages build patterns), and (3) package.annotations explicit
 // opt-ins. Returns language -> units sorted by modroot; a language absent
 // from the result had no modroots from any source. migrations are the
-// go/bump steps' migration plans by pipeline index (see planMigration).
+// go/bump steps' migration plans by pipeline index (see planMigration); the
+// Go-only unit details are goUnitDetails'.
 func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bumpSteps []config.BumpStep, migrations map[int]migrationPlan) (map[string][]analysisUnit, []string) {
 	// language -> modroot -> sets of build package patterns and tags
 	type unitSets struct {
 		patterns, tags map[string]struct{}
 		step           *config.BumpStep // first bump step covering the root
-		goMinor        string
-		envs           []simulate.BuildEnv
+		built          []analysisUnit   // the build-step units building the root
 	}
 	units := make(map[string]map[string]*unitSets)
 
@@ -131,33 +130,20 @@ func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bump
 	}
 
 	notes := make(map[string]struct{})
-	var arches []string
+	golang := goDiscovery{migrations: migrations}
 	if cfg != nil {
 		scan := scanBuildSteps(ctx, cfg)
 		notes = scan.notes
-		arches = goTargetArches(ctx, cfg)
+		golang.load(ctx, cfg)
 		for language, buildUnits := range scan.units {
 			for _, unit := range buildUnits {
 				for _, sets := range add(language, []string{unit.Modroot}, unit.Packages, unit.Tags) {
-					if unit.GoMinor != "" && (sets.goMinor == "" || goversion.Compare(unit.GoMinor, sets.goMinor) < 0) {
-						sets.goMinor = unit.GoMinor
-					}
-					sets.envs = append(sets.envs, unit.envs...)
+					sets.built = append(sets.built, unit)
 				}
 			}
 		}
 		for language, modroots := range modrootsFromAnnotations(cfg) {
 			add(language, modroots, nil, nil)
-		}
-	}
-
-	envMinor := ""
-	if cfg != nil {
-		for _, pkg := range cfg.Environment.Contents.Packages {
-			if _, minor, ok := parseGoPackagePin(pkg); ok && minor != "" {
-				envMinor = minor
-				break
-			}
 		}
 	}
 
@@ -168,35 +154,14 @@ func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bump
 		}
 		langUnits := make([]analysisUnit, 0, len(byRoot))
 		for root, sets := range byRoot {
-			unit := analysisUnit{Modroot: root, Engine: simulate.EngineOmnibump, GoMinor: sets.goMinor}
+			// A new step is `uses: bump` (omnibump's apply semantics).
+			unit := analysisUnit{Modroot: root, Engine: simulate.EngineOmnibump}
 			if sets.step != nil {
 				unit.NoTidy = sets.step.NoTidy
-				if sets.step.Action == "go/bump" {
-					if plan := migrations[sets.step.Index]; plan.ok {
-						unit.Migrating = true
-						if unit.GoMinor == "" {
-							unit.GoMinor = plan.goMinor
-						}
-					} else {
-						unit.Engine = simulate.EngineGobump
-					}
-				}
 			}
 			if language == "go" {
-				if unit.GoMinor == "" {
-					unit.GoMinor = envMinor
-				}
-				unit.Arches = arches
-				if len(sets.envs) > 0 {
-					unit.Env = mergeBuildEnvs(root, sets.envs, notes)
-				} else if cfg != nil {
-					// No build step: the package builds it some other way
-					// (runs:), under the package-level environment.
-					var tags []string
-					unit.Env, tags = buildEnv("environment", cfg.Environment.Environment, nil, newLenientRenderer(ctx, cfg), notes)
-					for _, tag := range tags {
-						sets.tags[tag] = struct{}{}
-					}
+				for _, tag := range goUnitDetails(ctx, golang, &unit, sets.step, sets.built, notes) {
+					sets.tags[tag] = struct{}{}
 				}
 			}
 			for pattern := range sets.patterns {

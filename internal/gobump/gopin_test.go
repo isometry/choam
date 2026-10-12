@@ -228,9 +228,9 @@ func TestReconcileGoPackagePins(t *testing.T) {
 
 	t.Run("raises too-old base-go pins, preserving comments; warns on variant, templated and unrecognized; leaves the rest", func(t *testing.T) {
 		gp := goPinTestProcessor(t)
-		applier := NewGoBumpApplier(nil)
+		pinStage := NewGoPackagePinStage(nil)
 
-		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, dotFloor("1.25.3")))
+		require.NoError(t, pinStage.reconcileGoPackagePins(ctx, gp, dotFloor("1.25.3")))
 
 		content := string(gp.GetCurrentYAML())
 
@@ -288,9 +288,9 @@ func TestReconcileGoPackagePins(t *testing.T) {
 	t.Run("templated pin resolving at or above the floor stays silent", func(t *testing.T) {
 		gp := goPinTestProcessor(t)
 		gp.Config.Vars["go-pkg"] = "go-1.30"
-		applier := NewGoBumpApplier(nil)
+		pinStage := NewGoPackagePinStage(nil)
 
-		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, dotFloor("1.25")))
+		require.NoError(t, pinStage.reconcileGoPackagePins(ctx, gp, dotFloor("1.25")))
 
 		for _, msg := range gp.GetMessages() {
 			assert.NotContains(t, msg, "update the variable manually")
@@ -300,9 +300,9 @@ func TestReconcileGoPackagePins(t *testing.T) {
 	t.Run("nil gp.Config degrades templated pin to a warning, not a silent skip", func(t *testing.T) {
 		gp := goPinTestProcessor(t)
 		gp.Config = nil // no renderer can be built - the templated value can't be evaluated
-		applier := NewGoBumpApplier(nil)
+		pinStage := NewGoPackagePinStage(nil)
 
-		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, dotFloor("1.25.3")))
+		require.NoError(t, pinStage.reconcileGoPackagePins(ctx, gp, dotFloor("1.25.3")))
 
 		content := string(gp.GetCurrentYAML())
 		// The templated pin is never rewritten.
@@ -316,9 +316,9 @@ func TestReconcileGoPackagePins(t *testing.T) {
 
 	t.Run("empty floors is a no-op", func(t *testing.T) {
 		gp := goPinTestProcessor(t)
-		applier := NewGoBumpApplier(nil)
+		pinStage := NewGoPackagePinStage(nil)
 
-		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, nil))
+		require.NoError(t, pinStage.reconcileGoPackagePins(ctx, gp, nil))
 
 		assert.Equal(t, goPinFixtureYAML, string(gp.GetCurrentYAML()))
 		assert.False(t, gp.ActualChangesApplied)
@@ -328,10 +328,10 @@ func TestReconcileGoPackagePins(t *testing.T) {
 
 	t.Run("all pins sufficient - no rewrite, no change flag, identity outcomes recorded", func(t *testing.T) {
 		gp := goPinTestProcessor(t)
-		applier := NewGoBumpApplier(nil)
+		pinStage := NewGoPackagePinStage(nil)
 
 		// Floor below every versioned pin's minor: nothing to raise or warn.
-		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, dotFloor("1.20")))
+		require.NoError(t, pinStage.reconcileGoPackagePins(ctx, gp, dotFloor("1.20")))
 
 		assert.Equal(t, goPinFixtureYAML, string(gp.GetCurrentYAML()))
 		assert.False(t, gp.ActualChangesApplied)
@@ -345,9 +345,9 @@ func TestReconcileGoPackagePins(t *testing.T) {
 	t.Run("templated pin below the floor records nothing", func(t *testing.T) {
 		gp := goPinTestProcessor(t)
 		gp.Config.Vars["go-pkg"] = "go-1.21" // templated pin renders below the floor
-		applier := NewGoBumpApplier(nil)
+		pinStage := NewGoPackagePinStage(nil)
 
-		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, dotFloor("1.25")))
+		require.NoError(t, pinStage.reconcileGoPackagePins(ctx, gp, dotFloor("1.25")))
 
 		_, templatedRecorded := gp.RaisedPinMinors["1.21"]
 		assert.False(t, templatedRecorded, "templated pins are never edited, so they must not record an outcome")
@@ -355,11 +355,11 @@ func TestReconcileGoPackagePins(t *testing.T) {
 
 	t.Run("double run is byte-stable", func(t *testing.T) {
 		gp := goPinTestProcessor(t)
-		applier := NewGoBumpApplier(nil)
+		pinStage := NewGoPackagePinStage(nil)
 
-		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, dotFloor("1.25")))
+		require.NoError(t, pinStage.reconcileGoPackagePins(ctx, gp, dotFloor("1.25")))
 		firstPass := string(gp.GetCurrentYAML())
-		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, dotFloor("1.25")))
+		require.NoError(t, pinStage.reconcileGoPackagePins(ctx, gp, dotFloor("1.25")))
 		assert.Equal(t, firstPass, string(gp.GetCurrentYAML()))
 	})
 }
@@ -412,11 +412,11 @@ func TestReconcileGoPackagePins_PerModroot(t *testing.T) {
 
 	t.Run("only pins whose own modroot has a floor are raised; other modroots untouched", func(t *testing.T) {
 		gp := goPinModrootProcessor(t)
-		applier := NewGoBumpApplier(nil)
+		pinStage := NewGoPackagePinStage(nil)
 
 		// ./cmd/app demands 1.25.3; ./cmd/other is present but demands nothing.
 		floors := map[string]string{"./cmd/app": "1.25.3", "./cmd/other": ""}
-		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, floors))
+		require.NoError(t, pinStage.reconcileGoPackagePins(ctx, gp, floors))
 
 		content := string(gp.GetCurrentYAML())
 
@@ -441,10 +441,10 @@ func TestReconcileGoPackagePins_PerModroot(t *testing.T) {
 
 	t.Run("pin whose modroot is absent from analysis is left untouched", func(t *testing.T) {
 		gp := goPinModrootProcessor(t)
-		applier := NewGoBumpApplier(nil)
+		pinStage := NewGoPackagePinStage(nil)
 
 		// ./cmd/other is not present in floors at all (unanalyzed).
-		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, map[string]string{"./cmd/app": "1.25.3"}))
+		require.NoError(t, pinStage.reconcileGoPackagePins(ctx, gp, map[string]string{"./cmd/app": "1.25.3"}))
 
 		content := string(gp.GetCurrentYAML())
 		assert.Contains(t, content, "go-package: go-1.22\n          modroot: ./cmd/other",
@@ -472,9 +472,9 @@ func TestReconcileGoPackagePins_VariantByteIdentical(t *testing.T) {
 	gp.OriginalYAML = []byte(goPinFipsFixtureYAML)
 	gp.SetCurrentYAML([]byte(goPinFipsFixtureYAML))
 	gp.Config = &melange.Configuration{}
-	applier := NewGoBumpApplier(nil)
+	pinStage := NewGoPackagePinStage(nil)
 
-	require.NoError(t, applier.reconcileGoPackagePins(context.Background(), gp, map[string]string{".": "1.25.3"}))
+	require.NoError(t, pinStage.reconcileGoPackagePins(context.Background(), gp, map[string]string{".": "1.25.3"}))
 
 	// A variant toolchain in need of a raise must leave the file byte-identical.
 	assert.Equal(t, goPinFipsFixtureYAML, string(gp.GetCurrentYAML()))
@@ -549,10 +549,10 @@ func TestReconcileGoPackagePins_FloorValidation(t *testing.T) {
 		releaseServer := releaseFixtureServer(t, "1.25.3") // no 1.99 series ever shipped
 		t.Setenv("GOPROXY", releaseServer.URL)
 		analyzer := NewAnalyzer(releaseServer.Client())
-		applier := NewGoBumpApplier(analyzer)
+		pinStage := NewGoPackagePinStage(analyzer)
 
 		gp := goPinTestProcessor(t)
-		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, dotFloor("1.99")))
+		require.NoError(t, pinStage.reconcileGoPackagePins(ctx, gp, dotFloor("1.99")))
 
 		assert.Equal(t, goPinFixtureYAML, string(gp.GetCurrentYAML()),
 			"an unknown Go release must never be written as a pin floor")
@@ -567,10 +567,10 @@ func TestReconcileGoPackagePins_FloorValidation(t *testing.T) {
 		releaseServer := releaseFixtureServer(t, "1.25.3")
 		t.Setenv("GOPROXY", releaseServer.URL)
 		analyzer := NewAnalyzer(releaseServer.Client())
-		applier := NewGoBumpApplier(analyzer)
+		pinStage := NewGoPackagePinStage(analyzer)
 
 		gp := goPinTestProcessor(t)
-		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, dotFloor("1.25.3")))
+		require.NoError(t, pinStage.reconcileGoPackagePins(ctx, gp, dotFloor("1.25.3")))
 
 		content := string(gp.GetCurrentYAML())
 		assert.Contains(t, content, "go-package: go-1.25\n")
@@ -584,10 +584,10 @@ func TestReconcileGoPackagePins_FloorValidation(t *testing.T) {
 		t.Cleanup(failingIndex.Close)
 		t.Setenv("GOPROXY", failingIndex.URL)
 		analyzer := NewAnalyzer(failingIndex.Client())
-		applier := NewGoBumpApplier(analyzer)
+		pinStage := NewGoPackagePinStage(analyzer)
 
 		gp := goPinTestProcessor(t)
-		require.NoError(t, applier.reconcileGoPackagePins(ctx, gp, dotFloor("1.25.3")))
+		require.NoError(t, pinStage.reconcileGoPackagePins(ctx, gp, dotFloor("1.25.3")))
 
 		content := string(gp.GetCurrentYAML())
 		assert.Contains(t, content, "go-package: go-1.25\n", "an unreachable index must fail open")

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"maps"
 	"net/http"
-	"os"
 	"slices"
 	"sort"
 	"strings"
@@ -16,9 +15,7 @@ import (
 	"github.com/isometry/choam/internal/config"
 	"github.com/isometry/choam/internal/ecosystem"
 	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
-	"github.com/isometry/choam/internal/goproxy"
 	"github.com/isometry/choam/internal/gorelease"
-	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/processor"
 	"github.com/isometry/choam/internal/processor/stages"
@@ -39,7 +36,7 @@ type Analyzer struct {
 	goReleases *gorelease.Index
 
 	// httpClient is the client the fetcher/scanner were built with, retained
-	// so the applier's best-effort go-version fallback (see
+	// so the best-effort go-version fallback stage (see
 	// fallbackRequiredGoVersion) shares the same transport and timeouts.
 	httpClient *http.Client
 }
@@ -55,6 +52,28 @@ func NewAnalyzer(httpClient *http.Client) *Analyzer {
 		goReleases:           gorelease.NewIndex(httpClient),
 		httpClient:           httpClient,
 	}
+}
+
+// releaseIndex returns the shared per-run Go release index: the fallback
+// go-version probe, the go-package pin floor write and go/bump migration
+// planning consult it to reject a version that names no real Go release. A
+// nil Analyzer (some unit tests construct stages directly) means no index is
+// available - callers treat that as "nothing to validate against" rather
+// than an error.
+func (a *Analyzer) releaseIndex() *gorelease.Index {
+	if a == nil {
+		return nil
+	}
+	return a.goReleases
+}
+
+// client returns the analyzer's HTTP client, falling back to the default
+// client when a stage was built without an analyzer (tests).
+func (a *Analyzer) client() *http.Client {
+	if a != nil && a.httpClient != nil {
+		return a.httpClient
+	}
+	return http.DefaultClient
 }
 
 // VulnerabilityChecker checks for dependency vulnerabilities
@@ -102,92 +121,25 @@ func (v *VulnerabilityChecker) Check(ctx context.Context, p processor.Processor)
 type GoBumpApplier struct {
 	processor.BaseStage
 	Analyzer *Analyzer
-
-	// goProxyURL is the module proxy the best-effort go-version fallback
-	// queries; tests point it at an httptest server.
-	goProxyURL string
-
-	// probeDisabled mirrors GOPROXY=off: the best-effort go-version fallback
-	// probe is entirely skipped (it would just fail every fetch) and each
-	// affected modroot gets one explanatory message instead.
-	probeDisabled bool
-
-	// goPrivate/goNoProxy are GOPRIVATE/GONOPROXY captured once at
-	// construction (see internal/goproxy.IsPrivate) so the fallback probe
-	// never sends a private module's name/version to a public proxy.
-	goPrivate string
-	goNoProxy string
-
-	// goProxyIsPublic is true when goProxyURL is (or falls back to) the
-	// public https://proxy.golang.org - either because GOPROXY named it
-	// directly, or because GOPROXY's first entry was unusable ("direct",
-	// "off", unset, or garbage) and the probe fell back to it. See
-	// skipPrivateModule for why this changes which modules get skipped.
-	goProxyIsPublic bool
 }
 
 func NewGoBumpApplier(analyzer *Analyzer) *GoBumpApplier {
-	proxyURL, ok := goproxy.FirstURL(os.Getenv("GOPROXY"))
-	if !ok {
-		proxyURL = defaultGoProxyURL
-	}
 	return &GoBumpApplier{
 		BaseStage: processor.BaseStage{
 			StageName:        "gobump_apply",
 			StageDescription: "Apply bump/go-bump pipeline changes",
 		},
-		Analyzer:        analyzer,
-		goProxyURL:      proxyURL,
-		probeDisabled:   goproxy.Disabled(os.Getenv("GOPROXY")),
-		goPrivate:       os.Getenv("GOPRIVATE"),
-		goNoProxy:       os.Getenv("GONOPROXY"),
-		goProxyIsPublic: proxyURL == defaultGoProxyURL,
+		Analyzer: analyzer,
 	}
 }
 
-// skipPrivateModule reports whether modulePath is private per the
-// applier's captured GOPRIVATE/GONOPROXY - the skip func the best-effort
-// go-version fallback probe uses to avoid leaking private module
-// names/versions to a public proxy.
-//
-// When the probe queries the user's own configured proxy, Go's own
-// GONOPROXY-precedence rule applies (a non-empty GONOPROXY governs
-// exclusively; GOPRIVATE is only consulted as its default) - that precedence
-// exists to let a private proxy see modules that are GOPRIVATE-only but not
-// GONOPROXY-listed. But when goProxyIsPublic is true there is no private
-// proxy in play: the probe is talking to the public proxy.golang.org
-// regardless, so applying the same precedence would leak a module that
-// matches GOPRIVATE but not a (possibly unrelated, non-empty) GONOPROXY.
-// Skip on the UNION of GOPRIVATE and GONOPROXY instead, expressed by
-// consulting goproxy.IsPrivate once per pattern list with the other left
-// empty.
-func (g *GoBumpApplier) skipPrivateModule(modulePath string) bool {
-	if g.goProxyIsPublic {
-		return goproxy.IsPrivate(modulePath, g.goPrivate, "") || goproxy.IsPrivate(modulePath, "", g.goNoProxy)
-	}
-	return goproxy.IsPrivate(modulePath, g.goPrivate, g.goNoProxy)
-}
-
-// httpClient returns the analyzer's HTTP client, falling back to the default
-// client when the applier was built without one (tests).
-func (g *GoBumpApplier) httpClient() *http.Client {
-	if g.Analyzer != nil && g.Analyzer.httpClient != nil {
-		return g.Analyzer.httpClient
-	}
-	return http.DefaultClient
-}
-
-// releaseIndex returns the shared per-run Go release index (nil-safe,
-// mirroring httpClient above): the fallback go-version probe and the
-// go-package pin floor write both consult it to reject a floor that names no
-// real Go release. A nil Analyzer (some unit tests construct GoBumpApplier
-// directly) means no index is available - callers treat that as "nothing to
-// validate against" rather than an error.
-func (g *GoBumpApplier) releaseIndex() *gorelease.Index {
-	if g.Analyzer != nil {
-		return g.Analyzer.goReleases
-	}
-	return nil
+// bumpActionsPending is the apply phase's gate: vulnerabilities were found
+// and there are bump actions to apply. The applier and the Go-only stages
+// around it (GoVersionFallbackStage, GoPackagePinStage) share it.
+func bumpActionsPending(gp *GoBumpProcessor) bool {
+	return gp.VulnerabilityAnalysis != nil &&
+		gp.VulnerabilityAnalysis.VulnerabilitiesFound > 0 &&
+		len(gp.VulnerabilityAnalysis.BumpActions) > 0
 }
 
 func (g *GoBumpApplier) ShouldRun(ctx context.Context, p processor.Processor) (bool, error) {
@@ -195,14 +147,7 @@ func (g *GoBumpApplier) ShouldRun(ctx context.Context, p processor.Processor) (b
 	if err != nil {
 		return false, err
 	}
-
-	// Only run if vulnerabilities were found and there are actions to apply
-	if gp.VulnerabilityAnalysis == nil {
-		return false, nil
-	}
-
-	return gp.VulnerabilityAnalysis.VulnerabilitiesFound > 0 &&
-		len(gp.VulnerabilityAnalysis.BumpActions) > 0, nil
+	return bumpActionsPending(gp), nil
 }
 
 func (g *GoBumpApplier) Apply(ctx context.Context, p processor.Processor) error {
@@ -215,13 +160,24 @@ func (g *GoBumpApplier) Apply(ctx context.Context, p processor.Processor) error 
 		return err
 	}
 
+	// A go-package pin raise is an applied change too: when the pin stage
+	// follows, it reports the apply phase's outcome once it has run.
+	if !goPackagePinsPending(gp) {
+		reportApplyOutcome(gp)
+	}
+
+	return nil
+}
+
+// reportApplyOutcome emits the apply phase's one-line outcome, once every
+// stage of the phase that can change the YAML has run (see
+// GoBumpApplier.Apply and GoPackagePinStage.Apply).
+func reportApplyOutcome(gp *GoBumpProcessor) {
 	if gp.ActualChangesApplied {
 		gp.AddMessage("bump changes applied")
 	} else {
 		gp.AddMessage("no bump changes needed")
 	}
-
-	return nil
 }
 
 // NewGoBumpPipeline creates the gobump pipeline with the critical fix
@@ -238,8 +194,18 @@ func NewGoBumpPipeline(analyzer *Analyzer, opts ProcessorOptions) *processor.Pip
 		// SimulationStage; skipped and loudly reported when unavailable).
 		NewSimulationStage(analyzer, opts),
 
+		// Go only: best-effort required Go version for modroots the
+		// simulation did not prove - before the applier, whose go-version
+		// edits (fastPathGoVersion) read RequiredGoVersion.
+		NewGoVersionFallbackStage(analyzer),
+
 		// Apply phase
 		NewGoBumpApplier(analyzer),
+
+		// Go only: raise too-old go-package toolchain pins - after the
+		// applier (it edits the rewritten YAML) and before the stdlib stage
+		// (which reads RaisedPinMinors).
+		NewGoPackagePinStage(analyzer),
 
 		// Stdlib staleness: does rebuilding with a newer Go toolchain fix
 		// stdlib vulnerabilities baked into the last build? Runs even when
@@ -420,11 +386,7 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoB
 
 	// Migration is decided before simulation so the simulated engine is the
 	// one the written step will run (see planMigration).
-	var releases *gorelease.Index
-	if v.Analyzer != nil {
-		releases = v.Analyzer.goReleases
-	}
-	units, notes := discoverAnalysisUnits(ctx, gp.Config, bumpSteps, planMigrations(ctx, gp.GetCurrentYAML(), bumpSteps, releases))
+	units, notes := discoverAnalysisUnits(ctx, gp.Config, bumpSteps, planMigrations(ctx, gp.GetCurrentYAML(), bumpSteps, v.Analyzer.releaseIndex()))
 	for _, note := range notes {
 		gp.AddMessage("build: " + note)
 	}
@@ -664,30 +626,6 @@ func existingReplacesForModroots(modroots []string, bumpSteps []config.BumpStep)
 	return existingEntriesForModroots(modroots, bumpSteps, func(step config.BumpStep) []string { return step.Replaces })
 }
 
-// existingGoVersionsForModroots returns, for each modroot, the highest
-// with.go-version carried by any existing go/bump step that covers it (""
-// when none). It mirrors existingDepsForModroots' matching semantics (a step
-// covers a root when its modroot list contains it), but only go/bump steps
-// count: go-version is a gobump input, and the `uses: bump` pipeline has no
-// such input (omnibump never sees it). Values goversion can't order
-// (templated expressions) are ignored here; the reconciler warns about them
-// instead of editing (see fastPathGoVersion). Only go/bump steps that are not
-// migrated to `uses: bump` keep and raise their go-version.
-func existingGoVersionsForModroots(modroots []string, bumpSteps []config.BumpStep) map[string]string {
-	result := make(map[string]string, len(modroots))
-	for _, root := range modroots {
-		var highest string
-		for _, step := range bumpSteps {
-			if step.Action != "go/bump" || step.GoVersion == "" || !slices.Contains(step.Modroots, root) {
-				continue
-			}
-			highest = goversion.Max(highest, step.GoVersion)
-		}
-		result[root] = highest
-	}
-	return result
-}
-
 func existingEntriesForModroots(modroots []string, bumpSteps []config.BumpStep, entries func(config.BumpStep) []string) map[string][]string {
 	result := make(map[string][]string, len(modroots))
 	for _, root := range modroots {
@@ -770,18 +708,13 @@ func haveDepsChanged(existing, desired []string) bool {
 }
 
 // applyGoBumpChanges reconciles the package's bump/go-bump pipeline steps
-// with the desired per-modroot dependency sets computed during the check phase.
+// with the desired per-modroot dependency sets computed during the check
+// phase. (The Go-only stages around it - GoVersionFallbackStage before,
+// GoPackagePinStage after - handle go-version and go-package pins.)
 func (g *GoBumpApplier) applyGoBumpChanges(ctx context.Context, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis) error {
 	if len(analysis.BumpActions) == 0 {
 		logging.From(ctx).Debug("skipping apply - no actions to apply")
 		return nil
-	}
-
-	// Best-effort go-version computation for modroots the simulation didn't
-	// prove (--no-validate, degrade, or per-root skips) - must run before
-	// reconciliation so the value feeds step emission and the pin floor.
-	if err := g.fallbackGoVersions(ctx, gp, analysis); err != nil {
-		return err
 	}
 
 	loader := newMelangeLoader()
@@ -790,86 +723,6 @@ func (g *GoBumpApplier) applyGoBumpChanges(ctx context.Context, gp *GoBumpProces
 		return fmt.Errorf("reconciling bump steps: %w", err)
 	}
 
-	if err := g.reconcileGoPackagePins(ctx, gp, goPinFloors(analysis)); err != nil {
-		return fmt.Errorf("reconciling go-package pins: %w", err)
-	}
-
-	return nil
-}
-
-// fallbackGoVersions populates RequiredGoVersion for go modroots the
-// simulation didn't cover, from the best-effort proxy probe (see
-// fallbackRequiredGoVersion), gated against the pristine baseline exactly
-// like the simulation path. Fail-open throughout: any failure just leaves
-// RequiredGoVersion empty (with a warning), never blocks the apply - except
-// a cancellation, which is returned. When GOPROXY=off (probeDisabled), the
-// probe is skipped entirely - it would only fail every fetch - and each
-// affected modroot gets one message instead.
-func (g *GoBumpApplier) fallbackGoVersions(ctx context.Context, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis) error {
-	for li := range analysis.ByLanguage {
-		lang := &analysis.ByLanguage[li]
-		if lang.Language != "go" {
-			continue
-		}
-		for mi := range lang.ByModroot {
-			m := &lang.ByModroot[mi]
-			if m.Simulated || m.RequiredGoVersion != "" {
-				continue
-			}
-			if len(m.DesiredDeps) == 0 && len(m.DesiredReplaces) == 0 {
-				continue
-			}
-			if g.probeDisabled {
-				logging.From(ctx).Debug("go-version fallback: probe disabled (GOPROXY=off) - skipping", "modroot", m.Modroot)
-				gp.AddMessage(fmt.Sprintf("modroot %s: GOPROXY=off - skipping best-effort Go version probe", m.Modroot))
-				continue
-			}
-			required, unfetched, err := fallbackRequiredGoVersion(ctx, g.httpClient(), g.goProxyURL, m, g.skipPrivateModule)
-			if cerr := ctx.Err(); cerr != nil {
-				return cerr
-			}
-			if err == nil && unfetched > 0 {
-				logging.From(ctx).Warn("best-effort Go version probe incomplete - the required Go version may be higher",
-					"modroot", m.Modroot, "unfetched", unfetched)
-				gp.AddMessage(fmt.Sprintf("modroot %s: best-effort Go version probe incomplete (%d candidate go.mod file(s) could not be fetched) - the required Go version may be higher", m.Modroot, unfetched))
-			}
-			if err != nil {
-				logging.From(ctx).Warn("could not determine required Go version (best-effort probe failed)",
-					"modroot", m.Modroot, "error", err)
-				gp.AddMessage(fmt.Sprintf("modroot %s: could not determine required Go version (best-effort probe failed): %v", m.Modroot, err))
-				continue
-			}
-			if required == "" || goversion.Compare(required, pristineGoBaseline(m)) <= 0 {
-				continue
-			}
-
-			// The probed floor is unvalidated external input (a remote
-			// go.mod's go directive): before it can become RequiredGoVersion
-			// - which feeds both the go-version field and the go-package pin
-			// floor - confirm it names a real Go release.
-			valid, offlineErr := validateGoVersionFloor(ctx, g.releaseIndex(), goversion.Minor(required))
-			if cerr := ctx.Err(); cerr != nil {
-				return cerr
-			}
-			if offlineErr != nil {
-				logging.From(ctx).Warn("could not validate required Go version against known releases (index unavailable) - proceeding",
-					"modroot", m.Modroot, "version", required, "error", offlineErr)
-				gp.AddMessage(fmt.Sprintf("modroot %s: could not validate required Go %s against known releases (index unavailable) - proceeding without validation: %v",
-					m.Modroot, required, offlineErr))
-			}
-			if !valid {
-				logging.From(ctx).Warn("candidate dependencies claim to require an unknown Go release - ignoring",
-					"modroot", m.Modroot, "version", required)
-				gp.AddMessage(fmt.Sprintf("modroot %s: candidate dependencies claim to require Go %s, which is not a known Go release — ignoring (check the dependency's go.mod)",
-					m.Modroot, required))
-				continue
-			}
-
-			m.RequiredGoVersion = required
-			gp.AddMessage(fmt.Sprintf("modroot %s: candidate dependencies require Go %s (module baseline %s) - best-effort (direct candidates only); run with simulation for a proven result",
-				m.Modroot, required, baselineWord(pristineGoBaseline(m))))
-		}
-	}
 	return nil
 }
 
@@ -1045,8 +898,9 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(ctx context.Context, gp *GoBu
 
 // rewriteStep applies one changed stepEdit in place (see
 // reconcileLanguageBumpSteps): removal when nothing is left, else the first
-// group's deps/replaces/modroot on the step itself - migrating a go/bump
-// step when it can (see migrationFor) - and one clone per further group.
+// group's deps/replaces/modroot on the step itself - a go/bump step, or a
+// step carrying a stale go-version, through goStepRewrite - and one clone
+// per further group.
 func (g *GoBumpApplier) rewriteStep(ctx context.Context, gp *GoBumpProcessor, yamlContent []byte, edit stepEdit, hasBlankLines bool) ([]byte, error) {
 	loader := config.NewLoader()
 	step := edit.step
@@ -1059,34 +913,16 @@ func (g *GoBumpApplier) rewriteStep(ctx context.Context, gp *GoBumpProcessor, ya
 		return updated, nil
 	}
 
-	migrate, plan := g.migrationFor(ctx, gp, yamlContent, edit)
 	first := edit.groups[0]
-	var goVersion string
-	if step.Action == "go/bump" && !migrate {
-		goVersion = g.fastPathGoVersion(gp, step, maxEffectiveGoVersion(edit.owned))
+	var updated []byte
+	var err error
+	if step.Action == "go/bump" || step.GoVersion != "" {
+		updated, err = g.goStepRewrite(ctx, gp, loader, yamlContent, edit)
+	} else {
+		updated, err = updateStepInPlace(loader, yamlContent, step, first, "")
 	}
-	updated, err := loader.UpdateGoBumpStep(yamlContent, step.Index, first.Deps, first.Replaces, goVersion)
 	if err != nil {
-		return nil, fmt.Errorf("updating %s pipeline[%d]: %w", step.Action, step.Index, err)
-	}
-	if !sameRootSet(first.Modroots, step.Modroots) {
-		if updated, err = loader.SetBumpModroots(updated, step.Index, first.Modroots); err != nil {
-			return nil, fmt.Errorf("updating modroot of %s pipeline[%d]: %w", step.Action, step.Index, err)
-		}
-	}
-	switch {
-	case migrate:
-		if updated, err = migrateStep(gp, updated, step, plan); err != nil {
-			return nil, fmt.Errorf("migrating go/bump pipeline[%d]: %w", step.Index, err)
-		}
-		if step.NoTidy && anyBaselineTidies(edit.owned) {
-			gp.AddMessage(fmt.Sprintf("pipeline[%d]: tidy: false may no longer be needed (omnibump tidies without -go; the upstream module tidies under omnibump) - left as written", step.Index))
-		}
-	case step.Action != "go/bump" && step.GoVersion != "":
-		// The bump pipeline has no go-version input: drop a stale one.
-		if updated, err = loader.RemovePipelineWithFieldLines(updated, step.Index, "go-version"); err != nil {
-			return nil, fmt.Errorf("removing go-version from %s pipeline[%d]: %w", step.Action, step.Index, err)
-		}
+		return nil, err
 	}
 	gp.AddMessage(fmt.Sprintf("Updated %s pipeline[%d] in place with %d dependencies and %d replaces", step.Action, step.Index, len(first.Deps), len(first.Replaces)))
 
@@ -1109,62 +945,19 @@ func (g *GoBumpApplier) rewriteStep(ctx context.Context, gp *GoBumpProcessor, ya
 	return updated, nil
 }
 
-// migrationFor decides whether a go/bump step being rewritten migrates to
-// `uses: bump`: its plan allows it (see planMigration) AND every modroot it
-// owns was simulated with the omnibump engine - so what is written is what
-// was validated. A step that does not migrate gets a message saying why.
-func (g *GoBumpApplier) migrationFor(ctx context.Context, gp *GoBumpProcessor, yamlContent []byte, edit stepEdit) (bool, migrationPlan) {
-	step := edit.step
-	if step.Action != "go/bump" {
-		return false, migrationPlan{}
+// updateStepInPlace writes group's deps/replaces (and goVersion, when
+// non-empty) into the step, and its modroot list when that changed.
+func updateStepInPlace(loader *config.Loader, yamlContent []byte, step config.BumpStep, group modrootGroup, goVersion string) ([]byte, error) {
+	updated, err := loader.UpdateGoBumpStep(yamlContent, step.Index, group.Deps, group.Replaces, goVersion)
+	if err != nil {
+		return nil, fmt.Errorf("updating %s pipeline[%d]: %w", step.Action, step.Index, err)
 	}
-	plan := planMigration(ctx, yamlContent, step, g.releaseIndex())
-	if !plan.ok {
-		gp.AddMessage(fmt.Sprintf("go/bump pipeline[%d] not migrated to uses: bump: %s", step.Index, plan.reason))
-		return false, plan
-	}
-	for _, m := range edit.owned {
-		if !m.Simulated || m.BumpEngine != simulate.EngineOmnibump {
-			gp.AddMessage(fmt.Sprintf("go/bump pipeline[%d] not migrated to uses: bump: modroot %s was not validated with the omnibump engine", step.Index, m.Modroot))
-			return false, plan
+	if !sameRootSet(group.Modroots, step.Modroots) {
+		if updated, err = loader.SetBumpModroots(updated, step.Index, group.Modroots); err != nil {
+			return nil, fmt.Errorf("updating modroot of %s pipeline[%d]: %w", step.Action, step.Index, err)
 		}
 	}
-	return true, plan
-}
-
-// anyBaselineTidies reports whether any of the modroots tidies under omnibump.
-func anyBaselineTidies(roots []*ModrootAnalysis) bool {
-	for _, m := range roots {
-		if m.BaselineTidies {
-			return true
-		}
-	}
-	return false
-}
-
-// fastPathGoVersion decides the go-version argument for the in-place update
-// of a go/bump step that is not migrated: the group's effective value when
-// it genuinely raises the step's current one, "" (leave the field untouched,
-// byte-for-byte) when the step already carries an equal-or-higher value - so
-// re-running the applier on already-updated YAML never churns it, and an
-// existing value is NEVER lowered. A step value goversion can't order
-// (templated expression) is warned about, never overwritten.
-func (g *GoBumpApplier) fastPathGoVersion(gp *GoBumpProcessor, step config.BumpStep, effective string) string {
-	if effective == "" {
-		return ""
-	}
-	switch {
-	case step.GoVersion == "":
-		return effective
-	case !goversion.IsValid(step.GoVersion):
-		gp.AddMessage(fmt.Sprintf("%s pipeline[%d] go-version %q is not a plain version (templated?); required Go %s - not rewritten, update it manually",
-			step.Action, step.Index, step.GoVersion, effective))
-		return ""
-	case goversion.Compare(effective, step.GoVersion) > 0:
-		return effective
-	default:
-		return ""
-	}
+	return updated, nil
 }
 
 // modrootGroup is a set of modroots that share identical desired dependency
@@ -1223,28 +1016,6 @@ func sameRootSet(a, b []string) bool {
 		return false
 	}
 	return slices.Equal(sortedCopy(a), sortedCopy(b))
-}
-
-// effectiveGoVersion is the go-version a modroot's go/bump step should end
-// up carrying: the max of what its existing steps already declare and what
-// the proven/probed candidate set requires. Max never picks the lower of two
-// valid values, so an existing value is never lowered. "" for non-Go
-// modroots (both fields are Go-only) and when neither side has a value.
-func effectiveGoVersion(m ModrootAnalysis) string {
-	return goversion.Max(m.ExistingGoVersion, m.RequiredGoVersion)
-}
-
-// maxEffectiveGoVersion returns the highest effective go-version
-// (effectiveGoVersion) across the given modroots, "" if none has one: a step
-// covering several roots must satisfy all of them, and go-version is a floor,
-// so raising to the maximum is always safe - fastPathGoVersion still
-// enforces never-lower against the step's current value on top of this.
-func maxEffectiveGoVersion(roots []*ModrootAnalysis) string {
-	var max string
-	for _, m := range roots {
-		max = goversion.Max(max, effectiveGoVersion(*m))
-	}
-	return max
 }
 
 // addedAcrossRoots returns the deduplicated union, across all modroots, of

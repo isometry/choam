@@ -1491,7 +1491,7 @@ func TestReconcileBumpSteps_GeneralPathNeverWritesGoVersion(t *testing.T) {
 // TestApplyGoBumpChanges_GoVersionAndPinWiring: the full apply-phase wiring
 // in one pass - a simulated modroot with a required Go raise updates its bump
 // step's deps, upserts go-version, and raises the file's too-old go-package
-// pin, all in the same applyGoBumpChanges call.
+// pin, all in the same apply phase (fallback, applier, pin stage).
 func TestApplyGoBumpChanges_GoVersionAndPinWiring(t *testing.T) {
 	const wiringYAML = `package:
   name: example
@@ -1516,7 +1516,6 @@ pipeline:
 `
 	gp := newTestProcessor(t, wiringYAML)
 	gp.Config = &melange.Configuration{}
-	applier := NewGoBumpApplier(nil)
 
 	deps, err := golangDeps(t, "module example.com/app\n\ngo 1.22\n")
 	require.NoError(t, err)
@@ -1539,7 +1538,7 @@ pipeline:
 		BumpActions: []BumpAction{{Action: "needs_bump", Language: "go", Modroots: []string{"."}}},
 	}
 
-	require.NoError(t, applier.applyGoBumpChanges(t.Context(), gp, analysis))
+	require.NoError(t, runApplyPhase(t, gp, analysis))
 
 	content := string(gp.GetCurrentYAML())
 	assert.Contains(t, content, "golang.org/x/net@v0.56.0")

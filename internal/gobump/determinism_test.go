@@ -66,7 +66,7 @@ func TestApplyGoBumpChanges_SecondPassIsNoOp(t *testing.T) {
 			}},
 			BumpActions: []BumpAction{{Action: "needs_bump", Language: "go", Modroots: []string{"."}}},
 		}
-		require.NoError(t, NewGoBumpApplier(nil).applyGoBumpChanges(t.Context(), gp, analysis))
+		require.NoError(t, runApplyPhase(t, gp, analysis))
 		return gp
 	}
 	desired := []string{docker + "@v2.8.2+incompatible", "golang.org/x/crypto@v0.56.0"}

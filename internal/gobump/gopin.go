@@ -138,11 +138,11 @@ func goPinFloors(analysis *VulnerabilityAnalysis) map[string]string {
 // ctx is consulted for release-existence validation (see validateFloor below)
 // and carries this file's logger (internal/logging).
 //
-// Scope note: this only runs when the applier runs at all
-// (GoBumpApplier.ShouldRun gates on bump actions), so a package whose pins
-// are stale but whose deps need no bump is not rewritten - an accepted v1
-// limitation.
-func (g *GoBumpApplier) reconcileGoPackagePins(ctx context.Context, gp *GoBumpProcessor, floors map[string]string) error {
+// Scope note: this only runs when the apply phase runs at all
+// (GoPackagePinStage.ShouldRun shares the applier's bump-actions gate), so a
+// package whose pins are stale but whose deps need no bump is not rewritten -
+// an accepted v1 limitation.
+func (s *GoPackagePinStage) reconcileGoPackagePins(ctx context.Context, gp *GoBumpProcessor, floors map[string]string) error {
 	if len(floors) == 0 {
 		return nil
 	}
@@ -189,7 +189,7 @@ func (g *GoBumpApplier) reconcileGoPackagePins(ctx context.Context, gp *GoBumpPr
 	// on that path; simulation-proven values are untouched by design). A
 	// typo'd or otherwise bogus floor must never be written into a pin.
 	// Memoized per minor since the same floor commonly recurs across pins.
-	validateFloor := newFloorValidator(ctx, g.releaseIndex())
+	validateFloor := newFloorValidator(ctx, s.Analyzer.releaseIndex())
 
 	changed := false
 	for _, pin := range pins {
