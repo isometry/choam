@@ -71,6 +71,27 @@ type GoBumpProcessor struct {
 	RaisedPinMinors map[string]string `json:"-"`
 }
 
+// asBump narrows the pipeline's processor to the bump processor every bump
+// stage operates on.
+func asBump(p processor.Processor) (*GoBumpProcessor, error) {
+	gp, ok := p.(*GoBumpProcessor)
+	if !ok {
+		return nil, fmt.Errorf("expected GoBumpProcessor, got %T", p)
+	}
+	return gp, nil
+}
+
+// cancelledOr propagates a cancellation instead of letting a best-effort
+// fallback misreport it as an ordinary tool failure: it returns ctx's error
+// when the run was cancelled, otherwise runs degrade and returns nil.
+func cancelledOr(ctx context.Context, degrade func()) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	degrade()
+	return nil
+}
+
 // NewGoBumpProcessor creates a new gobump processor
 func NewGoBumpProcessor(filePath, packageName, currentVersion string, currentEpoch int64) *GoBumpProcessor {
 	return &GoBumpProcessor{

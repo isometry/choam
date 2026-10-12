@@ -1,6 +1,7 @@
 package gobump
 
 import (
+	"context"
 	"testing"
 
 	"github.com/isometry/choam/internal/processor"
@@ -9,6 +10,28 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestAsBump(t *testing.T) {
+	gp := NewGoBumpProcessor("test.yaml", "test", "1.0.0", 0)
+	got, err := asBump(gp)
+	require.NoError(t, err)
+	assert.Same(t, gp, got)
+
+	_, err = asBump(processor.NewBaseProcessor("test.yaml", "test", "1.0.0", 0))
+	assert.EqualError(t, err, "expected GoBumpProcessor, got *processor.BaseProcessor")
+}
+
+func TestCancelledOr(t *testing.T) {
+	degraded := false
+	require.NoError(t, cancelledOr(t.Context(), func() { degraded = true }))
+	assert.True(t, degraded, "a live context runs the fallback")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	degraded = false
+	assert.ErrorIs(t, cancelledOr(ctx, func() { degraded = true }), context.Canceled)
+	assert.False(t, degraded, "a cancellation must not be reported as a degrade")
+}
 
 func TestNewGoBumpProcessor(t *testing.T) {
 	tests := []struct {

@@ -7,7 +7,6 @@ import (
 
 	melange "chainguard.dev/melange/pkg/config"
 	"github.com/isometry/choam/internal/logging"
-	"github.com/isometry/choam/internal/processor"
 )
 
 // ProcessFile processes a single file using the shared pipeline architecture
@@ -37,12 +36,7 @@ func ProcessFile(ctx context.Context, filePath string, opts ProcessorOptions, an
 	goBumpProcessor.Config = cfg
 	goBumpProcessor.OriginalYAML = content
 	goBumpProcessor.SetCurrentYAML(content)
-	goBumpProcessor.SetOptions(processor.ProcessorOptions{
-		DryRun:       opts.DryRun,
-		Force:        false,
-		BackupSuffix: opts.BackupSuffix,
-		TempDir:      opts.TempDir,
-	})
+	goBumpProcessor.SetOptions(opts.ProcessorOptions)
 
 	// From here on, every log emitted while processing this file - however
 	// deep in the pipeline - carries package/file attribution via the ctx

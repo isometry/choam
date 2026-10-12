@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/isometry/choam/internal/ecosystem"
+	"github.com/isometry/choam/internal/processor"
 	"github.com/isometry/choam/internal/scan"
 	"github.com/isometry/choam/internal/simulate"
 )
@@ -216,11 +217,11 @@ type VulnerabilityAnalysis struct {
 	ExpectedCommit string `json:"expected_commit,omitempty" yaml:"expected_commit,omitempty"`
 }
 
-// ProcessorOptions configures processor behavior
+// ProcessorOptions configures processor behavior: the shared processor
+// options (DryRun, BackupSuffix, TempDir; Force is unused by bump) plus the
+// bump-specific ones below.
 type ProcessorOptions struct {
-	DryRun       bool   `json:"dry_run" yaml:"dry_run"`
-	BackupSuffix string `json:"backup_suffix" yaml:"backup_suffix"`
-	TempDir      string `json:"temp_dir" yaml:"temp_dir"`
+	processor.ProcessorOptions
 
 	// Validate enables bump simulation (default true): Go bump candidates
 	// are applied to a clone of the upstream source with the real go

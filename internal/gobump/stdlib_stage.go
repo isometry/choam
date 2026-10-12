@@ -70,9 +70,9 @@ func NewStdlibStage(analyzer *Analyzer, opts ProcessorOptions) *StdlibStage {
 // earlier stage was skipped (a package with no dependency changes can still
 // need a stdlib rebuild).
 func (s *StdlibStage) ShouldRun(ctx context.Context, p processor.Processor) (bool, error) {
-	gp, ok := p.(*GoBumpProcessor)
-	if !ok {
-		return false, fmt.Errorf("expected GoBumpProcessor, got %T", p)
+	gp, err := asBump(p)
+	if err != nil {
+		return false, err
 	}
 	if !s.Options.StdlibCheck || gp.Config == nil {
 		return false, nil
@@ -84,9 +84,9 @@ func (s *StdlibStage) ShouldRun(ctx context.Context, p processor.Processor) (boo
 // Apply runs the staleness check. EVERY failure path degrades to a
 // skip-with-message and returns nil - this stage must never fail the run.
 func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
-	gp, ok := p.(*GoBumpProcessor)
-	if !ok {
-		return fmt.Errorf("expected GoBumpProcessor, got %T", p)
+	gp, err := asBump(p)
+	if err != nil {
+		return err
 	}
 
 	if s.index == nil || s.scanner == nil {
@@ -103,11 +103,9 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 		gp.AddMessage("stdlib: melange file has no commit history - skipping stdlib staleness check")
 		return nil
 	case err != nil:
-		if cerr := ctx.Err(); cerr != nil {
-			return cerr
-		}
-		s.skipWarn(ctx, gp, fmt.Sprintf("stdlib: could not determine the melange file's last commit (%v) - skipping stdlib staleness check", err))
-		return nil
+		return cancelledOr(ctx, func() {
+			s.skipWarn(ctx, gp, fmt.Sprintf("stdlib: could not determine the melange file's last commit (%v) - skipping stdlib staleness check", err))
+		})
 	}
 	if info.Dirty {
 		// The idempotency guard: an epoch bump this tool wrote on a previous
@@ -137,11 +135,7 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 
 	bumps, messages, err := evaluateStdlibStaleness(ctx, s.index, s.scanner, in)
 	if err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return cerr
-		}
-		s.skipWarn(ctx, gp, fmt.Sprintf("stdlib: staleness check unavailable (%v) - skipping", err))
-		return nil
+		return cancelledOr(ctx, func() { s.skipWarn(ctx, gp, fmt.Sprintf("stdlib: staleness check unavailable (%v) - skipping", err)) })
 	}
 
 	// Fallback checkout: only worth a clone when the preliminary unfiltered

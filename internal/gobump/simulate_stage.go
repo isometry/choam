@@ -88,9 +88,9 @@ func defaultSimulator(ctx context.Context, opts ProcessorOptions, analyzer *Anal
 }
 
 func (s *SimulationStage) ShouldRun(_ context.Context, p processor.Processor) (bool, error) {
-	gp, ok := p.(*GoBumpProcessor)
-	if !ok {
-		return false, fmt.Errorf("expected GoBumpProcessor, got %T", p)
+	gp, err := asBump(p)
+	if err != nil {
+		return false, err
 	}
 	if !s.Options.Validate {
 		return false, nil
@@ -108,19 +108,15 @@ func (s *SimulationStage) ShouldRun(_ context.Context, p processor.Processor) (b
 }
 
 func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) error {
-	gp, ok := p.(*GoBumpProcessor)
-	if !ok {
-		return fmt.Errorf("expected GoBumpProcessor, got %T", p)
+	gp, err := asBump(p)
+	if err != nil {
+		return err
 	}
 	analysis := gp.VulnerabilityAnalysis
 
 	sim, err := s.newSimulator(ctx, s.Options, s.Analyzer)
 	if err != nil {
-		if cerr := ctx.Err(); cerr != nil {
-			return cerr
-		}
-		s.degrade(ctx, gp, err)
-		return nil
+		return cancelledOr(ctx, func() { s.degrade(ctx, gp, err) })
 	}
 
 	for i := range analysis.ByLanguage {
@@ -166,18 +162,14 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 
 		results, err := sim.Simulate(ctx, analysis.RepoURL, analysis.Tag, analysis.ExpectedCommit, reqs)
 		if err != nil {
-			if cerr := ctx.Err(); cerr != nil {
-				return cerr
-			}
-			if s.failClosed(err) {
+			if ctx.Err() == nil && s.failClosed(err) {
 				// The simulation could not prove the candidate set (compile
 				// gate, or a go tool infrastructure failure): writing it (or
 				// the raw pre-simulation set) could break the build, so fail
 				// the file and leave its deps untouched.
 				return fmt.Errorf("bump simulation could not validate the deps (file left unchanged): %w", err)
 			}
-			s.degrade(ctx, gp, err)
-			return nil
+			return cancelledOr(ctx, func() { s.degrade(ctx, gp, err) })
 		}
 
 		reach := newReachabilityDiff()
@@ -362,9 +354,9 @@ func (s *SimulationStage) failClosed(err error) bool {
 
 // degrade falls back to the unvalidated pre-simulation candidate set,
 // loudly: the written deps list has not been proven to resolve or to cover
-// every advisory. Callers must check ctx.Err() before calling this - a
-// cancelled run must propagate that cancellation, not degrade and write an
-// unvalidated result as if simulation had merely failed.
+// every advisory. Callers must check ctx.Err() before calling this (see
+// cancelledOr) - a cancelled run must propagate that cancellation, not
+// degrade and write an unvalidated result as if simulation had merely failed.
 func (s *SimulationStage) degrade(ctx context.Context, gp *GoBumpProcessor, err error) {
 	gp.Validated = false
 	logging.From(ctx).Warn("bump simulation unavailable - proceeding with UNVALIDATED deps", "error", err)
@@ -377,12 +369,12 @@ func (s *SimulationStage) degrade(ctx context.Context, gp *GoBumpProcessor, err 
 // which entries to defend. Replace seeds come first: the loop routes a deps
 // seed for an already-replace-claimed module into the replace channel.
 func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
-	bumpByModule := make(map[string]*simulateBumpInfo)
+	bumpByModule := make(map[string]scan.SecurityBump)
 	var vulns []scan.Vulnerability
 	if m.ScanResult != nil {
 		vulns = m.ScanResult.Vulnerabilities
 		for _, bump := range m.ScanResult.SecurityBumps {
-			bumpByModule[bump.Name] = &simulateBumpInfo{name: bump.Name, current: bump.CurrentVersion, vulnIDs: bump.VulnIDs, severity: bump.Severity}
+			bumpByModule[bump.Name] = bump
 		}
 	}
 	existingVersions := make(map[string][]string)
@@ -391,15 +383,6 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 			existingVersions[module] = append(existingVersions[module], version)
 		}
 	}
-	infoFor := func(module string) *simulateBumpInfo {
-		if info := bumpByModule[module]; info != nil {
-			return info
-		}
-		// OSV names v2+ modules without the /vN path suffix that
-		// FilterBumps normalizes in.
-		return bumpByModule[ecogolang.TrimMajorSuffix(module)]
-	}
-
 	seeds := make([]simulate.Candidate, 0, len(m.DesiredDeps)+len(m.ExistingReplaces))
 
 	for _, replace := range m.ExistingReplaces {
@@ -411,10 +394,10 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 			Module: newPath, Version: version,
 			Replace: true, ReplaceOld: oldPath,
 		}
-		if info := infoFor(newPath); info != nil {
+		if info, ok := lookupModule(bumpByModule, newPath); ok {
 			candidate.FromCVE = true
-			candidate.VulnIDs = info.vulnIDs
-			candidate.Severity = info.severity
+			candidate.VulnIDs = info.VulnIDs
+			candidate.Severity = info.Severity
 		}
 		seeds = append(seeds, candidate)
 	}
@@ -425,34 +408,27 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 			continue
 		}
 		candidate := simulate.Candidate{Module: module, Version: version}
-		if info := infoFor(module); info != nil {
+		if info, ok := lookupModule(bumpByModule, module); ok {
 			candidate.FromCVE = true
-			candidate.VulnIDs = info.vulnIDs
-			candidate.Severity = info.severity
+			candidate.VulnIDs = info.VulnIDs
+			candidate.Severity = info.Severity
 			// The fix ladder keeps every advisory's own fix version and the
 			// existing YAML pin, which FilterBumps merged into one (the
 			// highest) version: the compile gate relaxes down these rungs.
 			// A single rung is implied by the candidate itself.
 			also := []string{version}
 			for _, existing := range existingVersions[module] {
-				if semver.Compare(existing, info.current) > 0 {
+				if semver.Compare(existing, info.CurrentVersion) > 0 {
 					also = append(also, existing) // a pin at/below the vulnerable baseline is no rung
 				}
 			}
-			if rungs := simulate.FixRungs(vulns, info.name, info.vulnIDs, also...); len(rungs) > 1 {
+			if rungs := simulate.FixRungs(vulns, info.Name, info.VulnIDs, also...); len(rungs) > 1 {
 				candidate.Rungs = rungs
 			}
 		}
 		seeds = append(seeds, candidate)
 	}
 	return seeds
-}
-
-type simulateBumpInfo struct {
-	name     string // OSV module name (no /vN suffix)
-	current  string // vulnerable version the analysis scanned
-	vulnIDs  []string
-	severity string
 }
 
 // rebuildLanguageActions recomputes one language's bump actions from its

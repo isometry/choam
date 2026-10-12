@@ -490,7 +490,7 @@ func TestPipeline_StdlibOnlyBumpsEpochAndWrites(t *testing.T) {
 // DryRun branch: the intent is recorded but neither CurrentYAML nor the file
 // on disk changes.
 func TestPipeline_StdlibDryRunRecordsIntentWithoutWriting(t *testing.T) {
-	opts := ProcessorOptions{StdlibCheck: true, Validate: false, DryRun: true}
+	opts := ProcessorOptions{StdlibCheck: true, Validate: false, ProcessorOptions: processor.ProcessorOptions{DryRun: true}}
 	pipeline, gp, filePath := buildStdlibPipeline(t, stdlibPipelineYAML, opts)
 
 	require.NoError(t, pipeline.Execute(t.Context(), gp))
@@ -630,7 +630,7 @@ func TestPipeline_BackupSuffixAndDryRun(t *testing.T) {
 	}
 
 	t.Run("real run writes a backup of the original", func(t *testing.T) {
-		opts := ProcessorOptions{StdlibCheck: true, BackupSuffix: ".orig", TempDir: t.TempDir()}
+		opts := ProcessorOptions{StdlibCheck: true, ProcessorOptions: processor.ProcessorOptions{BackupSuffix: ".orig", TempDir: t.TempDir()}}
 		pipeline, gp, filePath := buildStdlibPipeline(t, stdlibPipelineYAML, opts)
 		require.NoError(t, pipeline.Execute(t.Context(), gp))
 
@@ -641,7 +641,7 @@ func TestPipeline_BackupSuffixAndDryRun(t *testing.T) {
 	})
 
 	t.Run("dry run is side-effect free", func(t *testing.T) {
-		opts := ProcessorOptions{StdlibCheck: true, DryRun: true, BackupSuffix: ".orig", TempDir: t.TempDir()}
+		opts := ProcessorOptions{StdlibCheck: true, ProcessorOptions: processor.ProcessorOptions{DryRun: true, BackupSuffix: ".orig", TempDir: t.TempDir()}}
 		pipeline, gp, filePath := buildStdlibPipeline(t, stdlibPipelineYAML, opts)
 		require.NoError(t, pipeline.Execute(t.Context(), gp))
 

@@ -378,6 +378,7 @@ func TestReconcileBumpSteps_JavaGrammar(t *testing.T) {
 							CurrentVersion: "4.1.90.Final",
 							FixedVersion:   "4.1.94.Final",
 							VulnIDs:        []string{"GHSA-xxxx-yyyy"},
+							Severity:       "HIGH",
 						},
 					},
 				},
@@ -403,6 +404,48 @@ func TestReconcileBumpSteps_JavaGrammar(t *testing.T) {
 	// OSV colon-format name can never match the rendered coordinate).
 	assert.Equal(t, "GHSA-xxxx-yyyy", gp.SecurityFixes[0].Vulnerability)
 	assert.Equal(t, "4.1.90.Final", gp.SecurityFixes[0].OldVersion)
+	// The scan bump's severity is reported, not a placeholder.
+	assert.Equal(t, "HIGH", gp.SecurityFixes[0].Severity)
+}
+
+func TestRecordSecurityFixes_Attribution(t *testing.T) {
+	lang := LanguageAnalysis{
+		Language: "go",
+		ByModroot: []ModrootAnalysis{{
+			Modroot: ".",
+			ScanResult: &scan.ScanResult{SecurityBumps: []scan.SecurityBump{
+				{Name: "github.com/foo/bar", CurrentVersion: "v2.0.0", VulnIDs: []string{"GO-1"}, Severity: "CRITICAL"},
+				{Name: "github.com/foo/baz", CurrentVersion: "v1.0.0", VulnIDs: []string{"GO-2"}},
+			}},
+		}},
+	}
+	gp := NewGoBumpProcessor("test.yaml", "test", "1.0.0", 0)
+	NewGoBumpApplier(nil).recordSecurityFixes(gp, lang, []string{
+		"github.com/foo/bar/v2@v2.1.0", // OSV name lacks the /vN suffix
+		"github.com/foo/baz@v1.1.0",    // bump without severity data
+		"github.com/other/mod@v1.0.0",  // no scan bump at all
+	})
+
+	require.Len(t, gp.SecurityFixes, 3)
+	assert.Equal(t, SecurityFix{Module: "github.com/foo/bar/v2", Vulnerability: "GO-1", OldVersion: "v2.0.0", NewVersion: "v2.1.0", Severity: "CRITICAL"}, gp.SecurityFixes[0])
+	assert.Equal(t, SecurityFix{Module: "github.com/foo/baz", Vulnerability: "GO-2", OldVersion: "v1.0.0", NewVersion: "v1.1.0", Severity: "varies"}, gp.SecurityFixes[1])
+	assert.Equal(t, SecurityFix{Module: "github.com/other/mod", Vulnerability: "security vulnerability", OldVersion: "vulnerable", NewVersion: "v1.0.0", Severity: "varies"}, gp.SecurityFixes[2])
+}
+
+func TestLookupModule(t *testing.T) {
+	byModule := map[string]int{"github.com/foo/bar": 1, "github.com/foo/bar/v3": 3}
+
+	for module, want := range map[string]int{
+		"github.com/foo/bar":    1,
+		"github.com/foo/bar/v3": 3, // exact key wins over the trimmed alias
+		"github.com/foo/bar/v2": 1, // falls back to the OSV name
+	} {
+		got, ok := lookupModule(byModule, module)
+		assert.True(t, ok, module)
+		assert.Equal(t, want, got, module)
+	}
+	_, ok := lookupModule(byModule, "github.com/other/mod")
+	assert.False(t, ok)
 }
 
 func TestExistingDepsForModroots(t *testing.T) {
