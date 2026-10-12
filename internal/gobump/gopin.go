@@ -166,22 +166,6 @@ func (s *GoPackagePinStage) reconcileGoPackagePins(ctx context.Context, gp *GoBu
 
 	render := newLenientRenderer(ctx, gp.Config)
 
-	// pinFloor is the Go version the given pin must satisfy: floors[modroot]
-	// for go/build (its templated modroot rendered), maxFloor for go/install.
-	// "" means this pin's target proved no requirement - leave it alone.
-	pinFloor := func(pin config.GoPackagePin) string {
-		if pin.Uses == "go/install" {
-			return maxFloor
-		}
-		modroot := render.value(pin.Modroot)
-		floor, ok := floors[modroot]
-		if !ok {
-			logging.From(ctx).Debug("go-package pin modroot not in analysis - no floor, leaving untouched",
-				"modroot", modroot, "value", pin.Value)
-		}
-		return floor
-	}
-
 	// validateFloor is defense in depth against an untrusted floor reaching
 	// the write below: floors come from goPinFloors, which takes the max of
 	// pristineGoBaseline (the modroot's own, pre-existing config - never
@@ -194,78 +178,56 @@ func (s *GoPackagePinStage) reconcileGoPackagePins(ctx context.Context, gp *GoBu
 	changed := false
 	for _, pin := range pins {
 		where := describePinLocation(pin)
-		floor := pinFloor(pin)
-		floorMinor := goversion.Minor(floor)
+		floor := pinFloor(ctx, render, pin, floors, maxFloor)
 
 		if strings.Contains(pin.Value, "${{") {
-			if floorMinor == "" {
-				// This pin's target demands nothing; nothing to check.
-				continue
-			}
-			if render.renderer == nil {
-				// Degraded path (no gp.Config, or the renderer failed to
-				// build): the templated value can't be evaluated at all, so
-				// raw-value parsing below would silently misjudge or skip it.
-				// Warn instead of going quiet.
-				gp.AddMessage(fmt.Sprintf("go-package %q (%s) is templated and could not be evaluated; verify manually against required Go %s",
-					pin.Value, where, floor))
-				continue
-			}
-			// Templated pin: judge the rendered value, but never edit the
-			// template - the variable behind it is the user's to update.
-			_, minor, ok := parseGoPackagePin(render.value(pin.Value))
-			if ok && minor != "" && goversion.Compare(minor, floorMinor) < 0 {
-				gp.AddMessage(fmt.Sprintf("go-package %q (%s) is templated and resolves to Go %s, below required Go %s; update the variable manually",
-					pin.Value, where, minor, floor))
-			}
+			checkTemplatedPin(gp, render, pin, where, floor)
 			continue
 		}
 
-		base, minor, ok := parseGoPackagePin(pin.Value)
-		if !ok {
-			if floorMinor == "" {
-				continue // no requirement for this pin's target
-			}
+		d := decidePin(pin.Value, floor)
+		switch d.verdict {
+		case pinNoRequirement:
+			continue
+		case pinUnrecognized:
 			gp.AddMessage(fmt.Sprintf("unrecognized go-package %q (%s); required Go %s - not rewritten", pin.Value, where, floor))
 			continue
-		}
-		if minor == "" {
+		case pinUnversioned:
 			// Unversioned toolchain package ("go", "go-fips"): tracks the
 			// latest release already, nothing to raise.
 			logging.From(ctx).Debug("go-package pin is unversioned - leaving untouched", "value", pin.Value, "where", where)
 			continue
-		}
-		if floorMinor == "" || goversion.Compare(minor, floorMinor) >= 0 {
+		case pinSufficient:
 			// No requirement, or already sufficient: effective minor is its own.
-			recordPinOutcome(gp, minor, minor)
+			recordPinOutcome(gp, d.minor, d.minor)
 			continue
-		}
-		if base != "go" {
+		case pinVariant:
 			// Variant toolchain (go-fips, ...): separate release/validation
 			// cadences and compliance implications mean we must not silently
 			// rewrite it - surface it for manual attention. The pin keeps its
 			// current minor, so its effective outcome is the identity.
-			recordPinOutcome(gp, minor, minor)
+			recordPinOutcome(gp, d.minor, d.minor)
 			gp.AddMessage(fmt.Sprintf("go-package pin %s (%s) needs Go %s but is a variant toolchain with separate release/validation cadences and compliance implications; raise it manually",
 				pin.Value, where, floor))
 			continue
 		}
 
-		valid, offlineErr := validateFloor(floorMinor)
+		// pinRaise: validate the floor, then rewrite the pin.
+		valid, offlineErr := validateFloor(d.floorMinor)
 		if offlineErr != nil {
 			gp.AddMessage(fmt.Sprintf("go-package pin %s (%s): could not validate required Go %s against known releases (index unavailable) - proceeding without validation: %v",
 				pin.Value, where, floor, offlineErr))
 		}
 		if !valid {
-			recordPinOutcome(gp, minor, minor)
+			recordPinOutcome(gp, d.minor, d.minor)
 			gp.AddMessage(fmt.Sprintf("go-package pin %s (%s) required Go %s, which is not a known Go release — leaving pin unchanged (check the dependency's go.mod)",
 				pin.Value, where, floor))
 			continue
 		}
 
-		recordPinOutcome(gp, minor, floorMinor)
+		recordPinOutcome(gp, d.minor, d.floorMinor)
 
-		newValue := base + "-" + floorMinor
+		newValue := d.base + "-" + d.floorMinor
 		updated, err := loader.UpdateField(yamlContent, pin.Path, newValue)
 		if err != nil {
 			return fmt.Errorf("updating go-package pin %s: %w", pin.Path, err)
@@ -280,6 +242,94 @@ func (s *GoPackagePinStage) reconcileGoPackagePins(ctx context.Context, gp *GoBu
 		gp.MarkActualChangesApplied()
 	}
 	return nil
+}
+
+// pinFloor is the Go version the given pin must satisfy: floors[modroot]
+// for go/build (its templated modroot rendered), maxFloor for go/install.
+// "" means this pin's target proved no requirement - leave it alone.
+func pinFloor(ctx context.Context, render lenientRenderer, pin config.GoPackagePin, floors map[string]string, maxFloor string) string {
+	if pin.Uses == "go/install" {
+		return maxFloor
+	}
+	modroot := render.value(pin.Modroot)
+	floor, ok := floors[modroot]
+	if !ok {
+		logging.From(ctx).Debug("go-package pin modroot not in analysis - no floor, leaving untouched",
+			"modroot", modroot, "value", pin.Value)
+	}
+	return floor
+}
+
+// checkTemplatedPin judges a templated pin's rendered value against its
+// floor, warning when it falls short - but never edits the template: the
+// variable behind it is the user's to update.
+func checkTemplatedPin(gp *GoBumpProcessor, render lenientRenderer, pin config.GoPackagePin, where, floor string) {
+	floorMinor := goversion.Minor(floor)
+	if floorMinor == "" {
+		// This pin's target demands nothing; nothing to check.
+		return
+	}
+	if render.renderer == nil {
+		// Degraded path (no gp.Config, or the renderer failed to
+		// build): the templated value can't be evaluated at all, so
+		// raw-value parsing would silently misjudge or skip it.
+		// Warn instead of going quiet.
+		gp.AddMessage(fmt.Sprintf("go-package %q (%s) is templated and could not be evaluated; verify manually against required Go %s",
+			pin.Value, where, floor))
+		return
+	}
+	_, minor, ok := parseGoPackagePin(render.value(pin.Value))
+	if ok && minor != "" && goversion.Compare(minor, floorMinor) < 0 {
+		gp.AddMessage(fmt.Sprintf("go-package %q (%s) is templated and resolves to Go %s, below required Go %s; update the variable manually",
+			pin.Value, where, minor, floor))
+	}
+}
+
+// pinVerdict is decidePin's classification of one non-templated pin.
+type pinVerdict int
+
+const (
+	pinNoRequirement pinVerdict = iota // unrecognized value, but its target demands nothing
+	pinUnrecognized                    // not a recognizable go toolchain package name
+	pinUnversioned                     // "go", "go-fips": already floats to the latest release
+	pinSufficient                      // no requirement, or the pin already satisfies it
+	pinVariant                         // needs a raise, but is a variant toolchain (base != "go")
+	pinRaise                           // needs a raise to floorMinor
+)
+
+// pinDecision is decidePin's result: the verdict plus the parsed pin
+// (base, minor) and the floor's minor.
+type pinDecision struct {
+	verdict     pinVerdict
+	base, minor string
+	floorMinor  string
+}
+
+// decidePin classifies a non-templated go-package pin value against its
+// floor (pure: no I/O, no messages).
+func decidePin(value, floor string) pinDecision {
+	d := pinDecision{floorMinor: goversion.Minor(floor)}
+	base, minor, ok := parseGoPackagePin(value)
+	if !ok {
+		if d.floorMinor == "" {
+			d.verdict = pinNoRequirement
+		} else {
+			d.verdict = pinUnrecognized
+		}
+		return d
+	}
+	d.base, d.minor = base, minor
+	switch {
+	case minor == "":
+		d.verdict = pinUnversioned
+	case d.floorMinor == "" || goversion.Compare(minor, d.floorMinor) >= 0:
+		d.verdict = pinSufficient
+	case base != "go":
+		d.verdict = pinVariant
+	default:
+		d.verdict = pinRaise
+	}
+	return d
 }
 
 // describePinLocation renders a human-readable location for a pin's messages,

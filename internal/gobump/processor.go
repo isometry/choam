@@ -291,16 +291,7 @@ func (p *GoBumpProcessor) ToResult() *GoBumpResult {
 	}
 
 	residuals := append(slices.Clone(p.Residuals), p.noFixResiduals()...)
-	residualIDs := make(map[string]struct{})
-	baselineResidualIDs := make(map[string]struct{})
-	for _, r := range residuals {
-		for _, id := range r.VulnIDs {
-			residualIDs[id] = struct{}{}
-			if !r.Introduced {
-				baselineResidualIDs[id] = struct{}{}
-			}
-		}
-	}
+	residualIDs, baselineResidualIDs := residualIDSets(residuals)
 
 	// Defensive: an ID that ended up residual anywhere is accounted there,
 	// never double-counted as unreachable.
@@ -315,17 +306,7 @@ func (p *GoBumpProcessor) ToResult() *GoBumpResult {
 	if p.Validated {
 		vulnerabilitiesFixed = max(vulnerabilitiesFound-len(baselineResidualIDs)-len(unreachableIDs), 0)
 	}
-	fixedIDs := p.fixedVulnIDs()
-	severities := analysisSeverities(p)
-	criticalFixed, highFixed := 0, 0
-	for id := range fixedIDs {
-		switch severities[id] {
-		case "CRITICAL":
-			criticalFixed++
-		case "HIGH":
-			highFixed++
-		}
-	}
+	criticalFixed, highFixed := countBySeverity(p.fixedVulnIDs(), analysisSeverities(p))
 
 	var errorStr string
 	if len(p.GetErrors()) > 0 {
@@ -364,4 +345,33 @@ func (p *GoBumpProcessor) ToResult() *GoBumpResult {
 		Messages:                   p.GetMessages(),
 		Error:                      errorStr,
 	}
+}
+
+// residualIDSets collects the advisory IDs of residuals: all of them, and
+// the baseline subset (those not introduced by the bump itself).
+func residualIDSets(residuals []simulate.Residual) (all, baseline map[string]struct{}) {
+	all = make(map[string]struct{})
+	baseline = make(map[string]struct{})
+	for _, r := range residuals {
+		for _, id := range r.VulnIDs {
+			all[id] = struct{}{}
+			if !r.Introduced {
+				baseline[id] = struct{}{}
+			}
+		}
+	}
+	return all, baseline
+}
+
+// countBySeverity counts ids rated CRITICAL and HIGH in severities.
+func countBySeverity(ids map[string]struct{}, severities map[string]string) (critical, high int) {
+	for id := range ids {
+		switch severities[id] {
+		case "CRITICAL":
+			critical++
+		case "HIGH":
+			high++
+		}
+	}
+	return critical, high
 }

@@ -128,38 +128,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 		// simulating this language carries it.
 		ctx := logging.With(ctx, "language", lang.Language)
 
-		goEco := ecogolang.New()
-		reqs := make([]simulate.ModrootRequest, 0, len(lang.ByModroot))
-		omnibumpRoots := 0
-		for _, m := range lang.ByModroot {
-			if m.BumpEngine == simulate.EngineOmnibump {
-				omnibumpRoots++
-			}
-			if note := compileCgoNote(m, s.Options.Compile); note != "" {
-				gp.AddMessage(note)
-			}
-			reqs = append(reqs, simulate.ModrootRequest{
-				Modroot:         m.Modroot,
-				Seeds:           seedCandidates(m),
-				Baseline:        goEco.EffectiveVersions(ctx, m.Deps),
-				Packages:        m.BuildPackages,
-				Tags:            m.BuildTags,
-				Arches:          m.BuildArches,
-				Env:             m.BuildEnv,
-				VulnImports:     vulnImports(m.ScanResult),
-				BaselineVulnIDs: baselineVulnIDs(m.ScanResult),
-				Engine:          m.BumpEngine,
-				NoTidy:          m.BumpNoTidy,
-				ProbeTidy:       m.BumpMigrating && m.BumpNoTidy,
-				GoVersion:       s.buildGoVersion(ctx, m.GoPackageMinor),
-			})
-		}
-		if omnibumpRoots > 0 {
-			version := simulate.OmnibumpVersion()
-			logging.From(ctx).Debug("simulating uses: bump steps with omnibump", "omnibump", version, "modroots", omnibumpRoots)
-			gp.AddMessage(fmt.Sprintf("simulation: uses: bump applied with omnibump %s", version))
-		}
-
+		reqs := s.buildRequests(ctx, gp, lang)
 		results, err := sim.Simulate(ctx, analysis.RepoURL, analysis.Tag, analysis.ExpectedCommit, reqs)
 		if err != nil {
 			if ctx.Err() == nil && s.failClosed(err) {
@@ -172,157 +141,238 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 			return cancelledOr(ctx, func() { s.degrade(ctx, gp, err) })
 		}
 
-		reach := newReachabilityDiff()
-		// Scanner-hygiene bumps proposed in any modroot, by module (OSV
-		// naming included), for the unreachable-advisory messages below.
-		hygieneProposed := make(map[string]bool)
-		// stdUnion accumulates the linked-stdlib packages across every
-		// modroot in this language; stdComplete tracks whether every one of
-		// them actually contributed a validated set. A skipped modroot or a
-		// failed-open stdlib walk in ANY modroot must invalidate the whole
-		// union - see below.
-		stdUnion := map[string]struct{}{}
-		// A versioned go/install builds another module version, whose
-		// stdlib slice no checkout shows.
-		stdComplete := len(scanBuildSteps(ctx, gp.Config).versionedInstalls) == 0
-		for mi := range lang.ByModroot {
-			m := &lang.ByModroot[mi]
-			// Shadowed for the rest of this iteration - see the
-			// language-level shadow above.
-			ctx := logging.With(ctx, "modroot", m.Modroot)
-
-			result := results[m.Modroot]
-			if result == nil {
-				// Skipped/unsimulated modroot: everything it found counts as
-				// reachable (fail open).
-				reach.observe(*m, nil, nil, false, nil)
-				stdComplete = false
-				continue
-			}
-			m.DesiredDeps = result.FinalDeps
-			m.DesiredReplaces = result.FinalReplaces
-			m.SecurityBumpModules = result.CVEBackedModules
-			m.Simulated = true
-			m.SimulationConverged = result.Converged
-			m.Residuals = result.Residuals
-			m.Dropped = result.Dropped
-			m.BaselineTidies = result.BaselineTidies
-			m.HygieneModules = result.HygieneModules
-			gp.AddResiduals(result.Residuals)
-			unlinkedHere := reach.observe(*m, result.Linked, result.LinkedPackages, true, degradedUnlinkedSet(result))
-
-			// Union the linked stdlib slice into a local set for the stdlib
-			// staleness stage (Go only - this loop already is), so it can
-			// filter stdlib advisories by artifact reachability without its
-			// own checkout. nil = this modroot's walk failed open, which
-			// taints the whole union (see below) rather than just
-			// contributing nothing.
-			if result.StdPackages != nil {
-				for pkg := range result.StdPackages {
-					stdUnion[pkg] = struct{}{}
-				}
-			} else {
-				stdComplete = false
-			}
-
-			// The proven graph's Go language requirement, gated against the
-			// module's own pristine baseline: only a genuine raise is recorded
-			// (an existing step's go-version is additionally never lowered -
-			// see the reconcilers' effectiveGoVersion handling).
-			if result.MaxDepGoVersion != "" {
-				baseline := pristineGoBaseline(m)
-				if goversion.Compare(result.MaxDepGoVersion, baseline) > 0 {
-					m.RequiredGoVersion = result.MaxDepGoVersion
-					gp.AddMessage(fmt.Sprintf("modroot %s: validated dependencies require Go %s (module baseline %s)",
-						m.Modroot, result.MaxDepGoVersion, baselineWord(baseline)))
-				}
-			}
-
-			gp.AddMessage(fmt.Sprintf(
-				"simulation: modroot %s %s in %d iteration(s): %d validated dep(s), %d replace(s), %d dropped, %d residual advisory(ies), %d advisory(ies) in unlinked modules",
-				m.Modroot, convergedWord(result.Converged), result.Iterations,
-				len(result.FinalDeps), len(result.FinalReplaces), len(result.Dropped), len(result.RemainingVulnIDs), unlinkedHere))
-			for _, dropped := range result.Dropped {
-				if dropped.Redundant {
-					gp.AddMessage(fmt.Sprintf("modroot %s: removed redundant %s@%s (%s)",
-						m.Modroot, dropped.Module, dropped.Version, strings.TrimPrefix(dropped.Reason, "redundant: ")))
-				}
-				switch {
-				case dropped.Hygiene && strings.HasPrefix(dropped.Reason, "shed: "):
-					gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s - no bump proposed",
-						m.Modroot, strings.TrimPrefix(dropped.Reason, "shed: ")))
-				case dropped.Hygiene:
-					gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s@%s %s - no bump proposed",
-						m.Modroot, dropped.Module, dropped.Version, strings.TrimPrefix(dropped.Reason, "scanner hygiene: ")))
-				}
-				logging.From(ctx).Info("bump candidate dropped by simulation",
-					"module", dropped.Module, "version", dropped.Version, "reason", dropped.Reason)
-			}
-			for _, h := range result.HygieneModules {
-				hygieneProposed[h.Module], hygieneProposed[ecogolang.TrimMajorSuffix(h.Module)] = true, true
-				gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s@%s proposed for scanners (%s; vulnerable package not linked, not a security fix)",
-					m.Modroot, h.Module, h.Version, strings.Join(h.VulnIDs, ", ")))
-			}
-			if result.HygieneSkipped != "" {
-				gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: scanner-hygiene bumps not evaluated: %s", m.Modroot, result.HygieneSkipped))
-			}
-			for _, residual := range result.Residuals {
-				logging.From(ctx).Warn("residual vulnerability after simulation",
-					"module", residual.Module,
-					"resolved", residual.ResolvedVersion, "fix", residual.FixedVersion,
-					"vulns", strings.Join(residual.VulnIDs, ","), "reason", residual.Reason)
-			}
-		}
-
-		// Publish the union only when every modroot actually contributed a
-		// validated stdlib set - a partial union must not masquerade as
-		// complete (the stdlib stage treats non-nil as proof it can safely
-		// demote unlinked-package advisories). Otherwise leave
-		// gp.LinkedStdPackages nil: unknown, so the stdlib stage fails open.
-		if stdComplete && len(stdUnion) > 0 {
-			gp.LinkedStdPackages = stdUnion
-		} else if !stdComplete {
-			logging.From(ctx).Debug("discarding partial linked-stdlib union: not every go modroot contributed a validated stdlib package set",
-				"modroot_count", len(lang.ByModroot))
-		}
-
-		// Advisories whose modules were unlinked in EVERY modroot that saw
-		// them: informational only - no bump proposed, neither fixed nor
-		// residual (an ID linked - and therefore fixed or residual - in any
-		// other modroot counts as reachable).
-		unreachableIDs, unreachableModules := reach.finalize()
-		gp.AddUnreachableVulnIDs(unreachableIDs)
-		for _, module := range unreachableModules {
-			var msg string
-			switch {
-			case module.moduleLinked && hygieneProposed[module.name]:
-				msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - scanner hygiene bump proposed, not a security fix",
-					module.name, strings.Join(module.vulnIDs, ", "))
-			case module.moduleLinked:
-				// Precise, package-only: the module IS in the artifact, the
-				// vulnerable packages are not.
-				msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - no bump proposed",
-					module.name, strings.Join(module.vulnIDs, ", "))
-			case module.degraded:
-				// Degraded module-level signal: precise reachability was
-				// unavailable, but the tidied go.mod's require block proves
-				// the module unlinkable.
-				msg = fmt.Sprintf("info: %s (%s) vulnerable but not required by the tidied go.mod - cannot be linked into build artifacts - no bump proposed (module-level signal; package import graph unavailable)",
-					module.name, strings.Join(module.vulnIDs, ", "))
-			default:
-				msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts - no bump proposed",
-					module.name, strings.Join(module.vulnIDs, ", "))
-			}
-			gp.AddMessage(msg)
-			logging.From(ctx).Info("advisory in unlinked code - no bump proposed",
-				"module", module.name, "module_linked", module.moduleLinked, "degraded", module.degraded, "vulns", strings.Join(module.vulnIDs, ","))
-		}
-
+		adoptResults(ctx, gp, lang, results)
 		rebuildLanguageActions(analysis, lang)
 	}
 
 	gp.Validated = true
 	return nil
+}
+
+// buildRequests turns one language's modroot analyses into simulation
+// requests, emitting the per-modroot compile-gate cgo notes and (once) the
+// omnibump engine note as it goes.
+func (s *SimulationStage) buildRequests(ctx context.Context, gp *GoBumpProcessor, lang *LanguageAnalysis) []simulate.ModrootRequest {
+	goEco := ecogolang.New()
+	reqs := make([]simulate.ModrootRequest, 0, len(lang.ByModroot))
+	omnibumpRoots := 0
+	for _, m := range lang.ByModroot {
+		if m.BumpEngine == simulate.EngineOmnibump {
+			omnibumpRoots++
+		}
+		if note := compileCgoNote(m, s.Options.Compile); note != "" {
+			gp.AddMessage(note)
+		}
+		reqs = append(reqs, simulate.ModrootRequest{
+			Modroot:         m.Modroot,
+			Seeds:           seedCandidates(m),
+			Baseline:        goEco.EffectiveVersions(ctx, m.Deps),
+			Packages:        m.BuildPackages,
+			Tags:            m.BuildTags,
+			Arches:          m.BuildArches,
+			Env:             m.BuildEnv,
+			VulnImports:     vulnImports(m.ScanResult),
+			BaselineVulnIDs: baselineVulnIDs(m.ScanResult),
+			Engine:          m.BumpEngine,
+			NoTidy:          m.BumpNoTidy,
+			ProbeTidy:       m.BumpMigrating && m.BumpNoTidy,
+			GoVersion:       s.buildGoVersion(ctx, m.GoPackageMinor),
+		})
+	}
+	if omnibumpRoots > 0 {
+		version := simulate.OmnibumpVersion()
+		logging.From(ctx).Debug("simulating uses: bump steps with omnibump", "omnibump", version, "modroots", omnibumpRoots)
+		gp.AddMessage(fmt.Sprintf("simulation: uses: bump applied with omnibump %s", version))
+	}
+	return reqs
+}
+
+// adoptResults folds one language's simulation results back into its
+// modroot analyses, reports each modroot's outcome, publishes the linked
+// stdlib union and reports the advisories unreachable in every modroot.
+func adoptResults(ctx context.Context, gp *GoBumpProcessor, lang *LanguageAnalysis, results map[string]*simulate.ModrootResult) {
+	reach := newReachabilityDiff()
+	// Scanner-hygiene bumps proposed in any modroot, by module (OSV
+	// naming included), for the unreachable-advisory messages below.
+	hygieneProposed := make(map[string]bool)
+	// A versioned go/install builds another module version, whose
+	// stdlib slice no checkout shows.
+	std := newStdUnion(len(scanBuildSteps(ctx, gp.Config).versionedInstalls) == 0)
+	for mi := range lang.ByModroot {
+		m := &lang.ByModroot[mi]
+		// Shadowed for the rest of this iteration - see the
+		// language-level shadow in Apply.
+		ctx := logging.With(ctx, "modroot", m.Modroot)
+
+		result := results[m.Modroot]
+		if result == nil {
+			// Skipped/unsimulated modroot: everything it found counts as
+			// reachable (fail open).
+			reach.observe(*m, nil, nil, false, nil)
+			std.taint()
+			continue
+		}
+		unlinkedHere := adoptResult(gp, m, result, reach, std)
+		reportModrootResult(ctx, gp, m, result, unlinkedHere, hygieneProposed)
+	}
+
+	std.publish(ctx, gp, len(lang.ByModroot))
+	reportUnreachable(ctx, gp, reach, hygieneProposed)
+}
+
+// adoptResult replaces modroot m's desired state with the simulation's
+// proven result, records its reachability and linked-stdlib slice, and
+// records a genuine Go language requirement raise. Returns how many
+// advisory IDs were unlinked in this modroot.
+func adoptResult(gp *GoBumpProcessor, m *ModrootAnalysis, result *simulate.ModrootResult, reach *reachabilityDiff, std *stdUnion) int {
+	m.DesiredDeps = result.FinalDeps
+	m.DesiredReplaces = result.FinalReplaces
+	m.SecurityBumpModules = result.CVEBackedModules
+	m.Simulated = true
+	m.SimulationConverged = result.Converged
+	m.Residuals = result.Residuals
+	m.Dropped = result.Dropped
+	m.BaselineTidies = result.BaselineTidies
+	m.HygieneModules = result.HygieneModules
+	gp.AddResiduals(result.Residuals)
+	unlinkedHere := reach.observe(*m, result.Linked, result.LinkedPackages, true, degradedUnlinkedSet(result))
+
+	// Union the linked stdlib slice into a local set for the stdlib
+	// staleness stage (Go only), so it can filter stdlib advisories by
+	// artifact reachability without its own checkout. nil = this modroot's
+	// walk failed open, which taints the whole union (see stdUnion) rather
+	// than just contributing nothing.
+	std.add(result.StdPackages)
+
+	// The proven graph's Go language requirement, gated against the
+	// module's own pristine baseline: only a genuine raise is recorded
+	// (an existing step's go-version is additionally never lowered -
+	// see the reconcilers' effectiveGoVersion handling).
+	if result.MaxDepGoVersion != "" {
+		baseline := pristineGoBaseline(m)
+		if goversion.Compare(result.MaxDepGoVersion, baseline) > 0 {
+			m.RequiredGoVersion = result.MaxDepGoVersion
+			gp.AddMessage(fmt.Sprintf("modroot %s: validated dependencies require Go %s (module baseline %s)",
+				m.Modroot, result.MaxDepGoVersion, baselineWord(baseline)))
+		}
+	}
+	return unlinkedHere
+}
+
+// reportModrootResult reports one simulated modroot's outcome: the summary
+// line, redundant and hygiene drops, proposed hygiene bumps (recorded into
+// hygieneProposed for reportUnreachable) and residual advisories.
+func reportModrootResult(ctx context.Context, gp *GoBumpProcessor, m *ModrootAnalysis, result *simulate.ModrootResult, unlinkedHere int, hygieneProposed map[string]bool) {
+	gp.AddMessage(fmt.Sprintf(
+		"simulation: modroot %s %s in %d iteration(s): %d validated dep(s), %d replace(s), %d dropped, %d residual advisory(ies), %d advisory(ies) in unlinked modules",
+		m.Modroot, convergedWord(result.Converged), result.Iterations,
+		len(result.FinalDeps), len(result.FinalReplaces), len(result.Dropped), len(result.RemainingVulnIDs), unlinkedHere))
+	for _, dropped := range result.Dropped {
+		if dropped.Redundant {
+			gp.AddMessage(fmt.Sprintf("modroot %s: removed redundant %s@%s (%s)",
+				m.Modroot, dropped.Module, dropped.Version, strings.TrimPrefix(dropped.Reason, "redundant: ")))
+		}
+		switch {
+		case dropped.Hygiene && strings.HasPrefix(dropped.Reason, "shed: "):
+			gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s - no bump proposed",
+				m.Modroot, strings.TrimPrefix(dropped.Reason, "shed: ")))
+		case dropped.Hygiene:
+			gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s@%s %s - no bump proposed",
+				m.Modroot, dropped.Module, dropped.Version, strings.TrimPrefix(dropped.Reason, "scanner hygiene: ")))
+		}
+		logging.From(ctx).Info("bump candidate dropped by simulation",
+			"module", dropped.Module, "version", dropped.Version, "reason", dropped.Reason)
+	}
+	for _, h := range result.HygieneModules {
+		hygieneProposed[h.Module], hygieneProposed[ecogolang.TrimMajorSuffix(h.Module)] = true, true
+		gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s@%s proposed for scanners (%s; vulnerable package not linked, not a security fix)",
+			m.Modroot, h.Module, h.Version, strings.Join(h.VulnIDs, ", ")))
+	}
+	if result.HygieneSkipped != "" {
+		gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: scanner-hygiene bumps not evaluated: %s", m.Modroot, result.HygieneSkipped))
+	}
+	for _, residual := range result.Residuals {
+		logging.From(ctx).Warn("residual vulnerability after simulation",
+			"module", residual.Module,
+			"resolved", residual.ResolvedVersion, "fix", residual.FixedVersion,
+			"vulns", strings.Join(residual.VulnIDs, ","), "reason", residual.Reason)
+	}
+}
+
+// stdUnion accumulates the linked-stdlib packages across every modroot of
+// a language; complete tracks whether every one of them actually
+// contributed a validated set. A skipped modroot or a failed-open stdlib
+// walk in ANY modroot invalidates the whole union.
+type stdUnion struct {
+	pkgs     map[string]struct{}
+	complete bool
+}
+
+func newStdUnion(complete bool) *stdUnion {
+	return &stdUnion{pkgs: map[string]struct{}{}, complete: complete}
+}
+
+// taint marks the union incomplete.
+func (u *stdUnion) taint() { u.complete = false }
+
+// add unions one modroot's linked stdlib packages; nil (the walk failed
+// open) taints the union.
+func (u *stdUnion) add(pkgs map[string]struct{}) {
+	if pkgs == nil {
+		u.taint()
+		return
+	}
+	for pkg := range pkgs {
+		u.pkgs[pkg] = struct{}{}
+	}
+}
+
+// publish sets gp.LinkedStdPackages only when every modroot actually
+// contributed a validated stdlib set - a partial union must not masquerade
+// as complete (the stdlib stage treats non-nil as proof it can safely
+// demote unlinked-package advisories). Otherwise gp.LinkedStdPackages stays
+// nil: unknown, so the stdlib stage fails open.
+func (u *stdUnion) publish(ctx context.Context, gp *GoBumpProcessor, modroots int) {
+	if u.complete && len(u.pkgs) > 0 {
+		gp.LinkedStdPackages = u.pkgs
+	} else if !u.complete {
+		logging.From(ctx).Debug("discarding partial linked-stdlib union: not every go modroot contributed a validated stdlib package set",
+			"modroot_count", modroots)
+	}
+}
+
+// reportUnreachable reports the advisories whose modules were unlinked in
+// EVERY modroot that saw them: informational only - no bump proposed,
+// neither fixed nor residual (an ID linked - and therefore fixed or
+// residual - in any other modroot counts as reachable).
+func reportUnreachable(ctx context.Context, gp *GoBumpProcessor, reach *reachabilityDiff, hygieneProposed map[string]bool) {
+	unreachableIDs, unreachableModules := reach.finalize()
+	gp.AddUnreachableVulnIDs(unreachableIDs)
+	for _, module := range unreachableModules {
+		var msg string
+		switch {
+		case module.moduleLinked && hygieneProposed[module.name]:
+			msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - scanner hygiene bump proposed, not a security fix",
+				module.name, strings.Join(module.vulnIDs, ", "))
+		case module.moduleLinked:
+			// Precise, package-only: the module IS in the artifact, the
+			// vulnerable packages are not.
+			msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - no bump proposed",
+				module.name, strings.Join(module.vulnIDs, ", "))
+		case module.degraded:
+			// Degraded module-level signal: precise reachability was
+			// unavailable, but the tidied go.mod's require block proves
+			// the module unlinkable.
+			msg = fmt.Sprintf("info: %s (%s) vulnerable but not required by the tidied go.mod - cannot be linked into build artifacts - no bump proposed (module-level signal; package import graph unavailable)",
+				module.name, strings.Join(module.vulnIDs, ", "))
+		default:
+			msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts - no bump proposed",
+				module.name, strings.Join(module.vulnIDs, ", "))
+		}
+		gp.AddMessage(msg)
+		logging.From(ctx).Info("advisory in unlinked code - no bump proposed",
+			"module", module.name, "module_linked", module.moduleLinked, "degraded", module.degraded, "vulns", strings.Join(module.vulnIDs, ","))
+	}
 }
 
 // buildGoVersion is the Go version the build's bump step runs with, for the
@@ -522,28 +572,6 @@ func (r *reachabilityDiff) observe(m ModrootAnalysis, linkedModules, linkedPacka
 	}
 	degradedMode := linkedModules == nil && unrequired != nil
 
-	moduleLinked := func(module string) bool {
-		if linkedModules == nil {
-			if unrequired == nil {
-				return true // fail open: no precise or degraded signal
-			}
-			_, unreq := unrequired[module]
-			return !unreq
-		}
-		if _, ok := linkedModules[module]; ok {
-			return true
-		}
-		// The analysis map's coordinates are go.mod-normalized, but no-fix
-		// vulnerability records carry OSV's own naming, which drops v2+
-		// path suffixes - tolerate the mismatch in the linked direction.
-		for candidate := range linkedModules {
-			if ecogolang.TrimMajorSuffix(candidate) == module {
-				return true
-			}
-		}
-		return false
-	}
-
 	// Per-advisory vulnerable import paths, from the analysis scan.
 	importsByID := make(map[string][]scan.VulnerableImport)
 	if m.ScanResult != nil {
@@ -556,7 +584,7 @@ func (r *reachabilityDiff) observe(m ModrootAnalysis, linkedModules, linkedPacka
 		if len(vulnIDs) == 0 {
 			return
 		}
-		modLinked := moduleLinked(module)
+		modLinked := moduleLinkedIn(module, linkedModules, unrequired)
 		for _, id := range vulnIDs {
 			if modLinked && scan.ImportsLinked(importsByID[id], linkedPackages) {
 				r.reachableIDs[id] = struct{}{}
@@ -598,6 +626,31 @@ func (r *reachabilityDiff) observe(m ModrootAnalysis, linkedModules, linkedPacka
 	}
 
 	return len(r.unreachableIDs) - unlinkedBefore
+}
+
+// moduleLinkedIn reports whether module is linked per the precise linked
+// module set, else (linkedModules nil) per the degraded unrequired signal,
+// else true (fail open: no precise or degraded signal).
+func moduleLinkedIn(module string, linkedModules, unrequired map[string]struct{}) bool {
+	if linkedModules == nil {
+		if unrequired == nil {
+			return true // fail open: no precise or degraded signal
+		}
+		_, unreq := unrequired[module]
+		return !unreq
+	}
+	if _, ok := linkedModules[module]; ok {
+		return true
+	}
+	// The analysis map's coordinates are go.mod-normalized, but no-fix
+	// vulnerability records carry OSV's own naming, which drops v2+
+	// path suffixes - tolerate the mismatch in the linked direction.
+	for candidate := range linkedModules {
+		if ecogolang.TrimMajorSuffix(candidate) == module {
+			return true
+		}
+	}
+	return false
 }
 
 // unreachableModule is one unlinked module and its advisory IDs, for

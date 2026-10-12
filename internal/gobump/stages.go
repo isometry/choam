@@ -490,19 +490,17 @@ type languageResult struct {
 // single-module path always applies replaces unconditionally), because a replace directive, unlike a bare require,
 // survives go mod tidy. That's why replaces pass through unfiltered here.
 func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosystem.Ecosystem, language, repoURL, ref string, langUnits []analysisUnit, bumpSteps []config.BumpStep, gp *GoBumpProcessor) (*languageResult, error) {
-	fetcher := v.Analyzer.fetcher
-	scanner := v.Analyzer.vulnerabilityScanner
-
 	modroots := unitRoots(langUnits)
-	existingDepsByRoot := existingDepsForModroots(modroots, bumpSteps)
-	existingReplacesByRoot := existingReplacesForModroots(modroots, bumpSteps)
-	// go-version is a Go-only (go/bump) pipeline input - other languages'
-	// analyses never carry one.
-	existingGoVersionByRoot := make(map[string]string)
-	if language == "go" {
-		existingGoVersionByRoot = existingGoVersionsForModroots(modroots, bumpSteps)
+	existing := modrootExisting{
+		deps:     existingDepsForModroots(modroots, bumpSteps),
+		replaces: existingReplacesForModroots(modroots, bumpSteps),
+		// go-version is a Go-only (go/bump) pipeline input - other languages'
+		// analyses never carry one.
+		goVersions: make(map[string]string),
 	}
-	required, optional := eco.ManifestFiles()
+	if language == "go" {
+		existing.goVersions = existingGoVersionsForModroots(modroots, bumpSteps)
+	}
 
 	result := &languageResult{
 		Vulns: make(map[string]scan.Vulnerability),
@@ -513,94 +511,20 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 	for _, unit := range langUnits {
 		root := unit.Modroot
 		// Shadowed for the rest of this iteration - see the language-level
-		// shadow above.
+		// shadow in checkVulnerabilities.
 		ctx := logging.With(ctx, "modroot", root)
 
-		files := make(map[string][]byte, len(required)+len(optional))
-		for _, name := range append(slices.Clone(required), optional...) {
-			content, err := fetcher.FetchFile(ctx, repoURL, ref, modrootPath(root, name))
-			if errors.Is(err, ecosystem.ErrNotFound) && slices.Contains(optional, name) {
-				logging.From(ctx).Debug("optional manifest file absent", "manifest", name)
-				continue
-			}
-			if err != nil {
-				return nil, fmt.Errorf("modroot %s: %w", root, err)
-			}
-			files[name] = content
-		}
-
-		deps, err := eco.Analyze(ctx, files)
+		m, err := v.analyzeModroot(ctx, eco, repoURL, ref, unit, existing, gp)
 		if err != nil {
-			return nil, fmt.Errorf("modroot %s: analyzing dependencies: %w", root, err)
+			return nil, err
 		}
-
-		pkgs := eco.ScanPackages(ctx, deps)
-		scanResult, err := scanner.ScanPackages(ctx, pkgs)
-		if err != nil {
-			return nil, fmt.Errorf("modroot %s: scanning dependencies for vulnerabilities: %w", root, err)
-		}
-		if scanResult.Error != "" {
-			return nil, fmt.Errorf("modroot %s: security scan error: %s", root, scanResult.Error)
-		}
-
-		for _, vuln := range scanResult.Vulnerabilities {
+		for _, vuln := range m.ScanResult.Vulnerabilities {
 			result.Vulns[vuln.ID] = vuln
 		}
+		result.Analysis.ByModroot = append(result.Analysis.ByModroot, m)
 
-		existingDeps := existingDepsByRoot[root]
-		existingReplaces := existingReplacesByRoot[root]
-		desiredDeps, held := eco.FilterBumps(ctx, existingDeps, scanResult.SecurityBumps, deps)
-		heldResiduals := make([]simulate.Residual, 0, len(held))
-		for _, h := range held {
-			heldResiduals = append(heldResiduals, simulate.Residual{
-				Module:          h.Bump.Name,
-				ResolvedVersion: h.Bump.CurrentVersion,
-				FixedVersion:    h.Bump.FixedVersion,
-				VulnIDs:         h.Bump.VulnIDs,
-				Reason:          h.Reason,
-			})
-			logging.From(ctx).Warn("fix held back", "module", h.Bump.Name, "fix", h.Bump.FixedVersion, "reason", h.Reason)
-		}
-		gp.AddResiduals(heldResiduals)
-
-		// Coordinates in this modroot's rendered dep grammar (not OSV's own
-		// naming - see Ecosystem.BumpCoords), so they compare directly
-		// against splitCoordVersion output downstream.
-		bumpCoords := eco.BumpCoords(ctx, scanResult.SecurityBumps, deps)
-		securityBumpModules := make([]string, 0, len(bumpCoords))
-		for coord := range bumpCoords {
-			securityBumpModules = append(securityBumpModules, coord)
-		}
-		sort.Strings(securityBumpModules)
-
-		result.Analysis.ByModroot = append(result.Analysis.ByModroot, ModrootAnalysis{
-			Modroot:        root,
-			BuildPackages:  unit.Packages,
-			BuildTags:      unit.Tags,
-			BuildArches:    unit.Arches,
-			BuildEnv:       unit.Env,
-			BumpEngine:     unit.Engine,
-			BumpMigrating:  unit.Migrating,
-			BumpNoTidy:     unit.NoTidy,
-			GoPackageMinor: unit.GoMinor,
-			Deps:           deps,
-			ScanResult:     scanResult,
-			ExistingDeps:   existingDeps,
-			DesiredDeps:    desiredDeps,
-			// Analysis never invents replaces - it carries existing ones
-			// forward (the simulation may raise or retire them, never add
-			// any). This also keeps the --no-validate degrade path a
-			// pass-through.
-			ExistingReplaces:     existingReplaces,
-			DesiredReplaces:      existingReplaces,
-			ExistingGoVersion:    existingGoVersionByRoot[root],
-			SecurityBumpModules:  securityBumpModules,
-			SecurityBumpsByCoord: bumpCoords,
-			Residuals:            heldResiduals,
-		})
-
-		if haveDepsChanged(existingDeps, desiredDeps) {
-			added := newlyAddedDeps(existingDeps, desiredDeps)
+		if haveDepsChanged(m.ExistingDeps, m.DesiredDeps) {
+			added := newlyAddedDeps(m.ExistingDeps, m.DesiredDeps)
 			result.Actions = append(result.Actions, BumpAction{
 				Action:       "needs_bump",
 				Language:     language,
@@ -612,6 +536,111 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 	}
 
 	return result, nil
+}
+
+// modrootExisting is what a language's existing bump steps already declare,
+// per modroot.
+type modrootExisting struct {
+	deps       map[string][]string
+	replaces   map[string][]string
+	goVersions map[string]string
+}
+
+// analyzeModroot fetches, analyzes and scans one module root, and filters
+// its candidate bumps against its own manifest (see performAnalysis). Fix
+// bumps the ecosystem holds back are recorded as residuals on gp.
+func (v *VulnerabilityChecker) analyzeModroot(ctx context.Context, eco ecosystem.Ecosystem, repoURL, ref string, unit analysisUnit, existing modrootExisting, gp *GoBumpProcessor) (ModrootAnalysis, error) {
+	root := unit.Modroot
+	files, err := v.fetchManifests(ctx, eco, repoURL, ref, root)
+	if err != nil {
+		return ModrootAnalysis{}, err
+	}
+
+	deps, err := eco.Analyze(ctx, files)
+	if err != nil {
+		return ModrootAnalysis{}, fmt.Errorf("modroot %s: analyzing dependencies: %w", root, err)
+	}
+
+	pkgs := eco.ScanPackages(ctx, deps)
+	scanResult, err := v.Analyzer.vulnerabilityScanner.ScanPackages(ctx, pkgs)
+	if err != nil {
+		return ModrootAnalysis{}, fmt.Errorf("modroot %s: scanning dependencies for vulnerabilities: %w", root, err)
+	}
+	if scanResult.Error != "" {
+		return ModrootAnalysis{}, fmt.Errorf("modroot %s: security scan error: %s", root, scanResult.Error)
+	}
+
+	existingDeps := existing.deps[root]
+	existingReplaces := existing.replaces[root]
+	desiredDeps, held := eco.FilterBumps(ctx, existingDeps, scanResult.SecurityBumps, deps)
+	heldResiduals := make([]simulate.Residual, 0, len(held))
+	for _, h := range held {
+		heldResiduals = append(heldResiduals, simulate.Residual{
+			Module:          h.Bump.Name,
+			ResolvedVersion: h.Bump.CurrentVersion,
+			FixedVersion:    h.Bump.FixedVersion,
+			VulnIDs:         h.Bump.VulnIDs,
+			Reason:          h.Reason,
+		})
+		logging.From(ctx).Warn("fix held back", "module", h.Bump.Name, "fix", h.Bump.FixedVersion, "reason", h.Reason)
+	}
+	gp.AddResiduals(heldResiduals)
+
+	// Coordinates in this modroot's rendered dep grammar (not OSV's own
+	// naming - see Ecosystem.BumpCoords), so they compare directly
+	// against splitCoordVersion output downstream.
+	bumpCoords := eco.BumpCoords(ctx, scanResult.SecurityBumps, deps)
+	securityBumpModules := make([]string, 0, len(bumpCoords))
+	for coord := range bumpCoords {
+		securityBumpModules = append(securityBumpModules, coord)
+	}
+	sort.Strings(securityBumpModules)
+
+	return ModrootAnalysis{
+		Modroot:        root,
+		BuildPackages:  unit.Packages,
+		BuildTags:      unit.Tags,
+		BuildArches:    unit.Arches,
+		BuildEnv:       unit.Env,
+		BumpEngine:     unit.Engine,
+		BumpMigrating:  unit.Migrating,
+		BumpNoTidy:     unit.NoTidy,
+		GoPackageMinor: unit.GoMinor,
+		Deps:           deps,
+		ScanResult:     scanResult,
+		ExistingDeps:   existingDeps,
+		DesiredDeps:    desiredDeps,
+		// Analysis never invents replaces - it carries existing ones
+		// forward (the simulation may raise or retire them, never add
+		// any). This also keeps the --no-validate degrade path a
+		// pass-through.
+		ExistingReplaces:     existingReplaces,
+		DesiredReplaces:      existingReplaces,
+		ExistingGoVersion:    existing.goVersions[root],
+		SecurityBumpModules:  securityBumpModules,
+		SecurityBumpsByCoord: bumpCoords,
+		Residuals:            heldResiduals,
+	}, nil
+}
+
+// fetchManifests fetches a modroot's required and optional manifest files
+// at ref; only a confirmed 404 on an optional manifest is tolerated (fail
+// closed).
+func (v *VulnerabilityChecker) fetchManifests(ctx context.Context, eco ecosystem.Ecosystem, repoURL, ref, root string) (map[string][]byte, error) {
+	required, optional := eco.ManifestFiles()
+	files := make(map[string][]byte, len(required)+len(optional))
+	for _, name := range append(slices.Clone(required), optional...) {
+		content, err := v.Analyzer.fetcher.FetchFile(ctx, repoURL, ref, modrootPath(root, name))
+		if errors.Is(err, ecosystem.ErrNotFound) && slices.Contains(optional, name) {
+			logging.From(ctx).Debug("optional manifest file absent", "manifest", name)
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("modroot %s: %w", root, err)
+		}
+		files[name] = content
+	}
+	return files, nil
 }
 
 // existingDepsForModroots returns, for each modroot, the deduplicated union
@@ -769,29 +798,71 @@ type stepEdit struct {
 // order the simulation applied them (see simulate.ModrootResult.FinalDeps).
 func (g *GoBumpApplier) reconcileLanguageBumpSteps(ctx context.Context, gp *GoBumpProcessor, langAnalysis LanguageAnalysis, loader *config.Loader) error {
 	yamlContent := gp.GetCurrentYAML()
+	existingSteps, err := stepsForLanguage(loader, yamlContent, langAnalysis.Language)
+	if err != nil {
+		return err
+	}
+
+	owner := stepOwners(existingSteps)
+	edits := planEdits(existingSteps, langAnalysis, owner)
+
+	hasBlankLines := loader.HasBlankLinesBetweenPipelineSteps(yamlContent)
+	yamlContent, edited, err := g.applyEdits(ctx, gp, yamlContent, edits, hasBlankLines)
+	if err != nil {
+		return err
+	}
+	yamlContent, inserted, err := insertUnowned(gp, loader, yamlContent, langAnalysis, owner, hasBlankLines)
+	if err != nil {
+		return err
+	}
+
+	if !edited && !inserted {
+		return nil
+	}
+	gp.SetCurrentYAML(yamlContent)
+	gp.MarkActualChangesApplied()
+	g.recordSecurityFixes(gp, langAnalysis, addedAcrossRoots(langAnalysis.ByModroot))
+	recordHygieneBumps(gp, langAnalysis)
+	return nil
+}
+
+// stepsForLanguage returns the bump steps in yamlContent whose effective
+// language is language, in document order.
+func stepsForLanguage(loader *config.Loader, yamlContent []byte, language string) ([]config.BumpStep, error) {
 	allSteps, err := loader.FindBumpSteps(yamlContent)
 	if err != nil {
-		return fmt.Errorf("finding existing bump steps: %w", err)
+		return nil, fmt.Errorf("finding existing bump steps: %w", err)
 	}
-
-	var existingSteps []config.BumpStep
+	var steps []config.BumpStep
 	for _, step := range allSteps {
-		if step.EffectiveLanguage() == langAnalysis.Language {
-			existingSteps = append(existingSteps, step)
+		if step.EffectiveLanguage() == language {
+			steps = append(steps, step)
 		}
 	}
+	return steps, nil
+}
 
-	byRoot := make(map[string]*ModrootAnalysis, len(langAnalysis.ByModroot))
-	for i := range langAnalysis.ByModroot {
-		byRoot[langAnalysis.ByModroot[i].Modroot] = &langAnalysis.ByModroot[i]
-	}
+// stepOwners maps each modroot to the index (in steps) of the first step
+// covering it.
+func stepOwners(steps []config.BumpStep) map[string]int {
 	owner := make(map[string]int)
-	for i, step := range existingSteps {
+	for i, step := range steps {
 		for _, root := range step.Modroots {
 			if _, ok := owner[root]; !ok {
 				owner[root] = i
 			}
 		}
+	}
+	return owner
+}
+
+// planEdits builds one stepEdit per existing step owning at least one
+// analyzed modroot, in step order: its owned modroots grouped by identical
+// desired deps/replaces, and whether its content changes.
+func planEdits(existingSteps []config.BumpStep, langAnalysis LanguageAnalysis, owner map[string]int) []stepEdit {
+	byRoot := make(map[string]*ModrootAnalysis, len(langAnalysis.ByModroot))
+	for i := range langAnalysis.ByModroot {
+		byRoot[langAnalysis.ByModroot[i].Modroot] = &langAnalysis.ByModroot[i]
 	}
 
 	edits := make([]stepEdit, 0, len(existingSteps))
@@ -833,11 +904,14 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(ctx context.Context, gp *GoBu
 		}
 		edits = append(edits, edit)
 	}
+	return edits
+}
 
-	// Edit from the last step backwards: removals and clones only shift the
-	// indices of steps already handled.
+// applyEdits rewrites every changed edit's step, from the last step
+// backwards: removals and clones only shift the indices of steps already
+// handled. Reports whether anything changed.
+func (g *GoBumpApplier) applyEdits(ctx context.Context, gp *GoBumpProcessor, yamlContent []byte, edits []stepEdit, hasBlankLines bool) ([]byte, bool, error) {
 	slices.SortFunc(edits, func(a, b stepEdit) int { return cmp.Compare(b.step.Index, a.step.Index) })
-	hasBlankLines := loader.HasBlankLinesBetweenPipelineSteps(yamlContent)
 	changed := false
 	for _, edit := range edits {
 		if !edit.changed {
@@ -845,55 +919,54 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(ctx context.Context, gp *GoBu
 		}
 		updated, err := g.rewriteStep(ctx, gp, yamlContent, edit, hasBlankLines)
 		if err != nil {
-			return err
+			return nil, false, err
 		}
 		yamlContent = updated
 		changed = true
 	}
+	return yamlContent, changed, nil
+}
 
+// insertUnowned adds fresh `uses: bump` steps (coalesced by identical sets)
+// after the first git-checkout for the modroots no existing step covers.
+// Reports whether anything was inserted.
+func insertUnowned(gp *GoBumpProcessor, loader *config.Loader, yamlContent []byte, langAnalysis LanguageAnalysis, owner map[string]int, hasBlankLines bool) ([]byte, bool, error) {
 	var unowned []ModrootAnalysis
 	for _, m := range langAnalysis.ByModroot {
 		if _, ok := owner[m.Modroot]; !ok {
 			unowned = append(unowned, m)
 		}
 	}
-	if groups := coalesceModroots(unowned); len(groups) > 0 {
-		gitCheckoutIndices, err := loader.FindPipelinesByUse(yamlContent, "git-checkout")
+	groups := coalesceModroots(unowned)
+	if len(groups) == 0 {
+		return yamlContent, false, nil
+	}
+	gitCheckoutIndices, err := loader.FindPipelinesByUse(yamlContent, "git-checkout")
+	if err != nil {
+		return nil, false, fmt.Errorf("finding git-checkout pipeline: %w", err)
+	}
+	insertPos := 0
+	if len(gitCheckoutIndices) > 0 {
+		insertPos = gitCheckoutIndices[0] + 1
+	}
+	for _, group := range groups {
+		spec := config.BumpStepSpec{
+			Action:   "bump",
+			Language: langAnalysis.Language,
+			Modroots: group.Modroots,
+			Deps:     group.Deps,
+			Replaces: group.Replaces,
+		}
+		updated, err := loader.InsertBumpPipelineStep(yamlContent, insertPos, spec, hasBlankLines)
 		if err != nil {
-			return fmt.Errorf("finding git-checkout pipeline: %w", err)
+			return nil, false, fmt.Errorf("inserting bump step: %w", err)
 		}
-		insertPos := 0
-		if len(gitCheckoutIndices) > 0 {
-			insertPos = gitCheckoutIndices[0] + 1
-		}
-		for _, group := range groups {
-			spec := config.BumpStepSpec{
-				Action:   "bump",
-				Language: langAnalysis.Language,
-				Modroots: group.Modroots,
-				Deps:     group.Deps,
-				Replaces: group.Replaces,
-			}
-			updated, err := loader.InsertBumpPipelineStep(yamlContent, insertPos, spec, hasBlankLines)
-			if err != nil {
-				return fmt.Errorf("inserting bump step: %w", err)
-			}
-			yamlContent = updated
-			gp.AddMessage(fmt.Sprintf("Added %s bump step pipeline[%d] for modroot(s) %s with %d dependencies and %d replaces",
-				langAnalysis.Language, insertPos, strings.Join(group.Modroots, ", "), len(group.Deps), len(group.Replaces)))
-			insertPos++
-			changed = true
-		}
+		yamlContent = updated
+		gp.AddMessage(fmt.Sprintf("Added %s bump step pipeline[%d] for modroot(s) %s with %d dependencies and %d replaces",
+			langAnalysis.Language, insertPos, strings.Join(group.Modroots, ", "), len(group.Deps), len(group.Replaces)))
+		insertPos++
 	}
-
-	if !changed {
-		return nil
-	}
-	gp.SetCurrentYAML(yamlContent)
-	gp.MarkActualChangesApplied()
-	g.recordSecurityFixes(gp, langAnalysis, addedAcrossRoots(langAnalysis.ByModroot))
-	recordHygieneBumps(gp, langAnalysis)
-	return nil
+	return yamlContent, true, nil
 }
 
 // rewriteStep applies one changed stepEdit in place (see

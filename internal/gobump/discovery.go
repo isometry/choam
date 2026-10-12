@@ -88,41 +88,11 @@ const defaultToolchainTags = "netgo,osusergo"
 // go/bump steps' migration plans by pipeline index (see planMigration); the
 // Go-only unit details are goUnitDetails'.
 func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bumpSteps []config.BumpStep, migrations map[int]migrationPlan) (map[string][]analysisUnit, []string) {
-	// language -> modroot -> sets of build package patterns and tags
-	type unitSets struct {
-		patterns, tags map[string]struct{}
-		step           *config.BumpStep // first bump step covering the root
-		built          []analysisUnit   // the build-step units building the root
-	}
-	units := make(map[string]map[string]*unitSets)
-
-	add := func(language string, modroots, packages, tags []string) []*unitSets {
-		byRoot, ok := units[language]
-		if !ok {
-			byRoot = make(map[string]*unitSets)
-			units[language] = byRoot
-		}
-		added := make([]*unitSets, 0, len(modroots))
-		for _, root := range modroots {
-			sets, ok := byRoot[root]
-			if !ok {
-				sets = &unitSets{patterns: make(map[string]struct{}), tags: make(map[string]struct{})}
-				byRoot[root] = sets
-			}
-			added = append(added, sets)
-			for _, pattern := range packages {
-				sets.patterns[pattern] = struct{}{}
-			}
-			for _, tag := range tags {
-				sets.tags[tag] = struct{}{}
-			}
-		}
-		return added
-	}
+	units := make(unitSetBuilder)
 
 	for i := range bumpSteps {
 		step := &bumpSteps[i]
-		for _, sets := range add(step.EffectiveLanguage(), step.Modroots, nil, nil) {
+		for _, sets := range units.add(step.EffectiveLanguage(), step.Modroots, nil, nil) {
 			if sets.step == nil {
 				sets.step = step
 			}
@@ -137,18 +107,64 @@ func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bump
 		golang.load(ctx, cfg)
 		for language, buildUnits := range scan.units {
 			for _, unit := range buildUnits {
-				for _, sets := range add(language, []string{unit.Modroot}, unit.Packages, unit.Tags) {
+				for _, sets := range units.add(language, []string{unit.Modroot}, unit.Packages, unit.Tags) {
 					sets.built = append(sets.built, unit)
 				}
 			}
 		}
 		for language, modroots := range modrootsFromAnnotations(cfg) {
-			add(language, modroots, nil, nil)
+			units.add(language, modroots, nil, nil)
 		}
 	}
 
-	result := make(map[string][]analysisUnit, len(units))
-	for language, byRoot := range units {
+	return units.build(ctx, golang, notes), slices.Sorted(maps.Keys(notes))
+}
+
+// unitSets accumulates one modroot's discovery sources: its build package
+// patterns and tags, the first bump step covering it, and the build-step
+// units building it.
+type unitSets struct {
+	patterns, tags map[string]struct{}
+	step           *config.BumpStep // first bump step covering the root
+	built          []analysisUnit   // the build-step units building the root
+}
+
+// unitSetBuilder is discoverAnalysisUnits' accumulator: language ->
+// modroot -> sets.
+type unitSetBuilder map[string]map[string]*unitSets
+
+// add merges packages and tags into each of modroots' sets for language
+// (creating them on first sight), returning those sets in modroots order.
+func (b unitSetBuilder) add(language string, modroots, packages, tags []string) []*unitSets {
+	byRoot, ok := b[language]
+	if !ok {
+		byRoot = make(map[string]*unitSets)
+		b[language] = byRoot
+	}
+	added := make([]*unitSets, 0, len(modroots))
+	for _, root := range modroots {
+		sets, ok := byRoot[root]
+		if !ok {
+			sets = &unitSets{patterns: make(map[string]struct{}), tags: make(map[string]struct{})}
+			byRoot[root] = sets
+		}
+		added = append(added, sets)
+		for _, pattern := range packages {
+			sets.patterns[pattern] = struct{}{}
+		}
+		for _, tag := range tags {
+			sets.tags[tag] = struct{}{}
+		}
+	}
+	return added
+}
+
+// build turns the accumulated sets into language -> units sorted by
+// modroot (Go units completed by goUnitDetails); a language with no
+// modroots is absent.
+func (b unitSetBuilder) build(ctx context.Context, golang goDiscovery, notes map[string]struct{}) map[string][]analysisUnit {
+	result := make(map[string][]analysisUnit, len(b))
+	for language, byRoot := range b {
 		if len(byRoot) == 0 {
 			continue
 		}
@@ -177,7 +193,7 @@ func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bump
 		slices.SortStableFunc(langUnits, func(a, b analysisUnit) int { return strings.Compare(a.Modroot, b.Modroot) })
 		result[language] = langUnits
 	}
-	return result, slices.Sorted(maps.Keys(notes))
+	return result
 }
 
 // unitRoots projects a language's analysis units onto their modroots,

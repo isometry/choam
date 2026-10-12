@@ -94,30 +94,9 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 		return nil
 	}
 
-	info, err := s.lastCommit(ctx, gp.GetFilePath())
-	switch {
-	case errors.Is(err, git.ErrNotInRepository):
-		gp.AddMessage("stdlib: melange file is not in a git repository - skipping stdlib staleness check")
-		return nil
-	case errors.Is(err, git.ErrUntracked):
-		gp.AddMessage("stdlib: melange file has no commit history - skipping stdlib staleness check")
-		return nil
-	case err != nil:
-		return cancelledOr(ctx, func() {
-			s.skipWarn(ctx, gp, fmt.Sprintf("stdlib: could not determine the melange file's last commit (%v) - skipping stdlib staleness check", err))
-		})
-	}
-	if info.Dirty {
-		// The idempotency guard: an epoch bump this tool wrote on a previous
-		// run (or any other pending edit) makes the file dirty; re-running
-		// must not stack further bumps until the change is committed.
-		gp.AddMessage("stdlib: melange file has uncommitted changes - skipping stdlib staleness check (a bump may already be pending)")
-		return nil
-	}
-	if info.Shallow {
-		logging.From(ctx).Warn("melange repository history is shallow - stdlib staleness estimate may assume a newer toolchain than reality",
-			"commit_time", info.Time)
-		gp.AddMessage("stdlib: repository history is shallow - the assumed build toolchain may be newer than reality")
+	info, err := s.commitInfo(ctx, gp)
+	if info == nil {
+		return err
 	}
 
 	// Constraints come from the pristine config (the historical truth the
@@ -140,29 +119,10 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 
 	// Fallback checkout: only worth a clone when the preliminary unfiltered
 	// evaluation actually found fixable advisories to validate against the
-	// artifact's linked stdlib set. Any failure fails OPEN: the unfiltered
-	// (Validated=false) findings stand. A cancellation is the one failure
-	// that must NOT fail open - it means stop, not "proceed unfiltered".
+	// artifact's linked stdlib set.
 	if len(bumps) > 0 && in.Linked == nil && s.Options.Validate {
-		linked, err := s.linkStd(ctx, gp)
-		if err != nil {
-			if cerr := ctx.Err(); cerr != nil {
-				return cerr
-			}
-			logging.From(ctx).Warn("could not determine linked stdlib packages - stdlib findings remain unfiltered", "error", err)
-			gp.AddMessage(fmt.Sprintf("stdlib: could not determine linked stdlib packages (%v) - findings not filtered by artifact reachability", err))
-		} else if linked != nil {
-			in.Linked, in.Validated = linked, true
-			filteredBumps, filteredMessages, err := evaluateStdlibStaleness(ctx, s.index, s.scanner, in)
-			if err != nil {
-				if cerr := ctx.Err(); cerr != nil {
-					return cerr
-				}
-				logging.From(ctx).Warn("linked-import stdlib re-evaluation failed - stdlib findings remain unfiltered", "error", err)
-				gp.AddMessage(fmt.Sprintf("stdlib: linked-import re-evaluation failed (%v) - findings not filtered by artifact reachability", err))
-			} else {
-				bumps, messages = filteredBumps, filteredMessages
-			}
+		if bumps, messages, err = s.filterByLinkedStd(ctx, gp, in, bumps, messages); err != nil {
+			return err
 		}
 	}
 
@@ -175,6 +135,72 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 		logging.From(ctx).Debug("stdlib staleness check found nothing to fix")
 	}
 	return nil
+}
+
+// commitInfo looks up the melange file's last commit for the staleness
+// estimate. A nil info means skip: the reason is already reported (a
+// message, or a skip warning), and the error is non-nil only for a
+// cancellation, which must propagate. A shallow history is warned about
+// but proceeds.
+func (s *StdlibStage) commitInfo(ctx context.Context, gp *GoBumpProcessor) (*git.FileCommitInfo, error) {
+	info, err := s.lastCommit(ctx, gp.GetFilePath())
+	switch {
+	case errors.Is(err, git.ErrNotInRepository):
+		gp.AddMessage("stdlib: melange file is not in a git repository - skipping stdlib staleness check")
+		return nil, nil
+	case errors.Is(err, git.ErrUntracked):
+		gp.AddMessage("stdlib: melange file has no commit history - skipping stdlib staleness check")
+		return nil, nil
+	case err != nil:
+		return nil, cancelledOr(ctx, func() {
+			s.skipWarn(ctx, gp, fmt.Sprintf("stdlib: could not determine the melange file's last commit (%v) - skipping stdlib staleness check", err))
+		})
+	}
+	if info.Dirty {
+		// The idempotency guard: an epoch bump this tool wrote on a previous
+		// run (or any other pending edit) makes the file dirty; re-running
+		// must not stack further bumps until the change is committed.
+		gp.AddMessage("stdlib: melange file has uncommitted changes - skipping stdlib staleness check (a bump may already be pending)")
+		return nil, nil
+	}
+	if info.Shallow {
+		logging.From(ctx).Warn("melange repository history is shallow - stdlib staleness estimate may assume a newer toolchain than reality",
+			"commit_time", info.Time)
+		gp.AddMessage("stdlib: repository history is shallow - the assumed build toolchain may be newer than reality")
+	}
+	return info, nil
+}
+
+// filterByLinkedStd re-evaluates the staleness findings against the linked
+// stdlib set from a fallback checkout (see checkoutLinkedStd). Any failure
+// fails OPEN: the unfiltered (Validated=false) bumps and messages are
+// returned unchanged. A cancellation is the one failure that must NOT fail
+// open - it means stop, not "proceed unfiltered" - and is the only error
+// returned.
+func (s *StdlibStage) filterByLinkedStd(ctx context.Context, gp *GoBumpProcessor, in stdlibInput, bumps []StdlibBump, messages []string) ([]StdlibBump, []string, error) {
+	linked, err := s.linkStd(ctx, gp)
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, nil, cerr
+		}
+		logging.From(ctx).Warn("could not determine linked stdlib packages - stdlib findings remain unfiltered", "error", err)
+		gp.AddMessage(fmt.Sprintf("stdlib: could not determine linked stdlib packages (%v) - findings not filtered by artifact reachability", err))
+		return bumps, messages, nil
+	}
+	if linked == nil {
+		return bumps, messages, nil
+	}
+	in.Linked, in.Validated = linked, true
+	filteredBumps, filteredMessages, err := evaluateStdlibStaleness(ctx, s.index, s.scanner, in)
+	if err != nil {
+		if cerr := ctx.Err(); cerr != nil {
+			return nil, nil, cerr
+		}
+		logging.From(ctx).Warn("linked-import stdlib re-evaluation failed - stdlib findings remain unfiltered", "error", err)
+		gp.AddMessage(fmt.Sprintf("stdlib: linked-import re-evaluation failed (%v) - findings not filtered by artifact reachability", err))
+		return bumps, messages, nil
+	}
+	return filteredBumps, filteredMessages, nil
 }
 
 // checkoutLinkedStd clones the package's source (reusing the vulnerability
