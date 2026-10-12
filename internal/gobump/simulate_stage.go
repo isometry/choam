@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
 
 	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
@@ -151,7 +150,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 				Tags:            m.BuildTags,
 				Arches:          m.BuildArches,
 				Env:             m.BuildEnv,
-				VulnImports:     vulnImportPaths(m.ScanResult),
+				VulnImports:     vulnImports(m.ScanResult),
 				BaselineVulnIDs: baselineVulnIDs(m.ScanResult),
 				Engine:          m.BumpEngine,
 				NoTidy:          m.BumpNoTidy,
@@ -268,7 +267,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 					"module", dropped.Module, "version", dropped.Version, "reason", dropped.Reason)
 			}
 			for _, h := range result.HygieneModules {
-				hygieneProposed[h.Module], hygieneProposed[trimMajorSuffix(h.Module)] = true, true
+				hygieneProposed[h.Module], hygieneProposed[ecogolang.TrimMajorSuffix(h.Module)] = true, true
 				gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s@%s proposed for scanners (%s; vulnerable package not linked, not a security fix)",
 					m.Modroot, h.Module, h.Version, strings.Join(h.VulnIDs, ", ")))
 			}
@@ -398,18 +397,14 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 		}
 		// OSV names v2+ modules without the /vN path suffix that
 		// FilterBumps normalizes in.
-		return bumpByModule[trimMajorSuffix(module)]
+		return bumpByModule[ecogolang.TrimMajorSuffix(module)]
 	}
 
 	seeds := make([]simulate.Candidate, 0, len(m.DesiredDeps)+len(m.ExistingReplaces))
 
 	for _, replace := range m.ExistingReplaces {
-		coord, version, ok := splitCoordVersion(replace)
+		oldPath, newPath, version, ok := ecogolang.ParseReplace(replace)
 		if !ok {
-			continue
-		}
-		oldPath, newPath, found := strings.Cut(coord, "=")
-		if !found {
 			continue // not gobump grammar; leave to the loop's residual reporting
 		}
 		candidate := simulate.Candidate{
@@ -499,7 +494,7 @@ func degradedUnlinkedSet(result *simulate.ModrootResult) map[string]struct{} {
 	set := make(map[string]struct{}, len(result.UnrequiredModules))
 	for module := range result.UnrequiredModules {
 		set[module] = struct{}{}
-		trimmed := trimMajorSuffix(module)
+		trimmed := ecogolang.TrimMajorSuffix(module)
 		if trimmed == module {
 			continue
 		}
@@ -566,7 +561,7 @@ func (r *reachabilityDiff) observe(m ModrootAnalysis, linkedModules, linkedPacka
 		// vulnerability records carry OSV's own naming, which drops v2+
 		// path suffixes - tolerate the mismatch in the linked direction.
 		for candidate := range linkedModules {
-			if trimMajorSuffix(candidate) == module {
+			if ecogolang.TrimMajorSuffix(candidate) == module {
 				return true
 			}
 		}
@@ -580,21 +575,6 @@ func (r *reachabilityDiff) observe(m ModrootAnalysis, linkedModules, linkedPacka
 			importsByID[vuln.ID] = vuln.VulnerableImports
 		}
 	}
-	packagesLinked := func(vulnID string) bool {
-		imports := importsByID[vulnID]
-		if linkedPackages == nil || len(imports) == 0 {
-			return true // unknown either way - fail open
-		}
-		for _, imp := range imports {
-			if imp.Path == "" {
-				return true
-			}
-			if _, ok := linkedPackages[imp.Path]; ok {
-				return true
-			}
-		}
-		return false
-	}
 
 	record := func(module string, vulnIDs []string) {
 		if len(vulnIDs) == 0 {
@@ -602,7 +582,7 @@ func (r *reachabilityDiff) observe(m ModrootAnalysis, linkedModules, linkedPacka
 		}
 		modLinked := moduleLinked(module)
 		for _, id := range vulnIDs {
-			if modLinked && packagesLinked(id) {
+			if modLinked && scan.ImportsLinked(importsByID[id], linkedPackages) {
 				r.reachableIDs[id] = struct{}{}
 				continue
 			}
@@ -689,25 +669,25 @@ func (r *reachabilityDiff) finalize() ([]string, []unreachableModule) {
 	return ids, modules
 }
 
-// vulnImportPaths projects a modroot's analysis findings onto advisory ID ->
-// vulnerable import paths, for threading into the simulation (seed advisories
-// were scanned before the checkout exists).
-func vulnImportPaths(scanResult *scan.ScanResult) map[string][]string {
+// vulnImports projects a modroot's analysis findings onto advisory ID ->
+// vulnerable imports, for threading into the simulation (seed advisories
+// were scanned before the checkout exists; see
+// simulate.ModrootRequest.VulnImports). Advisories without import metadata
+// are omitted. Nil when nothing is known.
+func vulnImports(scanResult *scan.ScanResult) map[string][]scan.VulnerableImport {
 	if scanResult == nil {
 		return nil
 	}
-	paths := make(map[string][]string)
+	imports := make(map[string][]scan.VulnerableImport)
 	for _, vuln := range scanResult.Vulnerabilities {
-		for _, imp := range vuln.VulnerableImports {
-			if imp.Path != "" {
-				paths[vuln.ID] = append(paths[vuln.ID], imp.Path)
-			}
+		if len(vuln.VulnerableImports) > 0 {
+			imports[vuln.ID] = append(imports[vuln.ID], vuln.VulnerableImports...)
 		}
 	}
-	if len(paths) == 0 {
+	if len(imports) == 0 {
 		return nil
 	}
-	return paths
+	return imports
 }
 
 // baselineVulnIDs collects the advisory IDs the analysis scan found in the
@@ -723,23 +703,6 @@ func baselineVulnIDs(scanResult *scan.ScanResult) map[string]struct{} {
 		ids[vuln.ID] = struct{}{}
 	}
 	return ids
-}
-
-// trimMajorSuffix strips a trailing /vN major-version path element
-// (e.g. github.com/foo/bar/v2 -> github.com/foo/bar).
-func trimMajorSuffix(module string) string {
-	idx := strings.LastIndex(module, "/")
-	if idx < 0 {
-		return module
-	}
-	last := module[idx+1:]
-	if len(last) < 2 || last[0] != 'v' {
-		return module
-	}
-	if _, err := strconv.Atoi(last[1:]); err != nil {
-		return module
-	}
-	return module[:idx]
 }
 
 // pristineGoBaseline is the Go language version the modroot's own pristine

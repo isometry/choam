@@ -123,11 +123,7 @@ func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bump
 
 	for i := range bumpSteps {
 		step := &bumpSteps[i]
-		language := step.Language
-		if language == "" {
-			language = "go" // legacy go/bump and language-less bump steps default to go
-		}
-		for _, sets := range add(language, step.Modroots, nil, nil) {
+		for _, sets := range add(step.EffectiveLanguage(), step.Modroots, nil, nil) {
 			if sets.step == nil {
 				sets.step = step
 			}
@@ -257,46 +253,38 @@ func scanBuildSteps(ctx context.Context, cfg *melange.Configuration) buildStepSc
 	render := newLenientRenderer(ctx, cfg)
 	arches := goTargetArches(ctx, cfg)
 
-	collect := func(steps []melange.Pipeline) {
-		for i := range steps {
-			step := &steps[i]
-			var unit analysisUnit
-			language := "go"
-			switch step.Uses {
-			case "go/install":
-				var ok bool
-				if unit, ok = goInstallUnit(step, render, &result); !ok {
-					continue
-				}
-			default:
-				var ok bool
-				if language, ok = buildStepSignals[step.Uses]; !ok {
-					continue
-				}
-				unit = analysisUnit{
-					Modroot:  cmp.Or(render.value(step.With["modroot"]), "."),
-					Packages: strings.Fields(render.value(step.With["packages"])),
-				}
-				if step.Uses != "go/build" {
-					break
-				}
-				unit.Tags, unit.GoMinor = goStepTags(step, render)
+	config.ForEachPipelineStep(cfg, func(step *melange.Pipeline) {
+		var unit analysisUnit
+		language := "go"
+		switch step.Uses {
+		case "go/install":
+			var ok bool
+			if unit, ok = goInstallUnit(step, render, &result); !ok {
+				return
 			}
-			if language == "go" {
-				experiments := step.With["experiments"]
-				unit.Arches = arches
-				unit.Env, _ = buildEnv(step.Uses+" (modroot "+unit.Modroot+")",
-					mergedEnv(cfg.Environment.Environment, step.Environment), &experiments, render, result.notes)
-				unit.envs = []simulate.BuildEnv{unit.Env}
+		default:
+			var ok bool
+			if language, ok = buildStepSignals[step.Uses]; !ok {
+				return
 			}
-			result.units[language] = append(result.units[language], unit)
+			unit = analysisUnit{
+				Modroot:  cmp.Or(render.value(step.With["modroot"]), "."),
+				Packages: strings.Fields(render.value(step.With["packages"])),
+			}
+			if step.Uses != "go/build" {
+				break
+			}
+			unit.Tags, unit.GoMinor = goStepTags(step, render)
 		}
-	}
-
-	collect(cfg.Pipeline)
-	for _, subpkg := range cfg.Subpackages {
-		collect(subpkg.Pipeline)
-	}
+		if language == "go" {
+			experiments := step.With["experiments"]
+			unit.Arches = arches
+			unit.Env, _ = buildEnv(step.Uses+" (modroot "+unit.Modroot+")",
+				mergedEnv(cfg.Environment.Environment, step.Environment), &experiments, render, result.notes)
+			unit.envs = []simulate.BuildEnv{unit.Env}
+		}
+		result.units[language] = append(result.units[language], unit)
+	})
 	slices.Sort(result.versionedInstalls)
 	return result
 }
@@ -486,17 +474,20 @@ func mergeBuildEnvs(modroot string, envs []simulate.BuildEnv, notes map[string]s
 }
 
 // lenientRenderer renders melange template expressions in step fields,
-// tolerating failure (see value and full).
+// tolerating failure (see value and full, and config.Renderer.RenderOrRaw).
 type lenientRenderer struct {
 	ctx      context.Context
 	renderer *config.Renderer
 }
 
 func newLenientRenderer(ctx context.Context, cfg *melange.Configuration) lenientRenderer {
-	renderer, err := config.NewRenderer(cfg)
-	if err != nil {
-		logging.From(ctx).Debug("could not build template renderer for build-step discovery", "error", err)
-		renderer = nil
+	var renderer *config.Renderer
+	if cfg != nil {
+		var err error
+		if renderer, err = config.NewRenderer(cfg); err != nil {
+			logging.From(ctx).Debug("could not build template renderer; templated values stay raw", "error", err)
+			renderer = nil
+		}
 	}
 	return lenientRenderer{ctx: ctx, renderer: renderer}
 }
@@ -504,24 +495,13 @@ func newLenientRenderer(ctx context.Context, cfg *melange.Configuration) lenient
 // full renders value, reporting whether it rendered completely (no template
 // expression left).
 func (r lenientRenderer) full(value string) (string, bool) {
-	if !strings.Contains(value, "${{") {
-		return value, true
-	}
-	if r.renderer == nil {
-		return value, false
-	}
-	rendered, err := r.renderer.RenderString(value)
-	if err != nil {
-		logging.From(r.ctx).Debug("could not render build-step field", "value", value, "error", err)
-		return value, false
-	}
+	rendered := r.value(value)
 	return rendered, !strings.Contains(rendered, "${{")
 }
 
 // value renders value, keeping it raw when it does not render.
 func (r lenientRenderer) value(value string) string {
-	rendered, _ := r.full(value)
-	return rendered
+	return r.renderer.RenderOrRaw(r.ctx, value)
 }
 
 // splitBuildTags splits go/build's comma-separated tag lists (tolerating

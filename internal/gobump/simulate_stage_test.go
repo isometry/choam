@@ -226,14 +226,6 @@ func TestSimulationStage_ShouldRunGates(t *testing.T) {
 	})
 }
 
-func TestTrimMajorSuffix(t *testing.T) {
-	assert.Equal(t, "github.com/foo/bar", trimMajorSuffix("github.com/foo/bar/v2"))
-	assert.Equal(t, "github.com/foo/bar/v2x", trimMajorSuffix("github.com/foo/bar/v2x"))
-	assert.Equal(t, "gopkg.in/yaml.v2", trimMajorSuffix("gopkg.in/yaml.v2"))
-	assert.Equal(t, "example.com/verystuff", trimMajorSuffix("example.com/verystuff"))
-	assert.Equal(t, "module", trimMajorSuffix("module"))
-}
-
 func TestSimulationStage_ReplacesFoldBackAndSeeds(t *testing.T) {
 	fake := &fakeBumpSimulator{
 		results: map[string]*simulate.ModrootResult{
@@ -1044,4 +1036,20 @@ func TestSimulationStage_ThreadsEngine(t *testing.T) {
 	assert.True(t, fake.gotReqs[0].NoTidy)
 	assert.Equal(t, "", fake.gotReqs[0].GoVersion, "no go-package pin: the host go")
 	assert.Contains(t, gp.GetMessages(), "simulation: uses: bump applied with omnibump "+simulate.OmnibumpVersion())
+}
+
+// TestVulnImports: the seed-side projection keeps every import entry (the
+// pathless and GOOS-constrained ones included - scan.ImportsLinked judges
+// them) and omits advisories without metadata.
+func TestVulnImports(t *testing.T) {
+	assert.Nil(t, vulnImports(nil))
+	assert.Nil(t, vulnImports(&scan.ScanResult{Vulnerabilities: []scan.Vulnerability{{ID: "GO-NONE"}}}))
+
+	windows := scan.VulnerableImport{Path: "golang.org/x/sys/windows", GOOS: []string{"windows"}}
+	pathless := scan.VulnerableImport{GOOS: []string{"linux"}}
+	got := vulnImports(&scan.ScanResult{Vulnerabilities: []scan.Vulnerability{
+		{ID: "GO-A", VulnerableImports: []scan.VulnerableImport{windows, pathless}},
+		{ID: "GO-NONE"},
+	}})
+	assert.Equal(t, map[string][]scan.VulnerableImport{"GO-A": {windows, pathless}}, got)
 }

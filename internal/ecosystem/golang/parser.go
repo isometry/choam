@@ -3,6 +3,7 @@ package golang
 import (
 	"fmt"
 	"maps"
+	"strconv"
 	"strings"
 
 	"golang.org/x/mod/modfile"
@@ -128,4 +129,36 @@ func (p *parser) parseGoModWithSum(goModContent, goSumContent []byte) (*GoModInf
 	}
 
 	return goModInfo, nil
+}
+
+// ParseReplace parses a bump step's replaces entry, "old=new@version" (the
+// version split on the LAST "@", so old may carry its own "@version"); ok is
+// false for an entry without "@" or without "=".
+func ParseReplace(entry string) (oldPath, newPath, version string, ok bool) {
+	idx := strings.LastIndex(entry, "@")
+	if idx < 0 {
+		return "", "", "", false
+	}
+	oldPath, newPath, ok = strings.Cut(entry[:idx], "=")
+	if !ok {
+		return "", "", "", false
+	}
+	return oldPath, newPath, entry[idx+1:], true
+}
+
+// TrimMajorSuffix strips a trailing /vN major-version path element
+// (e.g. github.com/foo/bar/v2 -> github.com/foo/bar).
+func TrimMajorSuffix(module string) string {
+	idx := strings.LastIndex(module, "/")
+	if idx < 0 {
+		return module
+	}
+	last := module[idx+1:]
+	if len(last) < 2 || last[0] != 'v' {
+		return module
+	}
+	if _, err := strconv.Atoi(last[1:]); err != nil {
+		return module
+	}
+	return module[:idx]
 }

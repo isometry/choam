@@ -457,6 +457,15 @@ type BumpStep struct {
 	Replaces  []string // parsed with.replaces entries ("old=new@version")
 }
 
+// EffectiveLanguage is the language the step bumps: its with.language, or
+// "go" when absent (legacy go/bump and language-less bump steps are Go).
+func (s BumpStep) EffectiveLanguage() string {
+	if s.Language == "" {
+		return "go"
+	}
+	return s.Language
+}
+
 // FindBumpSteps finds all bump and go/bump pipeline steps, in pipeline order,
 // with their modroot and deps fields parsed.
 func (l *Loader) FindBumpSteps(yamlContent []byte) ([]BumpStep, error) {

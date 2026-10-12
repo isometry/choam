@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
 	"github.com/isometry/choam/internal/gorelease"
 	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/logging"
@@ -122,11 +123,7 @@ func fallbackCandidates(m *ModrootAnalysis) []moduleVersion {
 		}
 	}
 	for _, replace := range m.DesiredReplaces {
-		coord, version, ok := splitCoordVersion(replace)
-		if !ok {
-			continue
-		}
-		if _, newPath, found := strings.Cut(coord, "="); found {
+		if _, newPath, version, ok := ecogolang.ParseReplace(replace); ok {
 			add(newPath, version)
 		}
 	}

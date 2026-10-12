@@ -146,7 +146,7 @@ func TestRunLoop_SecondPassMatches_GateRejectedPin(t *testing.T) {
 		result, err := RunLoop(t.Context(), newTC(), sc, newTestModuleDir(t), ModrootRequest{
 			Modroot:     ".",
 			Seeds:       seeds,
-			VulnImports: map[string][]string{"GO-O": {jws.Path}},
+			VulnImports: map[string][]scan.VulnerableImport{"GO-O": {{Path: jws.Path}}},
 			Baseline:    map[string]string{"example.com/k": "v1.0.0", "example.com/o": "v1.0.0"},
 		}, Options{})
 		require.NoError(t, err)

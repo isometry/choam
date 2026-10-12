@@ -125,12 +125,10 @@ var (
 
 // vulnImportsOf is ModrootRequest.VulnImports for a fake scanner's
 // advisories (the analysis scan's metadata).
-func vulnImportsOf(sc *fakeScanner) map[string][]string {
-	imports := make(map[string][]string)
+func vulnImportsOf(sc *fakeScanner) map[string][]scan.VulnerableImport {
+	imports := make(map[string][]scan.VulnerableImport)
 	for _, adv := range sc.advisories {
-		for _, imp := range adv.imports {
-			imports[adv.id] = append(imports[adv.id], imp.Path)
-		}
+		imports[adv.id] = append(imports[adv.id], adv.imports...)
 	}
 	return imports
 }

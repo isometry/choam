@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
@@ -37,7 +35,7 @@ type StdlibStage struct {
 	// and narrow interfaces defaulting to the real implementations.
 	lastCommit func(ctx context.Context, filePath string) (*git.FileCommitInfo, error)
 	index      goReleaseIndex
-	scanner    stdlibScanner
+	scanner    simulate.Scanner
 
 	// linkStd computes the artifact-linked stdlib import set from a fresh
 	// source checkout - the fallback used only when the simulation didn't
@@ -211,38 +209,15 @@ func (s *StdlibStage) checkoutLinkedStd(ctx context.Context, gp *GoBumpProcessor
 	ctx, cancel := context.WithTimeout(ctx, simOpts.Budget)
 	defer cancel()
 
-	cloneDir, err := os.MkdirTemp(s.Options.TempDir, "choam-stdlib-*")
+	cloneDir, cleanup, err := simulate.Checkout(ctx, git.New(), analysis.RepoURL, analysis.Tag, analysis.ExpectedCommit, s.Options.TempDir, "stdlib")
 	if err != nil {
-		return nil, fmt.Errorf("creating stdlib checkout directory: %w", err)
+		return nil, err
 	}
-	defer func() {
-		if err := os.RemoveAll(cloneDir); err != nil {
-			logging.From(ctx).Debug("could not remove stdlib checkout directory", "dir", cloneDir, "error", err)
-		}
-	}()
-
-	gitClient := git.New()
-	logging.From(ctx).Debug("cloning source for stdlib reachability", "repository", analysis.RepoURL, "tag", analysis.Tag, "dir", cloneDir)
-	if err := gitClient.CloneAtTag(ctx, analysis.RepoURL, analysis.Tag, cloneDir); err != nil {
-		return nil, fmt.Errorf("cloning %s at %s: %w", analysis.RepoURL, analysis.Tag, err)
-	}
-	if analysis.ExpectedCommit != "" {
-		// Warn-only, mirroring the simulator: melange enforces it at build time.
-		if head, err := gitClient.HeadCommit(ctx, cloneDir); err != nil {
-			logging.From(ctx).Warn("could not verify expected commit for stdlib checkout", "error", err)
-		} else if head != analysis.ExpectedCommit {
-			logging.From(ctx).Warn("stdlib checkout does not match expected-commit; using the tag's actual state",
-				"tag", analysis.Tag, "expected", analysis.ExpectedCommit, "actual", head)
-		}
-	}
+	defer cleanup()
 
 	union := make(map[string]struct{})
 	for _, unit := range scan.units["go"] {
-		dir := cloneDir
-		if unit.Modroot != "" && unit.Modroot != "." {
-			dir = filepath.Join(cloneDir, filepath.FromSlash(unit.Modroot))
-		}
-		std, err := toolchain.LinkedStd(ctx, dir, simulate.BuildTarget{Patterns: unit.Packages, Tags: unit.Tags, Arches: unit.Arches, Env: unit.Env})
+		std, err := toolchain.LinkedStd(ctx, simulate.ModrootDir(cloneDir, unit.Modroot), simulate.BuildTarget{Patterns: unit.Packages, Tags: unit.Tags, Arches: unit.Arches, Env: unit.Env})
 		if err != nil {
 			return nil, fmt.Errorf("computing linked stdlib packages for modroot %s: %w", unit.Modroot, err)
 		}

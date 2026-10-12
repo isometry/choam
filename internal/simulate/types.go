@@ -379,12 +379,12 @@ type ModrootRequest struct {
 	Arches []string
 	// Env is the build environment the spec sets (see BuildEnv).
 	Env BuildEnv
-	// VulnImports maps each seed advisory ID to the import paths its
-	// vulnerable code lives in (from the analysis scan's OSV metadata; see
+	// VulnImports maps each seed advisory ID to its vulnerable imports (from
+	// the analysis scan's OSV metadata; see
 	// scan.Vulnerability.VulnerableImports). Seed candidates whose
 	// advisories all live in unlinked packages are dropped before the
-	// first apply. Absent/empty entries fail open.
-	VulnImports map[string][]string
+	// first apply. Absent/empty entries fail open (see scan.ImportsLinked).
+	VulnImports map[string][]scan.VulnerableImport
 	// BaselineVulnIDs are the advisory IDs the analysis scan found in the
 	// pristine graph. Residual advisories with no ID in this set were
 	// INTRODUCED by the bump (they apply only to a bumped-to version) and

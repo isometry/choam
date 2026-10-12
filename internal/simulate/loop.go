@@ -1158,42 +1158,15 @@ func (l *loop) trimUnlinkedRungs(c *candState) bool {
 
 // seedVulnPackagesLinked reports whether any of the given seed advisories'
 // vulnerable packages (threaded in via ModrootRequest.VulnImports) is in the
-// artifact's import graph. Fail open everywhere data is missing: unknown
-// package graph, no IDs, an ID without import metadata, or a pathless entry
-// all count as linked.
+// artifact's import graph (see scan.ImportsLinked). Fail open everywhere
+// data is missing: unknown package graph, no IDs, or an ID without import
+// metadata all count as linked.
 func (l *loop) seedVulnPackagesLinked(vulnIDs []string) bool {
 	if l.linkedPackages == nil || len(vulnIDs) == 0 {
 		return true
 	}
 	for _, id := range vulnIDs {
-		paths, known := l.req.VulnImports[id]
-		if !known || len(paths) == 0 {
-			return true
-		}
-		for _, path := range paths {
-			if path == "" {
-				return true
-			}
-			if _, linked := l.linkedPackages[path]; linked {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// vulnApplies reports whether a rescan finding's vulnerable packages (from
-// its own OSV metadata) intersect the artifact's import graph. Fail open
-// when either side is unknown.
-func (l *loop) vulnApplies(v scan.Vulnerability) bool {
-	if l.linkedPackages == nil || len(v.VulnerableImports) == 0 {
-		return true
-	}
-	for _, imp := range v.VulnerableImports {
-		if imp.Path == "" {
-			return true
-		}
-		if _, linked := l.linkedPackages[imp.Path]; linked {
+		if scan.ImportsLinked(l.req.VulnImports[id], l.linkedPackages) {
 			return true
 		}
 	}
@@ -1363,7 +1336,7 @@ func (l *loop) upstreamHoldBack(module string) string {
 func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]string) ([]raise, []Residual, []raise) {
 	applies := make(map[string]bool, len(scanResult.Vulnerabilities))
 	for _, vuln := range scanResult.Vulnerabilities {
-		applies[vuln.ID] = l.vulnApplies(vuln)
+		applies[vuln.ID] = scan.ImportsLinked(vuln.VulnerableImports, l.linkedPackages)
 	}
 
 	noFixByModule := make(map[string]*Residual)

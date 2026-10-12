@@ -1,11 +1,15 @@
 package config
 
 import (
+	"context"
 	"fmt"
 	"strconv"
+	"strings"
 
 	"chainguard.dev/melange/pkg/cond"
 	melange "chainguard.dev/melange/pkg/config"
+
+	"github.com/isometry/choam/internal/logging"
 )
 
 // Renderer provides variable rendering for melange configurations
@@ -149,4 +153,37 @@ func (r *Renderer) RenderString(template string) (string, error) {
 	}
 
 	return result, nil
+}
+
+// RenderOrRaw renders a value leniently: a value with no template
+// expression, a nil renderer, or a render error all keep the raw value (the
+// error is logged at debug). Callers that must know whether a value
+// rendered completely check the result for a leftover "${{".
+func (r *Renderer) RenderOrRaw(ctx context.Context, value string) string {
+	if r == nil || !strings.Contains(value, "${{") {
+		return value
+	}
+	rendered, err := r.RenderString(value)
+	if err != nil {
+		logging.From(ctx).Debug("could not render templated value; keeping it raw", "value", value, "error", err)
+		return value
+	}
+	return rendered
+}
+
+// ForEachPipelineStep calls fn for every step of the top-level pipeline,
+// then of each subpackage's pipeline, in order.
+func ForEachPipelineStep(cfg *melange.Configuration, fn func(step *melange.Pipeline)) {
+	if cfg == nil {
+		return
+	}
+	for i := range cfg.Pipeline {
+		fn(&cfg.Pipeline[i])
+	}
+	for s := range cfg.Subpackages {
+		steps := cfg.Subpackages[s].Pipeline
+		for i := range steps {
+			fn(&steps[i])
+		}
+	}
 }

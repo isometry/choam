@@ -15,6 +15,7 @@ import (
 	melange "chainguard.dev/melange/pkg/config"
 	"github.com/isometry/choam/internal/config"
 	"github.com/isometry/choam/internal/ecosystem"
+	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
 	"github.com/isometry/choam/internal/goproxy"
 	"github.com/isometry/choam/internal/gorelease"
 	"github.com/isometry/choam/internal/goversion"
@@ -922,11 +923,7 @@ func (g *GoBumpApplier) reconcileLanguageBumpSteps(ctx context.Context, gp *GoBu
 
 	var existingSteps []config.BumpStep
 	for _, step := range allSteps {
-		stepLanguage := step.Language
-		if stepLanguage == "" {
-			stepLanguage = "go"
-		}
-		if stepLanguage == langAnalysis.Language {
+		if step.EffectiveLanguage() == langAnalysis.Language {
 			existingSteps = append(existingSteps, step)
 		}
 	}
@@ -1268,7 +1265,7 @@ func addedAcrossRoots(byModroot []ModrootAnalysis) []string {
 			if _, ok := securityModules[module]; ok {
 				return true
 			}
-			_, ok := securityModules[trimMajorSuffix(module)]
+			_, ok := securityModules[ecogolang.TrimMajorSuffix(module)]
 			return ok
 		}
 
@@ -1294,7 +1291,7 @@ func addedAcrossRoots(byModroot []ModrootAnalysis) []string {
 			if !ok {
 				continue
 			}
-			if _, newPath, found := strings.Cut(coord, "="); found {
+			if _, newPath, _, isReplace := ecogolang.ParseReplace(replace); isReplace {
 				coord = newPath
 			}
 			if !isSecurityModule(coord) {
@@ -1380,7 +1377,7 @@ func bumpDetails(langAnalysis LanguageAnalysis) func(module string) bumpDetail {
 		if detail, ok := byModule[module]; ok {
 			return detail
 		}
-		return byModule[trimMajorSuffix(module)]
+		return byModule[ecogolang.TrimMajorSuffix(module)]
 	}
 }
 

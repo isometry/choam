@@ -80,3 +80,30 @@ github.com/sum/only v1.2.3/go.mod h1:hash=
 		assert.Equal(t, "v1.2.3", info.AllRequirements["github.com/sum/only"])
 	})
 }
+
+func TestParseReplace(t *testing.T) {
+	tests := []struct {
+		entry                 string
+		oldPath, newPath, ver string
+		ok                    bool
+	}{
+		{"github.com/a/b=github.com/c/d@v1.2.3", "github.com/a/b", "github.com/c/d", "v1.2.3", true},
+		{"github.com/a/b@v1.0.0=github.com/c/d@v1.2.3", "github.com/a/b@v1.0.0", "github.com/c/d", "v1.2.3", true},
+		{"github.com/a/b=github.com/a/b@v1.2.3", "github.com/a/b", "github.com/a/b", "v1.2.3", true},
+		{"github.com/c/d@v1.2.3", "", "", "", false},
+		{"github.com/a/b=github.com/c/d", "", "", "", false},
+		{"", "", "", "", false},
+	}
+	for _, tt := range tests {
+		oldPath, newPath, ver, ok := ParseReplace(tt.entry)
+		assert.Equal(t, []any{tt.oldPath, tt.newPath, tt.ver, tt.ok}, []any{oldPath, newPath, ver, ok}, tt.entry)
+	}
+}
+
+func TestTrimMajorSuffix(t *testing.T) {
+	assert.Equal(t, "github.com/foo/bar", TrimMajorSuffix("github.com/foo/bar/v2"))
+	assert.Equal(t, "github.com/foo/bar/v2x", TrimMajorSuffix("github.com/foo/bar/v2x"))
+	assert.Equal(t, "gopkg.in/yaml.v2", TrimMajorSuffix("gopkg.in/yaml.v2"))
+	assert.Equal(t, "example.com/verystuff", TrimMajorSuffix("example.com/verystuff"))
+	assert.Equal(t, "module", TrimMajorSuffix("module"))
+}

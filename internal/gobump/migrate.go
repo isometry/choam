@@ -155,6 +155,8 @@ func migrateStep(gp *GoBumpProcessor, yamlContent []byte, step config.BumpStep, 
 		return nil, fmt.Errorf("rewriting uses: %w", err)
 	}
 	yamlContent = updated
+	// The raw value, not EffectiveLanguage: write language: go only when the
+	// step does not already say it.
 	if step.Language == "" {
 		if yamlContent, err = loader.SpliceIntoWith(yamlContent, fmt.Sprintf("$.pipeline[%d].with", step.Index), []string{"language: go"}); err != nil {
 			return nil, fmt.Errorf("adding language: %w", err)

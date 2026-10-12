@@ -64,32 +64,25 @@ func goToolchainPins(ctx context.Context, cfg *melange.Configuration) []GoToolch
 
 	render := newLenientRenderer(ctx, cfg).value
 
-	collect := func(steps []melange.Pipeline) {
-		for _, step := range steps {
-			if _, ok := goToolchainSteps[step.Uses]; !ok {
-				continue
-			}
-
-			raw := step.With["go-package"]
-			if raw == "" {
-				pins = append(pins, GoToolchainPin{})
-				continue
-			}
-
-			pkg := render(raw)
-			_, minor, ok := parseGoPackagePin(pkg)
-			if !ok {
-				pins = append(pins, GoToolchainPin{Package: pkg})
-				continue
-			}
-			pins = append(pins, GoToolchainPin{Package: pkg, Minor: minor})
+	config.ForEachPipelineStep(cfg, func(step *melange.Pipeline) {
+		if _, ok := goToolchainSteps[step.Uses]; !ok {
+			return
 		}
-	}
 
-	collect(cfg.Pipeline)
-	for _, subpkg := range cfg.Subpackages {
-		collect(subpkg.Pipeline)
-	}
+		raw := step.With["go-package"]
+		if raw == "" {
+			pins = append(pins, GoToolchainPin{})
+			return
+		}
+
+		pkg := render(raw)
+		_, minor, ok := parseGoPackagePin(pkg)
+		if !ok {
+			pins = append(pins, GoToolchainPin{Package: pkg})
+			return
+		}
+		pins = append(pins, GoToolchainPin{Package: pkg, Minor: minor})
+	})
 
 	return pins
 }
@@ -171,25 +164,7 @@ func (g *GoBumpApplier) reconcileGoPackagePins(ctx context.Context, gp *GoBumpPr
 		return nil
 	}
 
-	var renderer *config.Renderer
-	if gp.Config != nil {
-		renderer, err = config.NewRenderer(gp.Config)
-		if err != nil {
-			logging.From(ctx).Debug("could not build template renderer for go-package pin reconciliation", "error", err)
-			renderer = nil
-		}
-	}
-	render := func(value string) string {
-		if renderer == nil || !strings.Contains(value, "${{") {
-			return value
-		}
-		r, err := renderer.RenderString(value)
-		if err != nil {
-			logging.From(ctx).Debug("could not render templated value during pin reconciliation", "value", value, "error", err)
-			return value
-		}
-		return r
-	}
+	render := newLenientRenderer(ctx, gp.Config)
 
 	// pinFloor is the Go version the given pin must satisfy: floors[modroot]
 	// for go/build (its templated modroot rendered), maxFloor for go/install.
@@ -198,7 +173,7 @@ func (g *GoBumpApplier) reconcileGoPackagePins(ctx context.Context, gp *GoBumpPr
 		if pin.Uses == "go/install" {
 			return maxFloor
 		}
-		modroot := render(pin.Modroot)
+		modroot := render.value(pin.Modroot)
 		floor, ok := floors[modroot]
 		if !ok {
 			logging.From(ctx).Debug("go-package pin modroot not in analysis - no floor, leaving untouched",
@@ -227,7 +202,7 @@ func (g *GoBumpApplier) reconcileGoPackagePins(ctx context.Context, gp *GoBumpPr
 				// This pin's target demands nothing; nothing to check.
 				continue
 			}
-			if renderer == nil {
+			if render.renderer == nil {
 				// Degraded path (no gp.Config, or the renderer failed to
 				// build): the templated value can't be evaluated at all, so
 				// raw-value parsing below would silently misjudge or skip it.
@@ -238,7 +213,7 @@ func (g *GoBumpApplier) reconcileGoPackagePins(ctx context.Context, gp *GoBumpPr
 			}
 			// Templated pin: judge the rendered value, but never edit the
 			// template - the variable behind it is the user's to update.
-			_, minor, ok := parseGoPackagePin(render(pin.Value))
+			_, minor, ok := parseGoPackagePin(render.value(pin.Value))
 			if ok && minor != "" && goversion.Compare(minor, floorMinor) < 0 {
 				gp.AddMessage(fmt.Sprintf("go-package %q (%s) is templated and resolves to Go %s, below required Go %s; update the variable manually",
 					pin.Value, where, minor, floor))

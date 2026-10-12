@@ -1518,7 +1518,7 @@ func TestRunLoop_PackageUnreachableSeedDroppedPreApply(t *testing.T) {
 			{Module: "golang.org/x/sys", Version: "v0.44.0", FromCVE: true, VulnIDs: []string{"GO-2026-5024"}},
 		},
 		Baseline:    map[string]string{"golang.org/x/sys": "v0.39.0"},
-		VulnImports: map[string][]string{"GO-2026-5024": {"golang.org/x/sys/windows"}},
+		VulnImports: map[string][]scan.VulnerableImport{"GO-2026-5024": {{Path: "golang.org/x/sys/windows"}}},
 	}, Options{})
 
 	require.NoError(t, err)
@@ -2583,7 +2583,7 @@ func TestCompileGate_RelinkedAfterGateRevivesFix(t *testing.T) {
 			{Module: "example.com/k", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-K"}},
 			{Module: "example.com/o", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-O"}},
 		},
-		VulnImports: map[string][]string{"GO-O": {jws.Path}},
+		VulnImports: map[string][]scan.VulnerableImport{"GO-O": {{Path: jws.Path}}},
 		Baseline:    map[string]string{"example.com/k": "v1.0.0", "example.com/o": "v1.0.0"},
 	}, Options{})
 
@@ -3095,4 +3095,28 @@ func TestScanFindings_HygieneSplit(t *testing.T) {
 		), resolved)
 		assert.Empty(t, hygiene)
 	})
+}
+
+// TestSeedVulnPackagesLinked pins the seed-side semantics over
+// scan.ImportsLinked: unknown graph, no IDs and unknown IDs fail open; any
+// linked advisory keeps the seed; a GOOS-excluded entry never counts.
+func TestSeedVulnPackagesLinked(t *testing.T) {
+	linked := map[string]struct{}{"golang.org/x/sys/unix": {}}
+	l := &loop{linkedPackages: linked, req: ModrootRequest{VulnImports: map[string][]scan.VulnerableImport{
+		"GO-UNIX":            {{Path: "golang.org/x/sys/unix"}},
+		"GO-WINDOWS":         {{Path: "golang.org/x/sys/windows"}},
+		"GO-EXCLUDED-LINKED": {{Path: "golang.org/x/sys/unix", GOOS: []string{"windows"}}},
+		"GO-PATHLESS-LINUX":  {{GOOS: []string{"linux"}}, {Path: "golang.org/x/sys/windows"}},
+	}}}
+
+	assert.True(t, l.seedVulnPackagesLinked(nil), "no IDs")
+	assert.True(t, l.seedVulnPackagesLinked([]string{"GO-UNKNOWN"}), "no import metadata")
+	assert.True(t, l.seedVulnPackagesLinked([]string{"GO-UNIX"}))
+	assert.False(t, l.seedVulnPackagesLinked([]string{"GO-WINDOWS"}))
+	assert.True(t, l.seedVulnPackagesLinked([]string{"GO-WINDOWS", "GO-UNIX"}), "any linked advisory")
+	assert.False(t, l.seedVulnPackagesLinked([]string{"GO-EXCLUDED-LINKED"}), "GOOS-excluded entry ignored")
+	assert.True(t, l.seedVulnPackagesLinked([]string{"GO-PATHLESS-LINUX"}), "pathless linux entry = whole module")
+
+	l.linkedPackages = nil
+	assert.True(t, l.seedVulnPackagesLinked([]string{"GO-WINDOWS"}), "unknown graph")
 }

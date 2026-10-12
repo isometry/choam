@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -12,6 +11,7 @@ import (
 	"github.com/isometry/choam/internal/gorelease"
 	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/scan"
+	"github.com/isometry/choam/internal/simulate"
 )
 
 // stdlibToolchainLagMargin models how far the distro (Wolfi) Go toolchain
@@ -34,12 +34,6 @@ type goReleaseIndex interface {
 	LatestAvailableAsOf(ctx context.Context, cutoff time.Time, minorConstraint string) (string, error)
 }
 
-// stdlibScanner is the OSV seam for the stdlib staleness check;
-// *scan.VulnerabilityScanner satisfies it.
-type stdlibScanner interface {
-	ScanPackages(ctx context.Context, pkgs []scan.Package) (*scan.ScanResult, error)
-}
-
 // stdlibInput is the package-derived state evaluateStdlibStaleness works
 // from: when the melange file was last committed (the build-time estimate),
 // which go-package pin constraints apply, and - when known - which stdlib
@@ -60,11 +54,6 @@ type stdlibInput struct {
 	// zero value defaults to time.Now(); tests set it explicitly.
 	Now time.Time
 }
-
-// stdlibTargetGOOS mirrors internal/scan's targetGOOS: melange builds linux
-// packages, so a vulnerable import GOOS-constrained to other platforms can
-// never be linked into an artifact CHOAM manages.
-const stdlibTargetGOOS = "linux"
 
 // evaluateStdlibStaleness decides, per go-package pin constraint, whether
 // rebuilding with the newest allowed Go release would fix stdlib advisories
@@ -93,7 +82,7 @@ const stdlibTargetGOOS = "linux"
 // Returns one StdlibBump per constraint with fixable, applicable advisories,
 // plus human-readable messages; any index/scan failure returns an error for the
 // caller to degrade on.
-func evaluateStdlibStaleness(ctx context.Context, index goReleaseIndex, scanner stdlibScanner, in stdlibInput) ([]StdlibBump, []string, error) {
+func evaluateStdlibStaleness(ctx context.Context, index goReleaseIndex, scanner simulate.Scanner, in stdlibInput) ([]StdlibBump, []string, error) {
 	var bumps []StdlibBump
 	var messages []string
 
@@ -211,7 +200,7 @@ func evaluateStdlibStaleness(ctx context.Context, index goReleaseIndex, scanner 
 				residualIDs = append(residualIDs, vuln.ID)
 				continue
 			}
-			if filter && !stdlibVulnLinked(vuln, in.Linked) {
+			if filter && !scan.ImportsLinked(vuln.VulnerableImports, in.Linked) {
 				unlinkedIDs = append(unlinkedIDs, vuln.ID)
 				continue
 			}
@@ -300,7 +289,7 @@ func pluralize(n int, singular, plural string) string {
 }
 
 // scanStdlib OSV-scans the Go standard library at one release version.
-func scanStdlib(ctx context.Context, scanner stdlibScanner, version string) ([]scan.Vulnerability, error) {
+func scanStdlib(ctx context.Context, scanner simulate.Scanner, version string) ([]scan.Vulnerability, error) {
 	result, err := scanner.ScanPackages(ctx, []scan.Package{{Name: "stdlib", Ecosystem: "Go", Version: version}})
 	if err != nil {
 		return nil, fmt.Errorf("scanning Go stdlib %s: %w", version, err)
@@ -309,30 +298,6 @@ func scanStdlib(ctx context.Context, scanner stdlibScanner, version string) ([]s
 		return nil, fmt.Errorf("scanning Go stdlib %s: %s", version, result.Error)
 	}
 	return result.Vulnerabilities, nil
-}
-
-// stdlibVulnLinked reports whether an advisory's vulnerable import paths
-// intersect the artifact-linked stdlib set. Fail open exactly like
-// internal/simulate's vulnApplies: no import metadata at all, or a pathless
-// entry, counts as linked. Import entries GOOS-constrained away from linux
-// are ignored (mirroring scan's applicableToTarget - such code can never be
-// in a linux artifact, and Linked itself is a GOOS=linux import graph).
-func stdlibVulnLinked(vuln scan.Vulnerability, linked map[string]struct{}) bool {
-	if len(vuln.VulnerableImports) == 0 {
-		return true
-	}
-	for _, imp := range vuln.VulnerableImports {
-		if len(imp.GOOS) > 0 && !slices.Contains(imp.GOOS, stdlibTargetGOOS) {
-			continue
-		}
-		if imp.Path == "" {
-			return true
-		}
-		if _, ok := linked[imp.Path]; ok {
-			return true
-		}
-	}
-	return false
 }
 
 // pinWord renders a go-package pin constraint for messages.
