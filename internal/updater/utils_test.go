@@ -1,7 +1,6 @@
 package updater
 
 import (
-	"os"
 	"testing"
 )
 
@@ -159,67 +158,4 @@ func TestStripVersionAffix(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestIsMelangeConfig(t *testing.T) {
-	// Create temp files for testing
-	tempDir := t.TempDir()
-
-	// Valid melange config
-	validConfig := `package:
-  name: test-package
-  version: 1.0.0
-
-pipeline:
-  - uses: fetch`
-
-	validPath := tempDir + "/valid.yaml"
-	if err := writeTestFile(validPath, validConfig); err != nil {
-		t.Fatal(err)
-	}
-
-	// Invalid config (missing required fields)
-	invalidConfig := `name: test-package
-version: 1.0.0`
-
-	invalidPath := tempDir + "/invalid.yaml"
-	if err := writeTestFile(invalidPath, invalidConfig); err != nil {
-		t.Fatal(err)
-	}
-
-	tests := []struct {
-		name     string
-		filePath string
-		expected bool
-	}{
-		{
-			name:     "valid melange config",
-			filePath: validPath,
-			expected: true,
-		},
-		{
-			name:     "invalid config",
-			filePath: invalidPath,
-			expected: false,
-		},
-		{
-			name:     "non-existent file",
-			filePath: tempDir + "/nonexistent.yaml",
-			expected: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := isMelangeConfig(tt.filePath)
-			if result != tt.expected {
-				t.Errorf("isMelangeConfig(%q) = %v, want %v", tt.filePath, result, tt.expected)
-			}
-		})
-	}
-}
-
-// Helper function to write test files
-func writeTestFile(path, content string) error {
-	return os.WriteFile(path, []byte(content), 0644)
 }

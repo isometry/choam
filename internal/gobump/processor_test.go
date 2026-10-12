@@ -583,8 +583,6 @@ func TestGoBumpProcessor_Integration(t *testing.T) {
 				// Set up vulnerability analysis
 				proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 					VulnerabilitiesFound: 3,
-					CriticalCount:        1,
-					HighCount:            2,
 					BumpActions: []BumpAction{
 						{
 							Action:       "update",

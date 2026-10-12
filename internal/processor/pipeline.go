@@ -9,10 +9,9 @@ import (
 
 // Pipeline represents a sequence of stages that operate on a processor
 type Pipeline struct {
-	Name     string
-	Stages   []Stage
-	Options  PipelineOptions
-	Registry *StageRegistry
+	Name    string
+	Stages  []Stage
+	Options PipelineOptions
 }
 
 // PipelineOptions configures pipeline behavior
@@ -25,19 +24,13 @@ type PipelineOptions struct {
 // NewPipeline creates a new pipeline
 func NewPipeline(name string) *Pipeline {
 	return &Pipeline{
-		Name:     name,
-		Stages:   make([]Stage, 0),
-		Registry: NewStageRegistry(),
+		Name:   name,
+		Stages: make([]Stage, 0),
 		Options: PipelineOptions{
 			StopOnError:    true,
 			SkipValidation: false,
 		},
 	}
-}
-
-// AddStage adds a stage to the pipeline
-func (p *Pipeline) AddStage(stage Stage) {
-	p.Stages = append(p.Stages, stage)
 }
 
 // AddStages adds multiple stages to the pipeline
@@ -128,9 +121,4 @@ func (p *Pipeline) Execute(ctx context.Context, processor Processor) error {
 		"has_errors", len(processor.GetErrors()) > 0)
 
 	return nil
-}
-
-// SetOptions configures pipeline execution options
-func (p *Pipeline) SetOptions(opts PipelineOptions) {
-	p.Options = opts
 }

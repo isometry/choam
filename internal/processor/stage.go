@@ -2,7 +2,6 @@ package processor
 
 import (
 	"context"
-	"fmt"
 )
 
 // Stage represents a single processing step
@@ -36,40 +35,6 @@ type ApplyStage interface {
 type ValidatingStage interface {
 	Stage
 	Validate(ctx context.Context, p Processor) error
-}
-
-// StageRegistry manages available stages and provides stage construction
-type StageRegistry struct {
-	stages map[string]func() Stage
-}
-
-// NewStageRegistry creates a new stage registry
-func NewStageRegistry() *StageRegistry {
-	return &StageRegistry{
-		stages: make(map[string]func() Stage),
-	}
-}
-
-// Register adds a stage constructor to the registry
-func (r *StageRegistry) Register(name string, constructor func() Stage) {
-	r.stages[name] = constructor
-}
-
-// Create instantiates a stage by name
-func (r *StageRegistry) Create(name string) (Stage, error) {
-	if constructor, ok := r.stages[name]; ok {
-		return constructor(), nil
-	}
-	return nil, fmt.Errorf("unknown stage: %s", name)
-}
-
-// ListStages returns all registered stage names
-func (r *StageRegistry) ListStages() []string {
-	names := make([]string, 0, len(r.stages))
-	for name := range r.stages {
-		names = append(names, name)
-	}
-	return names
 }
 
 // BaseStage provides common functionality for stages

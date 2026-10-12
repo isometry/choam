@@ -66,11 +66,10 @@ type Change struct {
 
 // ProcessorOptions contains configuration for package processing
 type ProcessorOptions struct {
-	DryRun        bool   `json:"dry_run"`
-	Force         bool   `json:"force"`
-	SharedUpdates bool   `json:"shared_updates"`
-	BackupSuffix  string `json:"backup_suffix"`
-	TempDir       string `json:"temp_dir"`
+	DryRun       bool   `json:"dry_run"`
+	Force        bool   `json:"force"`
+	BackupSuffix string `json:"backup_suffix"`
+	TempDir      string `json:"temp_dir"`
 }
 
 // BaseProcessor provides a base implementation that can be embedded

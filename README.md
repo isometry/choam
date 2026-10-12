@@ -100,7 +100,7 @@ choam update --force package.yaml
 - `--dry-run`: Show what would be changed without writing
 - `--backup-suffix`: Create backup files (e.g., `.bak`)
 - `--force`: Force update and increment epoch
-- `--shared`: Update shared dependencies (default: true)
+- `--shared`: Deprecated no-op, accepted for script compatibility (shared-dependency updates are not implemented)
 - `--verbose, -v`: Increase verbosity
 
 ### Fix Vulnerabilities

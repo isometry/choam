@@ -461,7 +461,6 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoB
 		ExpectedCommit: expectedCommit,
 	}
 	uniqueVulns := make(map[string]scan.Vulnerability)
-	var rawBumpsSeen []string
 
 	for _, language := range languages {
 		// Shadowed for the rest of this iteration: every log emitted while
@@ -490,22 +489,12 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoB
 
 		analysis.ByLanguage = append(analysis.ByLanguage, result.Analysis)
 		analysis.BumpActions = append(analysis.BumpActions, result.Actions...)
-		rawBumpsSeen = append(rawBumpsSeen, result.RawBumps...)
 		maps.Copy(uniqueVulns, result.Vulns)
 
 		gp.AddMessage(fmt.Sprintf("%s analysis complete: %d modroot(s), %d action(s) needed", language, len(modroots), len(result.Actions)))
 	}
 
 	analysis.VulnerabilitiesFound = len(uniqueVulns)
-	for _, vuln := range uniqueVulns {
-		switch vuln.Severity {
-		case "CRITICAL":
-			analysis.CriticalCount++
-		case "HIGH":
-			analysis.HighCount++
-		}
-	}
-	analysis.SecurityBumps = dedupeSorted(rawBumpsSeen)
 
 	gp.AddMessage(fmt.Sprintf("Analysis complete: %d language(s), %d vulnerabilities, %d action(s) needed",
 		len(analysis.ByLanguage), analysis.VulnerabilitiesFound, len(analysis.BumpActions)))
@@ -516,13 +505,11 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoB
 // languageResult holds one language's per-modroot analysis, plus its
 // contribution to the overall multi-language aggregate: unique
 // vulnerabilities found (keyed by ID, so checkVulnerabilities can dedupe
-// across languages), bump actions, and the raw OSV-recommended bump strings
-// (for the human-readable SecurityBumps summary).
+// across languages) and bump actions.
 type languageResult struct {
 	Analysis LanguageAnalysis
 	Vulns    map[string]scan.Vulnerability
 	Actions  []BumpAction
-	RawBumps []string
 }
 
 // performAnalysis analyzes each module root independently: fetching its
@@ -612,10 +599,6 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 			logging.From(ctx).Warn("fix held back", "module", h.Bump.Name, "fix", h.Bump.FixedVersion, "reason", h.Reason)
 		}
 		gp.AddResiduals(heldResiduals)
-
-		for _, bump := range scanResult.SecurityBumps {
-			result.RawBumps = append(result.RawBumps, fmt.Sprintf("%s@%s", bump.Name, bump.FixedVersion))
-		}
 
 		// Coordinates in this modroot's rendered dep grammar (not OSV's own
 		// naming - see Ecosystem.BumpCoords), so they compare directly
@@ -783,23 +766,6 @@ func haveDepsChanged(existing, desired []string) bool {
 		return normalized
 	}
 	return !slices.Equal(normalize(existing), normalize(desired))
-}
-
-// dedupeSorted deduplicates and sorts a list of strings, returning nil for an empty input.
-func dedupeSorted(items []string) []string {
-	if len(items) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{}, len(items))
-	result := make([]string, 0, len(items))
-	for _, item := range items {
-		if _, ok := seen[item]; !ok {
-			seen[item] = struct{}{}
-			result = append(result, item)
-		}
-	}
-	sort.Strings(result)
-	return result
 }
 
 // applyGoBumpChanges reconciles the package's bump/go-bump pipeline steps

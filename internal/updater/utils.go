@@ -3,15 +3,13 @@ package updater
 import (
 	"fmt"
 	"log/slog"
-	"os"
 	"path"
-	"path/filepath"
 	"regexp"
 	"strings"
 
 	"chainguard.dev/melange/pkg/cond"
 	melange "chainguard.dev/melange/pkg/config"
-	"github.com/isometry/choam/internal/utils"
+	melangeConfig "github.com/isometry/choam/internal/config"
 )
 
 // stripVersionAffix removes a prefix or suffix from a version string using proper glob patterns.
@@ -88,36 +86,6 @@ func stripSuffixWithGlob(version, pattern string) string {
 		}
 	}
 	return version // No match found
-}
-
-// isMelangeConfig performs a quick check to see if a file is a melange config
-// Optimized to read only the first part of the file for efficiency
-func isMelangeConfig(filePath string) bool {
-	file, err := os.Open(filePath)
-	if err != nil {
-		return false
-	}
-	defer func() {
-		if err := file.Close(); err != nil {
-			// Log the error but don't fail the function
-			// since this is just a cleanup operation
-			slog.Debug("Failed to close file", "error", err, "file", filePath) //nolint:forbidigo // reachable only from GetSharedDependencies/UpdateSharedDependencies, which have no live callers
-		}
-	}()
-
-	// Read only the first 1KB to check for melange markers
-	buffer := make([]byte, 1024)
-	n, err := file.Read(buffer)
-	if err != nil && n == 0 {
-		return false
-	}
-
-	contentStr := string(buffer[:n])
-	// Look for melange-specific fields in the beginning of the file
-	hasPackage := strings.Contains(contentStr, "package:")
-	hasMarker := strings.Contains(contentStr, "pipeline:") || strings.Contains(contentStr, "update:")
-
-	return hasPackage && hasMarker
 }
 
 // createVariableLookup creates a VariableLookupFunction that handles melange variable substitution
@@ -208,30 +176,21 @@ func substituteVariablesWithConfig(template, version string, cfg *melange.Config
 	return result
 }
 
-// findMelangeFiles finds all YAML files in a directory that appear to be melange configs
-func findMelangeFiles(dirPath string) ([]string, error) {
-	var files []string
+// newMelangeLoader creates a new melange configuration loader
+// This centralizes the loader creation pattern used throughout the package
+func newMelangeLoader() *melangeConfig.Loader {
+	return melangeConfig.NewLoader()
+}
 
-	entries, err := os.ReadDir(dirPath)
-	if err != nil {
-		return nil, err
-	}
-
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-
-		name := entry.Name()
-		if utils.IsYAMLFile(name) {
-			fullPath := filepath.Join(dirPath, name)
-
-			// Quick check if it looks like a melange config
-			if isMelangeConfig(fullPath) {
-				files = append(files, fullPath)
+// extractRepositoryFromConfig extracts repository URL from melange configuration.
+// This is a fallback method for configurations without YAML pipeline processing.
+func extractRepositoryFromConfig(cfg *melange.Configuration) (string, error) {
+	for _, pipeline := range cfg.Pipeline {
+		if pipeline.Uses == "git-checkout" && pipeline.With != nil {
+			if repoURL, exists := pipeline.With["repository"]; exists {
+				return repoURL, nil
 			}
 		}
 	}
-
-	return files, nil
+	return "", fmt.Errorf("no git-checkout pipeline step with repository found")
 }

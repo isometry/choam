@@ -18,14 +18,9 @@ const (
 	DefaultTLSHandshakeTimeout = 10 * time.Second
 )
 
-// NewHTTPClient creates a new HTTP client with sensible defaults for choam
-// (see NewHTTPClientWithTimeout) and the default request timeout.
-func NewHTTPClient() *http.Client {
-	return NewHTTPClientWithTimeout(DefaultTimeout)
-}
-
-// NewHTTPClientWithTimeout creates an HTTP client with a custom per-request
-// timeout, connection pooling, bounded TLS handshakes, and the standard
+// NewHTTPClientWithTimeout creates an HTTP client for choam with the given
+// per-request timeout (DefaultTimeout is a sensible value), connection
+// pooling, bounded TLS handshakes, and the standard
 // HTTPS_PROXY/HTTP_PROXY/NO_PROXY environment honoured.
 func NewHTTPClientWithTimeout(timeout time.Duration) *http.Client {
 	return &http.Client{

@@ -19,7 +19,6 @@ var (
 	httpTimeout  time.Duration
 
 	// Update-specific flags
-	updateShared bool
 	backupSuffix string
 
 	// Bump-specific flags

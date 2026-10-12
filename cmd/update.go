@@ -19,8 +19,7 @@ func NewUpdateCmd() *cobra.Command {
 		Short: "Apply available updates to melange build specifications",
 		Long: `Apply available updates to melange build specification files.
 This command will update the package version, reset epoch, update pipeline
-expected-commit values, fetch pipeline SHA256 checksums, and optionally
-update shared dependencies.
+expected-commit values, and fetch pipeline SHA256 checksums.
 
 Path can be a single file or a directory containing .yaml files.`,
 		Args: cobra.MinimumNArgs(1),
@@ -29,7 +28,8 @@ Path can be a single file or a directory containing .yaml files.`,
 
 	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "Show what would be updated without making changes")
 	cmd.Flags().BoolVar(&force, "force", false, "Force update even if no version change (increment epoch)")
-	cmd.Flags().BoolVar(&updateShared, "shared", true, "Update shared dependencies")
+	// Deprecated no-op, retained so existing scripts passing --shared keep working.
+	cmd.Flags().Bool("shared", true, "Deprecated no-op: shared-dependency updates are not implemented (accepted for compatibility)")
 	cmd.Flags().StringVarP(&outputFormat, "format", "f", "table", "Output format: table, json, yaml")
 	cmd.Flags().StringVar(&backupSuffix, "backup-suffix", "", "Suffix for backup files (empty = no backup)")
 
@@ -58,11 +58,10 @@ func runUpdate(cmd *cobra.Command, args []string) error {
 
 	// Configure processor options (note: no more SecurityScan - always enabled)
 	opts := updater.ProcessorOptions{
-		DryRun:        dryRun,
-		Force:         force,
-		SharedUpdates: updateShared,
-		BackupSuffix:  backupSuffix,
-		TempDir:       os.TempDir(),
+		DryRun:       dryRun,
+		Force:        force,
+		BackupSuffix: backupSuffix,
+		TempDir:      os.TempDir(),
 	}
 
 	if dryRun {

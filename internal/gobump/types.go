@@ -207,10 +207,7 @@ type LanguageAnalysis struct {
 type VulnerabilityAnalysis struct {
 	ByLanguage           []LanguageAnalysis `json:"by_language" yaml:"by_language"`
 	VulnerabilitiesFound int                `json:"vulnerabilities_found" yaml:"vulnerabilities_found"` // aggregated across all languages
-	CriticalCount        int                `json:"critical_count" yaml:"critical_count"`
-	HighCount            int                `json:"high_count" yaml:"high_count"`
-	SecurityBumps        []string           `json:"security_bumps" yaml:"security_bumps"`
-	BumpActions          []BumpAction       `json:"bump_actions" yaml:"bump_actions"` // each carries its own Language
+	BumpActions          []BumpAction       `json:"bump_actions" yaml:"bump_actions"`                   // each carries its own Language
 
 	// Source coordinates from the package's git-checkout step, retained so
 	// the simulation stage can clone the exact source the build will use.

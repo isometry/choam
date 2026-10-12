@@ -38,11 +38,10 @@ func ProcessFile(ctx context.Context, filePath string, opts ProcessorOptions, an
 	goBumpProcessor.OriginalYAML = content
 	goBumpProcessor.SetCurrentYAML(content)
 	goBumpProcessor.SetOptions(processor.ProcessorOptions{
-		DryRun:        opts.DryRun,
-		Force:         false,
-		SharedUpdates: false,
-		BackupSuffix:  opts.BackupSuffix,
-		TempDir:       opts.TempDir,
+		DryRun:       opts.DryRun,
+		Force:        false,
+		BackupSuffix: opts.BackupSuffix,
+		TempDir:      opts.TempDir,
 	})
 
 	// From here on, every log emitted while processing this file - however

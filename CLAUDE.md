@@ -37,16 +37,16 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 ## Essential Navigation Map
 
 ### CLI Entry Points
-- `main.go:10` - Application bootstrap (Execute command)
-- `cmd/root.go:26` - `NewRootCmd()` base command constructor
-- `cmd/root.go:58` - `collectMelangeFiles()` YAML discovery
-- `cmd/check.go:14` - `NewCheckCmd()` update detection command
-- `cmd/update.go:15` - `NewUpdateCmd()` apply updates command
+- `main.go:12` - Application bootstrap (Execute command)
+- `cmd/root.go:33` - `NewRootCmd()` base command constructor
+- `cmd/root.go:55` - `collectMelangeFiles()` YAML discovery
+- `cmd/check.go:15` - `NewCheckCmd()` update detection command
+- `cmd/update.go:16` - `NewUpdateCmd()` apply updates command
 - `cmd/bump.go:19` - `NewBumpCmd()` vulnerability-bump command (`gobump` alias; flags: `--dry-run`, `--format`, `--backup-suffix`, `--no-validate`, `--simulation-timeout`, `--no-stdlib`, `--fail-on-residual`)
 - `cmd/bump.go:51` - `runBump()` vulnerability scan/apply logic; exits non-zero (`ErrBumpFailed`) when any file errors; `summarizeBumpResults()` feeds both table and JSON/YAML (results keyed by file path)
 
 ### Core Processing Architecture
-- `internal/processor/processor.go:11` - `Processor` interface definition
+- `internal/processor/processor.go:12` - `Processor` interface definition
 - `internal/processor/processor.go:76` - `BaseProcessor` struct
 - `internal/processor/stages/file.go` - YAML I/O with backup operations
 - `internal/processor/stages/validation.go` - Configuration integrity validation
@@ -85,7 +85,7 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `internal/types/types.go` - Core data structures and types
 
 ### Update Detection & Processing
-- `internal/updater/orchestrator.go:33` - `NewOrchestrator()` update coordinator
+- `internal/updater/orchestrator.go:41` - `NewOrchestratorWithTimeout()` update coordinator
 - `internal/updater/processor.go:24` - `NewUpdaterProcessor()` update processor
 - `internal/updater/pipeline.go` - Pipeline composition and execution
 - `internal/updater/version.go` - Semantic version comparison and handling

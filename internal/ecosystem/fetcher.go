@@ -33,7 +33,7 @@ type Fetcher struct {
 }
 
 // NewFetcher creates a new fetcher with the provided HTTP client.
-// The httpClient parameter is required and should be obtained from httpclient.NewHTTPClient()
+// The httpClient parameter is required and should be obtained from httpclient.NewHTTPClientWithTimeout()
 func NewFetcher(httpClient *http.Client) *Fetcher {
 	if httpClient == nil {
 		panic("ecosystem.NewFetcher: httpClient cannot be nil")

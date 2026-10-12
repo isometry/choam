@@ -77,58 +77,6 @@ func (b *BumpOnSecurityFixStrategy) GetReason() string {
 	return "security fixes applied"
 }
 
-// BumpOnFileChangeStrategy bumps epoch only when actual file changes are made
-type BumpOnFileChangeStrategy struct {
-	CheckFunc func(p processor.Processor) bool
-}
-
-func (b *BumpOnFileChangeStrategy) ShouldUpdateEpoch(p processor.Processor) bool {
-	if b.CheckFunc != nil {
-		return b.CheckFunc(p)
-	}
-	// Default: check if actual file changes were made
-	return p.HasFileChanges()
-}
-
-func (b *BumpOnFileChangeStrategy) CalculateNewEpoch(p processor.Processor) int64 {
-	return p.GetCurrentEpoch() + 1
-}
-
-func (b *BumpOnFileChangeStrategy) GetReason() string {
-	return "file changes applied"
-}
-
-// CompositeEpochStrategy combines multiple strategies with priority order
-type CompositeEpochStrategy struct {
-	Strategies []EpochStrategy
-}
-
-func (c *CompositeEpochStrategy) ShouldUpdateEpoch(p processor.Processor) bool {
-	for _, strategy := range c.Strategies {
-		if strategy.ShouldUpdateEpoch(p) {
-			return true
-		}
-	}
-	return false
-}
-
-func (c *CompositeEpochStrategy) CalculateNewEpoch(p processor.Processor) int64 {
-	// Return the epoch from the first strategy that wants to update
-	for _, strategy := range c.Strategies {
-		if strategy.ShouldUpdateEpoch(p) {
-			return strategy.CalculateNewEpoch(p)
-		}
-	}
-	return p.GetCurrentEpoch()
-}
-
-func (c *CompositeEpochStrategy) GetReason() string {
-	// Note: This method doesn't have access to processor, so it returns a generic reason.
-	// In practice, GetReason is called after ShouldUpdateEpoch has already determined
-	// which strategy should be used.
-	return "composite strategy triggered"
-}
-
 // EpochStage handles epoch updates using a configurable strategy
 type EpochStage struct {
 	processor.BaseStage

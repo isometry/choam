@@ -111,11 +111,10 @@ func (o *UpdateOrchestrator) ProcessPackageApply(ctx context.Context, filePath s
 
 	// Convert options to the correct type
 	processorOptions := processor.ProcessorOptions{
-		DryRun:        options.DryRun,
-		Force:         options.Force,
-		SharedUpdates: options.SharedUpdates,
-		BackupSuffix:  options.BackupSuffix,
-		TempDir:       options.TempDir,
+		DryRun:       options.DryRun,
+		Force:        options.Force,
+		BackupSuffix: options.BackupSuffix,
+		TempDir:      options.TempDir,
 	}
 	updaterProcessor.SetOptions(processorOptions)
 

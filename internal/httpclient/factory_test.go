@@ -6,12 +6,11 @@ import (
 	"time"
 )
 
-func TestNewHTTPClient_HonoursProxyEnvironment(t *testing.T) {
+func TestNewHTTPClientWithTimeout_HonoursProxyEnvironment(t *testing.T) {
 	t.Setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
 	t.Setenv("NO_PROXY", "")
 
 	for name, client := range map[string]*http.Client{
-		"default":      NewHTTPClient(),
 		"with timeout": NewHTTPClientWithTimeout(time.Second),
 	} {
 		transport, ok := client.Transport.(*http.Transport)
