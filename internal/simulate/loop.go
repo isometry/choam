@@ -29,9 +29,8 @@ import (
 // loop never creates replace directives of its own.
 type candState struct {
 	Candidate
-	seed    bool // seeded by the caller (vs raised by a rescan)
-	remedy  bool // added to repair an ambiguous import (applied first)
-	dropped bool
+	seed   bool // seeded by the caller (vs raised by a rescan)
+	remedy bool // added to repair an ambiguous import (applied first)
 
 	// ceiling is the lowest version whose fetch failed (see stepDown): the
 	// candidate never raises to it or above again, so the residual recorded
@@ -42,7 +41,8 @@ type candState struct {
 	// residual-free (unreachable, redundant). The rescan backfill only
 	// synthesizes residuals for dropped CVE candidates NOT marked here.
 	residualized bool
-	// dropReason mirrors the DroppedCandidate reason, for backfill wording.
+	// dropReason mirrors the DroppedCandidate reason, for backfill wording;
+	// non-empty exactly when the candidate is dropped (see isDropped).
 	dropReason string
 	// shedUnlinked marks a drop by dropUnreachable: judged against the graph
 	// current at the time, which a later adjustment can replace.
@@ -63,9 +63,12 @@ type candState struct {
 	hygieneIDs []string
 }
 
-// drop marks the candidate dropped and records it with the given reason.
+// isDropped reports whether the candidate was dropped (see loop.drop).
+func (c *candState) isDropped() bool { return c.dropReason != "" }
+
+// drop marks the candidate dropped and records it with the given reason
+// (never empty).
 func (l *loop) drop(c *candState, reason string) {
-	c.dropped = true
 	c.dropReason = reason
 	l.dropped = append(l.dropped, DroppedCandidate{
 		Module:  c.Module,
@@ -158,49 +161,10 @@ type raise struct {
 // means the simulation itself could not run (unreadable module, toolchain or
 // scanner failure) and the caller should fall back to unvalidated behavior.
 func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req ModrootRequest, opts Options) (*ModrootResult, error) {
-	opts = opts.WithDefaults()
-
-	var pristineReplaces map[string]ReplaceTarget
-	l := &loop{
-		tc:       tc,
-		sc:       sc,
-		dir:      dir,
-		req:      req,
-		opts:     opts,
-		byModule: make(map[string]*candState),
-		remedied: make(map[string]remedyState),
-		target: BuildTarget{
-			Patterns: req.Packages,
-			Tags:     req.Tags,
-			Arches:   TargetArches(req.Arches),
-			Env:      req.Env,
-		},
-	}
-	if len(l.target.Patterns) == 0 {
-		l.target.Patterns = []string{"./..."}
-	}
-	if compiler, ok := tc.(Compiler); ok && !opts.NoCompile {
-		l.compiler = compiler
-	}
-	if err := l.savePristine(ctx); err != nil {
-		return nil, err
-	}
-	eng, err := l.newEngine(ctx)
+	l, baselineTidies, err := newLoop(ctx, tc, sc, dir, req, opts)
 	if err != nil {
 		return nil, err
 	}
-	l.engine = eng
-	baselineTidies := false
-	if prober, ok := eng.(*omnibumpEngine); ok && req.ProbeTidy && req.NoTidy {
-		if baselineTidies, err = prober.probeTidy(ctx); err != nil {
-			return nil, err
-		}
-	}
-	pristineReplaces, err = tc.Replaces(ctx, dir)
-	if err != nil {
-		return nil, fmt.Errorf("reading upstream replace directives: %w", err)
-	}
-	l.pristineReplaces = pristineReplaces
 
 	for _, seed := range req.Seeds {
 		l.seedCandidate(seed)
@@ -221,64 +185,9 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 
 	result := &ModrootResult{Modroot: req.Modroot, BaselineTidies: baselineTidies}
 
-	var resolved map[string]string
-	for iter := 1; iter <= opts.MaxIterations; iter++ {
-		result.Iterations = iter
-
-		if err := l.apply(ctx); err != nil {
-			return nil, err
-		}
-
-		// Re-apply until every surviving pin is sustained by the tidied
-		// go.mod (melange's gobump rejects entries the tidy pruned or
-		// downgraded) AND linked into a build artifact; each pass sheds at
-		// least one candidate, so this is bounded. Shedding inside this loop
-		// (rather than a separate phase) matters: a dropped candidate's MVS
-		// ripple is unwound by the re-apply, so the validated final state
-		// matches what melange's gobump will produce from FinalDeps alone.
-		for {
-			var err error
-			resolved, err = l.tc.ListModules(ctx, l.dir)
-			if err != nil {
-				return nil, err
-			}
-			l.requirements, err = l.tc.Requirements(ctx, l.dir)
-			if err != nil {
-				return nil, err
-			}
-			// The tidied go.mod's go directive cannot change between applies
-			// by the same engine (gobump tidies with the same `-go=` flag,
-			// omnibump lowers to the same build Go), so this needs no
-			// recompute in adoptTrial.
-			l.tidiedModern = l.tidiedGoModern()
-			if l.tidiedModern && l.linked == nil && !l.degradedNoted {
-				l.degradedNoted = true
-				logging.From(ctx).Info("artifact reachability degraded: using tidied go.mod require membership as module-level reachability",
-					"modroot", l.req.Modroot)
-			}
-			l.replaces, err = l.tc.Replaces(ctx, l.dir)
-			if err != nil {
-				return nil, err
-			}
-			l.refreshLinked(ctx)
-			if !l.dropUnsustained(ctx) && !l.dropUnreachable() {
-				break
-			}
-			if err := l.apply(ctx); err != nil {
-				return nil, err
-			}
-		}
-
-		scanResult, err := l.sc.ScanPackages(ctx, l.scanTargets(resolved, l.requirements, l.replaces))
-		if err != nil {
-			return nil, err
-		}
-
-		raises := l.processScan(ctx, scanResult, resolved)
-		if len(raises) == 0 {
-			result.Converged = true
-			break
-		}
+	resolved, err := l.converge(ctx, result)
+	if err != nil {
+		return nil, err
 	}
 
 	// Dependency-graph capabilities (max go directive, linked stdlib set) are
@@ -316,6 +225,159 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	result.MaxDepGoVersion = l.maxDepGoVersion(ctx)
 	result.StdPackages = l.linkedStdPackages(ctx)
 
+	if resolved, err = l.refine(ctx, resolved, result); err != nil {
+		return nil, err
+	}
+
+	if err := l.crossArchCompile(ctx); err != nil {
+		return nil, err
+	}
+
+	if l.infraErr != nil {
+		// A best-effort lookup hit an infrastructure failure: some verdict
+		// above may rest on it, so nothing here is trusted.
+		return nil, l.infraErr
+	}
+
+	l.buildResult(ctx, resolved, result)
+	return result, nil
+}
+
+// newLoop builds the loop for the module at dir: the build target, the
+// compile gate (when the toolchain supports it), the pristine go.mod/go.sum
+// snapshot, the step's engine and the upstream replace directives. It also
+// reports whether the pristine module already tidies (see
+// ModrootResult.BaselineTidies; probed only for `tidy: false`).
+func newLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req ModrootRequest, opts Options) (*loop, bool, error) {
+	opts = opts.WithDefaults()
+
+	l := &loop{
+		tc:       tc,
+		sc:       sc,
+		dir:      dir,
+		req:      req,
+		opts:     opts,
+		byModule: make(map[string]*candState),
+		remedied: make(map[string]remedyState),
+		target: BuildTarget{
+			Patterns: req.Packages,
+			Tags:     req.Tags,
+			Arches:   TargetArches(req.Arches),
+			Env:      req.Env,
+		},
+	}
+	if len(l.target.Patterns) == 0 {
+		l.target.Patterns = []string{"./..."}
+	}
+	if compiler, ok := tc.(Compiler); ok && !opts.NoCompile {
+		l.compiler = compiler
+	}
+	if err := l.savePristine(ctx); err != nil {
+		return nil, false, err
+	}
+	eng, err := l.newEngine(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	l.engine = eng
+	baselineTidies := false
+	if prober, ok := eng.(*omnibumpEngine); ok && req.ProbeTidy && req.NoTidy {
+		if baselineTidies, err = prober.probeTidy(ctx); err != nil {
+			return nil, false, err
+		}
+	}
+	pristineReplaces, err := tc.Replaces(ctx, dir)
+	if err != nil {
+		return nil, false, fmt.Errorf("reading upstream replace directives: %w", err)
+	}
+	l.pristineReplaces = pristineReplaces
+	return l, baselineTidies, nil
+}
+
+// converge runs the fixpoint: apply the candidates, resync to the resolved
+// graph, rescan it and raise, until a rescan demands no further raise
+// (result.Converged) or opts.MaxIterations is reached. It records the
+// iteration count in result and returns the last resolved graph (nil when no
+// iteration ran).
+func (l *loop) converge(ctx context.Context, result *ModrootResult) (map[string]string, error) {
+	var resolved map[string]string
+	for iter := 1; iter <= l.opts.MaxIterations; iter++ {
+		result.Iterations = iter
+
+		if err := l.apply(ctx); err != nil {
+			return nil, err
+		}
+
+		var err error
+		if resolved, err = l.resync(ctx); err != nil {
+			return nil, err
+		}
+
+		scanResult, err := l.sc.ScanPackages(ctx, l.scanTargets(resolved, l.requirements, l.replaces))
+		if err != nil {
+			return nil, err
+		}
+
+		raises := l.processScan(ctx, scanResult, resolved)
+		if len(raises) == 0 {
+			result.Converged = true
+			break
+		}
+	}
+	return resolved, nil
+}
+
+// resync reads the applied checkout back (resolved graph, requirements,
+// replaces, reachability) and returns the resolved graph.
+//
+// It re-applies until every surviving pin is sustained by the tidied
+// go.mod (melange's gobump rejects entries the tidy pruned or
+// downgraded) AND linked into a build artifact; each pass sheds at
+// least one candidate, so this is bounded. Shedding inside this loop
+// (rather than a separate phase) matters: a dropped candidate's MVS
+// ripple is unwound by the re-apply, so the validated final state
+// matches what melange's gobump will produce from FinalDeps alone.
+func (l *loop) resync(ctx context.Context) (map[string]string, error) {
+	for {
+		resolved, err := l.tc.ListModules(ctx, l.dir)
+		if err != nil {
+			return nil, err
+		}
+		l.requirements, err = l.tc.Requirements(ctx, l.dir)
+		if err != nil {
+			return nil, err
+		}
+		// The tidied go.mod's go directive cannot change between applies
+		// by the same engine (gobump tidies with the same `-go=` flag,
+		// omnibump lowers to the same build Go), so this needs no
+		// recompute in adoptTrial.
+		l.tidiedModern = l.tidiedGoModern()
+		if l.tidiedModern && l.linked == nil && !l.degradedNoted {
+			l.degradedNoted = true
+			logging.From(ctx).Info("artifact reachability degraded: using tidied go.mod require membership as module-level reachability",
+				"modroot", l.req.Modroot)
+		}
+		l.replaces, err = l.tc.Replaces(ctx, l.dir)
+		if err != nil {
+			return nil, err
+		}
+		l.refreshLinked(ctx)
+		if !l.dropUnsustained(ctx) && !l.dropUnreachable() {
+			return resolved, nil
+		}
+		if err := l.apply(ctx); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// refine runs the post-fixpoint phases on the converged set, in order:
+// shed pins no advisory needs (confirmMinimalSet; on non-convergence the
+// last raises become residuals instead), the compile gate, the redundancy
+// check (minimise) and scanner-hygiene bumps. Returns the final resolved
+// graph.
+func (l *loop) refine(ctx context.Context, resolved map[string]string, result *ModrootResult) (map[string]string, error) {
+	var err error
 	if !result.Converged {
 		// The final rescan still wanted to move modules forward; surface
 		// those targets as residuals rather than looping further.
@@ -363,20 +425,12 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 
 	// Last: scanner-hygiene bumps, only where they are free against that
 	// final go.mod (see hygienePass).
-	if resolved, err = l.hygienePass(ctx, ref, resolved, result); err != nil {
-		return nil, err
-	}
+	return l.hygienePass(ctx, ref, resolved, result)
+}
 
-	if err := l.crossArchCompile(ctx); err != nil {
-		return nil, err
-	}
-
-	if l.infraErr != nil {
-		// A best-effort lookup hit an infrastructure failure: some verdict
-		// above may rest on it, so nothing here is trusted.
-		return nil, l.infraErr
-	}
-
+// buildResult fills result from the final loop state and resolved graph:
+// the outputs, drops and residuals (backfilled, classified and sorted).
+func (l *loop) buildResult(ctx context.Context, resolved map[string]string, result *ModrootResult) {
 	result.Resolved = resolved
 	result.Linked = l.linked
 	result.LinkedPackages = l.linkedPackages
@@ -396,8 +450,6 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	l.classifyIntroduced(ctx, result.Residuals)
 	slices.SortStableFunc(result.Residuals, compareResiduals)
 	result.RemainingVulnIDs = remainingVulnIDs(result.Residuals)
-
-	return result, nil
 }
 
 // seedCandidate routes one caller-provided seed into the right channel.
@@ -414,7 +466,7 @@ func (l *loop) seedCandidate(c Candidate) {
 		return
 	}
 
-	if existing, ok := l.byModule[c.Module]; ok && !existing.dropped && existing.Replace {
+	if existing, ok := l.byModule[c.Module]; ok && !existing.isDropped() && existing.Replace {
 		// Merge advisory backing, but the entry stays in the replace channel.
 		l.addCandidate(Candidate{
 			Module: c.Module, Version: c.Version, FromCVE: c.FromCVE, VulnIDs: c.VulnIDs,
@@ -486,7 +538,7 @@ func (l *loop) dropLocalReplacePinned(c Candidate, oldPath string) {
 // module: the higher version wins, and of two spellings of the same version
 // the one scan.PreferVersion picks.
 func (l *loop) addCandidate(c Candidate, seed bool) *candState {
-	if existing, ok := l.byModule[c.Module]; ok && !existing.dropped {
+	if existing, ok := l.byModule[c.Module]; ok && !existing.isDropped() {
 		existing.Rungs = mergeRungs(existing.fixRungs(), c.fixRungs())
 		switch rel := semver.Compare(c.Version, existing.Version); {
 		case rel > 0:
@@ -516,7 +568,7 @@ func mergeSeverity(a, b string) string {
 func (l *loop) activeCandidates() []*candState {
 	active := make([]*candState, 0, len(l.cands))
 	for _, c := range l.cands {
-		if !c.dropped {
+		if !c.isDropped() {
 			active = append(active, c)
 		}
 	}
@@ -679,7 +731,7 @@ func (l *loop) addAmbiguityRemedies(ctx context.Context, err error) bool {
 			continue
 		}
 		existing, ok := l.byModule[module]
-		active := ok && !existing.dropped
+		active := ok && !existing.isDropped()
 		if active && existing.Replace {
 			continue
 		}
@@ -806,7 +858,7 @@ func (l *loop) shedCandidate(err error, eligible func(*candState) bool) bool {
 	var victim *candState
 	for i := len(l.cands) - 1; i >= 0; i-- {
 		c := l.cands[i]
-		if c.dropped || !eligible(c) {
+		if c.isDropped() || !eligible(c) {
 			continue
 		}
 		if victim == nil {
@@ -1246,7 +1298,7 @@ func (l *loop) processScan(ctx context.Context, scanResult *scan.ScanResult, res
 	l.lastRaised = l.lastRaised[:0]
 	applied := make([]raise, 0, len(raises))
 	for _, r := range raises {
-		if existing, ok := l.byModule[r.module]; ok && existing.dropped {
+		if existing, ok := l.byModule[r.module]; ok && existing.isDropped() {
 			if existing.FromCVE {
 				if !existing.residualized {
 					if l.degradedUnlinked(r.module, l.requirements, l.replaces) {
@@ -1301,7 +1353,7 @@ func (l *loop) processScan(ctx context.Context, scanResult *scan.ScanResult, res
 		// reports the replacement path, so identity already matches the
 		// replace candidate's target. (Upstream-pinned modules never get
 		// here: scanFindings holds them back.)
-		if existing, ok := l.byModule[r.module]; ok && !existing.dropped && existing.Replace {
+		if existing, ok := l.byModule[r.module]; ok && !existing.isDropped() && existing.Replace {
 			candidate.Replace, candidate.ReplaceOld = true, existing.ReplaceOld
 		}
 		state := l.addCandidate(candidate, false)
@@ -1315,7 +1367,7 @@ func (l *loop) processScan(ctx context.Context, scanResult *scan.ScanResult, res
 // replace-pins module (either side of the directive) to a module version and
 // no user-authored replace candidate takes it over, "" otherwise.
 func (l *loop) upstreamHoldBack(module string) string {
-	if c, ok := l.byModule[module]; ok && !c.dropped && c.Replace {
+	if c, ok := l.byModule[module]; ok && !c.isDropped() && c.Replace {
 		return ""
 	}
 	if oldPath, target, pinned := l.pristinePinFor(module); pinned && target.Version != "" {
@@ -1339,58 +1391,17 @@ func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]str
 		applies[vuln.ID] = scan.ImportsLinked(vuln.VulnerableImports, l.linkedPackages)
 	}
 
-	noFixByModule := make(map[string]*Residual)
-	for _, vuln := range scanResult.Vulnerabilities {
-		if vuln.FixedVersion != "" || !applies[vuln.ID] {
-			continue
-		}
-		if existing, ok := noFixByModule[vuln.Module]; ok {
-			existing.VulnIDs = mergeIDs(existing.VulnIDs, []string{vuln.ID})
-			continue
-		}
-		noFixByModule[vuln.Module] = &Residual{
-			Module:          vuln.Module,
-			ResolvedVersion: resolved[vuln.Module],
-			VulnIDs:         []string{vuln.ID},
-			Reason:          "no released fix",
-		}
-	}
-
-	var raises []raise
-	var residuals []Residual
-	for _, r := range noFixByModule {
-		residuals = append(residuals, *r)
-	}
-
-	var hygiene []raise
+	var raises, hygiene []raise
+	residuals := noFixResiduals(scanResult, applies, resolved)
 	for _, bump := range scanResult.SecurityBumps {
-		var linked, unlinked []string
-		for _, id := range bump.VulnIDs {
-			if applicable, known := applies[id]; known && !applicable {
-				unlinked = append(unlinked, id)
-			} else {
-				linked = append(linked, id) // unknown fails open
-			}
-		}
+		linked, unlinked := splitLinked(bump.VulnIDs, applies)
 		resolvedVersion := resolved[bump.Name]
 		target, blocked := "", false
 		if len(linked) > 0 || len(bump.VulnIDs) == 0 {
-			fix := raise{module: bump.Name, version: bump.FixedVersion, vulnIDs: bump.VulnIDs, severity: bump.Severity,
-				rungs: FixRungs(scanResult.Vulnerabilities, bump.Name, bump.VulnIDs)}
-			if len(unlinked) > 0 {
-				if rungs := FixRungs(scanResult.Vulnerabilities, bump.Name, linked); len(rungs) > 0 {
-					fix = raise{module: bump.Name, version: rungs[0].Version, vulnIDs: linked, severity: rungSeverity(rungs), rungs: rungs}
-				}
-			}
+			fix := securityFix(scanResult, bump, linked, unlinked)
 			target = fix.version
 			if resolvedVersion == "" || semver.Compare(fix.version, resolvedVersion) > 0 {
-				reason := ""
-				if majorChange(bump.Name, fix.version, resolvedVersion) {
-					reason = fmt.Sprintf("fix requires a major version change (%s -> %s)", resolvedVersion, fix.version)
-				} else if oldPath := l.upstreamHoldBack(bump.Name); oldPath != "" {
-					reason = holdBackReason(oldPath)
-				}
-				if reason != "" {
+				if reason := l.raiseBlocked(bump.Name, fix.version, resolvedVersion); reason != "" {
 					blocked = true
 					residuals = append(residuals, Residual{
 						Module:          bump.Name,
@@ -1407,22 +1418,9 @@ func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]str
 		if len(unlinked) == 0 || blocked {
 			continue
 		}
-		// Unlinked advisories fixed only above the security target.
-		var above []Rung
-		for _, r := range FixRungs(scanResult.Vulnerabilities, bump.Name, unlinked) {
-			if target == "" || semver.Compare(r.Version, target) > 0 {
-				above = append(above, r)
-			}
+		if h, ok := l.hygieneFinding(scanResult, bump.Name, unlinked, target, resolvedVersion); ok {
+			hygiene = append(hygiene, h)
 		}
-		if len(above) == 0 || semver.Compare(above[0].Version, resolvedVersion) <= 0 ||
-			majorChange(bump.Name, above[0].Version, resolvedVersion) || l.upstreamHoldBack(bump.Name) != "" {
-			continue
-		}
-		var ids []string
-		for _, r := range above {
-			ids = mergeIDs(ids, r.VulnIDs)
-		}
-		hygiene = append(hygiene, raise{module: bump.Name, version: above[0].Version, vulnIDs: ids, severity: rungSeverity(above), rungs: above})
 	}
 
 	byModule := func(a, b raise) int {
@@ -1431,6 +1429,95 @@ func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]str
 	slices.SortFunc(raises, byModule)
 	slices.SortFunc(hygiene, byModule)
 	return raises, residuals, hygiene
+}
+
+// noFixResiduals groups the linked advisories without a released fix into
+// one residual per module.
+func noFixResiduals(scanResult *scan.ScanResult, applies map[string]bool, resolved map[string]string) []Residual {
+	noFixByModule := make(map[string]*Residual)
+	for _, vuln := range scanResult.Vulnerabilities {
+		if vuln.FixedVersion != "" || !applies[vuln.ID] {
+			continue
+		}
+		if existing, ok := noFixByModule[vuln.Module]; ok {
+			existing.VulnIDs = mergeIDs(existing.VulnIDs, []string{vuln.ID})
+			continue
+		}
+		noFixByModule[vuln.Module] = &Residual{
+			Module:          vuln.Module,
+			ResolvedVersion: resolved[vuln.Module],
+			VulnIDs:         []string{vuln.ID},
+			Reason:          "no released fix",
+		}
+	}
+	var residuals []Residual
+	for _, r := range noFixByModule {
+		residuals = append(residuals, *r)
+	}
+	return residuals
+}
+
+// splitLinked partitions advisory ids by whether their vulnerable packages
+// are linked (see scanFindings); an id missing from applies counts as
+// linked (fails open).
+func splitLinked(ids []string, applies map[string]bool) (linked, unlinked []string) {
+	for _, id := range ids {
+		if applicable, known := applies[id]; known && !applicable {
+			unlinked = append(unlinked, id)
+		} else {
+			linked = append(linked, id) // unknown fails open
+		}
+	}
+	return linked, unlinked
+}
+
+// securityFix is bump's security raise: the scanner's fix for all its
+// advisories, or, when some are unlinked, the highest fix among the linked
+// ones only.
+func securityFix(scanResult *scan.ScanResult, bump scan.SecurityBump, linked, unlinked []string) raise {
+	fix := raise{module: bump.Name, version: bump.FixedVersion, vulnIDs: bump.VulnIDs, severity: bump.Severity,
+		rungs: FixRungs(scanResult.Vulnerabilities, bump.Name, bump.VulnIDs)}
+	if len(unlinked) > 0 {
+		if rungs := FixRungs(scanResult.Vulnerabilities, bump.Name, linked); len(rungs) > 0 {
+			fix = raise{module: bump.Name, version: rungs[0].Version, vulnIDs: linked, severity: rungSeverity(rungs), rungs: rungs}
+		}
+	}
+	return fix
+}
+
+// raiseBlocked is why module cannot be raised from resolvedVersion to fix
+// with a deps entry ("" when it can): a major version change, or an upstream
+// replace pin.
+func (l *loop) raiseBlocked(module, fix, resolvedVersion string) string {
+	if majorChange(module, fix, resolvedVersion) {
+		return fmt.Sprintf("fix requires a major version change (%s -> %s)", resolvedVersion, fix)
+	}
+	if oldPath := l.upstreamHoldBack(module); oldPath != "" {
+		return holdBackReason(oldPath)
+	}
+	return ""
+}
+
+// hygieneFinding is module's scanner-hygiene target: its unlinked
+// advisories fixed only above the security target (all of them when target
+// is ""), when that fix is above resolvedVersion and reachable without a
+// major change or an upstream replace pin.
+func (l *loop) hygieneFinding(scanResult *scan.ScanResult, module string, unlinked []string, target, resolvedVersion string) (raise, bool) {
+	var above []Rung
+	for _, r := range FixRungs(scanResult.Vulnerabilities, module, unlinked) {
+		if target == "" || semver.Compare(r.Version, target) > 0 {
+			above = append(above, r)
+		}
+	}
+	if len(above) == 0 || semver.Compare(above[0].Version, resolvedVersion) <= 0 ||
+		majorChange(module, above[0].Version, resolvedVersion) || l.upstreamHoldBack(module) != "" {
+		return raise{}, false
+	}
+	var ids []string
+	for _, r := range above {
+		ids = mergeIDs(ids, r.VulnIDs)
+	}
+	return raise{module: module, version: above[0].Version, vulnIDs: ids, severity: rungSeverity(above), rungs: above}, true
 }
 
 // rungSeverity is the most severe level across rungs.
@@ -1669,66 +1756,102 @@ func (l *loop) readGoModState(ctx context.Context) (st *goModState, err error) {
 // holding the final set; the returned state is its go.mod (nil when it was
 // never computed: nothing to trial, or the final set no longer applies).
 func (l *loop) minimise(ctx context.Context) (*goModState, error) {
-	var set, order []*candState
+	set, order := l.minimiseCandidates(ctx)
+	if len(order) == 0 {
+		return nil, nil
+	}
+
+	start := time.Now()
+	ref, ok, err := l.finalState(ctx, l.inApplyOrder(set))
+	if err != nil || !ok {
+		return nil, l.stopMinimise(ctx, set, err, "the final set no longer applies")
+	}
+	return l.leaveOneOut(ctx, ref, set, order, time.Since(start))
+}
+
+// minimiseCandidates drops the active entries that are redundant without a
+// trial (see classifyRedundant) and returns the rest: set is the final set,
+// order the entries to trial for redundancy (every one but the user-authored
+// replaces), in trial order (see compareMinimiseOrder).
+func (l *loop) minimiseCandidates(ctx context.Context) (set, order []*candState) {
 	for _, c := range l.activeCandidates() {
-		switch {
-		case c.Replace:
-			if base := l.baselineVersion(c.Module); c.OldPath() == c.Module && semver.IsValid(base) &&
-				semver.Compare(c.Version, base) <= 0 {
-				l.dropRedundant(ctx, c, "self-replace at or below the baseline-resolved "+base)
-				continue
-			}
-		default:
-			if why := l.engine.upstreamSkip(c); why != "" {
-				l.dropRedundant(ctx, c, "matches or regresses upstream go.mod ("+why+")")
-				continue
-			}
+		if why, redundant := l.classifyRedundant(c); redundant {
+			l.dropRedundant(ctx, c, why)
+			continue
+		}
+		if !c.Replace {
 			order = append(order, c)
 		}
 		set = append(set, c)
 	}
-	if len(order) == 0 {
-		return nil, nil
-	}
-	slices.SortFunc(order, func(a, b *candState) int {
-		if a.FromCVE != b.FromCVE {
-			if a.FromCVE {
-				return 1
-			}
-			return -1
-		}
-		if ra, rb := scan.SeverityRank(a.Severity), scan.SeverityRank(b.Severity); a.FromCVE && ra != rb {
-			return rb - ra
-		}
-		return strings.Compare(a.Module, b.Module)
-	})
+	slices.SortFunc(order, compareMinimiseOrder)
+	return set, order
+}
 
-	// settle leaves the checkout holding the final set, as the build's bump
-	// step will: a later modroot of the same clone may depend on this one
-	// (e.g. through a local replace), so a trial's state must not linger.
-	settle := func() error {
-		if fail := l.engine.apply(ctx, l.inApplyOrder(set)); fail != nil && errors.Is(ctx.Err(), context.Canceled) {
-			return ctx.Err()
+// classifyRedundant reports why c is redundant without a trial: a
+// self-replace at or below the baseline-resolved version, or a deps entry
+// that matches or regresses the upstream go.mod. Other user-authored
+// replaces are never redundant this way.
+func (l *loop) classifyRedundant(c *candState) (why string, ok bool) {
+	if c.Replace {
+		if base := l.baselineVersion(c.Module); c.OldPath() == c.Module && semver.IsValid(base) &&
+			semver.Compare(c.Version, base) <= 0 {
+			return "self-replace at or below the baseline-resolved " + base, true
 		}
-		return nil
+		return "", false
 	}
-	stop := func(err error, why string) error {
-		if errors.Is(ctx.Err(), context.Canceled) {
-			return ctx.Err()
+	if why := l.engine.upstreamSkip(c); why != "" {
+		return "matches or regresses upstream go.mod (" + why + ")", true
+	}
+	return "", false
+}
+
+// compareMinimiseOrder is the redundancy trial order: derived entries (no
+// advisory) first, then advisory-backed ones from the least severe; ties by
+// module path.
+func compareMinimiseOrder(a, b *candState) int {
+	if a.FromCVE != b.FromCVE {
+		if a.FromCVE {
+			return 1
 		}
-		if errors.Is(err, ErrInfrastructure) {
-			return err
-		}
-		logging.From(ctx).Info("redundancy check stopped; keeping the remaining entries",
-			"modroot", l.req.Modroot, "reason", why, "error", err)
-		return settle()
+		return -1
 	}
-	start := time.Now()
-	ref, ok, err := l.finalState(ctx, l.inApplyOrder(set))
-	if err != nil || !ok {
-		return nil, stop(err, "the final set no longer applies")
+	if ra, rb := scan.SeverityRank(a.Severity), scan.SeverityRank(b.Severity); a.FromCVE && ra != rb {
+		return rb - ra
 	}
-	cost := time.Since(start)
+	return strings.Compare(a.Module, b.Module)
+}
+
+// settleMinimise leaves the checkout holding the final set, as the build's
+// bump step will: a later modroot of the same clone may depend on this one
+// (e.g. through a local replace), so a trial's state must not linger.
+func (l *loop) settleMinimise(ctx context.Context, set []*candState) error {
+	if fail := l.engine.apply(ctx, l.inApplyOrder(set)); fail != nil && errors.Is(ctx.Err(), context.Canceled) {
+		return ctx.Err()
+	}
+	return nil
+}
+
+// stopMinimise ends the redundancy check early, keeping the remaining
+// entries of set: a cancellation or an infrastructure failure is returned,
+// anything else is logged and the checkout settled (see settleMinimise).
+func (l *loop) stopMinimise(ctx context.Context, set []*candState, err error, why string) error {
+	if errors.Is(ctx.Err(), context.Canceled) {
+		return ctx.Err()
+	}
+	if errors.Is(err, ErrInfrastructure) {
+		return err
+	}
+	logging.From(ctx).Info("redundancy check stopped; keeping the remaining entries",
+		"modroot", l.req.Modroot, "reason", why, "error", err)
+	return l.settleMinimise(ctx, set)
+}
+
+// leaveOneOut trials, in order, the final set without each entry and drops
+// the entry when the final go.mod (ref) is unchanged without it; cost is the
+// slowest apply so far, for the budget guard. Returns ref after settling the
+// checkout on the surviving set.
+func (l *loop) leaveOneOut(ctx context.Context, ref *goModState, set, order []*candState, cost time.Duration) (*goModState, error) {
 	// Necessary condition, from the final graph's requirement edges: an
 	// entry for a module upstream already requires can only be implied when
 	// some other selected module requires it at >= its version (tidy never
@@ -1739,6 +1862,7 @@ func (l *loop) minimise(ctx context.Context) (*goModState, error) {
 	if g, ok := l.tc.(interface {
 		RequiredBy(ctx context.Context, dir string) (map[string]map[string]string, error)
 	}); ok {
+		var err error
 		if requiredBy, err = g.RequiredBy(ctx, l.dir); err != nil {
 			requiredBy = nil
 		}
@@ -1750,14 +1874,14 @@ func (l *loop) minimise(ctx context.Context) (*goModState, error) {
 			continue
 		}
 		if dl, has := ctx.Deadline(); has && time.Until(dl) < 2*cost {
-			return ref, stop(nil, "simulation budget nearly exhausted")
+			return ref, l.stopMinimise(ctx, set, nil, "simulation budget nearly exhausted")
 		}
 		without := slices.DeleteFunc(slices.Clone(set), func(p *candState) bool { return p == c })
 		start := time.Now()
 		st, ok, err := l.finalState(ctx, l.inApplyOrder(without))
 		cost = max(cost, time.Since(start))
 		if err != nil || ctx.Err() != nil {
-			return ref, stop(err, "trial interrupted")
+			return ref, l.stopMinimise(ctx, set, err, "trial interrupted")
 		}
 		if !ok || !st.equal(ref) {
 			continue
@@ -1769,7 +1893,7 @@ func (l *loop) minimise(ctx context.Context) (*goModState, error) {
 		}
 		l.dropRedundant(ctx, c, "implied by "+implied+" (final go.mod unchanged without it)")
 	}
-	return ref, settle()
+	return ref, l.settleMinimise(ctx, set)
 }
 
 // baselineVersion is module's version in the pristine graph: the compile
@@ -2040,7 +2164,7 @@ func (l *loop) compileGate(ctx context.Context, resolved map[string]string, resu
 
 	purpose, subject := "gate: converged set", ""
 	for {
-		live := slices.DeleteFunc(slices.Clone(active), func(c *candState) bool { return c.dropped })
+		live := slices.DeleteFunc(slices.Clone(active), func(c *candState) bool { return c.isDropped() })
 		out, repairs, err := l.repairFixpoint(ctx, g, purpose, subject, live)
 		if err != nil {
 			return nil, false, err
@@ -2496,7 +2620,7 @@ func (l *loop) gateAdopt(ctx context.Context, g *gateRun, live []*candState, rep
 		c.Version = g.rung(c).Version
 	}
 	for _, module := range sortedKeys(repairs) {
-		if c, ok := l.byModule[module]; ok && !c.dropped {
+		if c, ok := l.byModule[module]; ok && !c.isDropped() {
 			if semver.Compare(repairs[module], c.Version) > 0 {
 				c.Version = repairs[module]
 			}
@@ -2534,7 +2658,7 @@ func (l *loop) gateFinish(ctx context.Context, keep []*candState, rejected map[s
 		reason, wasRejected := rejected[r.module]
 		switch c := l.byModule[r.module]; {
 		case wasRejected:
-		case c != nil && c.dropped && c.shedUnlinked:
+		case c != nil && c.isDropped() && c.shedUnlinked:
 			reason = "vulnerable code linked again after compile-gate adjustments (fix was shed as unlinked under the full bump set); fix not validated"
 		default:
 			reason = "advisory surfaced after compile-gate adjustments; fix not validated"
@@ -2560,13 +2684,13 @@ func (l *loop) reviveRelinked(ctx context.Context, raises []raise) bool {
 	revivedAny := false
 	for _, r := range raises {
 		c := l.byModule[r.module]
-		if c == nil || !c.dropped || !c.shedUnlinked || l.revived[r.module] {
+		if c == nil || !c.isDropped() || !c.shedUnlinked || l.revived[r.module] {
 			continue
 		}
 		l.dropped = slices.DeleteFunc(l.dropped, func(d DroppedCandidate) bool {
 			return d.Module == c.Module && d.Reason == c.dropReason
 		})
-		c.dropped, c.residualized, c.shedUnlinked, c.dropReason, c.hygieneSeed = false, false, false, "", ""
+		c.residualized, c.shedUnlinked, c.dropReason, c.hygieneSeed = false, false, "", ""
 		l.revived[r.module] = true
 		revivedAny = true
 		logging.From(ctx).Info("compile gate: vulnerable code linked again - fix revived for another gate round",

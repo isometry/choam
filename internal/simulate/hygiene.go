@@ -83,14 +83,7 @@ func (l *loop) hygienePass(ctx context.Context, ref *goModState, resolved map[st
 	if len(targets) == 0 {
 		return resolved, nil
 	}
-	skip := ""
-	switch {
-	case !result.Converged:
-		skip = "the simulation did not converge"
-	case l.compiler == nil:
-		skip = "compile gate disabled"
-	}
-	if skip != "" {
+	if skip := l.hygieneSkipReason(result); skip != "" {
 		coords := make([]string, 0, len(targets))
 		for _, t := range targets {
 			coords = append(coords, t.module+"@"+t.version)
@@ -115,104 +108,153 @@ func (l *loop) hygienePass(ctx context.Context, ref *goModState, resolved map[st
 
 	start := time.Now()
 	savedLinked, savedPackages := l.linked, l.linkedPackages
-	var cost time.Duration
-	trials := 0
-	try := func(purpose string, pins []hygienePin) (*hygieneOutcome, error) {
-		if dl, has := ctx.Deadline(); has && time.Until(dl) < 2*cost {
-			return nil, errHygieneBudget
+	s := &hygieneSearch{l: l, set: set, ref: ref, maxGo: result.MaxDepGoVersion, baseResiduals: baseResiduals,
+		whys: make(map[string]string, len(targets))}
+	if err := s.run(ctx, targets); err != nil {
+		return nil, err
+	}
+	l.linked, l.linkedPackages = savedLinked, savedPackages
+
+	final := set
+	if len(s.accepted) > 0 {
+		final = withHygiene(set, s.accepted)
+	}
+	settled := s.lastAccepted || s.trials == 0
+	if !settled {
+		if settled, err = l.settleHygiene(ctx, final); err != nil {
+			return nil, err
 		}
-		began := time.Now()
-		out, err := l.hygieneTrial(ctx, purpose, set, pins, ref, result.MaxDepGoVersion, baseResiduals)
-		cost = max(cost, time.Since(began))
-		trials++
-		if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return nil, errHygieneBudget
-		}
-		return out, err
+	}
+	l.rejectHygiene(ctx, targets, s.accepted, s.whys, s.stopped)
+	logging.From(ctx).Info("scanner hygiene pass", "modroot", l.req.Modroot, "targets", len(targets),
+		"accepted", len(s.accepted), "trials", s.trials, "duration", time.Since(start).Round(time.Millisecond))
+	if len(s.accepted) == 0 {
+		return resolved, nil
 	}
 
-	var accepted []hygienePin
-	var acceptedOut *hygieneOutcome
-	lastAccepted := false
-	whys := make(map[string]string, len(targets))
-	stopped := ""
+	l.adoptHygiene(s.accepted)
+	out := s.acceptedOut
+	l.requirements, l.replaces = out.st.requires, out.st.replaces
+	l.linked, l.linkedPackages = out.linked, out.linkedPackages
+	l.scanResiduals = out.residuals
+	if !settled {
+		return out.resolved, nil // disk state unknown: keep the superset stdlib slice
+	}
+	if std := l.linkedStdPackages(ctx); std != nil {
+		result.StdPackages = std
+	}
+	return out.resolved, nil
+}
+
+// hygieneSkipReason is why the hygiene pass cannot evaluate any target ("" when
+// it can): it needs a converged result and the compile gate.
+func (l *loop) hygieneSkipReason(result *ModrootResult) string {
+	switch {
+	case !result.Converged:
+		return "the simulation did not converge"
+	case l.compiler == nil:
+		return "compile gate disabled"
+	}
+	return ""
+}
+
+// hygieneSearch is the hygiene pass's trial search (see hygienePass) over
+// the final set and its go.mod (ref): the accepted pins and the outcome of
+// the trial that accepted the last of them, whether the last trial was
+// accepted (the checkout then already holds the final set), each rejected
+// module's reason, and why the search stopped early ("" when it did not).
+type hygieneSearch struct {
+	l             *loop
+	set           []*candState
+	ref           *goModState
+	maxGo         string
+	baseResiduals []Residual
+
+	cost   time.Duration // slowest trial so far, for the budget guard
+	trials int
+
+	accepted     []hygienePin
+	acceptedOut  *hygieneOutcome
+	lastAccepted bool
+	whys         map[string]string
+	stopped      string
+}
+
+// try runs one hygiene trial, or returns errHygieneBudget when the budget
+// is too low for another (or the trial ran out of it).
+func (s *hygieneSearch) try(ctx context.Context, purpose string, pins []hygienePin) (*hygieneOutcome, error) {
+	if dl, has := ctx.Deadline(); has && time.Until(dl) < 2*s.cost {
+		return nil, errHygieneBudget
+	}
+	began := time.Now()
+	out, err := s.l.hygieneTrial(ctx, purpose, s.set, pins, s.ref, s.maxGo, s.baseResiduals)
+	s.cost = max(s.cost, time.Since(began))
+	s.trials++
+	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return nil, errHygieneBudget
+	}
+	return out, err
+}
+
+// run searches targets: one batch trial of every target (when more than
+// one), and if that is not free, each target alone in order on top of those
+// already accepted, its versions highest first.
+func (s *hygieneSearch) run(ctx context.Context, targets []hygieneTarget) error {
 	if len(targets) > 1 {
 		pins := make([]hygienePin, 0, len(targets))
 		for _, t := range targets {
 			pins = append(pins, hygienePin{module: t.module, version: t.versions[0], ids: t.vulnIDs})
 		}
-		out, err := try("hygiene: batch", pins)
+		out, err := s.try(ctx, "hygiene: batch", pins)
 		switch {
 		case errors.Is(err, errHygieneBudget):
-			stopped = err.Error()
+			s.stopped = err.Error()
 		case err != nil:
-			return nil, err
+			return err
 		case out.why == "":
-			accepted, acceptedOut, lastAccepted = pins, out, true
+			s.accepted, s.acceptedOut, s.lastAccepted = pins, out, true
 		}
 	}
-	if accepted == nil && stopped == "" {
-	search:
-		for _, t := range targets {
-			for _, version := range t.versions {
-				pins := append(slices.Clone(accepted), hygienePin{module: t.module, version: version, ids: t.vulnIDs})
-				out, err := try("hygiene: "+t.module, pins)
-				if errors.Is(err, errHygieneBudget) {
-					stopped = err.Error()
-					break search
-				}
-				if err != nil {
-					return nil, err
-				}
-				lastAccepted = out.why == ""
-				if lastAccepted {
-					accepted, acceptedOut = pins, out
-					delete(whys, t.module)
-					break
-				}
-				whys[t.module] = out.why
+	if s.accepted != nil || s.stopped != "" {
+		return nil
+	}
+	for _, t := range targets {
+		for _, version := range t.versions {
+			pins := append(slices.Clone(s.accepted), hygienePin{module: t.module, version: version, ids: t.vulnIDs})
+			out, err := s.try(ctx, "hygiene: "+t.module, pins)
+			if errors.Is(err, errHygieneBudget) {
+				s.stopped = err.Error()
+				return nil
 			}
+			if err != nil {
+				return err
+			}
+			s.lastAccepted = out.why == ""
+			if s.lastAccepted {
+				s.accepted, s.acceptedOut = pins, out
+				delete(s.whys, t.module)
+				break
+			}
+			s.whys[t.module] = out.why
 		}
 	}
-	l.linked, l.linkedPackages = savedLinked, savedPackages
+	return nil
+}
 
-	final := set
-	if len(accepted) > 0 {
-		final = withHygiene(set, accepted)
-	}
-	settled := lastAccepted || trials == 0
-	if !settled {
-		// Leave the checkout holding the final set, as the build will (a
-		// later modroot of the same clone may depend on it).
-		if fail := l.engine.apply(ctx, final); fail != nil {
-			if cerr := ctx.Err(); errors.Is(cerr, context.Canceled) {
-				return nil, cerr
-			}
-			if ierr := l.recordInfra(fail.err); ierr != nil {
-				return nil, ierr
-			}
-		} else {
-			settled = true
+// settleHygiene leaves the checkout holding the final set, as the build will
+// (a later modroot of the same clone may depend on it). Reports whether it
+// did; only a cancellation or an infrastructure failure is an error.
+func (l *loop) settleHygiene(ctx context.Context, final []*candState) (bool, error) {
+	if fail := l.engine.apply(ctx, final); fail != nil {
+		if cerr := ctx.Err(); errors.Is(cerr, context.Canceled) {
+			return false, cerr
 		}
+		if ierr := l.recordInfra(fail.err); ierr != nil {
+			return false, ierr
+		}
+		return false, nil
 	}
-	l.rejectHygiene(ctx, targets, accepted, whys, stopped)
-	logging.From(ctx).Info("scanner hygiene pass", "modroot", l.req.Modroot, "targets", len(targets),
-		"accepted", len(accepted), "trials", trials, "duration", time.Since(start).Round(time.Millisecond))
-	if len(accepted) == 0 {
-		return resolved, nil
-	}
-
-	l.adoptHygiene(accepted)
-	l.requirements, l.replaces = acceptedOut.st.requires, acceptedOut.st.replaces
-	l.linked, l.linkedPackages = acceptedOut.linked, acceptedOut.linkedPackages
-	l.scanResiduals = acceptedOut.residuals
-	if !settled {
-		return acceptedOut.resolved, nil // disk state unknown: keep the superset stdlib slice
-	}
-	if std := l.linkedStdPackages(ctx); std != nil {
-		result.StdPackages = std
-	}
-	return acceptedOut.resolved, nil
+	return true, nil
 }
 
 // hygieneTargets turns scanFindings' hygiene findings into targets, most
@@ -222,7 +264,7 @@ func (l *loop) hygienePass(ctx context.Context, ref *goModState, resolved map[st
 func (l *loop) hygieneTargets(found []raise, resolved map[string]string) []hygieneTarget {
 	var targets []hygieneTarget
 	for _, r := range found {
-		if c := l.byModule[r.module]; c != nil && ((!c.dropped && (c.Replace || c.remedy)) ||
+		if c := l.byModule[r.module]; c != nil && ((!c.isDropped() && (c.Replace || c.remedy)) ||
 			(c.ceiling != "" && semver.Compare(r.version, c.ceiling) >= 0)) {
 			continue
 		}
@@ -431,12 +473,12 @@ func withHygiene(set []*candState, pins []hygienePin) []*candState {
 // unlinked advisories is kept after all, so its drop record is withdrawn.
 func (l *loop) adoptHygiene(accepted []hygienePin) {
 	for _, p := range accepted {
-		if c := l.byModule[p.module]; c != nil && !c.dropped {
+		if c := l.byModule[p.module]; c != nil && !c.isDropped() {
 			c.Version, c.hygieneIDs = p.version, p.ids
 			continue
 		}
 		for _, c := range l.cands {
-			if c.Module == p.module && c.dropped && c.shedUnlinked && c.hygieneSeed != "" {
+			if c.Module == p.module && c.isDropped() && c.shedUnlinked && c.hygieneSeed != "" {
 				l.dropped = slices.DeleteFunc(l.dropped, func(d DroppedCandidate) bool {
 					return d.Module == c.Module && d.Reason == c.dropReason
 				})
@@ -469,7 +511,7 @@ func (l *loop) rejectHygiene(ctx context.Context, targets []hygieneTarget, accep
 		reason := fmt.Sprintf("shed: scanner hygiene pin %s@%s not free (%s)", t.module, t.seed, why)
 		reworded := false
 		for _, c := range l.cands {
-			if c.Module != t.module || c.hygieneSeed != t.seed || !c.dropped || !c.shedUnlinked {
+			if c.Module != t.module || c.hygieneSeed != t.seed || !c.isDropped() || !c.shedUnlinked {
 				continue
 			}
 			for i := range l.dropped {
