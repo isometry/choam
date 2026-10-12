@@ -14,7 +14,7 @@ import (
 
 // notBumpableFixtureYAML has no bump/go-bump steps and no go/build or
 // cargo/build steps, so ProcessFile hits checkVulnerabilities' "not a
-// bumpable project" fast path (stages.go) - no network access and no go
+// bumpable project" fast path (analyze.go) - no network access and no go
 // toolchain required, so this is safe to run in any environment.
 const notBumpableFixtureYAML = `package:
   name: not-bumpable
@@ -29,7 +29,7 @@ pipeline:
 `
 
 // TestProcessFile_LogsCarryFileAttribution is the acceptance test for the
-// per-file ctx boundary wired in adapter.go: every log record emitted while
+// per-file ctx boundary wired in run.go: every log record emitted while
 // processing one melange spec file - however deep in the pipeline - must
 // carry file= for that spec's path, and never carry it twice (Into replaces,
 // not layers - see internal/logging).

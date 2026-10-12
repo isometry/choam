@@ -381,3 +381,23 @@ func pinWord(constraint string) string {
 	}
 	return constraint
 }
+
+// stdlibRebuildVersions collects the unique "go<version>" rebuild targets
+// across the stdlib bumps, sorted.
+func stdlibRebuildVersions(bumps []StdlibBump) []string {
+	seen := make(map[string]struct{}, len(bumps))
+	var versions []string
+	for _, bump := range bumps {
+		if bump.RebuildGoVersion == "" {
+			continue
+		}
+		name := "go" + bump.RebuildGoVersion
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		versions = append(versions, name)
+	}
+	sort.Strings(versions)
+	return versions
+}

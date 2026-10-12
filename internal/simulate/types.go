@@ -251,6 +251,7 @@ type HygieneModule struct {
 
 // Residual is a vulnerability the simulation could not eliminate, with the
 // reason zero-vulnerability state is unreachable for it.
+// Not Go-only: gobump also reuses it for Rust/Java bumps it holds back.
 type Residual struct {
 	Module          string   `json:"module" yaml:"module"`
 	ResolvedVersion string   `json:"resolved_version" yaml:"resolved_version"`

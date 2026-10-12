@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/isometry/choam/internal/config"
+
 	melange "chainguard.dev/melange/pkg/config"
 	"github.com/isometry/choam/internal/simulate"
 	"github.com/stretchr/testify/assert"
@@ -27,40 +29,6 @@ func goUnits(t *testing.T, cfg *melange.Configuration) ([]analysisUnit, []string
 	t.Helper()
 	units, notes := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
 	return units["go"], notes
-}
-
-func TestGoTargetArches(t *testing.T) {
-	for _, tt := range []struct {
-		name string
-		in   []string
-		want []string
-	}{
-		{"absent: melange's default", nil, []string{"amd64", "arm64"}},
-		{"x86_64", []string{"x86_64"}, []string{"amd64"}},
-		{"aarch64", []string{"aarch64"}, []string{"arm64"}},
-		{"both, any order", []string{"aarch64", "x86_64"}, []string{"amd64", "arm64"}},
-		{"GOARCH spellings", []string{"arm64", "amd64"}, []string{"amd64", "arm64"}},
-		{"all", []string{"all"}, []string{"amd64", "arm64"}},
-		{"others mapped", []string{"armv7", "ppc64le", "x86_64"}, []string{"amd64", "arm", "ppc64le"}},
-		{"unknown only: default", []string{"pdp11"}, []string{"amd64", "arm64"}},
-	} {
-		t.Run(tt.name, func(t *testing.T) {
-			cfg := &melange.Configuration{Package: melange.Package{TargetArchitecture: tt.in}}
-			assert.Equal(t, tt.want, goTargetArches(t.Context(), cfg))
-		})
-	}
-
-	t.Run("threaded onto every go unit", func(t *testing.T) {
-		cfg := &melange.Configuration{
-			Package:  melange.Package{TargetArchitecture: []string{"x86_64"}, Annotations: map[string]string{"choam/bump-go": "cmd/annotated"}},
-			Pipeline: []melange.Pipeline{{Uses: "go/build"}},
-		}
-		units, _ := goUnits(t, cfg)
-		require.Len(t, units, 2)
-		for _, unit := range units {
-			assert.Equal(t, []string{"amd64"}, unit.Arches, unit.Modroot)
-		}
-	})
 }
 
 func TestDiscoverGoInstall(t *testing.T) {
@@ -239,4 +207,225 @@ func TestDiscoverApksSpecs(t *testing.T) {
 			assert.Empty(t, notes)
 		})
 	}
+}
+
+func TestDiscoverAnalysisUnits(t *testing.T) {
+	loader := config.NewLoader()
+
+	t.Run("union of existing bump step modroots", func(t *testing.T) {
+		steps, err := loader.FindBumpSteps([]byte(certManagerLikeYAML))
+		require.NoError(t, err)
+
+		units, _ := discoverAnalysisUnits(t.Context(), &melange.Configuration{}, steps, nil)
+		require.Contains(t, units, "go")
+		assert.ElementsMatch(t, []string{"cmd/a", "cmd/b", ".", "test/e2e"}, roots(units["go"]))
+	})
+
+	t.Run("go/build modroot signal, top-level pipeline", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{
+				{Uses: "git-checkout"},
+				{Uses: "go/build", With: map[string]string{"modroot": "cmd/foo"}},
+			},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		assert.Equal(t, []string{"cmd/foo"}, roots(units["go"]))
+	})
+
+	t.Run("go/build with no explicit modroot defaults to \".\"", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{{Uses: "go/build"}},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		assert.Equal(t, []string{"."}, roots(units["go"]))
+	})
+
+	t.Run("cargo/build signal", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{{Uses: "cargo/build", With: map[string]string{"modroot": "."}}},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		assert.Equal(t, []string{"."}, roots(units["rust"]))
+	})
+
+	t.Run("go/build signal found only in a subpackage pipeline", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{{Uses: "git-checkout"}},
+			Subpackages: []melange.Subpackage{
+				{Name: "sub", Pipeline: []melange.Pipeline{
+					{Uses: "go/build", With: map[string]string{"modroot": "cmd/sub"}},
+				}},
+			},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		assert.Equal(t, []string{"cmd/sub"}, roots(units["go"]))
+	})
+
+	t.Run("multiple go/build steps across top-level and subpackages, all collected", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{
+				{Uses: "go/build", With: map[string]string{"modroot": "cmd/a"}},
+			},
+			Subpackages: []melange.Subpackage{
+				{Name: "sub1", Pipeline: []melange.Pipeline{
+					{Uses: "go/build", With: map[string]string{"modroot": "cmd/b"}},
+				}},
+			},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		assert.ElementsMatch(t, []string{"cmd/a", "cmd/b"}, roots(units["go"]))
+	})
+
+	t.Run("annotation opt-in with explicit modroot list", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Package: melange.Package{Annotations: map[string]string{
+				"choam/bump-rust": "cmd/foo, cmd/bar",
+			}},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		assert.ElementsMatch(t, []string{"cmd/foo", "cmd/bar"}, roots(units["rust"]))
+	})
+
+	t.Run("annotation present but empty defaults to \".\"", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Package: melange.Package{Annotations: map[string]string{"choam/bump-java": ""}},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		assert.Equal(t, []string{"."}, roots(units["java"]))
+	})
+
+	t.Run("all three sources additively union for the same language", func(t *testing.T) {
+		bumpSteps := []config.BumpStep{{Language: "go", Modroots: []string{"cmd/existing"}}}
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{{Uses: "go/build", With: map[string]string{"modroot": "cmd/build"}}},
+			Package: melange.Package{Annotations: map[string]string{
+				"choam/bump-go": "cmd/annotated",
+			}},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, bumpSteps, nil)
+		assert.ElementsMatch(t, []string{"cmd/existing", "cmd/build", "cmd/annotated"}, roots(units["go"]))
+	})
+
+	t.Run("engine, tidy and go-package pin per modroot", func(t *testing.T) {
+		bumpSteps := []config.BumpStep{
+			{Action: "go/bump", Modroots: []string{"cmd/legacy"}},
+			{Action: "bump", Language: "go", Modroots: []string{"cmd/untidy"}, NoTidy: true},
+			{Action: "bump", Language: "go", Modroots: []string{"cmd/legacy"}}, // first covering step wins
+		}
+		cfg := &melange.Configuration{Pipeline: []melange.Pipeline{
+			{Uses: "go/build", With: map[string]string{"modroot": "cmd/new", "go-package": "go-1.26"}},
+			{Uses: "go/build", With: map[string]string{"modroot": "cmd/new", "go-package": "go-fips-1.25"}},
+		}}
+		byRoot := make(map[string]analysisUnit)
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, bumpSteps, nil)
+		for _, unit := range units["go"] {
+			byRoot[unit.Modroot] = unit
+		}
+		assert.Equal(t, simulate.EngineGobump, byRoot["cmd/legacy"].Engine)
+		assert.Equal(t, simulate.EngineOmnibump, byRoot["cmd/untidy"].Engine)
+		assert.True(t, byRoot["cmd/untidy"].NoTidy)
+		assert.Equal(t, simulate.EngineOmnibump, byRoot["cmd/new"].Engine, "a root without a step gets choam's default `uses: bump`")
+		assert.False(t, byRoot["cmd/new"].NoTidy)
+		assert.Equal(t, "1.25", byRoot["cmd/new"].GoMinor, "the lowest pinned go minor")
+		assert.Equal(t, "", byRoot["cmd/legacy"].GoMinor)
+	})
+
+	t.Run("multiple languages coexist without conflict", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{
+				{Uses: "go/build", With: map[string]string{"modroot": "."}},
+				{Uses: "cargo/build", With: map[string]string{"modroot": "cli"}},
+			},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		assert.Equal(t, []string{"."}, roots(units["go"]))
+		assert.Equal(t, []string{"cli"}, roots(units["rust"]))
+	})
+
+	t.Run("nothing found at all - not bumpable", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{{Uses: "git-checkout"}, {Runs: "make build"}},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		assert.Empty(t, units)
+	})
+
+	t.Run("maven has no structured build signal - annotation only", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{{Uses: "maven/pombump"}}, // not a build step with modroot
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		assert.NotContains(t, units, "java")
+
+		cfg.Package.Annotations = map[string]string{"choam/bump-java": "."}
+		units, _ = discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		assert.Equal(t, []string{"."}, roots(units["java"]))
+	})
+
+	t.Run("go/build packages captured per modroot", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{
+				{Uses: "go/build", With: map[string]string{"modroot": ".", "packages": "./cmd/terraform ."}},
+			},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		require.Len(t, units["go"], 1)
+		assert.Equal(t, ".", units["go"][0].Modroot)
+		assert.ElementsMatch(t, []string{".", "./cmd/terraform"}, units["go"][0].Packages)
+	})
+
+	t.Run("packages unioned across go/build steps sharing a modroot", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{
+				{Uses: "go/build", With: map[string]string{"packages": "./cmd/a"}},
+				{Uses: "go/build", With: map[string]string{"packages": "./cmd/b ./cmd/a"}},
+			},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		require.Len(t, units["go"], 1)
+		assert.Equal(t, []string{"./cmd/a", "./cmd/b"}, units["go"][0].Packages)
+	})
+
+	t.Run("template expressions in packages are rendered", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Package: melange.Package{Name: "example", Version: "1.0.0"},
+			Pipeline: []melange.Pipeline{
+				{Uses: "go/build", With: map[string]string{"packages": "./cmd/${{package.name}}"}},
+			},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		require.Len(t, units["go"], 1)
+		assert.Equal(t, []string{"./cmd/example"}, units["go"][0].Packages)
+	})
+
+	t.Run("bump-step-only modroot has empty packages", func(t *testing.T) {
+		bumpSteps := []config.BumpStep{{Language: "go", Modroots: []string{"cmd/only"}}}
+		units, _ := discoverAnalysisUnits(t.Context(), &melange.Configuration{}, bumpSteps, nil)
+		require.Len(t, units["go"], 1)
+		assert.Empty(t, units["go"][0].Packages)
+		assert.Empty(t, units["go"][0].Tags)
+	})
+
+	t.Run("go/build tags: toolchaintags default plus tags, unioned", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{
+				{Uses: "go/build", With: map[string]string{"tags": "foo, bar"}},
+				{Uses: "go/build", With: map[string]string{"toolchaintags": "netgo", "tags": "baz"}},
+			},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		require.Len(t, units["go"], 1)
+		assert.Equal(t, []string{"bar", "baz", "foo", "netgo", "osusergo"}, units["go"][0].Tags)
+	})
+
+	t.Run("go/build empty toolchaintags override drops the default", func(t *testing.T) {
+		cfg := &melange.Configuration{
+			Pipeline: []melange.Pipeline{
+				{Uses: "go/build", With: map[string]string{"toolchaintags": ""}},
+			},
+		}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		require.Len(t, units["go"], 1)
+		assert.Empty(t, units["go"][0].Tags)
+	})
 }
