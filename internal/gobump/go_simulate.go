@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -608,11 +609,9 @@ func (r *reachabilityDiff) observe(m ModrootAnalysis, linkedModules, linkedPacka
 	degradedMode := linkedModules == nil && unrequired != nil
 
 	// Per-advisory vulnerable import paths, from the analysis scan.
-	importsByID := make(map[string][]scan.VulnerableImport)
+	var importsByID map[string][]scan.VulnerableImport
 	if m.ScanResult != nil {
-		for _, vuln := range m.ScanResult.Vulnerabilities {
-			importsByID[vuln.ID] = vuln.VulnerableImports
-		}
+		importsByID = importsByAdvisory(m.ScanResult.Vulnerabilities)
 	}
 
 	record := func(module string, vulnIDs []string) {
@@ -742,14 +741,27 @@ func vulnImports(scanResult *scan.ScanResult) map[string][]scan.VulnerableImport
 	if scanResult == nil {
 		return nil
 	}
-	imports := make(map[string][]scan.VulnerableImport)
-	for _, vuln := range scanResult.Vulnerabilities {
-		if len(vuln.VulnerableImports) > 0 {
-			imports[vuln.ID] = append(imports[vuln.ID], vuln.VulnerableImports...)
-		}
-	}
+	imports := importsByAdvisory(scanResult.Vulnerabilities)
+	maps.DeleteFunc(imports, func(_ string, v []scan.VulnerableImport) bool { return len(v) == 0 })
 	if len(imports) == 0 {
 		return nil
+	}
+	return imports
+}
+
+// importsByAdvisory maps advisory ID -> vulnerable imports. One ID can name
+// findings in several modules (IDs are CVE-first, so two modules' GO- records
+// can share one): their imports union, but a finding without import metadata
+// makes the ID's imports unknown (empty - every consumer fails open).
+func importsByAdvisory(vulns []scan.Vulnerability) map[string][]scan.VulnerableImport {
+	imports := make(map[string][]scan.VulnerableImport, len(vulns))
+	for _, vuln := range vulns {
+		prev, seen := imports[vuln.ID]
+		if seen && (len(prev) == 0 || len(vuln.VulnerableImports) == 0) {
+			imports[vuln.ID] = nil
+			continue
+		}
+		imports[vuln.ID] = append(prev, vuln.VulnerableImports...)
 	}
 	return imports
 }
