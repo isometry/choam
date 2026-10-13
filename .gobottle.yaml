@@ -1,0 +1,18 @@
+formula:
+  name: choam
+  description: Track updates for melange build specification files
+  homepage: https://just.breathe.io/project/choam/
+  license: MIT
+  install:
+    completions: true
+  test:
+    command: [--help]
+
+source:
+  type: local
+  build:
+    packages: ["."]
+    ldflags: "-s -w"
+
+tap:
+  owner: isometry

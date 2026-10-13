@@ -16,7 +16,7 @@ A Go CLI tool for managing melange build specifications and securing software su
 ### Using Homebrew
 
 ```bash
-# Install choam
+brew trust isometry/tap   # once, required on Homebrew >= 6
 brew install isometry/tap/choam
 ```
 
