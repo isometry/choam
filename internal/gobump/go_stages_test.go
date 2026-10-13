@@ -12,24 +12,24 @@ import (
 // runApplyPhase runs the apply phase's three steps directly, without
 // ShouldRun gating - the Go-only go-version fallback, the applier and the
 // Go-only go-package pin reconciliation, in pipeline order.
-func runApplyPhase(t *testing.T, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis) error {
+func runApplyPhase(t *testing.T, gp *Processor, analysis *VulnerabilityAnalysis) error {
 	t.Helper()
 	if err := NewGoVersionFallbackStage(nil).fallbackGoVersions(t.Context(), gp, analysis); err != nil {
 		return err
 	}
-	if err := NewGoBumpApplier(nil).applyGoBumpChanges(t.Context(), gp, analysis); err != nil {
+	if err := NewApplier(nil).applyChanges(t.Context(), gp, analysis); err != nil {
 		return err
 	}
 	return NewGoPackagePinStage(nil).reconcileGoPackagePins(t.Context(), gp, goPinFloors(analysis))
 }
 
-// TestNewGoBumpPipeline_StageOrder pins the stage order: the go-version
+// TestNewPipeline_StageOrder pins the stage order: the go-version
 // fallback before the applier (its RequiredGoVersion feeds
 // fastPathGoVersion and the pin floors), the go-package pin stage after the
 // applier (it edits the rewritten YAML) and before the stdlib stage (which
 // reads RaisedPinMinors).
-func TestNewGoBumpPipeline_StageOrder(t *testing.T) {
-	pipeline := NewGoBumpPipeline(NewAnalyzer(nil), ProcessorOptions{})
+func TestNewPipeline_StageOrder(t *testing.T) {
+	pipeline := NewPipeline(NewAnalyzer(nil), Options{})
 	names := make([]string, 0, len(pipeline.Stages))
 	for _, stage := range pipeline.Stages {
 		names = append(names, stage.Name())
@@ -38,7 +38,7 @@ func TestNewGoBumpPipeline_StageOrder(t *testing.T) {
 		"vulnerability_check",
 		"bump_simulation",
 		"go_version_fallback",
-		"gobump_apply",
+		"bump_apply",
 		"go_package_pins",
 		"stdlib_check",
 		"epoch",
@@ -107,13 +107,13 @@ func TestGoStages_ShouldRun(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			gp := NewGoBumpProcessor("/test/example.yaml", "example", "1.0.0", 0)
+			gp := NewProcessor("/test/example.yaml", "example", "1.0.0", 0)
 			gp.VulnerabilityAnalysis = tt.analysis
 			for _, check := range []struct {
 				stage processor.Stage
 				want  bool
 			}{
-				{NewGoBumpApplier(nil), tt.wantApplier},
+				{NewApplier(nil), tt.wantApplier},
 				{NewGoVersionFallbackStage(nil), tt.wantFallback},
 				{NewGoPackagePinStage(nil), tt.wantPins},
 			} {
@@ -127,12 +127,12 @@ func TestGoStages_ShouldRun(t *testing.T) {
 
 // runApplyStages runs the fallback, applier and pin stages through their
 // ShouldRun/Apply, as the pipeline does.
-func runApplyStages(t *testing.T, gp *GoBumpProcessor) {
+func runApplyStages(t *testing.T, gp *Processor) {
 	t.Helper()
 	for _, stage := range []interface {
 		processor.Stage
 		processor.ApplyStage
-	}{NewGoVersionFallbackStage(nil), NewGoBumpApplier(nil), NewGoPackagePinStage(nil)} {
+	}{NewGoVersionFallbackStage(nil), NewApplier(nil), NewGoPackagePinStage(nil)} {
 		run, err := stage.ShouldRun(t.Context(), gp)
 		require.NoError(t, err)
 		if run {

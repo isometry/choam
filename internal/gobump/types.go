@@ -10,7 +10,7 @@ import (
 )
 
 // BumpAction summarizes a change needed for one or more module roots, for
-// reporting purposes (see GoBumpResult.ActionsApplied).
+// reporting purposes (see Result.ActionsApplied).
 type BumpAction struct {
 	Action       string   `json:"action" yaml:"action"`                         // "needs_bump"
 	Language     string   `json:"language" yaml:"language"`                     // "go", "rust", "java"
@@ -48,14 +48,14 @@ type SecurityFix struct {
 	Severity      string `json:"severity" yaml:"severity"`           // critical, high, medium, low
 }
 
-// GoBumpResult represents the result of a bump operation.
+// Result represents the result of a bump operation.
 //
 // Counting units: VulnerabilitiesFound and VulnerabilitiesFixed/Residual
 // count advisories; ModulesBumped counts dependency entries changed. When
 // Validated is true, Fixed/Residual are proven by simulating the bump against
 // a real checkout; otherwise Fixed falls back to the historical
 // modules-changed approximation.
-type GoBumpResult struct {
+type Result struct {
 	PackageName             string `json:"package_name" yaml:"package_name"`
 	FilePath                string `json:"file_path" yaml:"file_path"`
 	VulnerabilitiesFound    int    `json:"vulnerabilities_found" yaml:"vulnerabilities_found"`
@@ -83,7 +83,7 @@ type GoBumpResult struct {
 	HygieneModulesBumped int           `json:"hygiene_modules_bumped,omitempty" yaml:"hygiene_modules_bumped,omitempty"`
 	ActionsApplied       []BumpAction  `json:"actions_applied" yaml:"actions_applied"`
 	// SkipReasons say why (part of) the package was not analyzed (status
-	// SKIPPED; see GoBumpProcessor.SkipReasons).
+	// SKIPPED; see Processor.SkipReasons).
 	SkipReasons []string `json:"skip_reasons,omitempty" yaml:"skip_reasons,omitempty"`
 	// StdlibBumps are the Go stdlib staleness findings that (each) justify
 	// an epoch bump; StdlibChecked reports whether the staleness check ran
@@ -217,10 +217,10 @@ type VulnerabilityAnalysis struct {
 	ExpectedCommit string `json:"expected_commit,omitempty" yaml:"expected_commit,omitempty"`
 }
 
-// ProcessorOptions configures processor behavior: the shared processor
+// Options configures processor behavior: the shared processor
 // options (DryRun, BackupSuffix, TempDir; Force is unused by bump) plus the
 // bump-specific ones below.
-type ProcessorOptions struct {
+type Options struct {
 	processor.ProcessorOptions
 
 	// Validate enables bump simulation (default true): Go bump candidates

@@ -13,16 +13,16 @@ import (
 	"github.com/isometry/choam/internal/scan"
 )
 
-// GoBumpApplier applies bump/go-bump pipeline changes
-type GoBumpApplier struct {
+// Applier applies bump/go-bump pipeline changes
+type Applier struct {
 	processor.BaseStage
 	Analyzer *Analyzer
 }
 
-func NewGoBumpApplier(analyzer *Analyzer) *GoBumpApplier {
-	return &GoBumpApplier{
+func NewApplier(analyzer *Analyzer) *Applier {
+	return &Applier{
 		BaseStage: processor.BaseStage{
-			StageName:        "gobump_apply",
+			StageName:        "bump_apply",
 			StageDescription: "Apply bump/go-bump pipeline changes",
 		},
 		Analyzer: analyzer,
@@ -32,13 +32,13 @@ func NewGoBumpApplier(analyzer *Analyzer) *GoBumpApplier {
 // bumpActionsPending is the apply phase's gate: vulnerabilities were found
 // and there are bump actions to apply. The applier and the Go-only stages
 // around it (GoVersionFallbackStage, GoPackagePinStage) share it.
-func bumpActionsPending(gp *GoBumpProcessor) bool {
+func bumpActionsPending(gp *Processor) bool {
 	return gp.VulnerabilityAnalysis != nil &&
 		gp.VulnerabilityAnalysis.VulnerabilitiesFound > 0 &&
 		len(gp.VulnerabilityAnalysis.BumpActions) > 0
 }
 
-func (g *GoBumpApplier) ShouldRun(ctx context.Context, p processor.Processor) (bool, error) {
+func (g *Applier) ShouldRun(ctx context.Context, p processor.Processor) (bool, error) {
 	gp, err := asBump(p)
 	if err != nil {
 		return false, err
@@ -46,13 +46,13 @@ func (g *GoBumpApplier) ShouldRun(ctx context.Context, p processor.Processor) (b
 	return bumpActionsPending(gp), nil
 }
 
-func (g *GoBumpApplier) Apply(ctx context.Context, p processor.Processor) error {
+func (g *Applier) Apply(ctx context.Context, p processor.Processor) error {
 	gp, err := asBump(p)
 	if err != nil {
 		return err
 	}
 
-	if err := g.applyGoBumpChanges(ctx, gp, gp.VulnerabilityAnalysis); err != nil {
+	if err := g.applyChanges(ctx, gp, gp.VulnerabilityAnalysis); err != nil {
 		return err
 	}
 
@@ -67,8 +67,8 @@ func (g *GoBumpApplier) Apply(ctx context.Context, p processor.Processor) error 
 
 // reportApplyOutcome emits the apply phase's one-line outcome, once every
 // stage of the phase that can change the YAML has run (see
-// GoBumpApplier.Apply and GoPackagePinStage.Apply).
-func reportApplyOutcome(gp *GoBumpProcessor) {
+// Applier.Apply and GoPackagePinStage.Apply).
+func reportApplyOutcome(gp *Processor) {
 	if gp.ActualChangesApplied {
 		gp.AddMessage("bump changes applied")
 	} else {
@@ -76,8 +76,8 @@ func reportApplyOutcome(gp *GoBumpProcessor) {
 	}
 }
 
-// NewGoBumpPipeline creates the gobump pipeline with the critical fix
-func NewGoBumpPipeline(analyzer *Analyzer, opts ProcessorOptions) *processor.Pipeline {
+// NewPipeline creates the gobump pipeline with the critical fix
+func NewPipeline(analyzer *Analyzer, opts Options) *processor.Pipeline {
 	pipeline := processor.NewPipeline("bump")
 
 	// Add stages in order
@@ -96,7 +96,7 @@ func NewGoBumpPipeline(analyzer *Analyzer, opts ProcessorOptions) *processor.Pip
 		NewGoVersionFallbackStage(analyzer),
 
 		// Apply phase
-		NewGoBumpApplier(analyzer),
+		NewApplier(analyzer),
 
 		// Go only: raise too-old go-package toolchain pins - after the
 		// applier (it edits the rewritten YAML) and before the stdlib stage
@@ -113,7 +113,7 @@ func NewGoBumpPipeline(analyzer *Analyzer, opts ProcessorOptions) *processor.Pip
 		// This is the critical fix that solves the issue described in the implementation plan
 		stages.NewEpochStage(&stages.BumpOnSecurityFixStrategy{
 			CheckFunc: func(p processor.Processor) bool {
-				if gp, ok := p.(*GoBumpProcessor); ok {
+				if gp, ok := p.(*Processor); ok {
 					// Dependency changes only count when actual changes were
 					// applied AND they include security fixes (the critical
 					// fix) or scanner-hygiene bumps (the rebuild is what
@@ -127,7 +127,7 @@ func NewGoBumpPipeline(analyzer *Analyzer, opts ProcessorOptions) *processor.Pip
 				return false
 			},
 			CommentFunc: func(p processor.Processor) string {
-				if gp, ok := p.(*GoBumpProcessor); ok {
+				if gp, ok := p.(*Processor); ok {
 					return epochComment(gp)
 				}
 				return ""
@@ -157,7 +157,7 @@ const epochCommentMaxIDs = 5
 // bumps clear for scanners, most critical first. The clause conditions
 // mirror the epoch CheckFunc exactly, so the comment always states why the
 // epoch actually bumped.
-func epochComment(gp *GoBumpProcessor) string {
+func epochComment(gp *Processor) string {
 	security := gp.ActualChangesApplied && len(gp.SecurityFixes) > 0
 	hygiene := gp.ActualChangesApplied && len(gp.HygieneBumps) > 0
 	var clauses []string
@@ -194,7 +194,7 @@ func epochComment(gp *GoBumpProcessor) string {
 // recorded on the SecurityFixes (skipping the "security vulnerability"
 // placeholder used when no OSV ID was matched). Stdlib rebuild fixes are
 // always included.
-func epochFixedVulnIDs(gp *GoBumpProcessor) []string {
+func epochFixedVulnIDs(gp *Processor) []string {
 	ids := make(map[string]struct{})
 	if gp.ActualChangesApplied && len(gp.SecurityFixes) > 0 {
 		ids = gp.fixedVulnIDs()
@@ -209,7 +209,7 @@ func epochFixedVulnIDs(gp *GoBumpProcessor) []string {
 
 // analysisSeverities maps every advisory ID the analysis scan found to its
 // most critical observed severity.
-func analysisSeverities(gp *GoBumpProcessor) map[string]string {
+func analysisSeverities(gp *Processor) map[string]string {
 	severities := make(map[string]string)
 	if gp.VulnerabilityAnalysis == nil {
 		return severities

@@ -49,26 +49,26 @@ func fixableScanner() *fakeStdlibScanner {
 	}}
 }
 
-func newStdlibTestStage(opts ProcessorOptions, index *fakeReleaseIndex, scanner *fakeStdlibScanner) *StdlibStage {
+func newStdlibTestStage(opts Options, index *fakeReleaseIndex, scanner *fakeStdlibScanner) *StdlibStage {
 	stage := NewStdlibStage(nil, opts)
 	stage.index = index
 	stage.scanner = scanner
 	stage.lastCommit = func(context.Context, string) (*git.FileCommitInfo, error) {
 		return &git.FileCommitInfo{Time: stdlibCommitTime, Hash: "abc123"}, nil
 	}
-	stage.linkStd = func(context.Context, *GoBumpProcessor) (map[string]struct{}, error) {
+	stage.linkStd = func(context.Context, *Processor) (map[string]struct{}, error) {
 		return nil, errors.New("linkStd must not be called in this test")
 	}
 	return stage
 }
 
-func newStdlibTestProcessor() *GoBumpProcessor {
-	gp := NewGoBumpProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
+func newStdlibTestProcessor() *Processor {
+	gp := NewProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
 	gp.Config = stdlibTestConfig()
 	return gp
 }
 
-func messagesContain(t *testing.T, gp *GoBumpProcessor, want string) {
+func messagesContain(t *testing.T, gp *Processor, want string) {
 	t.Helper()
 	for _, msg := range gp.GetMessages() {
 		if strings.Contains(msg, want) {
@@ -80,21 +80,21 @@ func messagesContain(t *testing.T, gp *GoBumpProcessor, want string) {
 
 func TestStdlibStage_ShouldRun(t *testing.T) {
 	t.Run("go build steps and enabled - runs", func(t *testing.T) {
-		stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true}, staleIndex(), fixableScanner())
+		stage := newStdlibTestStage(Options{StdlibCheck: true}, staleIndex(), fixableScanner())
 		ok, err := stage.ShouldRun(t.Context(), newStdlibTestProcessor())
 		require.NoError(t, err)
 		assert.True(t, ok)
 	})
 
 	t.Run("disabled by options", func(t *testing.T) {
-		stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: false}, staleIndex(), fixableScanner())
+		stage := newStdlibTestStage(Options{StdlibCheck: false}, staleIndex(), fixableScanner())
 		ok, err := stage.ShouldRun(t.Context(), newStdlibTestProcessor())
 		require.NoError(t, err)
 		assert.False(t, ok)
 	})
 
 	t.Run("no go build steps", func(t *testing.T) {
-		stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true}, staleIndex(), fixableScanner())
+		stage := newStdlibTestStage(Options{StdlibCheck: true}, staleIndex(), fixableScanner())
 		gp := newStdlibTestProcessor()
 		gp.Config = &melange.Configuration{
 			Pipeline: []melange.Pipeline{{Uses: "cargo/build"}},
@@ -105,7 +105,7 @@ func TestStdlibStage_ShouldRun(t *testing.T) {
 	})
 
 	t.Run("nil config", func(t *testing.T) {
-		stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true}, staleIndex(), fixableScanner())
+		stage := newStdlibTestStage(Options{StdlibCheck: true}, staleIndex(), fixableScanner())
 		gp := newStdlibTestProcessor()
 		gp.Config = nil
 		ok, err := stage.ShouldRun(t.Context(), gp)
@@ -116,7 +116,7 @@ func TestStdlibStage_ShouldRun(t *testing.T) {
 
 func TestStdlibStage_RecordsBump(t *testing.T) {
 	index, scanner := staleIndex(), fixableScanner()
-	stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true}, index, scanner)
+	stage := newStdlibTestStage(Options{StdlibCheck: true}, index, scanner)
 	gp := newStdlibTestProcessor()
 
 	require.NoError(t, stage.Apply(t.Context(), gp))
@@ -146,7 +146,7 @@ func TestStdlibStage_RebuildSideReflectsSameRunPinRaise(t *testing.T) {
 		"1.21.11": {stdlibVuln("GO-STD-1", scan.VulnerableImport{Path: "net/http"})},
 		"1.25.4":  nil,
 	}}
-	stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true}, index, scanner)
+	stage := newStdlibTestStage(Options{StdlibCheck: true}, index, scanner)
 
 	gp := newStdlibTestProcessor()
 	gp.Config.Pipeline[1].With["go-package"] = "go-1.21" // the pristine pin
@@ -194,7 +194,7 @@ func TestStdlibStage_SkipGates(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			index, scanner := staleIndex(), fixableScanner()
-			stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true}, index, scanner)
+			stage := newStdlibTestStage(Options{StdlibCheck: true}, index, scanner)
 			stage.lastCommit = func(context.Context, string) (*git.FileCommitInfo, error) {
 				return tt.commitInfo, tt.commitErr
 			}
@@ -211,7 +211,7 @@ func TestStdlibStage_SkipGates(t *testing.T) {
 
 func TestStdlibStage_ShallowWarnsAndContinues(t *testing.T) {
 	index, scanner := staleIndex(), fixableScanner()
-	stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true}, index, scanner)
+	stage := newStdlibTestStage(Options{StdlibCheck: true}, index, scanner)
 	stage.lastCommit = func(context.Context, string) (*git.FileCommitInfo, error) {
 		return &git.FileCommitInfo{Time: stdlibCommitTime, Shallow: true}, nil
 	}
@@ -224,7 +224,7 @@ func TestStdlibStage_ShallowWarnsAndContinues(t *testing.T) {
 
 func TestStdlibStage_IndexFailureDegradesToSkip(t *testing.T) {
 	index := &fakeReleaseIndex{asOfErr: errors.New("proxy unreachable")}
-	stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true}, index, fixableScanner())
+	stage := newStdlibTestStage(Options{StdlibCheck: true}, index, fixableScanner())
 	gp := newStdlibTestProcessor()
 
 	require.NoError(t, stage.Apply(t.Context(), gp), "index failure must degrade, never error")
@@ -235,7 +235,7 @@ func TestStdlibStage_IndexFailureDegradesToSkip(t *testing.T) {
 }
 
 func TestStdlibStage_NilIndexDegradesToSkip(t *testing.T) {
-	stage := NewStdlibStage(nil, ProcessorOptions{StdlibCheck: true})
+	stage := NewStdlibStage(nil, Options{StdlibCheck: true})
 	stage.lastCommit = func(context.Context, string) (*git.FileCommitInfo, error) {
 		t.Fatal("lastCommit must not be called without an index")
 		return nil, nil
@@ -249,9 +249,9 @@ func TestStdlibStage_NilIndexDegradesToSkip(t *testing.T) {
 
 func TestStdlibStage_ReusesSimulationLinkedSet(t *testing.T) {
 	index, scanner := staleIndex(), fixableScanner()
-	stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true, Validate: true}, index, scanner)
+	stage := newStdlibTestStage(Options{StdlibCheck: true, Validate: true}, index, scanner)
 	linkStdCalls := 0
-	stage.linkStd = func(context.Context, *GoBumpProcessor) (map[string]struct{}, error) {
+	stage.linkStd = func(context.Context, *Processor) (map[string]struct{}, error) {
 		linkStdCalls++
 		return nil, errors.New("unexpected clone")
 	}
@@ -269,9 +269,9 @@ func TestStdlibStage_ReusesSimulationLinkedSet(t *testing.T) {
 func TestStdlibStage_FallbackCloneOnlyWhenFixableVulnsFound(t *testing.T) {
 	t.Run("fixable vulns trigger the clone and filtering applies", func(t *testing.T) {
 		index, scanner := staleIndex(), fixableScanner()
-		stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true, Validate: true}, index, scanner)
+		stage := newStdlibTestStage(Options{StdlibCheck: true, Validate: true}, index, scanner)
 		linkStdCalls := 0
-		stage.linkStd = func(context.Context, *GoBumpProcessor) (map[string]struct{}, error) {
+		stage.linkStd = func(context.Context, *Processor) (map[string]struct{}, error) {
 			linkStdCalls++
 			return map[string]struct{}{"crypto/tls": {}}, nil // net/http NOT linked
 		}
@@ -289,9 +289,9 @@ func TestStdlibStage_FallbackCloneOnlyWhenFixableVulnsFound(t *testing.T) {
 	t.Run("no fixable vulns - no clone", func(t *testing.T) {
 		index := staleIndex()
 		scanner := &fakeStdlibScanner{vulnsByVersion: map[string][]scan.Vulnerability{}} // nothing anywhere
-		stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true, Validate: true}, index, scanner)
+		stage := newStdlibTestStage(Options{StdlibCheck: true, Validate: true}, index, scanner)
 		linkStdCalls := 0
-		stage.linkStd = func(context.Context, *GoBumpProcessor) (map[string]struct{}, error) {
+		stage.linkStd = func(context.Context, *Processor) (map[string]struct{}, error) {
 			linkStdCalls++
 			return map[string]struct{}{"net/http": {}}, nil
 		}
@@ -304,9 +304,9 @@ func TestStdlibStage_FallbackCloneOnlyWhenFixableVulnsFound(t *testing.T) {
 
 	t.Run("no-validate - no clone, unfiltered", func(t *testing.T) {
 		index, scanner := staleIndex(), fixableScanner()
-		stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true, Validate: false}, index, scanner)
+		stage := newStdlibTestStage(Options{StdlibCheck: true, Validate: false}, index, scanner)
 		linkStdCalls := 0
-		stage.linkStd = func(context.Context, *GoBumpProcessor) (map[string]struct{}, error) {
+		stage.linkStd = func(context.Context, *Processor) (map[string]struct{}, error) {
 			linkStdCalls++
 			return nil, nil
 		}
@@ -320,8 +320,8 @@ func TestStdlibStage_FallbackCloneOnlyWhenFixableVulnsFound(t *testing.T) {
 
 	t.Run("clone failure fails open to unfiltered findings", func(t *testing.T) {
 		index, scanner := staleIndex(), fixableScanner()
-		stage := newStdlibTestStage(ProcessorOptions{StdlibCheck: true, Validate: true}, index, scanner)
-		stage.linkStd = func(context.Context, *GoBumpProcessor) (map[string]struct{}, error) {
+		stage := newStdlibTestStage(Options{StdlibCheck: true, Validate: true}, index, scanner)
+		stage.linkStd = func(context.Context, *Processor) (map[string]struct{}, error) {
 			return nil, errors.New("clone failed")
 		}
 		gp := newStdlibTestProcessor()
@@ -411,10 +411,10 @@ func (sourceTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 }
 
 // buildStdlibPipeline writes yamlContent to disk, builds the REAL production
-// pipeline via NewGoBumpPipeline, re-seams its StdlibStage with fakes, and
+// pipeline via NewPipeline, re-seams its StdlibStage with fakes, and
 // returns the pipeline plus a processor wired exactly as adapter.ProcessFile
 // wires one.
-func buildStdlibPipeline(t *testing.T, yamlContent string, opts ProcessorOptions) (*processor.Pipeline, *GoBumpProcessor, string) {
+func buildStdlibPipeline(t *testing.T, yamlContent string, opts Options) (*processor.Pipeline, *Processor, string) {
 	t.Helper()
 
 	dir := t.TempDir()
@@ -424,14 +424,14 @@ func buildStdlibPipeline(t *testing.T, yamlContent string, opts ProcessorOptions
 	cfg, err := melange.ParseConfiguration(t.Context(), filePath)
 	require.NoError(t, err)
 
-	gp := NewGoBumpProcessor(filePath, cfg.Package.Name, cfg.Package.Version, int64(cfg.Package.Epoch))
+	gp := NewProcessor(filePath, cfg.Package.Name, cfg.Package.Version, int64(cfg.Package.Epoch))
 	gp.Config = cfg
 	gp.OriginalYAML = []byte(yamlContent)
 	gp.SetCurrentYAML([]byte(yamlContent))
 	gp.SetOptions(processor.ProcessorOptions{DryRun: opts.DryRun, BackupSuffix: opts.BackupSuffix, TempDir: opts.TempDir})
 
 	analyzer := NewAnalyzer(&http.Client{Transport: sourceTransport{}, Timeout: time.Second})
-	pipeline := NewGoBumpPipeline(analyzer, opts)
+	pipeline := NewPipeline(analyzer, opts)
 
 	var seamed bool
 	for _, stage := range pipeline.Stages {
@@ -441,13 +441,13 @@ func buildStdlibPipeline(t *testing.T, yamlContent string, opts ProcessorOptions
 			stdlibStage.lastCommit = func(context.Context, string) (*git.FileCommitInfo, error) {
 				return &git.FileCommitInfo{Time: stdlibCommitTime, Hash: "abc123"}, nil
 			}
-			stdlibStage.linkStd = func(context.Context, *GoBumpProcessor) (map[string]struct{}, error) {
+			stdlibStage.linkStd = func(context.Context, *Processor) (map[string]struct{}, error) {
 				return nil, errors.New("no clone in tests")
 			}
 			seamed = true
 		}
 	}
-	require.True(t, seamed, "NewGoBumpPipeline must contain a StdlibStage")
+	require.True(t, seamed, "NewPipeline must contain a StdlibStage")
 
 	return pipeline, gp, filePath
 }
@@ -457,7 +457,7 @@ func buildStdlibPipeline(t *testing.T, yamlContent string, opts ProcessorOptions
 // applier skipped), a stdlib staleness finding alone must bump package.epoch
 // in CurrentYAML and persist it to disk through the byte-inequality gate.
 func TestPipeline_StdlibOnlyBumpsEpochAndWrites(t *testing.T) {
-	opts := ProcessorOptions{StdlibCheck: true, Validate: false}
+	opts := Options{StdlibCheck: true, Validate: false}
 	pipeline, gp, filePath := buildStdlibPipeline(t, stdlibPipelineYAML, opts)
 
 	require.NoError(t, pipeline.Execute(t.Context(), gp))
@@ -490,7 +490,7 @@ func TestPipeline_StdlibOnlyBumpsEpochAndWrites(t *testing.T) {
 // DryRun branch: the intent is recorded but neither CurrentYAML nor the file
 // on disk changes.
 func TestPipeline_StdlibDryRunRecordsIntentWithoutWriting(t *testing.T) {
-	opts := ProcessorOptions{StdlibCheck: true, Validate: false, ProcessorOptions: processor.ProcessorOptions{DryRun: true}}
+	opts := Options{StdlibCheck: true, Validate: false, ProcessorOptions: processor.ProcessorOptions{DryRun: true}}
 	pipeline, gp, filePath := buildStdlibPipeline(t, stdlibPipelineYAML, opts)
 
 	require.NoError(t, pipeline.Execute(t.Context(), gp))
@@ -509,7 +509,7 @@ func TestPipeline_StdlibDryRunRecordsIntentWithoutWriting(t *testing.T) {
 // TestPipeline_StdlibCheckDisabledNoBump: with the stage disabled nothing in
 // the same no-dep-change package bumps the epoch or writes the file.
 func TestPipeline_StdlibCheckDisabledNoBump(t *testing.T) {
-	opts := ProcessorOptions{StdlibCheck: false, Validate: false}
+	opts := Options{StdlibCheck: false, Validate: false}
 	pipeline, gp, filePath := buildStdlibPipeline(t, stdlibPipelineYAML, opts)
 
 	require.NoError(t, pipeline.Execute(t.Context(), gp))
@@ -525,7 +525,7 @@ func TestPipeline_StdlibCheckDisabledNoBump(t *testing.T) {
 // security fixes and stdlib findings exist, the (single) epoch stage still
 // bumps exactly once.
 func TestEpochStage_SingleBumpWithDepAndStdlibFixes(t *testing.T) {
-	opts := ProcessorOptions{StdlibCheck: true, Validate: false}
+	opts := Options{StdlibCheck: true, Validate: false}
 	pipeline, _, _ := buildStdlibPipeline(t, stdlibPipelineYAML, opts)
 
 	var epochStage processor.Stage
@@ -565,7 +565,7 @@ func TestEpochStage_SingleBumpWithDepAndStdlibFixes(t *testing.T) {
 // TestEpochTrigger_Gates pins the widened CheckFunc semantics via the real
 // pipeline's epoch stage.
 func TestEpochTrigger_Gates(t *testing.T) {
-	opts := ProcessorOptions{StdlibCheck: true, Validate: false}
+	opts := Options{StdlibCheck: true, Validate: false}
 	pipeline, _, _ := buildStdlibPipeline(t, stdlibPipelineYAML, opts)
 
 	var epochStage processor.Stage
@@ -578,27 +578,27 @@ func TestEpochTrigger_Gates(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		mutate  func(*GoBumpProcessor)
+		mutate  func(*Processor)
 		wantRun bool
 	}{
-		{"nothing at all", func(*GoBumpProcessor) {}, false},
-		{"stdlib bump alone", func(gp *GoBumpProcessor) {
+		{"nothing at all", func(*Processor) {}, false},
+		{"stdlib bump alone", func(gp *Processor) {
 			gp.StdlibBumps = []StdlibBump{{VulnIDs: []string{"GO-STD-1"}}}
 		}, true},
-		{"security fixes without applied changes", func(gp *GoBumpProcessor) {
+		{"security fixes without applied changes", func(gp *Processor) {
 			gp.SecurityFixes = []SecurityFix{{Module: "m"}}
 		}, false},
-		{"applied changes without security fixes", func(gp *GoBumpProcessor) {
+		{"applied changes without security fixes", func(gp *Processor) {
 			gp.MarkActualChangesApplied()
 		}, false},
-		{"applied changes with security fixes", func(gp *GoBumpProcessor) {
+		{"applied changes with security fixes", func(gp *Processor) {
 			gp.MarkActualChangesApplied()
 			gp.SecurityFixes = []SecurityFix{{Module: "m"}}
 		}, true},
-		{"hygiene bumps without applied changes", func(gp *GoBumpProcessor) {
+		{"hygiene bumps without applied changes", func(gp *Processor) {
 			gp.HygieneBumps = []SecurityFix{{Module: "m"}}
 		}, false},
-		{"applied changes with hygiene bumps only", func(gp *GoBumpProcessor) {
+		{"applied changes with hygiene bumps only", func(gp *Processor) {
 			gp.MarkActualChangesApplied()
 			gp.HygieneBumps = []SecurityFix{{Module: "m"}}
 		}, true},
@@ -630,7 +630,7 @@ func TestPipeline_BackupSuffixAndDryRun(t *testing.T) {
 	}
 
 	t.Run("real run writes a backup of the original", func(t *testing.T) {
-		opts := ProcessorOptions{StdlibCheck: true, ProcessorOptions: processor.ProcessorOptions{BackupSuffix: ".orig", TempDir: t.TempDir()}}
+		opts := Options{StdlibCheck: true, ProcessorOptions: processor.ProcessorOptions{BackupSuffix: ".orig", TempDir: t.TempDir()}}
 		pipeline, gp, filePath := buildStdlibPipeline(t, stdlibPipelineYAML, opts)
 		require.NoError(t, pipeline.Execute(t.Context(), gp))
 
@@ -641,7 +641,7 @@ func TestPipeline_BackupSuffixAndDryRun(t *testing.T) {
 	})
 
 	t.Run("dry run is side-effect free", func(t *testing.T) {
-		opts := ProcessorOptions{StdlibCheck: true, ProcessorOptions: processor.ProcessorOptions{DryRun: true, BackupSuffix: ".orig", TempDir: t.TempDir()}}
+		opts := Options{StdlibCheck: true, ProcessorOptions: processor.ProcessorOptions{DryRun: true, BackupSuffix: ".orig", TempDir: t.TempDir()}}
 		pipeline, gp, filePath := buildStdlibPipeline(t, stdlibPipelineYAML, opts)
 		require.NoError(t, pipeline.Execute(t.Context(), gp))
 

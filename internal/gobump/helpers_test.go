@@ -76,9 +76,9 @@ pipeline:
       packages: .
 `
 
-func newTestProcessor(t *testing.T, yamlContent string) *GoBumpProcessor {
+func newTestProcessor(t *testing.T, yamlContent string) *Processor {
 	t.Helper()
-	gp := NewGoBumpProcessor("/test/example.yaml", "example", "1.0.0", 0)
+	gp := NewProcessor("/test/example.yaml", "example", "1.0.0", 0)
 	gp.OriginalYAML = []byte(yamlContent)
 	gp.SetCurrentYAML([]byte(yamlContent))
 	return gp

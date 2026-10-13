@@ -84,7 +84,7 @@ func migrationAnalysis(t *testing.T, yamlContent string, bump func(string) strin
 }
 
 // runApplier runs the apply phase over yamlContent and returns the result.
-func runApplier(t *testing.T, yamlContent string, analysis *VulnerabilityAnalysis, cfg *melange.Configuration) *GoBumpProcessor {
+func runApplier(t *testing.T, yamlContent string, analysis *VulnerabilityAnalysis, cfg *melange.Configuration) *Processor {
 	t.Helper()
 	gp := newTestProcessor(t, yamlContent)
 	gp.Config = cfg
@@ -165,7 +165,7 @@ func TestMigration_Matrix(t *testing.T) {
 			assert.Empty(t, again.BumpActions)
 			gp2 := newTestProcessor(t, string(out))
 			gp2.Config = cfg2
-			require.NoError(t, NewGoBumpApplier(nil).reconcileBumpSteps(t.Context(), gp2, again, config.NewLoader()))
+			require.NoError(t, NewApplier(nil).reconcileBumpSteps(t.Context(), gp2, again, config.NewLoader()))
 			assert.Equal(t, string(out), string(gp2.GetCurrentYAML()), "a second run is a no-op")
 			assert.False(t, gp2.ActualChangesApplied)
 		})
@@ -227,9 +227,9 @@ func TestMigration_UnvalidatedStepNotMigrated(t *testing.T) {
 }
 
 // epochWouldBump evaluates the real pipeline's epoch stage gate for gp.
-func epochWouldBump(t *testing.T, gp *GoBumpProcessor) bool {
+func epochWouldBump(t *testing.T, gp *Processor) bool {
 	t.Helper()
-	for _, stage := range NewGoBumpPipeline(NewAnalyzer(nil), ProcessorOptions{}).Stages {
+	for _, stage := range NewPipeline(NewAnalyzer(nil), Options{}).Stages {
 		if stage.Name() != "epoch" {
 			continue
 		}

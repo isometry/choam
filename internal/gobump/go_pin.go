@@ -142,7 +142,7 @@ func goPinFloors(analysis *VulnerabilityAnalysis) map[string]string {
 // (GoPackagePinStage.ShouldRun shares the applier's bump-actions gate), so a
 // package whose pins are stale but whose deps need no bump is not rewritten -
 // an accepted v1 limitation.
-func (s *GoPackagePinStage) reconcileGoPackagePins(ctx context.Context, gp *GoBumpProcessor, floors map[string]string) error {
+func (s *GoPackagePinStage) reconcileGoPackagePins(ctx context.Context, gp *Processor, floors map[string]string) error {
 	if len(floors) == 0 {
 		return nil
 	}
@@ -263,7 +263,7 @@ func pinFloor(ctx context.Context, render lenientRenderer, pin config.GoPackageP
 // checkTemplatedPin judges a templated pin's rendered value against its
 // floor, warning when it falls short - but never edits the template: the
 // variable behind it is the user's to update.
-func checkTemplatedPin(gp *GoBumpProcessor, render lenientRenderer, pin config.GoPackagePin, where, floor string) {
+func checkTemplatedPin(gp *Processor, render lenientRenderer, pin config.GoPackagePin, where, floor string) {
 	floorMinor := goversion.Minor(floor)
 	if floorMinor == "" {
 		// This pin's target demands nothing; nothing to check.
@@ -356,7 +356,7 @@ func describePinLocation(pin config.GoPackagePin) string {
 // effective per original minor so the stdlib rebuild side assumes the oldest
 // toolchain that will actually be used - over-detecting staleness, the safe
 // direction (a rebuild the older pin still triggers is never missed).
-func recordPinOutcome(gp *GoBumpProcessor, original, effective string) {
+func recordPinOutcome(gp *Processor, original, effective string) {
 	if gp.RaisedPinMinors == nil {
 		gp.RaisedPinMinors = make(map[string]string)
 	}
@@ -368,7 +368,7 @@ func recordPinOutcome(gp *GoBumpProcessor, original, effective string) {
 
 // rebuildConstraintsFor maps each pristine-config pin constraint to the
 // constraint the NEXT build will actually use, applying same-run go-package
-// pin raises (GoBumpProcessor.RaisedPinMinors). Unpinned ("") and untouched
+// pin raises (Processor.RaisedPinMinors). Unpinned ("") and untouched
 // constraints map to themselves and are omitted; nil is returned when no
 // raise changes anything. Note the deliberate coarseness: constraints are
 // distinct minors, so a raised raw pin also stands in for a templated pin

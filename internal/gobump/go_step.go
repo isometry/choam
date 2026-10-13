@@ -15,7 +15,7 @@ import (
 // can (see migrationFor), else raising its go-version when the group needs a
 // higher one (see fastPathGoVersion) - and, for a `uses: bump` step, the
 // removal of a stale go-version (the bump pipeline has no such input).
-func (g *GoBumpApplier) goStepRewrite(ctx context.Context, gp *GoBumpProcessor, loader *config.Loader, yamlContent []byte, edit stepEdit) ([]byte, error) {
+func (g *Applier) goStepRewrite(ctx context.Context, gp *Processor, loader *config.Loader, yamlContent []byte, edit stepEdit) ([]byte, error) {
 	step, first := edit.step, edit.groups[0]
 	if step.Action != "go/bump" {
 		updated, err := updateStepInPlace(loader, yamlContent, step, first, "")
@@ -53,7 +53,7 @@ func (g *GoBumpApplier) goStepRewrite(ctx context.Context, gp *GoBumpProcessor, 
 // `uses: bump`: its plan allows it (see planMigration) AND every modroot it
 // owns was simulated with the omnibump engine - so what is written is what
 // was validated. A step that does not migrate gets a message saying why.
-func (g *GoBumpApplier) migrationFor(ctx context.Context, gp *GoBumpProcessor, yamlContent []byte, edit stepEdit) (bool, migrationPlan) {
+func (g *Applier) migrationFor(ctx context.Context, gp *Processor, yamlContent []byte, edit stepEdit) (bool, migrationPlan) {
 	step := edit.step
 	plan := planMigration(ctx, yamlContent, step, g.Analyzer.releaseIndex())
 	if !plan.ok {
@@ -86,7 +86,7 @@ func anyBaselineTidies(roots []*ModrootAnalysis) bool {
 // re-running the applier on already-updated YAML never churns it, and an
 // existing value is NEVER lowered. A step value goversion can't order
 // (templated expression) is warned about, never overwritten.
-func (g *GoBumpApplier) fastPathGoVersion(gp *GoBumpProcessor, step config.BumpStep, effective string) string {
+func (g *Applier) fastPathGoVersion(gp *Processor, step config.BumpStep, effective string) string {
 	if effective == "" {
 		return ""
 	}

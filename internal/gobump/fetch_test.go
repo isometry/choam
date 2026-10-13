@@ -95,13 +95,13 @@ func TestPerformAnalysis_FetchFailuresFailClosed(t *testing.T) {
 
 // parsedProcessor is newTestProcessor with the melange Config parsed, as
 // ProcessFile wires it.
-func parsedProcessor(t *testing.T, yamlContent string) *GoBumpProcessor {
+func parsedProcessor(t *testing.T, yamlContent string) *Processor {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "example.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(yamlContent), 0o644))
 	cfg, err := melange.ParseConfiguration(t.Context(), path)
 	require.NoError(t, err)
-	gp := NewGoBumpProcessor(path, cfg.Package.Name, cfg.Package.Version, int64(cfg.Package.Epoch))
+	gp := NewProcessor(path, cfg.Package.Name, cfg.Package.Version, int64(cfg.Package.Epoch))
 	gp.Config = cfg
 	gp.OriginalYAML = []byte(yamlContent)
 	gp.SetCurrentYAML([]byte(yamlContent))

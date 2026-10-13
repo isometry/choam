@@ -43,7 +43,7 @@ func TestProcessFile_LogsCarryFileAttribution(t *testing.T) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	result, err := ProcessFile(t.Context(), filePath, ProcessorOptions{}, nil)
+	result, err := ProcessFile(t.Context(), filePath, Options{}, nil)
 	require.NoError(t, err)
 	require.NotNil(t, result)
 
@@ -68,7 +68,7 @@ func TestProcessFile_ReadFailureIsAttributed(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	missing := filepath.Join(t.TempDir(), "does-not-exist.yaml")
-	_, err := ProcessFile(t.Context(), missing, ProcessorOptions{}, nil)
+	_, err := ProcessFile(t.Context(), missing, Options{}, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, buf.String(), "file="+missing)

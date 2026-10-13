@@ -408,8 +408,8 @@ func splitWhitespaceList(value string) []string {
 	return result
 }
 
-// GetGoBumpDeps extracts the deps field from a bump or go/bump pipeline
-func (l *Loader) GetGoBumpDeps(yamlContent []byte, pipelineIndex int) ([]string, error) {
+// GetBumpDeps extracts the deps field from a bump or go/bump pipeline
+func (l *Loader) GetBumpDeps(yamlContent []byte, pipelineIndex int) ([]string, error) {
 	withFields, err := l.GetPipelineWithField(yamlContent, pipelineIndex)
 	if err != nil {
 		return nil, fmt.Errorf("getting pipeline with fields: %w", err)
@@ -483,7 +483,7 @@ func (l *Loader) FindBumpSteps(yamlContent []byte) ([]BumpStep, error) {
 				return nil, fmt.Errorf("getting modroot for pipeline[%d]: %w", idx, err)
 			}
 
-			deps, err := l.GetGoBumpDeps(yamlContent, idx)
+			deps, err := l.GetBumpDeps(yamlContent, idx)
 			if err != nil {
 				return nil, fmt.Errorf("getting deps for pipeline[%d]: %w", idx, err)
 			}
@@ -538,7 +538,7 @@ func (l *Loader) GetBumpModroots(yamlContent []byte, pipelineIndex int) ([]strin
 	return splitWhitespaceList(modroot), nil
 }
 
-// UpdateGoBumpStep updates a bump/go-bump step's deps, replaces and
+// UpdateBumpStep updates a bump/go-bump step's deps, replaces and
 // go-version fields in place. Both deps and replaces empty removes the whole
 // step; deps empty with replaces present keeps the step (gobump accepts a
 // replaces-only invocation) and removes just the deps field; an empty
@@ -546,7 +546,7 @@ func (l *Loader) GetBumpModroots(yamlContent []byte, pipelineIndex int) ([]strin
 // go-version field untouched (it is never removed by this call); a non-empty
 // goVersion upserts go-version as a quoted scalar so it can never round-trip
 // as a YAML float.
-func (l *Loader) UpdateGoBumpStep(yamlContent []byte, pipelineIndex int, deps, replaces []string, goVersion string) ([]byte, error) {
+func (l *Loader) UpdateBumpStep(yamlContent []byte, pipelineIndex int, deps, replaces []string, goVersion string) ([]byte, error) {
 	if len(deps) == 0 && len(replaces) == 0 {
 		return l.RemovePipelineStep(yamlContent, pipelineIndex)
 	}

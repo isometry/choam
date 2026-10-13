@@ -80,7 +80,7 @@ func runBump(cmd *cobra.Command, args []string) error {
 	httpClient := httpclient.NewHTTPClientWithTimeout(httpTimeout)
 	analyzer := gobump.NewAnalyzer(httpClient)
 
-	results := make([]*gobump.GoBumpResult, 0, len(files))
+	results := make([]*gobump.Result, 0, len(files))
 	for i, file := range files {
 		if ctx.Err() != nil {
 			break
@@ -93,7 +93,7 @@ func runBump(cmd *cobra.Command, args []string) error {
 			slog.Error("processing melange file failed", "file", file, "error", err) //nolint:forbidigo // ProcessFile failed before/without seeding a ctx logger
 			if result == nil {
 				// Read/parse failure: no processor, so no partial state.
-				result = &gobump.GoBumpResult{
+				result = &gobump.Result{
 					PackageName: strings.TrimSuffix(filepath.Base(file), filepath.Ext(file)),
 					FilePath:    file,
 				}
@@ -121,11 +121,11 @@ func runBump(cmd *cobra.Command, args []string) error {
 }
 
 // buildBumpProcessorOptions maps the bump command's flag-backed package
-// variables onto gobump.ProcessorOptions. Factored out of runBump so the
+// variables onto gobump.Options. Factored out of runBump so the
 // flag-to-option wiring (e.g. --no-stdlib -> StdlibCheck) is directly
 // testable without driving the full command.
-func buildBumpProcessorOptions() gobump.ProcessorOptions {
-	return gobump.ProcessorOptions{
+func buildBumpProcessorOptions() gobump.Options {
+	return gobump.Options{
 		ProcessorOptions: processor.ProcessorOptions{
 			DryRun:       dryRun,
 			BackupSuffix: backupSuffix,
@@ -138,7 +138,7 @@ func buildBumpProcessorOptions() gobump.ProcessorOptions {
 	}
 }
 
-func outputBumpResults(results []*gobump.GoBumpResult, format string) error {
+func outputBumpResults(results []*gobump.Result, format string) error {
 	switch format {
 	case "json":
 		return outputBumpStructured(results, "json")
@@ -155,8 +155,8 @@ func outputBumpResults(results []*gobump.GoBumpResult, format string) error {
 // and the structured summary. An errored file counts only in Errors (its
 // partial counts are incomplete); a file counts as fixed when it fixes at
 // least one advisory (VulnerabilitiesFixed > 0 - see bumpRowStatus).
-func summarizeBumpResults(results []*gobump.GoBumpResult) output.GoBumpSummary {
-	summary := output.GoBumpSummary{TotalPackages: len(results)}
+func summarizeBumpResults(results []*gobump.Result) output.BumpSummary {
+	summary := output.BumpSummary{TotalPackages: len(results)}
 	for _, r := range results {
 		if distinct := output.DistinctStdlibVulnIDs(r.StdlibBumps); len(distinct) > 0 {
 			summary.PackagesStdlibStale++
@@ -194,12 +194,12 @@ func summarizeBumpResults(results []*gobump.GoBumpResult) output.GoBumpSummary {
 
 // outputBumpStructured renders the results keyed by file path (as given on
 // the command line / discovered - unique, unlike basenames) plus the summary.
-func outputBumpStructured(results []*gobump.GoBumpResult, format string) error {
-	resultsMap := make(map[string]*gobump.GoBumpResult, len(results))
+func outputBumpStructured(results []*gobump.Result, format string) error {
+	resultsMap := make(map[string]*gobump.Result, len(results))
 	for _, result := range results {
 		resultsMap[result.FilePath] = result
 	}
-	response := output.GoBumpResponse{
+	response := output.BumpResponse{
 		Results: resultsMap,
 		Summary: summarizeBumpResults(results),
 	}
@@ -209,7 +209,7 @@ func outputBumpStructured(results []*gobump.GoBumpResult, format string) error {
 	return output.OutputYAML(os.Stdout, response)
 }
 
-func outputBumpTable(results []*gobump.GoBumpResult) error {
+func outputBumpTable(results []*gobump.Result) error {
 	maxPkgLen := len("PACKAGE")
 	for _, result := range results {
 		maxPkgLen = max(maxPkgLen, len(result.PackageName))
@@ -322,7 +322,7 @@ func outputBumpTable(results []*gobump.GoBumpResult) error {
 //	UP-TO-DATE     advisories found, all handled by the existing deps list
 //	STDLIB-REBUILD no dependency advisories; epoch bumped for a stdlib fix
 //	NO VULNS       nothing found
-func bumpRowStatus(result *gobump.GoBumpResult, stdlibVulns int) string {
+func bumpRowStatus(result *gobump.Result, stdlibVulns int) string {
 	fixed := result.VulnerabilitiesFixed > 0
 	switch {
 	case result.Error != "":

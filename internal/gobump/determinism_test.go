@@ -51,7 +51,7 @@ func TestSeedCandidates_EqualRungsDeterministic(t *testing.T) {
 // byte-identical, and nothing triggers an epoch bump.
 func TestApplyGoBumpChanges_SecondPassIsNoOp(t *testing.T) {
 	const docker = "github.com/docker/distribution"
-	pass := func(yamlContent string, existing, desired []string) *GoBumpProcessor {
+	pass := func(yamlContent string, existing, desired []string) *Processor {
 		gp := newTestProcessor(t, yamlContent)
 		analysis := &VulnerabilityAnalysis{
 			ByLanguage: []LanguageAnalysis{{

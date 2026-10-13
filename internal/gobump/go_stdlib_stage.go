@@ -29,7 +29,7 @@ import (
 type StdlibStage struct {
 	processor.BaseStage
 	Analyzer *Analyzer
-	Options  ProcessorOptions
+	Options  Options
 
 	// Test seams, mirroring SimulationStage's style: overridable functions
 	// and narrow interfaces defaulting to the real implementations.
@@ -41,10 +41,10 @@ type StdlibStage struct {
 	// source checkout - the fallback used only when the simulation didn't
 	// already provide gp.LinkedStdPackages AND an unfiltered evaluation
 	// found fixable advisories worth validating.
-	linkStd func(ctx context.Context, gp *GoBumpProcessor) (map[string]struct{}, error)
+	linkStd func(ctx context.Context, gp *Processor) (map[string]struct{}, error)
 }
 
-func NewStdlibStage(analyzer *Analyzer, opts ProcessorOptions) *StdlibStage {
+func NewStdlibStage(analyzer *Analyzer, opts Options) *StdlibStage {
 	stage := &StdlibStage{
 		BaseStage: processor.BaseStage{
 			StageName:        "stdlib_check",
@@ -142,7 +142,7 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 // message, or a skip warning), and the error is non-nil only for a
 // cancellation, which must propagate. A shallow history is warned about
 // but proceeds.
-func (s *StdlibStage) commitInfo(ctx context.Context, gp *GoBumpProcessor) (*git.FileCommitInfo, error) {
+func (s *StdlibStage) commitInfo(ctx context.Context, gp *Processor) (*git.FileCommitInfo, error) {
 	info, err := s.lastCommit(ctx, gp.GetFilePath())
 	switch {
 	case errors.Is(err, git.ErrNotInRepository):
@@ -177,7 +177,7 @@ func (s *StdlibStage) commitInfo(ctx context.Context, gp *GoBumpProcessor) (*git
 // returned unchanged. A cancellation is the one failure that must NOT fail
 // open - it means stop, not "proceed unfiltered" - and is the only error
 // returned.
-func (s *StdlibStage) filterByLinkedStd(ctx context.Context, gp *GoBumpProcessor, in stdlibInput, bumps []StdlibBump, messages []string) ([]StdlibBump, []string, error) {
+func (s *StdlibStage) filterByLinkedStd(ctx context.Context, gp *Processor, in stdlibInput, bumps []StdlibBump, messages []string) ([]StdlibBump, []string, error) {
 	linked, err := s.linkStd(ctx, gp)
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
@@ -210,7 +210,7 @@ func (s *StdlibStage) filterByLinkedStd(ctx context.Context, gp *GoBumpProcessor
 // union over the package's target arches, each step's build environment). A
 // versioned go/install step's artifact is built from another module
 // version, whose stdlib slice is unknown: an error (fail open).
-func (s *StdlibStage) checkoutLinkedStd(ctx context.Context, gp *GoBumpProcessor) (map[string]struct{}, error) {
+func (s *StdlibStage) checkoutLinkedStd(ctx context.Context, gp *Processor) (map[string]struct{}, error) {
 	analysis := gp.VulnerabilityAnalysis
 	if analysis == nil || analysis.RepoURL == "" || analysis.Tag == "" {
 		return nil, fmt.Errorf("no source coordinates available (repository/tag unknown)")
@@ -255,7 +255,7 @@ func (s *StdlibStage) checkoutLinkedStd(ctx context.Context, gp *GoBumpProcessor
 
 // skipWarn records a degrade-to-skip both in the log and the per-package
 // messages (this stage never fails the run).
-func (s *StdlibStage) skipWarn(ctx context.Context, gp *GoBumpProcessor, msg string) {
+func (s *StdlibStage) skipWarn(ctx context.Context, gp *Processor, msg string) {
 	logging.From(ctx).Warn(msg)
 	gp.AddMessage(msg)
 }

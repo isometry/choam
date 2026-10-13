@@ -12,8 +12,8 @@ import (
 	"github.com/isometry/choam/internal/simulate"
 )
 
-// GoBumpProcessor extends BaseProcessor with security-specific fields
-type GoBumpProcessor struct {
+// Processor extends BaseProcessor with security-specific fields
+type Processor struct {
 	*processor.BaseProcessor
 
 	// Security-specific fields
@@ -22,7 +22,7 @@ type GoBumpProcessor struct {
 	ActualChangesApplied  bool                   `json:"actual_changes_applied"`
 
 	// HygieneBumps are the scanner-hygiene entries the applier wrote (see
-	// GoBumpResult.HygieneBumps); like SecurityFixes they justify an epoch
+	// Result.HygieneBumps); like SecurityFixes they justify an epoch
 	// bump only together with ActualChangesApplied.
 	HygieneBumps []SecurityFix `json:"hygiene_bumps,omitempty"`
 
@@ -73,10 +73,10 @@ type GoBumpProcessor struct {
 
 // asBump narrows the pipeline's processor to the bump processor every bump
 // stage operates on.
-func asBump(p processor.Processor) (*GoBumpProcessor, error) {
-	gp, ok := p.(*GoBumpProcessor)
+func asBump(p processor.Processor) (*Processor, error) {
+	gp, ok := p.(*Processor)
 	if !ok {
-		return nil, fmt.Errorf("expected GoBumpProcessor, got %T", p)
+		return nil, fmt.Errorf("expected Processor, got %T", p)
 	}
 	return gp, nil
 }
@@ -92,9 +92,9 @@ func cancelledOr(ctx context.Context, degrade func()) error {
 	return nil
 }
 
-// NewGoBumpProcessor creates a new gobump processor
-func NewGoBumpProcessor(filePath, packageName, currentVersion string, currentEpoch int64) *GoBumpProcessor {
-	return &GoBumpProcessor{
+// NewProcessor creates a new gobump processor
+func NewProcessor(filePath, packageName, currentVersion string, currentEpoch int64) *Processor {
+	return &Processor{
 		BaseProcessor:        processor.NewBaseProcessor(filePath, packageName, currentVersion, currentEpoch),
 		SecurityFixes:        make([]SecurityFix, 0),
 		ActualChangesApplied: false,
@@ -102,7 +102,7 @@ func NewGoBumpProcessor(filePath, packageName, currentVersion string, currentEpo
 }
 
 // AddSecurityFix adds a security fix to the processor
-func (p *GoBumpProcessor) AddSecurityFix(fix SecurityFix) {
+func (p *Processor) AddSecurityFix(fix SecurityFix) {
 	p.SecurityFixes = append(p.SecurityFixes, fix)
 
 	// Add as a change for tracking
@@ -117,7 +117,7 @@ func (p *GoBumpProcessor) AddSecurityFix(fix SecurityFix) {
 }
 
 // AddHygieneBump records a scanner-hygiene entry the applier wrote.
-func (p *GoBumpProcessor) AddHygieneBump(fix SecurityFix) {
+func (p *Processor) AddHygieneBump(fix SecurityFix) {
 	p.HygieneBumps = append(p.HygieneBumps, fix)
 	p.AddChange(processor.Change{
 		Type:        "hygiene",
@@ -131,14 +131,14 @@ func (p *GoBumpProcessor) AddHygieneBump(fix SecurityFix) {
 
 // Skip records why (part of) the package was not analyzed: logged now, and
 // reported with the result (see SkipReasons).
-func (p *GoBumpProcessor) Skip(ctx context.Context, reason string) {
+func (p *Processor) Skip(ctx context.Context, reason string) {
 	logging.From(ctx).Info("skipped", "reason", reason)
 	p.SkipReasons = append(p.SkipReasons, reason)
 }
 
 // AddResiduals aggregates per-modroot simulation residuals, deduplicated by
 // (module, reason) across modroots.
-func (p *GoBumpProcessor) AddResiduals(residuals []simulate.Residual) {
+func (p *Processor) AddResiduals(residuals []simulate.Residual) {
 	seen := make(map[string]struct{}, len(p.Residuals))
 	for _, r := range p.Residuals {
 		seen[r.Module+"|"+r.Reason] = struct{}{}
@@ -155,7 +155,7 @@ func (p *GoBumpProcessor) AddResiduals(residuals []simulate.Residual) {
 
 // AddUnreachableVulnIDs records advisory IDs affecting only unlinked
 // modules, deduplicated.
-func (p *GoBumpProcessor) AddUnreachableVulnIDs(ids []string) {
+func (p *Processor) AddUnreachableVulnIDs(ids []string) {
 	seen := make(map[string]struct{}, len(p.UnreachableVulnIDs))
 	for _, id := range p.UnreachableVulnIDs {
 		seen[id] = struct{}{}
@@ -171,12 +171,12 @@ func (p *GoBumpProcessor) AddUnreachableVulnIDs(ids []string) {
 
 // MarkActualChangesApplied marks that actual changes were made to the YAML
 // This is critical for the epoch bumping logic - epoch should only bump when file changes occur
-func (p *GoBumpProcessor) MarkActualChangesApplied() {
+func (p *Processor) MarkActualChangesApplied() {
 	p.ActualChangesApplied = true
 }
 
 // HasActualChanges returns true if actual file modifications were made (not just vulnerabilities found)
-func (p *GoBumpProcessor) HasActualChanges() bool {
+func (p *Processor) HasActualChanges() bool {
 	// Check if YAML content actually changed
 	return !bytes.Equal(p.GetOriginalYAML(), p.GetCurrentYAML()) || p.ActualChangesApplied
 }
@@ -187,7 +187,7 @@ func (p *GoBumpProcessor) HasActualChanges() bool {
 // analysis found, minus those still residual and those in unlinked code.
 // Unvalidated: the advisory IDs recorded on the applied SecurityFixes (no
 // proof beyond "this module moved").
-func (p *GoBumpProcessor) fixedVulnIDs() map[string]struct{} {
+func (p *Processor) fixedVulnIDs() map[string]struct{} {
 	ids := make(map[string]struct{})
 	if p.Validated {
 		for id := range analysisSeverities(p) {
@@ -229,7 +229,7 @@ func fixVulnIDs(fixes []SecurityFix) map[string]struct{} {
 // with no released fix: they remain whatever the deps list says, and must not
 // read as fixed or up to date. (A validated run's final rescan already
 // reports them in Residuals.)
-func (p *GoBumpProcessor) noFixResiduals() []simulate.Residual {
+func (p *Processor) noFixResiduals() []simulate.Residual {
 	if p.Validated || p.VulnerabilityAnalysis == nil {
 		return nil
 	}
@@ -263,7 +263,7 @@ func (p *GoBumpProcessor) noFixResiduals() []simulate.Residual {
 	return residuals
 }
 
-// ToResult converts the processor state to a GoBumpResult.
+// ToResult converts the processor state to a Result.
 //
 // Advisory accounting: VulnerabilitiesFound counts unique advisories across
 // the package (the baseline analysis scan). When the bump was validated by
@@ -279,7 +279,7 @@ func (p *GoBumpProcessor) noFixResiduals() []simulate.Residual {
 // as ModulesBumped, and advisories with no released fix are residual (see
 // noFixResiduals). CriticalFixed/HighFixed count fixedVulnIDs by the
 // analysis scan's severity.
-func (p *GoBumpProcessor) ToResult() *GoBumpResult {
+func (p *Processor) ToResult() *Result {
 	vulnerabilitiesFound := 0
 	if p.VulnerabilityAnalysis != nil {
 		vulnerabilitiesFound = p.VulnerabilityAnalysis.VulnerabilitiesFound
@@ -318,7 +318,7 @@ func (p *GoBumpProcessor) ToResult() *GoBumpResult {
 		actionsApplied = p.VulnerabilityAnalysis.BumpActions
 	}
 
-	return &GoBumpResult{
+	return &Result{
 		PackageName:                p.GetPackageName(),
 		FilePath:                   p.GetFilePath(),
 		VulnerabilitiesFound:       vulnerabilitiesFound,

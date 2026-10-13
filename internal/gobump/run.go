@@ -10,7 +10,7 @@ import (
 )
 
 // ProcessFile processes a single file using the shared pipeline architecture
-func ProcessFile(ctx context.Context, filePath string, opts ProcessorOptions, analyzer *Analyzer) (*GoBumpResult, error) {
+func ProcessFile(ctx context.Context, filePath string, opts Options, analyzer *Analyzer) (*Result, error) {
 	// filePath is attributed via logging.ForFile before a processor exists,
 	// so a read/parse failure - which never reaches the pipeline, and so
 	// never gets the processor's logger - is still logged with the file it
@@ -32,7 +32,7 @@ func ProcessFile(ctx context.Context, filePath string, opts ProcessorOptions, an
 	}
 
 	// Create the new processor with the shared architecture
-	goBumpProcessor := NewGoBumpProcessor(filePath, cfg.Package.Name, cfg.Package.Version, int64(cfg.Package.Epoch))
+	goBumpProcessor := NewProcessor(filePath, cfg.Package.Name, cfg.Package.Version, int64(cfg.Package.Epoch))
 	goBumpProcessor.Config = cfg
 	goBumpProcessor.OriginalYAML = content
 	goBumpProcessor.SetCurrentYAML(content)
@@ -44,7 +44,7 @@ func ProcessFile(ctx context.Context, filePath string, opts ProcessorOptions, an
 	ctx = logging.Into(ctx, goBumpProcessor.GetLogger())
 
 	// Create and execute the pipeline
-	pipeline := NewGoBumpPipeline(analyzer, opts)
+	pipeline := NewPipeline(analyzer, opts)
 
 	if err := pipeline.Execute(ctx, goBumpProcessor); err != nil {
 		goBumpProcessor.AddError(err)

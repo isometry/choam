@@ -34,8 +34,8 @@ func (f *fakeBumpSimulator) Simulate(_ context.Context, repoURL, tag, expectedCo
 	return f.results, nil
 }
 
-func newSimulationProcessor() *GoBumpProcessor {
-	gp := NewGoBumpProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
+func newSimulationProcessor() *Processor {
+	gp := NewProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
 	gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 		RepoURL:        "https://github.com/example/repo",
 		Tag:            "v1.0.0",
@@ -71,8 +71,8 @@ func newSimulationProcessor() *GoBumpProcessor {
 }
 
 func newStageWithFake(fake *fakeBumpSimulator) *SimulationStage {
-	stage := NewSimulationStage(nil, ProcessorOptions{Validate: true})
-	stage.newSimulator = func(context.Context, ProcessorOptions, *Analyzer) (bumpSimulator, error) {
+	stage := NewSimulationStage(nil, Options{Validate: true})
+	stage.newSimulator = func(context.Context, Options, *Analyzer) (bumpSimulator, error) {
 		return fake, nil
 	}
 	return stage
@@ -184,8 +184,8 @@ func TestSimulationStage_FailsClosedOnCompileGate(t *testing.T) {
 }
 
 func TestSimulationStage_DegradesWhenToolchainMissing(t *testing.T) {
-	stage := NewSimulationStage(nil, ProcessorOptions{Validate: true})
-	stage.newSimulator = func(context.Context, ProcessorOptions, *Analyzer) (bumpSimulator, error) {
+	stage := NewSimulationStage(nil, Options{Validate: true})
+	stage.newSimulator = func(context.Context, Options, *Analyzer) (bumpSimulator, error) {
 		return nil, errors.New("go toolchain not found in PATH")
 	}
 	gp := newSimulationProcessor()
@@ -198,7 +198,7 @@ func TestSimulationStage_ShouldRunGates(t *testing.T) {
 	fake := &fakeBumpSimulator{}
 
 	t.Run("disabled by options", func(t *testing.T) {
-		stage := NewSimulationStage(nil, ProcessorOptions{Validate: false})
+		stage := NewSimulationStage(nil, Options{Validate: false})
 		gp := newSimulationProcessor()
 		shouldRun, err := stage.ShouldRun(t.Context(), gp)
 		require.NoError(t, err)
@@ -355,7 +355,7 @@ func TestSimulationStage_UnreachableCrossModrootDedup(t *testing.T) {
 		"example.com/old": scanResult.SecurityBumps[0],
 	}
 
-	gp := NewGoBumpProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
+	gp := NewProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
 	gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 		RepoURL: "https://github.com/example/repo", Tag: "v1.0.0",
 		ByLanguage: []LanguageAnalysis{{
@@ -401,7 +401,7 @@ func TestSimulationStage_UnreachableCrossModrootDedup(t *testing.T) {
 
 // coUpdateTestProcessor builds a processor whose modroot carries a parsed
 // pristine go.mod (via the golang ecosystem's Analyze) and an otel bump.
-func coUpdateTestProcessor(t *testing.T) *GoBumpProcessor {
+func coUpdateTestProcessor(t *testing.T) *Processor {
 	t.Helper()
 	goMod := `module example.com/app
 
@@ -416,7 +416,7 @@ require (
 	deps, err := ecogolang.New().Analyze(t.Context(), map[string][]byte{"go.mod": []byte(goMod)})
 	require.NoError(t, err)
 
-	gp := NewGoBumpProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
+	gp := NewProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
 	gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 		RepoURL: "https://github.com/example/repo", Tag: "v1.0.0",
 		ByLanguage: []LanguageAnalysis{{
@@ -608,7 +608,7 @@ func TestSimulationStage_PackageUnreachableClassifiedAsInfo(t *testing.T) {
 		},
 	}
 
-	gp := NewGoBumpProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
+	gp := NewProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
 	gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 		RepoURL: "https://github.com/example/repo", Tag: "v1.0.0",
 		ByLanguage: []LanguageAnalysis{{
@@ -676,7 +676,7 @@ func TestSimulationStage_HygieneOutcomes(t *testing.T) {
 			{Name: "golang.org/x/net", CurrentVersion: "v0.40.0", FixedVersion: "v0.45.0", VulnIDs: []string{"GO-2026-0001"}},
 		},
 	}
-	gp := NewGoBumpProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
+	gp := NewProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
 	gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 		RepoURL: "https://github.com/example/repo", Tag: "v1.0.0",
 		ByLanguage: []LanguageAnalysis{{Language: "go", ByModroot: []ModrootAnalysis{{
@@ -712,8 +712,8 @@ func TestSimulationStage_HygieneOutcomes(t *testing.T) {
 // newTwoModrootSimulationProcessor builds a VulnerabilityAnalysis with two Go
 // modroots ("." and "sub"), each with its own advisory, for exercising the
 // linked-stdlib union's completeness gating across modroots.
-func newTwoModrootSimulationProcessor() *GoBumpProcessor {
-	gp := NewGoBumpProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
+func newTwoModrootSimulationProcessor() *Processor {
+	gp := NewProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
 	gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 		RepoURL:        "https://github.com/example/repo",
 		Tag:            "v1.0.0",
@@ -882,8 +882,8 @@ func TestSimulationStage_DegradedUnreachableReportedAndPruned(t *testing.T) {
 // alias (a distinct real module of that trimmed name exists) must fail open
 // - the advisory stays reachable rather than being misclassified.
 func TestSimulationStage_DegradedUnrequiredMajorSuffixAlias(t *testing.T) {
-	newAliasProcessor := func() *GoBumpProcessor {
-		gp := NewGoBumpProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
+	newAliasProcessor := func() *Processor {
+		gp := NewProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
 		gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 			RepoURL: "https://github.com/example/repo", Tag: "v1.0.0",
 			ByLanguage: []LanguageAnalysis{{
@@ -961,7 +961,7 @@ func TestSimulationStage_DegradedUnreachableCrossModrootReachable(t *testing.T) 
 		"example.com/old": scanResult.SecurityBumps[0],
 	}
 
-	gp := NewGoBumpProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
+	gp := NewProcessor("/tmp/test.yaml", "test-package", "1.0.0", 1)
 	gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 		RepoURL: "https://github.com/example/repo", Tag: "v1.0.0",
 		ByLanguage: []LanguageAnalysis{{

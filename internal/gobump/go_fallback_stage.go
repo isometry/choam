@@ -135,7 +135,7 @@ func needsGoVersionFallback(m *ModrootAnalysis) bool {
 // a cancellation, which is returned. When GOPROXY=off (probeDisabled), the
 // probe is skipped entirely - it would only fail every fetch - and each
 // affected modroot gets one message instead.
-func (s *GoVersionFallbackStage) fallbackGoVersions(ctx context.Context, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis) error {
+func (s *GoVersionFallbackStage) fallbackGoVersions(ctx context.Context, gp *Processor, analysis *VulnerabilityAnalysis) error {
 	for li := range analysis.ByLanguage {
 		lang := &analysis.ByLanguage[li]
 		if lang.Language != "go" {

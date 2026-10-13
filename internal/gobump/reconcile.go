@@ -12,11 +12,11 @@ import (
 	"github.com/isometry/choam/internal/logging"
 )
 
-// applyGoBumpChanges reconciles the package's bump/go-bump pipeline steps
+// applyChanges reconciles the package's bump/go-bump pipeline steps
 // with the desired per-modroot dependency sets computed during the check
 // phase. (The Go-only stages around it - GoVersionFallbackStage before,
 // GoPackagePinStage after - handle go-version and go-package pins.)
-func (g *GoBumpApplier) applyGoBumpChanges(ctx context.Context, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis) error {
+func (g *Applier) applyChanges(ctx context.Context, gp *Processor, analysis *VulnerabilityAnalysis) error {
 	if len(analysis.BumpActions) == 0 {
 		logging.From(ctx).Debug("skipping apply - no actions to apply")
 		return nil
@@ -34,7 +34,7 @@ func (g *GoBumpApplier) applyGoBumpChanges(ctx context.Context, gp *GoBumpProces
 // reconcileBumpSteps writes the desired per-modroot dependency sets back into
 // the package's bump/go-bump pipeline steps, one language at a time (see
 // reconcileLanguageBumpSteps).
-func (g *GoBumpApplier) reconcileBumpSteps(ctx context.Context, gp *GoBumpProcessor, analysis *VulnerabilityAnalysis, loader *config.Loader) error {
+func (g *Applier) reconcileBumpSteps(ctx context.Context, gp *Processor, analysis *VulnerabilityAnalysis, loader *config.Loader) error {
 	for _, langAnalysis := range analysis.ByLanguage {
 		if len(langAnalysis.ByModroot) == 0 {
 			continue
@@ -72,7 +72,7 @@ type stepEdit struct {
 // merged. Modroots no step covers get fresh `uses: bump` steps (coalesced by
 // identical sets) after the first git-checkout. Deps are written in the
 // order the simulation applied them (see simulate.ModrootResult.FinalDeps).
-func (g *GoBumpApplier) reconcileLanguageBumpSteps(ctx context.Context, gp *GoBumpProcessor, langAnalysis LanguageAnalysis, loader *config.Loader) error {
+func (g *Applier) reconcileLanguageBumpSteps(ctx context.Context, gp *Processor, langAnalysis LanguageAnalysis, loader *config.Loader) error {
 	yamlContent := gp.GetCurrentYAML()
 	existingSteps, err := stepsForLanguage(loader, yamlContent, langAnalysis.Language)
 	if err != nil {
@@ -186,7 +186,7 @@ func planEdits(existingSteps []config.BumpStep, langAnalysis LanguageAnalysis, o
 // applyEdits rewrites every changed edit's step, from the last step
 // backwards: removals and clones only shift the indices of steps already
 // handled. Reports whether anything changed.
-func (g *GoBumpApplier) applyEdits(ctx context.Context, gp *GoBumpProcessor, yamlContent []byte, edits []stepEdit, hasBlankLines bool) ([]byte, bool, error) {
+func (g *Applier) applyEdits(ctx context.Context, gp *Processor, yamlContent []byte, edits []stepEdit, hasBlankLines bool) ([]byte, bool, error) {
 	slices.SortFunc(edits, func(a, b stepEdit) int { return cmp.Compare(b.step.Index, a.step.Index) })
 	changed := false
 	for _, edit := range edits {
@@ -206,7 +206,7 @@ func (g *GoBumpApplier) applyEdits(ctx context.Context, gp *GoBumpProcessor, yam
 // insertUnowned adds fresh `uses: bump` steps (coalesced by identical sets)
 // after the first git-checkout for the modroots no existing step covers.
 // Reports whether anything was inserted.
-func insertUnowned(gp *GoBumpProcessor, loader *config.Loader, yamlContent []byte, langAnalysis LanguageAnalysis, owner map[string]int, hasBlankLines bool) ([]byte, bool, error) {
+func insertUnowned(gp *Processor, loader *config.Loader, yamlContent []byte, langAnalysis LanguageAnalysis, owner map[string]int, hasBlankLines bool) ([]byte, bool, error) {
 	var unowned []ModrootAnalysis
 	for _, m := range langAnalysis.ByModroot {
 		if _, ok := owner[m.Modroot]; !ok {
@@ -250,7 +250,7 @@ func insertUnowned(gp *GoBumpProcessor, loader *config.Loader, yamlContent []byt
 // group's deps/replaces/modroot on the step itself - a go/bump step, or a
 // step carrying a stale go-version, through goStepRewrite - and one clone
 // per further group.
-func (g *GoBumpApplier) rewriteStep(ctx context.Context, gp *GoBumpProcessor, yamlContent []byte, edit stepEdit, hasBlankLines bool) ([]byte, error) {
+func (g *Applier) rewriteStep(ctx context.Context, gp *Processor, yamlContent []byte, edit stepEdit, hasBlankLines bool) ([]byte, error) {
 	loader := config.NewLoader()
 	step := edit.step
 	if len(edit.groups) == 0 {
@@ -282,7 +282,7 @@ func (g *GoBumpApplier) rewriteStep(ctx context.Context, gp *GoBumpProcessor, ya
 			return nil, fmt.Errorf("splitting pipeline[%d]: %w", step.Index, err)
 		}
 		clone := step.Index + 1
-		if updated, err = loader.UpdateGoBumpStep(updated, clone, group.Deps, group.Replaces, ""); err != nil {
+		if updated, err = loader.UpdateBumpStep(updated, clone, group.Deps, group.Replaces, ""); err != nil {
 			return nil, fmt.Errorf("updating split of pipeline[%d]: %w", step.Index, err)
 		}
 		if updated, err = loader.SetBumpModroots(updated, clone, group.Modroots); err != nil {
@@ -297,7 +297,7 @@ func (g *GoBumpApplier) rewriteStep(ctx context.Context, gp *GoBumpProcessor, ya
 // updateStepInPlace writes group's deps/replaces (and goVersion, when
 // non-empty) into the step, and its modroot list when that changed.
 func updateStepInPlace(loader *config.Loader, yamlContent []byte, step config.BumpStep, group modrootGroup, goVersion string) ([]byte, error) {
-	updated, err := loader.UpdateGoBumpStep(yamlContent, step.Index, group.Deps, group.Replaces, goVersion)
+	updated, err := loader.UpdateBumpStep(yamlContent, step.Index, group.Deps, group.Replaces, goVersion)
 	if err != nil {
 		return nil, fmt.Errorf("updating %s pipeline[%d]: %w", step.Action, step.Index, err)
 	}

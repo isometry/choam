@@ -119,7 +119,7 @@ func (v *VulnerabilityChecker) Check(ctx context.Context, p processor.Processor)
 // checkVulnerabilities performs real vulnerability analysis across every
 // language and module root discovered for this package (see
 // discoverAnalysisUnits) - a package may have more than one language.
-func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *GoBumpProcessor) (*VulnerabilityAnalysis, error) {
+func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *Processor) (*VulnerabilityAnalysis, error) {
 	logging.From(ctx).Debug("checking vulnerabilities")
 
 	loader := newMelangeLoader()
@@ -234,7 +234,7 @@ type languageResult struct {
 // replace pin for a module absent from a sub-module's go.mod (AUTO-954; the
 // single-module path always applies replaces unconditionally), because a replace directive, unlike a bare require,
 // survives go mod tidy. That's why replaces pass through unfiltered here.
-func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosystem.Ecosystem, language, repoURL, ref string, langUnits []analysisUnit, bumpSteps []config.BumpStep, gp *GoBumpProcessor) (*languageResult, error) {
+func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosystem.Ecosystem, language, repoURL, ref string, langUnits []analysisUnit, bumpSteps []config.BumpStep, gp *Processor) (*languageResult, error) {
 	modroots := unitRoots(langUnits)
 	existing := modrootExisting{
 		deps:     existingDepsForModroots(modroots, bumpSteps),
@@ -294,7 +294,7 @@ type modrootExisting struct {
 // analyzeModroot fetches, analyzes and scans one module root, and filters
 // its candidate bumps against its own manifest (see performAnalysis). Fix
 // bumps the ecosystem holds back are recorded as residuals on gp.
-func (v *VulnerabilityChecker) analyzeModroot(ctx context.Context, eco ecosystem.Ecosystem, repoURL, ref string, unit analysisUnit, existing modrootExisting, gp *GoBumpProcessor) (ModrootAnalysis, error) {
+func (v *VulnerabilityChecker) analyzeModroot(ctx context.Context, eco ecosystem.Ecosystem, repoURL, ref string, unit analysisUnit, existing modrootExisting, gp *Processor) (ModrootAnalysis, error) {
 	root := unit.Modroot
 	files, err := v.fetchManifests(ctx, eco, repoURL, ref, root)
 	if err != nil {
@@ -543,7 +543,7 @@ func addedAcrossRoots(byModroot []ModrootAnalysis) []string {
 // Creates one SecurityFix per dependency so len(SecurityFixes) accurately
 // reflects the count. Advisory IDs and prior versions come from the scan's
 // SecurityBumps when available.
-func (g *GoBumpApplier) recordSecurityFixes(gp *GoBumpProcessor, langAnalysis LanguageAnalysis, dependencies []string) {
+func (g *Applier) recordSecurityFixes(gp *Processor, langAnalysis LanguageAnalysis, dependencies []string) {
 	bumps := analysisBumps(langAnalysis)
 	for _, dep := range dependencies {
 		module, version, ok := splitCoordVersion(dep)
@@ -605,7 +605,7 @@ func lookupModule[V any](byModule map[string]V, module string) (V, bool) {
 // ModrootAnalysis.HygieneModules) this write adds or changes, once per
 // module@version across modroots - apart from the security fixes, so they
 // are never counted as one.
-func recordHygieneBumps(gp *GoBumpProcessor, langAnalysis LanguageAnalysis) {
+func recordHygieneBumps(gp *Processor, langAnalysis LanguageAnalysis) {
 	bumps := analysisBumps(langAnalysis)
 	severities := analysisSeverities(gp)
 	seen := make(map[string]struct{})

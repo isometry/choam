@@ -55,15 +55,15 @@ func compileCgoNote(m ModrootAnalysis, compile bool) string {
 type SimulationStage struct {
 	processor.BaseStage
 	Analyzer *Analyzer
-	Options  ProcessorOptions
+	Options  Options
 
 	// newSimulator constructs the simulator lazily so a missing go toolchain
 	// degrades at Apply time (with a message) instead of failing pipeline
 	// construction; tests override it.
-	newSimulator func(ctx context.Context, opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error)
+	newSimulator func(ctx context.Context, opts Options, analyzer *Analyzer) (bumpSimulator, error)
 }
 
-func NewSimulationStage(analyzer *Analyzer, opts ProcessorOptions) *SimulationStage {
+func NewSimulationStage(analyzer *Analyzer, opts Options) *SimulationStage {
 	return &SimulationStage{
 		BaseStage: processor.BaseStage{
 			StageName:        "bump_simulation",
@@ -75,7 +75,7 @@ func NewSimulationStage(analyzer *Analyzer, opts ProcessorOptions) *SimulationSt
 	}
 }
 
-func defaultSimulator(ctx context.Context, opts ProcessorOptions, analyzer *Analyzer) (bumpSimulator, error) {
+func defaultSimulator(ctx context.Context, opts Options, analyzer *Analyzer) (bumpSimulator, error) {
 	simOpts := simulate.Options{
 		Budget:    opts.SimulationTimeout,
 		NoCompile: !opts.Compile,
@@ -152,7 +152,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 // buildRequests turns one language's modroot analyses into simulation
 // requests, emitting the per-modroot compile-gate cgo notes and (once) the
 // omnibump engine note as it goes.
-func (s *SimulationStage) buildRequests(ctx context.Context, gp *GoBumpProcessor, lang *LanguageAnalysis) []simulate.ModrootRequest {
+func (s *SimulationStage) buildRequests(ctx context.Context, gp *Processor, lang *LanguageAnalysis) []simulate.ModrootRequest {
 	goEco := ecogolang.New()
 	reqs := make([]simulate.ModrootRequest, 0, len(lang.ByModroot))
 	omnibumpRoots := 0
@@ -190,7 +190,7 @@ func (s *SimulationStage) buildRequests(ctx context.Context, gp *GoBumpProcessor
 // adoptResults folds one language's simulation results back into its
 // modroot analyses, reports each modroot's outcome, publishes the linked
 // stdlib union and reports the advisories unreachable in every modroot.
-func adoptResults(ctx context.Context, gp *GoBumpProcessor, lang *LanguageAnalysis, results map[string]*simulate.ModrootResult) {
+func adoptResults(ctx context.Context, gp *Processor, lang *LanguageAnalysis, results map[string]*simulate.ModrootResult) {
 	reach := newReachabilityDiff()
 	// Scanner-hygiene bumps proposed in any modroot, by module (OSV
 	// naming included), for the unreachable-advisory messages below.
@@ -224,7 +224,7 @@ func adoptResults(ctx context.Context, gp *GoBumpProcessor, lang *LanguageAnalys
 // proven result, records its reachability and linked-stdlib slice, and
 // records a genuine Go language requirement raise. Returns how many
 // advisory IDs were unlinked in this modroot.
-func adoptResult(gp *GoBumpProcessor, m *ModrootAnalysis, result *simulate.ModrootResult, reach *reachabilityDiff, std *stdUnion) int {
+func adoptResult(gp *Processor, m *ModrootAnalysis, result *simulate.ModrootResult, reach *reachabilityDiff, std *stdUnion) int {
 	m.DesiredDeps = result.FinalDeps
 	m.DesiredReplaces = result.FinalReplaces
 	m.SecurityBumpModules = result.CVEBackedModules
@@ -262,7 +262,7 @@ func adoptResult(gp *GoBumpProcessor, m *ModrootAnalysis, result *simulate.Modro
 // reportModrootResult reports one simulated modroot's outcome: the summary
 // line, redundant and hygiene drops, proposed hygiene bumps (recorded into
 // hygieneProposed for reportUnreachable) and residual advisories.
-func reportModrootResult(ctx context.Context, gp *GoBumpProcessor, m *ModrootAnalysis, result *simulate.ModrootResult, unlinkedHere int, hygieneProposed map[string]bool) {
+func reportModrootResult(ctx context.Context, gp *Processor, m *ModrootAnalysis, result *simulate.ModrootResult, unlinkedHere int, hygieneProposed map[string]bool) {
 	gp.AddMessage(fmt.Sprintf(
 		"simulation: modroot %s %s in %d iteration(s): %d validated dep(s), %d replace(s), %d dropped, %d residual advisory(ies), %d advisory(ies) in unlinked modules",
 		m.Modroot, convergedWord(result.Converged), result.Iterations,
@@ -332,7 +332,7 @@ func (u *stdUnion) add(pkgs map[string]struct{}) {
 // as complete (the stdlib stage treats non-nil as proof it can safely
 // demote unlinked-package advisories). Otherwise gp.LinkedStdPackages stays
 // nil: unknown, so the stdlib stage fails open.
-func (u *stdUnion) publish(ctx context.Context, gp *GoBumpProcessor, modroots int) {
+func (u *stdUnion) publish(ctx context.Context, gp *Processor, modroots int) {
 	if u.complete && len(u.pkgs) > 0 {
 		gp.LinkedStdPackages = u.pkgs
 	} else if !u.complete {
@@ -345,7 +345,7 @@ func (u *stdUnion) publish(ctx context.Context, gp *GoBumpProcessor, modroots in
 // EVERY modroot that saw them: informational only - no bump proposed,
 // neither fixed nor residual (an ID linked - and therefore fixed or
 // residual - in any other modroot counts as reachable).
-func reportUnreachable(ctx context.Context, gp *GoBumpProcessor, reach *reachabilityDiff, hygieneProposed map[string]bool) {
+func reportUnreachable(ctx context.Context, gp *Processor, reach *reachabilityDiff, hygieneProposed map[string]bool) {
 	unreachableIDs, unreachableModules := reach.finalize()
 	gp.AddUnreachableVulnIDs(unreachableIDs)
 	for _, module := range unreachableModules {
@@ -407,7 +407,7 @@ func (s *SimulationStage) failClosed(err error) bool {
 // every advisory. Callers must check ctx.Err() before calling this (see
 // cancelledOr) - a cancelled run must propagate that cancellation, not
 // degrade and write an unvalidated result as if simulation had merely failed.
-func (s *SimulationStage) degrade(ctx context.Context, gp *GoBumpProcessor, err error) {
+func (s *SimulationStage) degrade(ctx context.Context, gp *Processor, err error) {
 	gp.Validated = false
 	logging.From(ctx).Warn("bump simulation unavailable - proceeding with UNVALIDATED deps", "error", err)
 	gp.AddMessage(fmt.Sprintf("WARNING: deps list NOT validated - simulation unavailable: %v", err))

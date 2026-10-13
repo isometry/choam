@@ -22,7 +22,7 @@ import (
 func TestReconcileBumpSteps_JavaGrammar(t *testing.T) {
 	gp := newTestProcessor(t, noBumpStepYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -101,7 +101,7 @@ func TestSameRootSet(t *testing.T) {
 func TestReconcileBumpSteps_FastPathUpdatesInPlace(t *testing.T) {
 	gp := newTestProcessor(t, singleGoBumpYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -141,7 +141,7 @@ func TestReconcileBumpSteps_FastPathUpdatesInPlace(t *testing.T) {
 func TestReconcileBumpSteps_CoUpdateNotCreditedAsSecurityFix(t *testing.T) {
 	gp := newTestProcessor(t, singleGoBumpYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -183,7 +183,7 @@ func TestReconcileBumpSteps_CoUpdateNotCreditedAsSecurityFix(t *testing.T) {
 func TestReconcileBumpSteps_DivergentRootsSplitInPlace(t *testing.T) {
 	gp := newTestProcessor(t, certManagerLikeYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -231,7 +231,7 @@ func TestReconcileBumpSteps_DivergentRootsSplitInPlace(t *testing.T) {
 func TestReconcileBumpSteps_InsertsWhenNoStepExists(t *testing.T) {
 	gp := newTestProcessor(t, noBumpStepYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -279,7 +279,7 @@ pipeline:
 `
 	gp := newTestProcessor(t, multiLangYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{
@@ -325,7 +325,7 @@ pipeline:
 func TestReconcileBumpSteps_FastPathWritesReplaces(t *testing.T) {
 	gp := newTestProcessor(t, singleGoBumpYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -367,7 +367,7 @@ func TestReconcileBumpSteps_NewStepsCoalesceByReplaces(t *testing.T) {
 	// that was not analyzed) is left exactly as it was.
 	gp := newTestProcessor(t, singleGoBumpYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -415,7 +415,7 @@ func TestReconcileBumpSteps_NewStepsCoalesceByReplaces(t *testing.T) {
 func TestReconcileBumpSteps_PreservesBlankLineConvention(t *testing.T) {
 	gp := newTestProcessor(t, certManagerLikeYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -514,7 +514,7 @@ pipeline:
 				BumpActions: []BumpAction{{Action: "needs_bump", Modroots: []string{"."}}},
 			}
 
-			require.NoError(t, NewGoBumpApplier(nil).reconcileBumpSteps(t.Context(), gp, analysis, loader))
+			require.NoError(t, NewApplier(nil).reconcileBumpSteps(t.Context(), gp, analysis, loader))
 
 			content := string(gp.GetCurrentYAML())
 			assert.Contains(t, content, "golang.org/x/net@v0.56.0")
@@ -530,7 +530,7 @@ pipeline:
 func TestReconcileBumpSteps_FastPathEmitsGoVersion(t *testing.T) {
 	gp := newTestProcessor(t, singleGoBumpYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -604,7 +604,7 @@ pipeline:
 `
 	gp := newTestProcessor(t, pinnedGoVersionYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -663,7 +663,7 @@ pipeline:
 `
 	gp := newTestProcessor(t, divergentGoVersionYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -755,7 +755,7 @@ pipeline:
 `
 	gp := newTestProcessor(t, pinnedDivergentGoVersionYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -814,7 +814,7 @@ pipeline:
 `
 	gp := newTestProcessor(t, templatedGoVersionYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -879,7 +879,7 @@ pipeline:
 `
 	gp := newTestProcessor(t, twoStepsYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -903,7 +903,7 @@ pipeline:
 func TestReconcileBumpSteps_GeneralPathNeverWritesGoVersion(t *testing.T) {
 	gp := newTestProcessor(t, noBumpStepYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{
@@ -1041,7 +1041,7 @@ pipeline:
 `
 	gp := newTestProcessor(t, compactYAML)
 	loader := config.NewLoader()
-	applier := NewGoBumpApplier(nil)
+	applier := NewApplier(nil)
 
 	analysis := &VulnerabilityAnalysis{
 		ByLanguage: []LanguageAnalysis{{

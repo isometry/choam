@@ -31,7 +31,7 @@ func NewGoPackagePinStage(analyzer *Analyzer) *GoPackagePinStage {
 // goPackagePinsPending reports whether the pin stage will act on this
 // package: the apply phase ran (bumpActionsPending) and the analysis has Go
 // modroots, i.e. pin floors to reconcile against.
-func goPackagePinsPending(gp *GoBumpProcessor) bool {
+func goPackagePinsPending(gp *Processor) bool {
 	return bumpActionsPending(gp) && len(goPinFloors(gp.VulnerabilityAnalysis)) > 0
 }
 
@@ -44,7 +44,7 @@ func (s *GoPackagePinStage) ShouldRun(_ context.Context, p processor.Processor) 
 }
 
 // Apply reconciles the pins, then reports the apply phase's outcome (pin
-// raises are applied changes too - see GoBumpApplier.Apply).
+// raises are applied changes too - see Applier.Apply).
 func (s *GoPackagePinStage) Apply(ctx context.Context, p processor.Processor) error {
 	gp, err := asBump(p)
 	if err != nil {

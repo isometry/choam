@@ -88,102 +88,102 @@ func TestBuildBumpProcessorOptions_Compile(t *testing.T) {
 func TestBumpRowStatus(t *testing.T) {
 	tests := []struct {
 		name        string
-		result      *gobump.GoBumpResult
+		result      *gobump.Result
 		stdlibVulns int
 		want        string
 	}{
 		{
 			name:   "error takes precedence over everything",
-			result: &gobump.GoBumpResult{Error: "boom", VulnerabilitiesFound: 1, EpochChanged: true},
+			result: &gobump.Result{Error: "boom", VulnerabilitiesFound: 1, EpochChanged: true},
 			want:   "ERROR",
 		},
 		{
 			name:   "no vulnerabilities, no stdlib bump",
-			result: &gobump.GoBumpResult{},
+			result: &gobump.Result{},
 			want:   "NO VULNS",
 		},
 		{
 			name:        "stdlib-only epoch bump (zero dependency vulnerabilities found)",
-			result:      &gobump.GoBumpResult{EpochChanged: true},
+			result:      &gobump.Result{EpochChanged: true},
 			stdlibVulns: 2,
 			want:        "STDLIB-REBUILD",
 		},
 		{
 			name:        "stdlib bump found but epoch not changed - not a rebuild status",
-			result:      &gobump.GoBumpResult{EpochChanged: false},
+			result:      &gobump.Result{EpochChanged: false},
 			stdlibVulns: 2,
 			want:        "NO VULNS",
 		},
 		{
 			name:        "dependency fix and stdlib bump together keep dependency-driven status",
-			result:      &gobump.GoBumpResult{VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, EpochChanged: true, Validated: true},
+			result:      &gobump.Result{VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, EpochChanged: true, Validated: true},
 			stdlibVulns: 3,
 			want:        "FIXED",
 		},
 		{
 			name:   "dependency fixed and validated, no residual",
-			result: &gobump.GoBumpResult{VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, EpochChanged: true, Validated: true},
+			result: &gobump.Result{VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, EpochChanged: true, Validated: true},
 			want:   "FIXED",
 		},
 		{
 			name:   "dependency fixed but unvalidated",
-			result: &gobump.GoBumpResult{VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, EpochChanged: true, Validated: false},
+			result: &gobump.Result{VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, EpochChanged: true, Validated: false},
 			want:   "UNVALIDATED",
 		},
 		{
 			name:   "dependency fixed, validated, with residual",
-			result: &gobump.GoBumpResult{VulnerabilitiesFound: 2, VulnerabilitiesFixed: 1, VulnerabilitiesResidual: 1, EpochChanged: true, Validated: true},
+			result: &gobump.Result{VulnerabilitiesFound: 2, VulnerabilitiesFixed: 1, VulnerabilitiesResidual: 1, EpochChanged: true, Validated: true},
 			want:   "PARTIAL",
 		},
 		{
 			name:   "vulnerabilities found, file written but nothing fixed",
-			result: &gobump.GoBumpResult{VulnerabilitiesFound: 1, FileWasWritten: true},
+			result: &gobump.Result{VulnerabilitiesFound: 1, FileWasWritten: true},
 			want:   "UPDATED",
 		},
 		{
 			name:   "vulnerabilities found, pipeline already correct",
-			result: &gobump.GoBumpResult{VulnerabilitiesFound: 1, Validated: true},
+			result: &gobump.Result{VulnerabilitiesFound: 1, Validated: true},
 			want:   "UP-TO-DATE",
 		},
 		{
 			name:   "vulnerabilities found, validated, residual but nothing fixed",
-			result: &gobump.GoBumpResult{VulnerabilitiesFound: 1, VulnerabilitiesResidual: 1, Validated: true},
+			result: &gobump.Result{VulnerabilitiesFound: 1, VulnerabilitiesResidual: 1, Validated: true},
 			want:   "NO-FIX",
 		},
 		{
 			name:   "no simulation, unfixable advisories remain: never UP-TO-DATE",
-			result: &gobump.GoBumpResult{VulnerabilitiesFound: 2, VulnerabilitiesResidual: 2},
+			result: &gobump.Result{VulnerabilitiesFound: 2, VulnerabilitiesResidual: 2},
 			want:   "NO-FIX",
 		},
 		{
 			name:   "skipped and nothing analyzed",
-			result: &gobump.GoBumpResult{SkipReasons: []string{"cannot fetch dependency manifests"}},
+			result: &gobump.Result{SkipReasons: []string{"cannot fetch dependency manifests"}},
 			want:   "SKIPPED",
 		},
 		{
 			name:   "partly skipped but advisories found: normal status",
-			result: &gobump.GoBumpResult{SkipReasons: []string{"gradle: unsupported"}, VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, Validated: true},
+			result: &gobump.Result{SkipReasons: []string{"gradle: unsupported"}, VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, Validated: true},
 			want:   "FIXED",
 		},
 		{
 			name:   "error keeps precedence over skip",
-			result: &gobump.GoBumpResult{Error: "boom", SkipReasons: []string{"x"}},
+			result: &gobump.Result{Error: "boom", SkipReasons: []string{"x"}},
 			want:   "ERROR",
 		},
 		{
 			name:   "regression: dep vulns found, zero fixed, stdlib-only epoch => UP-TO-DATE, was FIXED",
-			result: &gobump.GoBumpResult{VulnerabilitiesFound: 1, VulnerabilitiesFixed: 0, ModulesBumped: 0, EpochChanged: true, Validated: true},
+			result: &gobump.Result{VulnerabilitiesFound: 1, VulnerabilitiesFixed: 0, ModulesBumped: 0, EpochChanged: true, Validated: true},
 			want:   "UP-TO-DATE",
 		},
 		{
 			name:        "stdlib+residual: dependency fixed with residuals and stdlib bump",
-			result:      &gobump.GoBumpResult{VulnerabilitiesFound: 2, VulnerabilitiesFixed: 1, VulnerabilitiesResidual: 1, ModulesBumped: 1, EpochChanged: true, Validated: true},
+			result:      &gobump.Result{VulnerabilitiesFound: 2, VulnerabilitiesFixed: 1, VulnerabilitiesResidual: 1, ModulesBumped: 1, EpochChanged: true, Validated: true},
 			stdlibVulns: 2,
 			want:        "PARTIAL",
 		},
 		{
 			name:   "ModulesBumped-only: modules moved but nothing fixed, residuals remain",
-			result: &gobump.GoBumpResult{VulnerabilitiesFound: 1, VulnerabilitiesFixed: 0, VulnerabilitiesResidual: 1, ModulesBumped: 1, Validated: true},
+			result: &gobump.Result{VulnerabilitiesFound: 1, VulnerabilitiesFixed: 0, VulnerabilitiesResidual: 1, ModulesBumped: 1, Validated: true},
 			want:   "NO-FIX",
 		},
 	}
@@ -222,7 +222,7 @@ func TestStdlibColumnValue(t *testing.T) {
 // appends a stdlib-stale clause when files with stdlib vulnerabilities exist,
 // matching the format "; N stdlib-stale".
 func TestOutputBumpTable_FooterWithStdlibStale(t *testing.T) {
-	results := []*gobump.GoBumpResult{
+	results := []*gobump.Result{
 		{
 			PackageName:   "pkg-a",
 			FilePath:      "pkg-a.yaml",
@@ -258,7 +258,7 @@ func TestOutputBumpTable_FooterWithStdlibStale(t *testing.T) {
 // TestOutputBumpTable_FooterWithoutStdlibStale verifies the summary footer
 // does not include a stdlib-stale clause when no files have stdlib vulnerabilities.
 func TestOutputBumpTable_FooterWithoutStdlibStale(t *testing.T) {
-	results := []*gobump.GoBumpResult{
+	results := []*gobump.Result{
 		{
 			PackageName:   "pkg-a",
 			FilePath:      "pkg-a.yaml",
@@ -287,7 +287,7 @@ func TestOutputBumpTable_FooterWithoutStdlibStale(t *testing.T) {
 // recurring across a file's go-package pin constraints, and that a
 // dependency-only file and a checked-but-clean file don't inflate the count.
 func TestOutputBumpStructured_StdlibSummary(t *testing.T) {
-	results := []*gobump.GoBumpResult{
+	results := []*gobump.Result{
 		{
 			FilePath:      "pkg-a.yaml",
 			StdlibChecked: true,
@@ -317,14 +317,14 @@ func TestOutputBumpStructured_StdlibSummary(t *testing.T) {
 		require.NoError(t, outputBumpStructured(results, "json"))
 	})
 
-	var resp output.GoBumpResponse
+	var resp output.BumpResponse
 	require.NoError(t, json.Unmarshal([]byte(stdout), &resp))
 
 	assert.Equal(t, 2, resp.Summary.PackagesStdlibStale, "pkg-a and pkg-b each have >=1 distinct stdlib vuln ID")
 	assert.Equal(t, 3, resp.Summary.TotalStdlibVulns, "pkg-a: GO-STD-1+GO-STD-2 (deduped), pkg-b: GO-STD-9")
 
 	// The per-file structured result carries StdlibBumps/StdlibChecked through
-	// verbatim (GoBumpResult's own json tags), including in the response map.
+	// verbatim (Result's own json tags), including in the response map.
 	require.Contains(t, resp.Results, "pkg-a.yaml")
 	assert.True(t, resp.Results["pkg-a.yaml"].StdlibChecked)
 	assert.Len(t, resp.Results["pkg-a.yaml"].StdlibBumps, 2)
@@ -335,7 +335,7 @@ func TestOutputBumpStructured_StdlibSummary(t *testing.T) {
 // errors, "fixed" means VulnerabilitiesFixed > 0 (a file that only moved
 // modules is not fixed), skips are counted.
 func TestSummarizeBumpResults(t *testing.T) {
-	results := []*gobump.GoBumpResult{
+	results := []*gobump.Result{
 		{FilePath: "a.yaml", VulnerabilitiesFound: 3, VulnerabilitiesFixed: 2, VulnerabilitiesResidual: 1, ModulesBumped: 2, Validated: true},
 		{FilePath: "b.yaml", VulnerabilitiesFound: 1, ModulesBumped: 1, Validated: true, VulnerabilitiesResidual: 1},
 		{FilePath: "c.yaml", PackageName: "c", VulnerabilitiesFound: 5, VulnerabilitiesFixed: 5, Error: "fetch failed"},
@@ -343,7 +343,7 @@ func TestSummarizeBumpResults(t *testing.T) {
 		{FilePath: "e.yaml", VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, ModulesBumped: 1},
 	}
 	s := summarizeBumpResults(results)
-	assert.Equal(t, output.GoBumpSummary{
+	assert.Equal(t, output.BumpSummary{
 		TotalPackages:       5,
 		PackagesWithVulns:   3,
 		PackagesFixed:       2,
@@ -367,7 +367,7 @@ func TestSummarizeBumpResults(t *testing.T) {
 // (after UNLINKED; BUMPED stays security-only), footer clause and summary
 // key, all absent when there are none.
 func TestBumpOutput_HygieneColumn(t *testing.T) {
-	results := []*gobump.GoBumpResult{
+	results := []*gobump.Result{
 		{FilePath: "k.yaml", PackageName: "kubeconform", VulnerabilitiesFound: 2, VulnerabilitiesUnreachable: 2, Validated: true,
 			HygieneModulesBumped: 1, HygieneBumps: []gobump.SecurityFix{{Module: "golang.org/x/text", Vulnerability: "GO-2026-5970"}}},
 	}
@@ -380,7 +380,7 @@ func TestBumpOutput_HygieneColumn(t *testing.T) {
 	assert.Contains(t, stdout, `"total_hygiene_modules_bumped": 1`)
 
 	plain := captureStdout(t, func() {
-		require.NoError(t, outputBumpStructured([]*gobump.GoBumpResult{{FilePath: "p.yaml"}}, "json"))
+		require.NoError(t, outputBumpStructured([]*gobump.Result{{FilePath: "p.yaml"}}, "json"))
 	})
 	assert.NotContains(t, plain, "hygiene")
 }
@@ -388,12 +388,12 @@ func TestBumpOutput_HygieneColumn(t *testing.T) {
 // TestOutputBumpStructured_KeyedByFullPath: two files sharing a basename in
 // different directories must both appear.
 func TestOutputBumpStructured_KeyedByFullPath(t *testing.T) {
-	results := []*gobump.GoBumpResult{
+	results := []*gobump.Result{
 		{FilePath: "x/pkg.yaml", PackageName: "pkg"},
 		{FilePath: "y/pkg.yaml", PackageName: "pkg"},
 	}
 	stdout := captureStdout(t, func() { require.NoError(t, outputBumpStructured(results, "json")) })
-	var resp output.GoBumpResponse
+	var resp output.BumpResponse
 	require.NoError(t, json.Unmarshal([]byte(stdout), &resp))
 	assert.Len(t, resp.Results, 2)
 	assert.Contains(t, resp.Results, "x/pkg.yaml")
@@ -403,10 +403,10 @@ func TestOutputBumpStructured_KeyedByFullPath(t *testing.T) {
 // TestOutputBumpTable_NotValidatedWarning fires only when something was
 // written or bumped without proof, never for an untouched package.
 func TestOutputBumpTable_NotValidatedWarning(t *testing.T) {
-	untouched := []*gobump.GoBumpResult{{PackageName: "quiet", VulnerabilitiesFound: 1}}
+	untouched := []*gobump.Result{{PackageName: "quiet", VulnerabilitiesFound: 1}}
 	assert.NotContains(t, captureStdout(t, func() { require.NoError(t, outputBumpTable(untouched)) }), "NOT validated")
 
-	written := []*gobump.GoBumpResult{{PackageName: "loud", VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, ModulesBumped: 1, FileWasWritten: true}}
+	written := []*gobump.Result{{PackageName: "loud", VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, ModulesBumped: 1, FileWasWritten: true}}
 	assert.Contains(t, captureStdout(t, func() { require.NoError(t, outputBumpTable(written)) }), "WARNING: loud deps list NOT validated")
 }
 

@@ -113,7 +113,7 @@ func planMigrations(ctx context.Context, yamlContent []byte, steps []config.Bump
 // lack one), then go-version (with the comment lines describing it) is
 // removed, uses is rewritten, and language: go is appended when the step
 // names no language. Every other byte of the file is preserved.
-func migrateStep(gp *GoBumpProcessor, yamlContent []byte, step config.BumpStep, plan migrationPlan) ([]byte, error) {
+func migrateStep(gp *Processor, yamlContent []byte, step config.BumpStep, plan migrationPlan) ([]byte, error) {
 	loader := config.NewLoader()
 	if plan.addPin != "" {
 		current, err := loader.FindGoToolchainSteps(yamlContent)

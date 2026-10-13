@@ -211,9 +211,9 @@ subpackages:
           go-package: go-1.30
 `
 
-func goPinTestProcessor(t *testing.T) *GoBumpProcessor {
+func goPinTestProcessor(t *testing.T) *Processor {
 	t.Helper()
-	gp := NewGoBumpProcessor("/test/example.yaml", "example", "1.0.0", 0)
+	gp := NewProcessor("/test/example.yaml", "example", "1.0.0", 0)
 	gp.OriginalYAML = []byte(goPinFixtureYAML)
 	gp.SetCurrentYAML([]byte(goPinFixtureYAML))
 	gp.Config = &melange.Configuration{Vars: map[string]string{"go-pkg": "go-1.22"}}
@@ -398,9 +398,9 @@ subpackages:
           modroot: ./cmd/other
 `
 
-func goPinModrootProcessor(t *testing.T) *GoBumpProcessor {
+func goPinModrootProcessor(t *testing.T) *Processor {
 	t.Helper()
-	gp := NewGoBumpProcessor("/test/example.yaml", "example", "1.0.0", 0)
+	gp := NewProcessor("/test/example.yaml", "example", "1.0.0", 0)
 	gp.OriginalYAML = []byte(goPinModrootFixtureYAML)
 	gp.SetCurrentYAML([]byte(goPinModrootFixtureYAML))
 	gp.Config = &melange.Configuration{Vars: map[string]string{"app-root": "./cmd/app"}}
@@ -468,7 +468,7 @@ pipeline:
 `
 
 func TestReconcileGoPackagePins_VariantByteIdentical(t *testing.T) {
-	gp := NewGoBumpProcessor("/test/example.yaml", "example", "1.0.0", 0)
+	gp := NewProcessor("/test/example.yaml", "example", "1.0.0", 0)
 	gp.OriginalYAML = []byte(goPinFipsFixtureYAML)
 	gp.SetCurrentYAML([]byte(goPinFipsFixtureYAML))
 	gp.Config = &melange.Configuration{}
@@ -489,7 +489,7 @@ func TestReconcileGoPackagePins_VariantByteIdentical(t *testing.T) {
 
 func TestRecordPinOutcome_MinPerOriginalMinor(t *testing.T) {
 	t.Run("records the minimum effective when pins sharing an original minor diverge", func(t *testing.T) {
-		gp := &GoBumpProcessor{}
+		gp := &Processor{}
 		recordPinOutcome(gp, "1.22", "1.25") // one pin raised
 		recordPinOutcome(gp, "1.22", "1.22") // another held back at its own minor
 		assert.Equal(t, "1.22", gp.RaisedPinMinors["1.22"],
@@ -497,14 +497,14 @@ func TestRecordPinOutcome_MinPerOriginalMinor(t *testing.T) {
 	})
 
 	t.Run("order-independent: smaller recorded first still keeps the smaller", func(t *testing.T) {
-		gp := &GoBumpProcessor{}
+		gp := &Processor{}
 		recordPinOutcome(gp, "1.22", "1.22")
 		recordPinOutcome(gp, "1.22", "1.25")
 		assert.Equal(t, "1.22", gp.RaisedPinMinors["1.22"])
 	})
 
 	t.Run("distinct original minors are recorded independently", func(t *testing.T) {
-		gp := &GoBumpProcessor{}
+		gp := &Processor{}
 		recordPinOutcome(gp, "1.22", "1.25")
 		recordPinOutcome(gp, "1.30", "1.30")
 		assert.Equal(t, map[string]string{"1.22": "1.25", "1.30": "1.30"}, gp.RaisedPinMinors)

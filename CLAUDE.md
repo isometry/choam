@@ -53,10 +53,10 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `internal/processor/stages/epoch.go` - Epoch management and updates
 
 ### Vulnerability Bumping (bump)
-- `internal/gobump/processor.go` - `NewGoBumpProcessor()` constructor
+- `internal/gobump/processor.go` - `NewProcessor()` constructor
 - `internal/gobump/doc.go` - package doc: which files are generic and which are Go-only (`go_*.go`)
 - `internal/gobump/run.go` - `ProcessFile()` per-file entry point
-- `internal/gobump/pipeline.go` - `NewGoBumpPipeline()` assembly, `GoBumpApplier`, epoch hooks/comment
+- `internal/gobump/pipeline.go` - `NewPipeline()` assembly, `Applier`, epoch hooks/comment
 - `internal/gobump/analyze.go` - language-agnostic analysis (`VulnerabilityChecker`, per-modroot fetch/scan, security-fix/hygiene recording, coordinate helpers)
 - `internal/gobump/reconcile.go` - language-agnostic reconcile of desired deps into bump/go-bump steps (plan/apply edits, coalesce modroots)
 - `internal/gobump/go_simulate.go` + `internal/simulate/` (Go-only) - bump simulation (proves candidate sets resolve and cover advisories with a real go toolchain)

@@ -52,8 +52,8 @@ func TestRecordSecurityFixes_Attribution(t *testing.T) {
 			}},
 		}},
 	}
-	gp := NewGoBumpProcessor("test.yaml", "test", "1.0.0", 0)
-	NewGoBumpApplier(nil).recordSecurityFixes(gp, lang, []string{
+	gp := NewProcessor("test.yaml", "test", "1.0.0", 0)
+	NewApplier(nil).recordSecurityFixes(gp, lang, []string{
 		"github.com/foo/bar/v2@v2.1.0", // OSV name lacks the /vN suffix
 		"github.com/foo/baz@v1.1.0",    // bump without severity data
 		"github.com/other/mod@v1.0.0",  // no scan bump at all
@@ -222,7 +222,7 @@ func TestRecordHygieneBumps(t *testing.T) {
 		return ModrootAnalysis{Modroot: root, ScanResult: scanResult, ExistingDeps: existing,
 			DesiredDeps: []string{"golang.org/x/text@v0.36.0", "example.com/sec@v1.1.0"}, HygieneModules: hygiene}
 	}
-	gp := NewGoBumpProcessor("/t.yaml", "pkg", "1.0.0", 1)
+	gp := NewProcessor("/t.yaml", "pkg", "1.0.0", 1)
 	gp.VulnerabilityAnalysis = &VulnerabilityAnalysis{ByLanguage: []LanguageAnalysis{{Language: "go",
 		ByModroot: []ModrootAnalysis{modroot(".", nil), modroot("sub", nil), modroot("same", []string{"golang.org/x/text@v0.36.0"})}}}}
 
@@ -241,7 +241,7 @@ func TestRecordHygieneBumps(t *testing.T) {
 	assert.Contains(t, string(out), `"hygiene_bumps":[{"module":"golang.org/x/text"`)
 	assert.Contains(t, string(out), `"hygiene_modules_bumped":1`)
 
-	empty, err := json.Marshal(NewGoBumpProcessor("/t.yaml", "pkg", "1.0.0", 1).ToResult())
+	empty, err := json.Marshal(NewProcessor("/t.yaml", "pkg", "1.0.0", 1).ToResult())
 	require.NoError(t, err)
 	assert.NotContains(t, string(empty), "hygiene", "no new keys without hygiene bumps")
 }
