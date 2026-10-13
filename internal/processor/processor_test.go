@@ -523,21 +523,19 @@ func TestBaseProcessor_Options(t *testing.T) {
 		{
 			name: "default options",
 			options: ProcessorOptions{
-				DryRun:        false,
-				Force:         false,
-				SharedUpdates: false,
-				BackupSuffix:  "",
-				TempDir:       "",
+				DryRun:       false,
+				Force:        false,
+				BackupSuffix: "",
+				TempDir:      "",
 			},
 		},
 		{
 			name: "custom options",
 			options: ProcessorOptions{
-				DryRun:        true,
-				Force:         true,
-				SharedUpdates: true,
-				BackupSuffix:  ".bak",
-				TempDir:       "/tmp/choam",
+				DryRun:       true,
+				Force:        true,
+				BackupSuffix: ".bak",
+				TempDir:      "/tmp/choam",
 			},
 		},
 	}

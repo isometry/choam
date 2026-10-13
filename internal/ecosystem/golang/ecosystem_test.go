@@ -200,3 +200,21 @@ github.com/graph/only v4.0.0/go.mod h1:hash=
 		assert.NotEqual(t, "github.com/graph/only", pkg.Name, "go.sum-only module must not be scanned for go>=1.17")
 	}
 }
+
+// TestEcosystem_ScanPackages_SkipsOnlyStdlibPseudoModules: only the exact
+// "std"/"cmd" pseudo-modules are skipped - a real module whose path merely
+// starts with "std" (stdout.dev/..., stdlib.example/...) must be scanned.
+func TestEcosystem_ScanPackages_SkipsOnlyStdlibPseudoModules(t *testing.T) {
+	info := &GoModInfo{AllRequirements: map[string]string{
+		"std":                "v0.0.0",
+		"cmd":                "v0.0.0",
+		"stdout.dev/logger":  "v1.0.0",
+		"stdlib.example/foo": "v1.0.0",
+	}}
+
+	var names []string
+	for _, pkg := range New().ScanPackages(t.Context(), &ecosystem.ModuleDeps{Raw: info}) {
+		names = append(names, pkg.Name)
+	}
+	assert.ElementsMatch(t, []string{"stdout.dev/logger", "stdlib.example/foo"}, names)
+}

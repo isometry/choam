@@ -408,8 +408,8 @@ func splitWhitespaceList(value string) []string {
 	return result
 }
 
-// GetGoBumpDeps extracts the deps field from a bump or go/bump pipeline
-func (l *Loader) GetGoBumpDeps(yamlContent []byte, pipelineIndex int) ([]string, error) {
+// GetBumpDeps extracts the deps field from a bump or go/bump pipeline
+func (l *Loader) GetBumpDeps(yamlContent []byte, pipelineIndex int) ([]string, error) {
 	withFields, err := l.GetPipelineWithField(yamlContent, pipelineIndex)
 	if err != nil {
 		return nil, fmt.Errorf("getting pipeline with fields: %w", err)
@@ -450,9 +450,20 @@ type BumpStep struct {
 	Action    string   // "bump" or "go/bump"
 	Language  string   // parsed with.language entry ("" when absent)
 	GoVersion string   // parsed with.go-version entry ("" when absent)
+	NoTidy    bool     // with.tidy is literally false (the input defaults to true)
+	Work      bool     // with.work is literally true (go/bump only: gobump's go.work mode)
 	Modroots  []string // parsed with.modroot entries; defaults to ["."] when absent
 	Deps      []string // parsed with.deps entries ("module@version")
 	Replaces  []string // parsed with.replaces entries ("old=new@version")
+}
+
+// EffectiveLanguage is the language the step bumps: its with.language, or
+// "go" when absent (legacy go/bump and language-less bump steps are Go).
+func (s BumpStep) EffectiveLanguage() string {
+	if s.Language == "" {
+		return "go"
+	}
+	return s.Language
 }
 
 // FindBumpSteps finds all bump and go/bump pipeline steps, in pipeline order,
@@ -472,7 +483,7 @@ func (l *Loader) FindBumpSteps(yamlContent []byte) ([]BumpStep, error) {
 				return nil, fmt.Errorf("getting modroot for pipeline[%d]: %w", idx, err)
 			}
 
-			deps, err := l.GetGoBumpDeps(yamlContent, idx)
+			deps, err := l.GetBumpDeps(yamlContent, idx)
 			if err != nil {
 				return nil, fmt.Errorf("getting deps for pipeline[%d]: %w", idx, err)
 			}
@@ -483,9 +494,12 @@ func (l *Loader) FindBumpSteps(yamlContent []byte) ([]BumpStep, error) {
 			}
 
 			var language, goVersion string
+			var noTidy, work bool
 			if withFields, err := l.GetPipelineWithField(yamlContent, idx); err == nil {
 				language = withFields["language"]
 				goVersion = withFields["go-version"]
+				noTidy = strings.TrimSpace(withFields["tidy"]) == "false"
+				work = strings.TrimSpace(withFields["work"]) == "true"
 			}
 
 			steps = append(steps, BumpStep{
@@ -493,6 +507,8 @@ func (l *Loader) FindBumpSteps(yamlContent []byte) ([]BumpStep, error) {
 				Action:    action,
 				Language:  language,
 				GoVersion: goVersion,
+				NoTidy:    noTidy,
+				Work:      work,
 				Modroots:  modroots,
 				Deps:      deps,
 				Replaces:  replaces,
@@ -522,12 +538,7 @@ func (l *Loader) GetBumpModroots(yamlContent []byte, pipelineIndex int) ([]strin
 	return splitWhitespaceList(modroot), nil
 }
 
-// UpdateGoBumpDeps updates the deps field in a go/bump pipeline
-func (l *Loader) UpdateGoBumpDeps(yamlContent []byte, pipelineIndex int, newDeps []string) ([]byte, error) {
-	return l.UpdateGoBumpStep(yamlContent, pipelineIndex, newDeps, nil, "")
-}
-
-// UpdateGoBumpStep updates a bump/go-bump step's deps, replaces and
+// UpdateBumpStep updates a bump/go-bump step's deps, replaces and
 // go-version fields in place. Both deps and replaces empty removes the whole
 // step; deps empty with replaces present keeps the step (gobump accepts a
 // replaces-only invocation) and removes just the deps field; an empty
@@ -535,7 +546,7 @@ func (l *Loader) UpdateGoBumpDeps(yamlContent []byte, pipelineIndex int, newDeps
 // go-version field untouched (it is never removed by this call); a non-empty
 // goVersion upserts go-version as a quoted scalar so it can never round-trip
 // as a YAML float.
-func (l *Loader) UpdateGoBumpStep(yamlContent []byte, pipelineIndex int, deps, replaces []string, goVersion string) ([]byte, error) {
+func (l *Loader) UpdateBumpStep(yamlContent []byte, pipelineIndex int, deps, replaces []string, goVersion string) ([]byte, error) {
 	if len(deps) == 0 && len(replaces) == 0 {
 		return l.RemovePipelineStep(yamlContent, pipelineIndex)
 	}
@@ -591,13 +602,40 @@ type GoPackagePin struct {
 // field are not returned; there's nothing to edit. Each pin's Path is a
 // goccy yaml path directly usable with UpdateField to rewrite it in place.
 func (l *Loader) FindGoPackagePins(yamlContent []byte) ([]GoPackagePin, error) {
+	steps, err := l.FindGoToolchainSteps(yamlContent)
+	if err != nil {
+		return nil, err
+	}
+	var pins []GoPackagePin
+	for _, step := range steps {
+		if step.HasPin {
+			pins = append(pins, step.GoPackagePin)
+		}
+	}
+	return pins, nil
+}
+
+// GoToolchainStep is one go/build|go/install step with a with block, pinned
+// (HasPin, GoPackagePin.Value set) or not. WithPath addresses its with block
+// (e.g. "$.subpackages[1].pipeline[0].with"), for SpliceIntoWith.
+type GoToolchainStep struct {
+	GoPackagePin
+	WithPath string
+	HasPin   bool
+}
+
+// FindGoToolchainSteps walks the top-level pipeline and every subpackage's
+// pipeline for go/build and go/install steps that have a with block, in
+// top-level-then-subpackage, then pipeline order. A step whose go-package is
+// not a string (absent, null, numeric) has HasPin false.
+func (l *Loader) FindGoToolchainSteps(yamlContent []byte) ([]GoToolchainStep, error) {
 	var parsed map[string]any
 	if err := yaml.Unmarshal(yamlContent, &parsed); err != nil {
-		return nil, fmt.Errorf("parsing YAML to find go-package pins: %w", err)
+		return nil, fmt.Errorf("parsing YAML to find go toolchain steps: %w", err)
 	}
 
-	var pins []GoPackagePin
-	collectGoPackagePins(&pins, parsed["pipeline"], "$", "")
+	var steps []GoToolchainStep
+	collectGoToolchainSteps(&steps, parsed["pipeline"], "$", "")
 
 	if subpackages, ok := parsed["subpackages"].([]any); ok {
 		for i, sp := range subpackages {
@@ -606,23 +644,23 @@ func (l *Loader) FindGoPackagePins(yamlContent []byte) ([]GoPackagePin, error) {
 				continue
 			}
 			name, _ := spMap["name"].(string)
-			collectGoPackagePins(&pins, spMap["pipeline"], fmt.Sprintf("$.subpackages[%d]", i), name)
+			collectGoToolchainSteps(&steps, spMap["pipeline"], fmt.Sprintf("$.subpackages[%d]", i), name)
 		}
 	}
 
-	return pins, nil
+	return steps, nil
 }
 
-// collectGoPackagePins appends a GoPackagePin for every go/build|go/install
-// step in pipeline (the raw, unmarshalled `pipeline:` sequence value) that
-// carries a string with.go-package, using pathPrefix (e.g. "$" or
-// "$.subpackages[2]") to build each pin's editable yaml path.
-func collectGoPackagePins(pins *[]GoPackagePin, pipeline any, pathPrefix, subpackage string) {
-	steps, ok := pipeline.([]any)
+// collectGoToolchainSteps appends a GoToolchainStep for every go/build|
+// go/install step with a with block in pipeline (the raw, unmarshalled
+// `pipeline:` sequence value), using pathPrefix (e.g. "$" or
+// "$.subpackages[2]") to build each step's editable yaml paths.
+func collectGoToolchainSteps(steps *[]GoToolchainStep, pipeline any, pathPrefix, subpackage string) {
+	list, ok := pipeline.([]any)
 	if !ok {
 		return
 	}
-	for i, step := range steps {
+	for i, step := range list {
 		stepMap, ok := step.(map[string]any)
 		if !ok {
 			continue
@@ -635,10 +673,7 @@ func collectGoPackagePins(pins *[]GoPackagePin, pipeline any, pathPrefix, subpac
 		if !ok {
 			continue
 		}
-		value, ok := withField["go-package"].(string)
-		if !ok {
-			continue
-		}
+		value, hasPin := withField["go-package"].(string)
 		// with.modroot associates a go/build pin with its module root (the
 		// pin's own floor is keyed by it); default "." matches the pipeline's
 		// own default. go/install has no modroot. Usually a string, but an
@@ -663,14 +698,41 @@ func collectGoPackagePins(pins *[]GoPackagePin, pipeline any, pathPrefix, subpac
 				modroot = mr
 			}
 		}
-		*pins = append(*pins, GoPackagePin{
-			Path:       fmt.Sprintf("%s.pipeline[%d].with.go-package", pathPrefix, i),
-			Subpackage: subpackage,
-			Value:      value,
-			Uses:       uses,
-			Modroot:    modroot,
+		withPath := fmt.Sprintf("%s.pipeline[%d].with", pathPrefix, i)
+		*steps = append(*steps, GoToolchainStep{
+			GoPackagePin: GoPackagePin{
+				Path:       withPath + ".go-package",
+				Subpackage: subpackage,
+				Value:      value,
+				Uses:       uses,
+				Modroot:    modroot,
+			},
+			WithPath: withPath,
+			HasPin:   hasPin,
 		})
 	}
+}
+
+// EnvironmentPackages returns the top-level environment.contents.packages
+// entries (strings only), in order.
+func (l *Loader) EnvironmentPackages(yamlContent []byte) ([]string, error) {
+	var parsed struct {
+		Environment struct {
+			Contents struct {
+				Packages []any `yaml:"packages"`
+			} `yaml:"contents"`
+		} `yaml:"environment"`
+	}
+	if err := yaml.Unmarshal(yamlContent, &parsed); err != nil {
+		return nil, fmt.Errorf("parsing YAML to find environment packages: %w", err)
+	}
+	var packages []string
+	for _, pkg := range parsed.Environment.Contents.Packages {
+		if name, ok := pkg.(string); ok {
+			packages = append(packages, name)
+		}
+	}
+	return packages, nil
 }
 
 // RemovePipelineStep removes a single pipeline step by index while preserving formatting

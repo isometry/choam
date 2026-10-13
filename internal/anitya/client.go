@@ -21,7 +21,7 @@ type Client struct {
 }
 
 // New creates a new anitya client with a custom HTTP client
-// The httpClient parameter is required and should be obtained from httpclient.NewHTTPClient()
+// The httpClient parameter is required and should be obtained from httpclient.NewHTTPClientWithTimeout()
 func New(httpClient *http.Client) *Client {
 	if httpClient == nil {
 		panic("anitya.New: httpClient cannot be nil")

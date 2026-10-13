@@ -49,38 +49,15 @@ func (s *Simulator) Simulate(ctx context.Context, repoURL, tag, expectedCommit s
 	ctx, cancel := context.WithTimeout(ctx, s.opts.Budget)
 	defer cancel()
 
-	cloneDir, err := os.MkdirTemp(s.tempDir, "choam-simulate-*")
+	cloneDir, cleanup, err := Checkout(ctx, s.git, repoURL, tag, expectedCommit, s.tempDir, "simulate")
 	if err != nil {
-		return nil, fmt.Errorf("creating simulation directory: %w", err)
+		return nil, err
 	}
-	defer func() {
-		if err := os.RemoveAll(cloneDir); err != nil {
-			logging.From(ctx).Debug("could not remove simulation directory", "dir", cloneDir, "error", err)
-		}
-	}()
-
-	logging.From(ctx).Debug("cloning source for bump simulation", "repository", repoURL, "tag", tag, "dir", cloneDir)
-	if err := s.git.CloneAtTag(ctx, repoURL, tag, cloneDir); err != nil {
-		return nil, fmt.Errorf("cloning %s at %s: %w", repoURL, tag, err)
-	}
-
-	if expectedCommit != "" {
-		if head, err := s.git.HeadCommit(ctx, cloneDir); err != nil {
-			logging.From(ctx).Warn("could not verify expected commit", "error", err)
-		} else if head != expectedCommit {
-			logging.From(ctx).Warn("checkout does not match expected-commit; simulating against the tag's actual state",
-				"tag", tag, "expected", expectedCommit, "actual", head)
-		}
-	}
+	defer cleanup()
 
 	results := make(map[string]*ModrootResult, len(reqs))
 	for _, req := range reqs {
-		dir := cloneDir
-		if req.Modroot != "" && req.Modroot != "." {
-			dir = filepath.Join(cloneDir, filepath.FromSlash(req.Modroot))
-		}
-
-		result, err := RunLoop(ctx, s.tc, s.sc, dir, req, s.opts)
+		result, err := RunLoop(ctx, s.tc, s.sc, ModrootDir(cloneDir, req.Modroot), req, s.opts)
 		if err != nil {
 			return nil, fmt.Errorf("simulating modroot %s: %w", req.Modroot, err)
 		}
@@ -95,4 +72,45 @@ func (s *Simulator) Simulate(ctx context.Context, repoURL, tag, expectedCommit s
 	}
 
 	return results, nil
+}
+
+// Checkout clones repoURL at tag into a fresh directory under tmpDir ("" =
+// the os.MkdirTemp default) named for purpose ("choam-<purpose>-*").
+// expectedCommit, when non-empty, is verified warn-only (melange enforces it
+// at build time). cleanup removes the directory; call it once err is nil.
+func Checkout(ctx context.Context, cloner Cloner, repoURL, tag, expectedCommit, tmpDir, purpose string) (dir string, cleanup func(), err error) {
+	dir, err = os.MkdirTemp(tmpDir, "choam-"+purpose+"-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("creating %s checkout directory: %w", purpose, err)
+	}
+	cleanup = func() {
+		if err := os.RemoveAll(dir); err != nil {
+			logging.From(ctx).Debug("could not remove checkout directory", "purpose", purpose, "dir", dir, "error", err)
+		}
+	}
+
+	logging.From(ctx).Debug("cloning source", "purpose", purpose, "repository", repoURL, "tag", tag, "dir", dir)
+	if err := cloner.CloneAtTag(ctx, repoURL, tag, dir); err != nil {
+		cleanup()
+		return "", nil, fmt.Errorf("cloning %s at %s: %w", repoURL, tag, err)
+	}
+
+	if expectedCommit != "" {
+		if head, err := cloner.HeadCommit(ctx, dir); err != nil {
+			logging.From(ctx).Warn("could not verify expected commit", "purpose", purpose, "error", err)
+		} else if head != expectedCommit {
+			logging.From(ctx).Warn("checkout does not match expected-commit; using the tag's actual state",
+				"purpose", purpose, "tag", tag, "expected", expectedCommit, "actual", head)
+		}
+	}
+	return dir, cleanup, nil
+}
+
+// ModrootDir is modroot's directory within a checkout at root ("" and "."
+// are the root itself).
+func ModrootDir(root, modroot string) string {
+	if modroot == "" || modroot == "." {
+		return root
+	}
+	return filepath.Join(root, filepath.FromSlash(modroot))
 }

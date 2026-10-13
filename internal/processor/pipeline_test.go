@@ -121,7 +121,6 @@ func TestNewPipeline(t *testing.T) {
 	assert.Equal(t, "test-pipeline", pipeline.Name)
 	assert.NotNil(t, pipeline.Stages)
 	assert.Empty(t, pipeline.Stages)
-	assert.NotNil(t, pipeline.Registry)
 	assert.True(t, pipeline.Options.StopOnError)
 	assert.False(t, pipeline.Options.SkipValidation)
 }
@@ -133,7 +132,7 @@ func TestPipeline_AddStage(t *testing.T) {
 		shouldRun: true,
 	}
 
-	pipeline.AddStage(stage)
+	pipeline.AddStages(stage)
 
 	require.Len(t, pipeline.Stages, 1)
 	assert.Equal(t, "test-stage", pipeline.Stages[0].Name())
@@ -157,21 +156,6 @@ func TestPipeline_AddStages(t *testing.T) {
 	assert.Equal(t, "stage2", pipeline.Stages[1].Name())
 }
 
-func TestPipeline_SetOptions(t *testing.T) {
-	pipeline := NewPipeline("test-pipeline")
-	opts := PipelineOptions{
-		StopOnError:       false,
-		SkipValidation:    true,
-		ParallelExecution: true,
-	}
-
-	pipeline.SetOptions(opts)
-
-	assert.False(t, pipeline.Options.StopOnError)
-	assert.True(t, pipeline.Options.SkipValidation)
-	assert.True(t, pipeline.Options.ParallelExecution)
-}
-
 func TestPipeline_Execute_EmptyPipeline(t *testing.T) {
 	pipeline := NewPipeline("empty-pipeline")
 	proc := createTestProcessor()
@@ -188,7 +172,7 @@ func TestPipeline_Execute_SingleExecutableStage(t *testing.T) {
 		BaseStage: BaseStage{StageName: "test-stage"},
 		shouldRun: true,
 	}
-	pipeline.AddStage(stage)
+	pipeline.AddStages(stage)
 	proc := createTestProcessor()
 
 	err := pipeline.Execute(context.Background(), proc)
@@ -204,7 +188,7 @@ func TestPipeline_Execute_SingleCheckStage(t *testing.T) {
 		BaseStage: BaseStage{StageName: "check-stage"},
 		shouldRun: true,
 	}
-	pipeline.AddStage(stage)
+	pipeline.AddStages(stage)
 	proc := createTestProcessor()
 
 	err := pipeline.Execute(context.Background(), proc)
@@ -220,7 +204,7 @@ func TestPipeline_Execute_SingleApplyStage(t *testing.T) {
 		BaseStage: BaseStage{StageName: "apply-stage"},
 		shouldRun: true,
 	}
-	pipeline.AddStage(stage)
+	pipeline.AddStages(stage)
 	proc := createTestProcessor()
 
 	err := pipeline.Execute(context.Background(), proc)
@@ -287,7 +271,7 @@ func TestPipeline_Execute_StageSkippedWhenShouldRunFalse(t *testing.T) {
 		BaseStage: BaseStage{StageName: "skipped-stage"},
 		shouldRun: false, // Stage should not run
 	}
-	pipeline.AddStage(stage)
+	pipeline.AddStages(stage)
 	proc := createTestProcessor()
 
 	err := pipeline.Execute(context.Background(), proc)
@@ -304,7 +288,7 @@ func TestPipeline_Execute_ShouldRunError_StopOnError(t *testing.T) {
 		shouldRun:    true,
 		shouldRunErr: errors.New("shouldRun check failed"),
 	}
-	pipeline.AddStage(stage)
+	pipeline.AddStages(stage)
 	proc := createTestProcessor()
 
 	err := pipeline.Execute(context.Background(), proc)
@@ -317,7 +301,7 @@ func TestPipeline_Execute_ShouldRunError_StopOnError(t *testing.T) {
 
 func TestPipeline_Execute_ShouldRunError_ContinueOnError(t *testing.T) {
 	pipeline := NewPipeline("test-pipeline")
-	pipeline.SetOptions(PipelineOptions{StopOnError: false})
+	pipeline.Options = PipelineOptions{StopOnError: false}
 
 	stage1 := &mockExecutableStage{
 		BaseStage:    BaseStage{StageName: "error-stage"},
@@ -367,7 +351,7 @@ func TestPipeline_Execute_ExecutionError_StopOnError(t *testing.T) {
 
 func TestPipeline_Execute_ExecutionError_ContinueOnError(t *testing.T) {
 	pipeline := NewPipeline("test-pipeline")
-	pipeline.SetOptions(PipelineOptions{StopOnError: false})
+	pipeline.Options = PipelineOptions{StopOnError: false}
 
 	stage1 := &mockExecutableStage{
 		BaseStage:  BaseStage{StageName: "error-stage"},
@@ -396,7 +380,7 @@ func TestPipeline_Execute_ValidatingStage_Success(t *testing.T) {
 		BaseStage: BaseStage{StageName: "validating-stage"},
 		shouldRun: true,
 	}
-	pipeline.AddStage(stage)
+	pipeline.AddStages(stage)
 	proc := createTestProcessor()
 
 	err := pipeline.Execute(context.Background(), proc)
@@ -414,7 +398,7 @@ func TestPipeline_Execute_ValidatingStage_ValidationError_StopOnError(t *testing
 		shouldRun:   true,
 		validateErr: errors.New("validation failed"),
 	}
-	pipeline.AddStage(stage)
+	pipeline.AddStages(stage)
 	proc := createTestProcessor()
 
 	err := pipeline.Execute(context.Background(), proc)
@@ -428,17 +412,17 @@ func TestPipeline_Execute_ValidatingStage_ValidationError_StopOnError(t *testing
 
 func TestPipeline_Execute_ValidatingStage_SkipValidation(t *testing.T) {
 	pipeline := NewPipeline("test-pipeline")
-	pipeline.SetOptions(PipelineOptions{
+	pipeline.Options = PipelineOptions{
 		StopOnError:    true,
 		SkipValidation: true,
-	})
+	}
 
 	stage := &mockValidatingStage{
 		BaseStage:   BaseStage{StageName: "validating-stage"},
 		shouldRun:   true,
 		validateErr: errors.New("validation would fail"),
 	}
-	pipeline.AddStage(stage)
+	pipeline.AddStages(stage)
 	proc := createTestProcessor()
 
 	err := pipeline.Execute(context.Background(), proc)
@@ -451,7 +435,7 @@ func TestPipeline_Execute_ValidatingStage_SkipValidation(t *testing.T) {
 
 func TestPipeline_Execute_ValidatingStage_ValidationError_ContinueOnError(t *testing.T) {
 	pipeline := NewPipeline("test-pipeline")
-	pipeline.SetOptions(PipelineOptions{StopOnError: false})
+	pipeline.Options = PipelineOptions{StopOnError: false}
 
 	stage1 := &mockValidatingStage{
 		BaseStage:   BaseStage{StageName: "validating-stage-error"},
@@ -481,7 +465,7 @@ func TestPipeline_Execute_InvalidStage_NoExecutionInterface(t *testing.T) {
 		BaseStage: BaseStage{StageName: "invalid-stage"},
 		shouldRun: true,
 	}
-	pipeline.AddStage(stage)
+	pipeline.AddStages(stage)
 	proc := createTestProcessor()
 
 	err := pipeline.Execute(context.Background(), proc)
@@ -563,7 +547,7 @@ func TestPipeline_Execute_ProcessorChangesTracked(t *testing.T) {
 		return nil
 	}
 
-	pipeline.AddStage(stage)
+	pipeline.AddStages(stage)
 	proc := createTestProcessor()
 
 	err := pipeline.Execute(context.Background(), proc)
@@ -590,7 +574,7 @@ func TestPipeline_Execute_ContextCancellation(t *testing.T) {
 		}
 	}
 
-	pipeline.AddStage(stage)
+	pipeline.AddStages(stage)
 	proc := createTestProcessor()
 
 	// Create cancelled context
@@ -615,7 +599,7 @@ func TestPipeline_Execute_CancelledBeforeAnyStage(t *testing.T) {
 		BaseStage: BaseStage{StageName: "never-runs"},
 		shouldRun: true,
 	}
-	pipeline.AddStage(stage)
+	pipeline.AddStages(stage)
 	proc := createTestProcessor()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -647,8 +631,8 @@ func TestPipeline_Execute_CancelledBetweenStages(t *testing.T) {
 		shouldRun: true,
 	}
 
-	pipeline.AddStage(first)
-	pipeline.AddStage(second)
+	pipeline.AddStages(first)
+	pipeline.AddStages(second)
 	proc := createTestProcessor()
 
 	err := pipeline.Execute(ctx, proc)
@@ -703,7 +687,7 @@ func TestPipeline_Execute_ComplexScenario(t *testing.T) {
 
 func TestPipeline_Execute_ErrorAccumulation_ContinueOnError(t *testing.T) {
 	pipeline := NewPipeline("test-pipeline")
-	pipeline.SetOptions(PipelineOptions{StopOnError: false})
+	pipeline.Options = PipelineOptions{StopOnError: false}
 
 	// Multiple stages that fail
 	stage1 := &mockExecutableStage{
@@ -741,7 +725,7 @@ func BenchmarkPipeline_Execute_SingleStage(b *testing.B) {
 		BaseStage: BaseStage{StageName: "bench-stage"},
 		shouldRun: true,
 	}
-	pipeline.AddStage(stage)
+	pipeline.AddStages(stage)
 	proc := createTestProcessor()
 	ctx := context.Background()
 
@@ -760,7 +744,7 @@ func BenchmarkPipeline_Execute_MultipleStages(b *testing.B) {
 			BaseStage: BaseStage{StageName: fmt.Sprintf("stage-%d", i)},
 			shouldRun: true,
 		}
-		pipeline.AddStage(stage)
+		pipeline.AddStages(stage)
 	}
 
 	proc := createTestProcessor()

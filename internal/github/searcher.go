@@ -2,6 +2,7 @@ package github
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -9,6 +10,12 @@ import (
 	"github.com/chainguard-dev/omnibump/pkg/remote"
 	"github.com/google/go-github/v81/github"
 )
+
+// ErrNotFound reports a confirmed absence: both the raw content host and the
+// Contents API answered 404 for the path at the ref. Any other failure (5xx,
+// 403/rate limit, timeout, cancellation) is not ErrNotFound - it says nothing
+// about whether the file exists.
+var ErrNotFound = errors.New("file not found")
 
 // Searcher satisfies omnibump's remote.GitHubSearcher interface.
 var _ remote.GitHubSearcher = (*Searcher)(nil)
@@ -43,18 +50,24 @@ func NewSearcher(httpClient *http.Client) *Searcher {
 // content host first and falling back to the authenticated Contents API.
 func (s *Searcher) GetFileContent(ctx context.Context, owner, repo, path, ref string) ([]byte, error) {
 	rawURL := fmt.Sprintf("https://raw.githubusercontent.com/%s/%s/%s/%s", owner, repo, ref, path)
-	content, rawErr := s.fetchRaw(ctx, rawURL)
+	content, rawStatus, rawErr := s.fetchRaw(ctx, rawURL)
 	if rawErr == nil {
 		return content, nil
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
 
 	// Fall back to the Contents API (handles private repos and raw outages).
-	fileContent, _, _, apiErr := s.client.Repositories.GetContents(
+	fileContent, _, apiResp, apiErr := s.client.Repositories.GetContents(
 		ctx, owner, repo, path,
 		&github.RepositoryContentGetOptions{Ref: ref},
 	)
 	if apiErr != nil {
-		return nil, fmt.Errorf("fetching %s/%s/%s@%s: raw (%w), api (%v)", owner, repo, path, ref, rawErr, apiErr)
+		if rawStatus == http.StatusNotFound && apiResp != nil && apiResp.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf("fetching %s/%s/%s@%s: %w", owner, repo, path, ref, ErrNotFound)
+		}
+		return nil, fmt.Errorf("fetching %s/%s/%s@%s: raw (%w), api (%w)", owner, repo, path, ref, rawErr, apiErr)
 	}
 	if fileContent == nil {
 		return nil, fmt.Errorf("fetching %s/%s/%s@%s: path is not a file", owner, repo, path, ref)
@@ -90,22 +103,24 @@ func (s *Searcher) ListFilePaths(ctx context.Context, owner, repo, ref string) (
 	return paths, nil
 }
 
-// fetchRaw performs a GET against raw.githubusercontent.com.
-func (s *Searcher) fetchRaw(ctx context.Context, rawURL string) ([]byte, error) {
+// fetchRaw performs a GET against raw.githubusercontent.com, returning the
+// HTTP status (0 when no response was received).
+func (s *Searcher) fetchRaw(ctx context.Context, rawURL string) ([]byte, int, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, fmt.Errorf("creating request: %w", err)
+		return nil, 0, fmt.Errorf("creating request: %w", err)
 	}
 
 	resp, err := s.rawHTTP.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("fetching %s: %w", rawURL, err)
+		return nil, 0, fmt.Errorf("fetching %s: %w", rawURL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP error %d fetching %s", resp.StatusCode, rawURL)
+		return nil, resp.StatusCode, fmt.Errorf("HTTP error %d fetching %s", resp.StatusCode, rawURL)
 	}
 
-	return io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	return body, resp.StatusCode, err
 }

@@ -6,21 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"time"
 )
 
-// ChecksumHelper handles SHA256 calculation for URLs and files
+// ChecksumHelper handles SHA256 calculation for URLs
 type ChecksumHelper struct {
 	httpClient *http.Client
-}
-
-// NewChecksumHelper creates a new checksum helper
-func NewChecksumHelper() *ChecksumHelper {
-	return &ChecksumHelper{
-		httpClient: &http.Client{
-			Timeout: 60 * time.Second, // Longer timeout for downloads
-		},
-	}
 }
 
 // NewChecksumHelperWithClient creates a checksum helper with custom HTTP client
@@ -64,20 +54,6 @@ func (ch *ChecksumHelper) CalculateSHA256FromURL(ctx context.Context, url string
 		if err != nil {
 			return "", fmt.Errorf("reading response from %s: %w", url, err)
 		}
-	}
-
-	return fmt.Sprintf("%x", hasher.Sum(nil)), nil
-}
-
-// CalculateSHA256FromFile calculates SHA256 hash of a local file
-func (ch *ChecksumHelper) CalculateSHA256FromFile(filePath string) (string, error) {
-	hasher := sha256.New()
-	err := withFileReader(filePath, func(reader io.Reader) error {
-		_, err := io.Copy(hasher, reader)
-		return err
-	})
-	if err != nil {
-		return "", fmt.Errorf("reading file %s: %w", filePath, err)
 	}
 
 	return fmt.Sprintf("%x", hasher.Sum(nil)), nil

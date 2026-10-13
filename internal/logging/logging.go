@@ -22,6 +22,8 @@ package logging
 import (
 	"context"
 	"log/slog"
+
+	"github.com/chainguard-dev/clog"
 )
 
 type ctxKey struct{}
@@ -55,4 +57,34 @@ func ForFile(path string) *slog.Logger {
 // package doc for why calling Into directly with an unrelated logger is not.
 func With(ctx context.Context, args ...any) context.Context {
 	return Into(ctx, From(ctx).With(args...))
+}
+
+// Library returns a copy of ctx carrying a clog logger - the logging facade
+// chainguard-dev libraries such as omnibump read from ctx - that writes into
+// From(ctx) (so records keep the file/modroot attribution), tagged
+// source=name and demoted to Debug: what a library says about one simulated
+// apply is diagnostic detail for -vv, not part of the operational stream.
+func Library(ctx context.Context, name string) context.Context {
+	logger := slog.New(debugHandler{inner: From(ctx).Handler()}).With("source", name)
+	return clog.WithLogger(ctx, clog.NewLogger(logger))
+}
+
+// debugHandler re-levels every record to Debug before handing it on.
+type debugHandler struct{ inner slog.Handler }
+
+func (h debugHandler) Enabled(ctx context.Context, _ slog.Level) bool {
+	return h.inner.Enabled(ctx, slog.LevelDebug)
+}
+
+func (h debugHandler) Handle(ctx context.Context, r slog.Record) error {
+	r.Level = slog.LevelDebug
+	return h.inner.Handle(ctx, r)
+}
+
+func (h debugHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return debugHandler{inner: h.inner.WithAttrs(attrs)}
+}
+
+func (h debugHandler) WithGroup(name string) slog.Handler {
+	return debugHandler{inner: h.inner.WithGroup(name)}
 }

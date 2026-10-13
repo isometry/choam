@@ -109,8 +109,8 @@ func LastCommitInfo(ctx context.Context, filePath string) (*FileCommitInfo, erro
 // lastCommitTouching finds the most recent commit that touched relPath.
 // It prefers shelling out to the real git binary (git log's file-history
 // walk is far cheaper than go-git's tree-diffing Log on large repositories)
-// and falls back to logViaGoGit when the binary is unavailable or fails to
-// execute.
+// and falls back to logViaGoGit only when no git binary is on PATH: a git
+// that runs and fails (or is cancelled) surfaces its error.
 func lastCommitTouching(ctx context.Context, repo *gogit.Repository, root, relPath string) (plumbing.Hash, time.Time, error) {
 	hash, when, invoked, err := runGitLog(ctx, root, relPath)
 	if invoked {
@@ -120,23 +120,20 @@ func lastCommitTouching(ctx context.Context, repo *gogit.Repository, root, relPa
 }
 
 // runGitLog shells out to `git -C root log -1 --format=%H|%cI -- relPath`.
-// invoked reports whether the git binary was found and executed
-// successfully; callers should fall back to logViaGoGit when it is false,
-// regardless of the returned error (which will be nil in that case).
+// invoked is false only when no git binary is on PATH (callers then fall
+// back to logViaGoGit; err is nil).
 func runGitLog(ctx context.Context, root, relPath string) (hash plumbing.Hash, when time.Time, invoked bool, err error) {
-	if _, lookErr := exec.LookPath("git"); lookErr != nil {
-		return plumbing.ZeroHash, time.Time{}, false, nil
+	stdout, invoked, err := gitOutput(ctx, root, "log", "-1", "--format=%H|%cI", "--", relPath)
+	if err != nil && ctx.Err() == nil && strings.Contains(err.Error(), "does not have any commits yet") {
+		// An empty repository has no history for any path (logViaGoGit's
+		// ErrReferenceNotFound case).
+		return plumbing.ZeroHash, time.Time{}, true, ErrUntracked
+	}
+	if !invoked || err != nil {
+		return plumbing.ZeroHash, time.Time{}, invoked, err
 	}
 
-	cmd := exec.CommandContext(ctx, "git", "-C", root, "log", "-1", "--format=%H|%cI", "--", relPath)
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
-	if runErr := cmd.Run(); runErr != nil {
-		// Fall back to go-git rather than surfacing an exec failure.
-		return plumbing.ZeroHash, time.Time{}, false, nil
-	}
-
-	out := strings.TrimSpace(stdout.String())
+	out := strings.TrimSpace(stdout)
 	if out == "" {
 		return plumbing.ZeroHash, time.Time{}, true, ErrUntracked
 	}
@@ -184,8 +181,7 @@ func logViaGoGit(repo *gogit.Repository, relPath string) (plumbing.Hash, time.Ti
 // shelling out to the real git binary via runGitStatus, which honours
 // content filters (core.autocrlf, .gitattributes eol rules) the same way
 // git itself does when populating the working tree, and falls back to the
-// isDirty raw byte-compare when the binary is unavailable or fails to
-// execute.
+// isDirty raw byte-compare only when no git binary is on PATH.
 func fileDirty(ctx context.Context, repo *gogit.Repository, root, absPath, relPath string) (bool, error) {
 	dirty, invoked, err := runGitStatus(ctx, root, relPath)
 	if invoked {
@@ -195,26 +191,34 @@ func fileDirty(ctx context.Context, repo *gogit.Repository, root, absPath, relPa
 }
 
 // runGitStatus shells out to `git -C root status --porcelain -- relPath`.
-// invoked reports whether the git binary was found and executed
-// successfully; callers should fall back to isDirty when it is false,
-// regardless of the returned error (which will be nil in that case).
-// err is currently always nil even when invoked is true; it is kept in the
-// signature for symmetry with runGitLog's fast-path/fallback contract.
+// invoked is false only when no git binary is on PATH (callers then fall
+// back to isDirty; err is nil).
 func runGitStatus(ctx context.Context, root, relPath string) (dirty bool, invoked bool, err error) {
+	stdout, invoked, err := gitOutput(ctx, root, "status", "--porcelain", "--", relPath)
+	if !invoked || err != nil {
+		return false, invoked, err
+	}
+	return strings.TrimSpace(stdout) != "", true, nil
+}
+
+// gitOutput runs `git -C root args...`. invoked is false (and err nil) only
+// when no git binary is on PATH. A cancelled ctx returns ctx's error; any
+// other failure returns git's error with its stderr - never a silent
+// fallback to go-git, whose answer could then silently differ.
+func gitOutput(ctx context.Context, root string, args ...string) (stdout string, invoked bool, err error) {
 	if _, lookErr := exec.LookPath("git"); lookErr != nil {
-		return false, false, nil
+		return "", false, nil
 	}
-
-	cmd := exec.CommandContext(ctx, "git", "-C", root, "status", "--porcelain", "--", relPath)
-	var stdout bytes.Buffer
-	cmd.Stdout = &stdout
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", root}, args...)...)
+	var out, stderr bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &stderr
 	if runErr := cmd.Run(); runErr != nil {
-		// Fall back to the go-git byte-compare rather than surfacing an exec
-		// failure.
-		return false, false, nil
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return "", true, ctxErr
+		}
+		return "", true, fmt.Errorf("git %s: %w: %s", args[0], runErr, strings.TrimSpace(stderr.String()))
 	}
-
-	return strings.TrimSpace(stdout.String()) != "", true, nil
+	return out.String(), true, nil
 }
 
 // isDirty reports whether the on-disk content at absPath differs from the

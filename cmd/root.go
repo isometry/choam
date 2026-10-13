@@ -19,13 +19,14 @@ var (
 	httpTimeout  time.Duration
 
 	// Update-specific flags
-	updateShared bool
 	backupSuffix string
 
 	// Bump-specific flags
 	noValidate        bool
 	simulationTimeout time.Duration
 	noStdlib          bool
+	noCompile         bool
+	failOnResidual    bool
 )
 
 // NewRootCmd creates the root command

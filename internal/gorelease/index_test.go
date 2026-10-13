@@ -555,6 +555,21 @@ func TestErrorPaths(t *testing.T) {
 		}
 	})
 
+	t.Run("empty list is not loaded: an error (never ErrNoReleases), retried", func(t *testing.T) {
+		fs := newFixtureServer("", fixtureInfoTimes())
+		ix, _ := newTestIndex(t, fs)
+
+		for range 2 {
+			_, err := ix.LatestAvailable(context.Background(), "1.23")
+			if err == nil || errors.Is(err, ErrNoReleases) {
+				t.Fatalf("LatestAvailable() on an empty list = %v, want a load error that is not ErrNoReleases", err)
+			}
+		}
+		if n := fs.listRequests(); n != 2 {
+			t.Errorf("@v/list fetched %d times, want 2 (an empty list must not be memoized as loaded)", n)
+		}
+	})
+
 	t.Run("context cancellation does not burn a load attempt", func(t *testing.T) {
 		fs := newFixtureServer(fixtureList, fixtureInfoTimes())
 		fs.listStatus = http.StatusInternalServerError

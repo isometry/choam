@@ -222,35 +222,41 @@ func validateQuotableValue(field, value string) error {
 	return nil
 }
 
-// spliceIntoPipelineWith inserts insertedLines (already relative to the with
-// block's own indentation - the first line typically "field: ..." and any
-// further lines its continuation) after the last existing line of a pipeline
-// step's with block, re-indenting each to match the block's first key.
-// goccy's renderer does not reliably emit AST nodes appended to an existing
-// mapping, so this locates the insertion point via the AST and splices
-// correctly indented lines into the source text directly instead.
+// spliceIntoPipelineWith is SpliceIntoWith for a top-level pipeline step.
 func (l *Loader) spliceIntoPipelineWith(yamlContent []byte, pipelineIndex int, insertedLines []string) ([]byte, error) {
+	return l.SpliceIntoWith(yamlContent, fmt.Sprintf("$.pipeline[%d].with", pipelineIndex), insertedLines)
+}
+
+// SpliceIntoWith inserts insertedLines (already relative to the with block's
+// own indentation - the first line typically "field: ..." and any further
+// lines its continuation) after the last existing line of the with block at
+// withPath (e.g. "$.subpackages[0].pipeline[2].with"), re-indenting each to
+// match the block's first key. goccy's renderer does not reliably emit AST
+// nodes appended to an existing mapping, so this locates the insertion point
+// via the AST and splices correctly indented lines into the source text
+// directly instead; every other byte is preserved.
+func (l *Loader) SpliceIntoWith(yamlContent []byte, withPath string, insertedLines []string) ([]byte, error) {
 	file, err := parser.ParseBytes(yamlContent, parser.ParseComments)
 	if err != nil {
 		return nil, fmt.Errorf("parsing YAML: %w", err)
 	}
 
-	withPath, err := yaml.PathString(fmt.Sprintf("$.pipeline[%d].with", pipelineIndex))
+	path, err := yaml.PathString(withPath)
 	if err != nil {
 		return nil, fmt.Errorf("creating with path: %w", err)
 	}
-	node, err := withPath.FilterFile(file)
+	node, err := path.FilterFile(file)
 	if err != nil {
-		return nil, fmt.Errorf("pipeline[%d] has no with block: %w", pipelineIndex, err)
+		return nil, fmt.Errorf("%s: no with block: %w", withPath, err)
 	}
-	mapping, ok := node.(*ast.MappingNode)
-	if !ok || len(mapping.Values) == 0 {
-		return nil, fmt.Errorf("pipeline[%d] with block is not a non-empty mapping", pipelineIndex)
+	values, ok := mappingValues(node)
+	if !ok || len(values) == 0 {
+		return nil, fmt.Errorf("%s is not a non-empty mapping", withPath)
 	}
 
-	keyColumn := mapping.Values[0].Key.GetToken().Position.Column // 1-based
+	keyColumn := values[0].Key.GetToken().Position.Column // 1-based
 	keyIndent := strings.Repeat(" ", keyColumn-1)
-	endLine := nodeEndLine(mapping) // 1-based line of the block's last content
+	endLine := nodeEndLine(node) // 1-based line of the block's last content
 
 	inserted := make([]string, len(insertedLines))
 	for i, line := range insertedLines {
@@ -258,30 +264,216 @@ func (l *Loader) spliceIntoPipelineWith(yamlContent []byte, pipelineIndex int, i
 	}
 
 	lines := strings.Split(string(yamlContent), "\n")
-	// When the with block being spliced into holds the file's very last
-	// content, goccy can position a multi-line block scalar's content node on
-	// its LAST source line rather than its first; nodeEndLine's "start line +
-	// embedded newline count" heuristic then overshoots by one, landing on
-	// the phantom empty element strings.Split appends for the file's trailing
-	// newline instead of the real last content line. That phantom element is
-	// unambiguous - the file ends in "\n" and endLine ran off the end - so
-	// correct for it here rather than reworking the line-counting heuristic
-	// for every node kind. Left uncorrected, the phantom line would be
-	// consumed into the "before insertion" half, leaving a spurious blank
-	// line before the insertion and no trailing newline after it: harmless
-	// once, but non-idempotent on a second splice into the same spot.
-	if endLine >= len(lines) && len(lines) > 0 && lines[len(lines)-1] == "" {
-		endLine = len(lines) - 1
-	}
-	if endLine > len(lines) {
-		endLine = len(lines)
-	}
+	endLine = clampEndLine(lines, endLine)
 	result := make([]string, 0, len(lines)+len(inserted))
 	result = append(result, lines[:endLine]...)
 	result = append(result, inserted...)
 	result = append(result, lines[endLine:]...)
 
 	return []byte(strings.Join(result, "\n")), nil
+}
+
+// clampEndLine corrects a nodeEndLine result against the source lines. When
+// the node holds the file's very last content, goccy can position a
+// multi-line block scalar's content node on its LAST source line rather than
+// its first; nodeEndLine's "start line + embedded newline count" heuristic
+// then overshoots by one, landing on the phantom empty element strings.Split
+// appends for the file's trailing newline instead of the real last content
+// line. That phantom element is unambiguous - the file ends in "\n" and
+// endLine ran off the end - so correct for it here rather than reworking the
+// line-counting heuristic for every node kind. Left uncorrected, the phantom
+// line would be consumed into the "before insertion" half, leaving a
+// spurious blank line before the insertion and no trailing newline after it:
+// harmless once, but non-idempotent on a second splice into the same spot.
+func clampEndLine(lines []string, endLine int) int {
+	if endLine >= len(lines) && len(lines) > 0 && lines[len(lines)-1] == "" {
+		endLine = len(lines) - 1
+	}
+	if endLine > len(lines) {
+		endLine = len(lines)
+	}
+	return endLine
+}
+
+// pipelineStepNode returns the mapping node of $.pipeline[pipelineIndex].
+func pipelineStepNode(yamlContent []byte, pipelineIndex int) (ast.Node, error) {
+	file, err := parser.ParseBytes(yamlContent, parser.ParseComments)
+	if err != nil {
+		return nil, fmt.Errorf("parsing YAML: %w", err)
+	}
+	path, err := yaml.PathString(fmt.Sprintf("$.pipeline[%d]", pipelineIndex))
+	if err != nil {
+		return nil, fmt.Errorf("creating pipeline path: %w", err)
+	}
+	node, err := path.FilterFile(file)
+	if err != nil {
+		return nil, fmt.Errorf("pipeline[%d] not found: %w", pipelineIndex, err)
+	}
+	return node, nil
+}
+
+// stepKey returns the key/value entry named key directly under node (a step
+// mapping or its with block), nil when absent.
+func stepKey(node ast.Node, key string) *ast.MappingValueNode {
+	values, _ := mappingValues(node)
+	for _, mv := range values {
+		if mv.Key.GetToken().Value == key {
+			return mv
+		}
+	}
+	return nil
+}
+
+// SetPipelineUses rewrites a top-level pipeline step's `uses:` value in the
+// source text (e.g. go/bump -> bump), leaving every other byte - including an
+// inline comment on that line - untouched. The value must be a plain or
+// quoted single-line scalar.
+func (l *Loader) SetPipelineUses(yamlContent []byte, pipelineIndex int, uses string) ([]byte, error) {
+	if err := validateQuotableValue("uses", strings.ReplaceAll(uses, "/", "")); err != nil {
+		return nil, err
+	}
+	step, err := pipelineStepNode(yamlContent, pipelineIndex)
+	if err != nil {
+		return nil, err
+	}
+	mv := stepKey(step, "uses")
+	if mv == nil {
+		return nil, fmt.Errorf("pipeline[%d] has no uses", pipelineIndex)
+	}
+	tk := mv.Value.GetToken()
+	if tk == nil || tk.Position == nil {
+		return nil, fmt.Errorf("pipeline[%d] uses has no position", pipelineIndex)
+	}
+	lines := strings.Split(string(yamlContent), "\n")
+	lineIdx, col := tk.Position.Line-1, tk.Position.Column-1
+	if lineIdx < 0 || lineIdx >= len(lines) || col < 0 || col > len(lines[lineIdx]) {
+		return nil, fmt.Errorf("pipeline[%d] uses position out of range", pipelineIndex)
+	}
+	line := lines[lineIdx]
+	rest := line[col:]
+	var width int
+	switch {
+	case strings.HasPrefix(rest, `"`+tk.Value+`"`), strings.HasPrefix(rest, `'`+tk.Value+`'`):
+		width = len(tk.Value) + 2
+	case strings.HasPrefix(rest, tk.Value):
+		width = len(tk.Value)
+	default:
+		return nil, fmt.Errorf("pipeline[%d] uses value %q not found at its source position", pipelineIndex, tk.Value)
+	}
+	lines[lineIdx] = line[:col] + uses + rest[width:]
+	return []byte(strings.Join(lines, "\n")), nil
+}
+
+// RemovePipelineWithFieldLines removes a top-level pipeline step's
+// with.<field> from the source text: the key's own lines (an inline comment
+// included) and the comment lines directly above it at the key's
+// indentation, which describe it. Every other byte is preserved. Absent
+// field: unchanged.
+func (l *Loader) RemovePipelineWithFieldLines(yamlContent []byte, pipelineIndex int, field string) ([]byte, error) {
+	step, err := pipelineStepNode(yamlContent, pipelineIndex)
+	if err != nil {
+		return nil, err
+	}
+	with := stepKey(step, "with")
+	if with == nil {
+		return yamlContent, nil
+	}
+	values, _ := mappingValues(with.Value)
+	at := -1
+	for i, mv := range values {
+		if mv.Key.GetToken().Value == field {
+			at = i
+		}
+	}
+	if at < 0 {
+		return yamlContent, nil
+	}
+	keyTk := values[at].Key.GetToken()
+	lines := strings.Split(string(yamlContent), "\n")
+	first := keyTk.Position.Line - 1 // 0-based
+	indent := strings.Repeat(" ", keyTk.Position.Column-1)
+	// The field ends where the next key's own lines (its head comments
+	// included) begin, or with the with block itself when it is the last key.
+	var last int
+	if at+1 < len(values) {
+		last = values[at+1].Key.GetToken().Position.Line - 2
+		for last > first && (strings.TrimSpace(lines[last]) == "" || strings.HasPrefix(lines[last], indent+"#")) {
+			last--
+		}
+	} else {
+		last = clampEndLine(lines, nodeEndLine(with.Value)) - 1
+	}
+	if last < first {
+		last = first
+	}
+	for first > 0 {
+		above := lines[first-1]
+		if !strings.HasPrefix(above, indent+"#") {
+			break
+		}
+		first--
+	}
+	result := make([]string, 0, len(lines))
+	result = append(result, lines[:first]...)
+	result = append(result, lines[last+1:]...)
+	return []byte(strings.Join(result, "\n")), nil
+}
+
+// ClonePipelineStepAfter duplicates the source text of top-level pipeline
+// step pipelineIndex (from its "- " line to its last content line, comments
+// inside the step included) as a new step directly after it, separated by a
+// blank line when blankLineBetweenSteps. The clone is at pipelineIndex+1.
+func (l *Loader) ClonePipelineStepAfter(yamlContent []byte, pipelineIndex int, blankLineBetweenSteps bool) ([]byte, error) {
+	step, err := pipelineStepNode(yamlContent, pipelineIndex)
+	if err != nil {
+		return nil, err
+	}
+	values, ok := mappingValues(step)
+	if !ok || len(values) == 0 {
+		return nil, fmt.Errorf("pipeline[%d] is not a mapping", pipelineIndex)
+	}
+	lines := strings.Split(string(yamlContent), "\n")
+	first := values[0].Key.GetToken().Position.Line - 1
+	last := clampEndLine(lines, nodeEndLine(step)) - 1
+	if first < 0 || last < first || last >= len(lines) {
+		return nil, fmt.Errorf("pipeline[%d] source range out of bounds", pipelineIndex)
+	}
+	clone := append([]string{}, lines[first:last+1]...)
+	if blankLineBetweenSteps {
+		clone = append([]string{""}, clone...)
+	}
+	result := make([]string, 0, len(lines)+len(clone))
+	result = append(result, lines[:last+1]...)
+	result = append(result, clone...)
+	result = append(result, lines[last+1:]...)
+	return []byte(strings.Join(result, "\n")), nil
+}
+
+// SetBumpModroots sets a top-level bump step's with.modroot to roots: a
+// single "." removes the field (the pipeline default), a single other root is
+// a plain scalar, several roots a block scalar list.
+func (l *Loader) SetBumpModroots(yamlContent []byte, pipelineIndex int, roots []string) ([]byte, error) {
+	if len(roots) == 0 || (len(roots) == 1 && roots[0] == ".") {
+		return l.RemovePipelineWithFieldLines(yamlContent, pipelineIndex, "modroot")
+	}
+	if len(roots) > 1 {
+		return l.UpsertPipelineWithBlockScalar(yamlContent, pipelineIndex, "modroot", strings.Join(roots, "\n"))
+	}
+	if err := validateQuotableValue("modroot", strings.ReplaceAll(roots[0], "/", "")); err != nil {
+		return nil, err
+	}
+	exists, err := l.pipelineWithHasField(yamlContent, pipelineIndex, "modroot")
+	if err != nil {
+		return nil, err
+	}
+	if exists {
+		updated, err := l.RemovePipelineWithFieldLines(yamlContent, pipelineIndex, "modroot")
+		if err != nil {
+			return nil, err
+		}
+		yamlContent = updated
+	}
+	return l.spliceIntoPipelineWith(yamlContent, pipelineIndex, []string{"modroot: " + roots[0]})
 }
 
 // UpsertPipelineWithBlockScalar sets a pipeline step's with.<field> to a
@@ -409,12 +601,11 @@ func (l *Loader) UpdateFieldAsQuotedString(yamlContent []byte, path string, newV
 // Modroots, just ["."] - the pipeline's own default) are omitted from the
 // emitted YAML entirely rather than written as empty/default values.
 type BumpStepSpec struct {
-	Action    string   // "bump" or "go/bump"
-	Language  string   // omitted from YAML when empty
-	GoVersion string   // omitted when empty; rendered as a quoted scalar
-	Modroots  []string // omitted when just ["."]; block scalar list otherwise
-	Deps      []string // block scalar list
-	Replaces  []string // block scalar list
+	Action   string   // "bump" or "go/bump"
+	Language string   // omitted from YAML when empty
+	Modroots []string // omitted when just ["."]; block scalar list otherwise
+	Deps     []string // block scalar list
+	Replaces []string // block scalar list
 }
 
 // InsertBumpPipelineStep inserts a bump or go/bump step with block-scalar deps
@@ -455,9 +646,7 @@ func (l *Loader) InsertBumpPipelineStep(yamlContent []byte, pipelineIndex int, s
 	// omitted since it's the pipeline's own default. language is written
 	// explicitly (rather than relying on the pipeline's own "auto" detection
 	// at build time) since the caller already knows definitively which
-	// language it analyzed. go-version is quoted inline in the template
-	// (rather than via UpsertPipelineWithQuotedString) since the whole step
-	// is freshly parsed here - there's no existing mapping to append to.
+	// language it analyzed.
 	stepYaml := "- uses: " + spec.Action + "\n  with:"
 	if len(spec.Deps) > 0 {
 		stepYaml += "\n    deps: |-\n      " + strings.Join(spec.Deps, "\n      ")
@@ -467,12 +656,6 @@ func (l *Loader) InsertBumpPipelineStep(yamlContent []byte, pipelineIndex int, s
 	}
 	if spec.Language != "" {
 		stepYaml += "\n    language: " + spec.Language
-	}
-	if spec.GoVersion != "" {
-		if err := validateQuotableValue("go-version", spec.GoVersion); err != nil {
-			return nil, err
-		}
-		stepYaml += "\n    go-version: \"" + spec.GoVersion + "\""
 	}
 	if len(spec.Modroots) > 0 && (len(spec.Modroots) != 1 || spec.Modroots[0] != ".") {
 		stepYaml += "\n    modroot: |-\n      " + strings.Join(spec.Modroots, "\n      ")
@@ -513,7 +696,7 @@ func (l *Loader) InsertBumpPipelineStep(yamlContent []byte, pipelineIndex int, s
 
 // HasBlankLinesBetweenPipelineSteps reports whether the YAML separates
 // pipeline steps with blank lines. Callers that remove steps before
-// re-inserting must capture this from the ORIGINAL content - a stripped
+// inserting must capture this from the ORIGINAL content - a stripped
 // pipeline may no longer have two adjacent steps to detect the convention from.
 func (l *Loader) HasBlankLinesBetweenPipelineSteps(yamlContent []byte) bool {
 	// \n\n\s*-\s*uses: matches a blank line followed by a pipeline step

@@ -1,12 +1,15 @@
 package config
 
 import (
+	"context"
 	"fmt"
-	"maps"
 	"strconv"
+	"strings"
 
 	"chainguard.dev/melange/pkg/cond"
 	melange "chainguard.dev/melange/pkg/config"
+
+	"github.com/isometry/choam/internal/logging"
 )
 
 // Renderer provides variable rendering for melange configurations
@@ -152,33 +155,35 @@ func (r *Renderer) RenderString(template string) (string, error) {
 	return result, nil
 }
 
-// GetVariableMap returns a copy of the complete variable map
-func (r *Renderer) GetVariableMap() map[string]string {
-	result := make(map[string]string, len(r.variableMap))
-	maps.Copy(result, r.variableMap)
-	return result
+// RenderOrRaw renders a value leniently: a value with no template
+// expression, a nil renderer, or a render error all keep the raw value (the
+// error is logged at debug). Callers that must know whether a value
+// rendered completely check the result for a leftover "${{".
+func (r *Renderer) RenderOrRaw(ctx context.Context, value string) string {
+	if r == nil || !strings.Contains(value, "${{") {
+		return value
+	}
+	rendered, err := r.RenderString(value)
+	if err != nil {
+		logging.From(ctx).Debug("could not render templated value; keeping it raw", "value", value, "error", err)
+		return value
+	}
+	return rendered
 }
 
-// GetVariable gets the value of a specific variable
-func (r *Renderer) GetVariable(key string) (string, bool) {
-	// Try direct key
-	if value, exists := r.variableMap[key]; exists {
-		return value, true
+// ForEachPipelineStep calls fn for every step of the top-level pipeline,
+// then of each subpackage's pipeline, in order.
+func ForEachPipelineStep(cfg *melange.Configuration, fn func(step *melange.Pipeline)) {
+	if cfg == nil {
+		return
 	}
-
-	// Try with ${{}} wrapper
-	wrappedKey := fmt.Sprintf("${{%s}}", key)
-	if value, exists := r.variableMap[wrappedKey]; exists {
-		return value, true
+	for i := range cfg.Pipeline {
+		fn(&cfg.Pipeline[i])
 	}
-
-	return "", false
-}
-
-// RenderConfig creates a new configuration with all variables resolved
-// This is useful when you need a fully rendered config for processing
-func (r *Renderer) RenderConfig() (*melange.Configuration, error) {
-	// For now, we'll focus on RenderString as it's the primary need
-	// Full config rendering would be more complex and may not be immediately needed
-	return nil, fmt.Errorf("full config rendering not implemented yet - use RenderString for specific fields")
+	for s := range cfg.Subpackages {
+		steps := cfg.Subpackages[s].Pipeline
+		for i := range steps {
+			fn(&steps[i])
+		}
+	}
 }

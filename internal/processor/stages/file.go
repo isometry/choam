@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/processor"
@@ -64,22 +65,55 @@ func (f *FileWriterStage) Apply(ctx context.Context, p processor.Processor) erro
 		return nil
 	}
 
+	info, err := os.Stat(filePath)
+	if err != nil {
+		return fmt.Errorf("writing file: %w", err)
+	}
+
 	// Create backup if requested
 	if f.CreateBackup {
 		backupPath := filePath + f.BackupSuffix
-		if err := os.WriteFile(backupPath, p.GetOriginalYAML(), 0644); err != nil {
+		if err := WriteFileAtomic(backupPath, p.GetOriginalYAML(), info.Mode().Perm()); err != nil {
 			return fmt.Errorf("creating backup: %w", err)
 		}
 		logger.Debug("Created backup", "path", backupPath)
 		p.AddMessage(fmt.Sprintf("created backup: %s", backupPath))
 	}
 
-	// Write the file
-	if err := os.WriteFile(filePath, p.GetCurrentYAML(), 0644); err != nil {
+	if err := WriteFileAtomic(filePath, p.GetCurrentYAML(), info.Mode().Perm()); err != nil {
 		return fmt.Errorf("writing file: %w", err)
 	}
 
 	p.AddMessage("file written successfully")
 	logger.Info("File written", "path", filePath)
 	return nil
+}
+
+// WriteFileAtomic replaces path with data via a temp file in the same
+// directory and a rename, so an interrupted write never leaves a truncated
+// file behind; the result has mode perm.
+func WriteFileAtomic(path string, data []byte, perm os.FileMode) (err error) {
+	tmp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = tmp.Close()
+			_ = os.Remove(tmp.Name())
+		}
+	}()
+	if _, err = tmp.Write(data); err != nil {
+		return err
+	}
+	if err = tmp.Chmod(perm); err != nil {
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), path)
 }

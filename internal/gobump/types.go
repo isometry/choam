@@ -4,12 +4,13 @@ import (
 	"time"
 
 	"github.com/isometry/choam/internal/ecosystem"
+	"github.com/isometry/choam/internal/processor"
 	"github.com/isometry/choam/internal/scan"
 	"github.com/isometry/choam/internal/simulate"
 )
 
 // BumpAction summarizes a change needed for one or more module roots, for
-// reporting purposes (see GoBumpResult.ActionsApplied).
+// reporting purposes (see Result.ActionsApplied).
 type BumpAction struct {
 	Action       string   `json:"action" yaml:"action"`                         // "needs_bump"
 	Language     string   `json:"language" yaml:"language"`                     // "go", "rust", "java"
@@ -47,14 +48,14 @@ type SecurityFix struct {
 	Severity      string `json:"severity" yaml:"severity"`           // critical, high, medium, low
 }
 
-// GoBumpResult represents the result of a bump operation.
+// Result represents the result of a bump operation.
 //
 // Counting units: VulnerabilitiesFound and VulnerabilitiesFixed/Residual
 // count advisories; ModulesBumped counts dependency entries changed. When
 // Validated is true, Fixed/Residual are proven by simulating the bump against
 // a real checkout; otherwise Fixed falls back to the historical
 // modules-changed approximation.
-type GoBumpResult struct {
+type Result struct {
 	PackageName             string `json:"package_name" yaml:"package_name"`
 	FilePath                string `json:"file_path" yaml:"file_path"`
 	VulnerabilitiesFound    int    `json:"vulnerabilities_found" yaml:"vulnerabilities_found"`
@@ -73,7 +74,20 @@ type GoBumpResult struct {
 	CriticalFixed              int                 `json:"critical_fixed" yaml:"critical_fixed"`
 	HighFixed                  int                 `json:"high_fixed" yaml:"high_fixed"`
 	SecurityFixes              []SecurityFix       `json:"security_fixes" yaml:"security_fixes"`
-	ActionsApplied             []BumpAction        `json:"actions_applied" yaml:"actions_applied"`
+	// HygieneBumps are the scanner-hygiene entries written (see
+	// simulate.HygieneModule): modules raised only so module-level scanners
+	// stop flagging advisories whose vulnerable packages are not linked.
+	// Never security fixes - their advisories stay unreachable, uncounted by
+	// Fixed; HygieneModulesBumped counts them (ModulesBumped does not).
+	HygieneBumps         []SecurityFix `json:"hygiene_bumps,omitempty" yaml:"hygiene_bumps,omitempty"`
+	HygieneModulesBumped int           `json:"hygiene_modules_bumped,omitempty" yaml:"hygiene_modules_bumped,omitempty"`
+	ActionsApplied       []BumpAction  `json:"actions_applied" yaml:"actions_applied"`
+	// SkipReasons say why (part of) the package was not analyzed (status
+	// SKIPPED; see Processor.SkipReasons).
+	SkipReasons []string `json:"skip_reasons,omitempty" yaml:"skip_reasons,omitempty"`
+	// Notes are degradations shown at default verbosity (see
+	// Processor.Notes); they do not change the row's status.
+	Notes []string `json:"notes,omitempty" yaml:"notes,omitempty"`
 	// StdlibBumps are the Go stdlib staleness findings that (each) justify
 	// an epoch bump; StdlibChecked reports whether the staleness check ran
 	// to completion (false when disabled, inapplicable, or skipped).
@@ -102,6 +116,30 @@ type ModrootAnalysis struct {
 	// roots); the simulation then over-approximates with ./....
 	BuildPackages []string `json:"build_packages,omitempty" yaml:"build_packages,omitempty"`
 
+	// BuildTags are this modroot's go/build steps' build tags (each step's
+	// toolchaintags - default netgo,osusergo - plus its tags), unioned, for
+	// the simulation's compile gate. Empty when no go/build step covers it.
+	BuildTags []string `json:"build_tags,omitempty" yaml:"build_tags,omitempty"`
+
+	// BuildArches are the GOARCHes the package is built for (from
+	// package.target-architecture) and BuildEnv the build environment the
+	// spec sets for this modroot (see analysisUnit). Go only.
+	BuildArches []string          `json:"-" yaml:"-"`
+	BuildEnv    simulate.BuildEnv `json:"-" yaml:"-"`
+
+	// BumpEngine is the apply semantics the build's bump step will use for
+	// this modroot once written (see analysisUnit.Engine); BumpMigrating
+	// marks a go/bump step that migrates to `uses: bump` when rewritten;
+	// BumpNoTidy mirrors that step's `tidy: false`; GoPackageMinor is the Go
+	// minor the build pins ("" when unpinned). BaselineTidies records that
+	// the simulation found the pristine module tidies under omnibump (only
+	// probed for a migrating `tidy: false` step). Go only.
+	BumpEngine     simulate.Engine `json:"-" yaml:"-"`
+	BumpMigrating  bool            `json:"-" yaml:"-"`
+	BumpNoTidy     bool            `json:"-" yaml:"-"`
+	GoPackageMinor string          `json:"-" yaml:"-"`
+	BaselineTidies bool            `json:"-" yaml:"-"`
+
 	Deps         *ecosystem.ModuleDeps `json:"-" yaml:"-"` // ecosystem-internal, not serialized
 	ScanResult   *scan.ScanResult      `json:"scan_result" yaml:"scan_result"`
 	ExistingDeps []string              `json:"existing_deps" yaml:"existing_deps"` // deps currently declared for this root
@@ -109,8 +147,8 @@ type ModrootAnalysis struct {
 
 	// Replace directives ("old=new@version", Go only): what the root's bump
 	// steps currently declare, and what they should end up declaring.
-	// Analysis only carries existing replaces forward; the simulation adds
-	// promotions (see SimulationStage and internal/simulate).
+	// Analysis only carries existing replaces forward; the simulation may
+	// raise or retire them (see SimulationStage and internal/simulate).
 	ExistingReplaces []string `json:"existing_replaces,omitempty" yaml:"existing_replaces,omitempty"`
 	DesiredReplaces  []string `json:"desired_replaces,omitempty" yaml:"desired_replaces,omitempty"`
 
@@ -133,7 +171,7 @@ type ModrootAnalysis struct {
 	// actually flagged as vulnerable for this modroot - i.e.
 	// scanResult.SecurityBumps, not DesiredDeps. The desired set may carry
 	// additional entries with no CVE of their own (e.g. coherence pins the
-	// simulation promotes to keep the module graph resolvable); this
+	// simulation adds to keep the module graph resolvable); this
 	// narrower list lets the applier credit only genuine CVE fixes toward
 	// SecurityFixes/epoch-bump accounting, so a coherence-only entry can't
 	// masquerade as a vulnerability fix. The simulation overwrites it
@@ -154,6 +192,9 @@ type ModrootAnalysis struct {
 	SimulationConverged bool                        `json:"simulation_converged" yaml:"simulation_converged"`
 	Residuals           []simulate.Residual         `json:"residuals,omitempty" yaml:"residuals,omitempty"`
 	Dropped             []simulate.DroppedCandidate `json:"dropped,omitempty" yaml:"dropped,omitempty"`
+	// HygieneModules are the DesiredDeps entries the simulation proposed only
+	// for scanner hygiene (see simulate.HygieneModule).
+	HygieneModules []simulate.HygieneModule `json:"hygiene_modules,omitempty" yaml:"hygiene_modules,omitempty"`
 }
 
 // LanguageAnalysis contains the results of scanning one language's
@@ -170,10 +211,7 @@ type LanguageAnalysis struct {
 type VulnerabilityAnalysis struct {
 	ByLanguage           []LanguageAnalysis `json:"by_language" yaml:"by_language"`
 	VulnerabilitiesFound int                `json:"vulnerabilities_found" yaml:"vulnerabilities_found"` // aggregated across all languages
-	CriticalCount        int                `json:"critical_count" yaml:"critical_count"`
-	HighCount            int                `json:"high_count" yaml:"high_count"`
-	SecurityBumps        []string           `json:"security_bumps" yaml:"security_bumps"`
-	BumpActions          []BumpAction       `json:"bump_actions" yaml:"bump_actions"` // each carries its own Language
+	BumpActions          []BumpAction       `json:"bump_actions" yaml:"bump_actions"`                   // each carries its own Language
 
 	// Source coordinates from the package's git-checkout step, retained so
 	// the simulation stage can clone the exact source the build will use.
@@ -182,11 +220,11 @@ type VulnerabilityAnalysis struct {
 	ExpectedCommit string `json:"expected_commit,omitempty" yaml:"expected_commit,omitempty"`
 }
 
-// ProcessorOptions configures processor behavior
-type ProcessorOptions struct {
-	DryRun       bool   `json:"dry_run" yaml:"dry_run"`
-	BackupSuffix string `json:"backup_suffix" yaml:"backup_suffix"`
-	TempDir      string `json:"temp_dir" yaml:"temp_dir"`
+// Options configures processor behavior: the shared processor
+// options (DryRun, BackupSuffix, TempDir; Force is unused by bump) plus the
+// bump-specific ones below.
+type Options struct {
+	processor.ProcessorOptions
 
 	// Validate enables bump simulation (default true): Go bump candidates
 	// are applied to a clone of the upstream source with the real go
@@ -197,6 +235,12 @@ type ProcessorOptions struct {
 
 	// SimulationTimeout bounds each package's bump simulation (default 10m).
 	SimulationTimeout time.Duration `json:"simulation_timeout" yaml:"simulation_timeout"`
+
+	// Compile enables the simulation's compile gate (default true at the
+	// CLI; --no-compile disables it): the validated deps set must also
+	// compile the go/build packages without new failures (see
+	// simulate.Compiler). Moot when Validate is false.
+	Compile bool `json:"compile" yaml:"compile"`
 
 	// StdlibCheck enables the Go stdlib staleness check (see StdlibStage):
 	// estimate the toolchain the package was last built with and bump the

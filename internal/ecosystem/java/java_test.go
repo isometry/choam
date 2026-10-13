@@ -100,24 +100,40 @@ func TestEcosystem_FilterBumps(t *testing.T) {
 			{Coord: "io.netty:netty-codec-http", Name: "io.netty:netty-codec-http", GroupID: "io.netty", ArtifactID: "netty-codec-http", Version: "4.1.90.Final"},
 		},
 	}
+	filter := func(existing []string, bumps ...scan.SecurityBump) ([]string, []ecosystem.HeldBump) {
+		return eco.FilterBumps(context.Background(), existing, bumps, deps)
+	}
 
 	t.Run("keeps bump newer than current, rendered as groupId@artifactId@version", func(t *testing.T) {
-		result := eco.FilterBumps(context.Background(), nil, []scan.SecurityBump{
-			{Name: "io.netty:netty-codec-http", FixedVersion: "4.1.94.Final"},
-		}, deps)
+		result, held := filter(nil, scan.SecurityBump{Name: "io.netty:netty-codec-http", FixedVersion: "4.1.94.Final"})
 		assert.Equal(t, []string{"io.netty@netty-codec-http@4.1.94.Final"}, result)
+		assert.Empty(t, held)
 	})
 
 	t.Run("drops bump for coordinate absent from pom.xml", func(t *testing.T) {
-		result := eco.FilterBumps(context.Background(), nil, []scan.SecurityBump{
-			{Name: "com.example:not-present", FixedVersion: "1.0.0"},
-		}, deps)
+		result, held := filter(nil, scan.SecurityBump{Name: "com.example:not-present", FixedVersion: "1.0.0"})
 		assert.Empty(t, result)
+		assert.Empty(t, held)
 	})
 
 	t.Run("existing 3-part entries parsed and re-filtered", func(t *testing.T) {
-		result := eco.FilterBumps(context.Background(), []string{"io.netty@netty-codec-http@4.1.92.Final"}, nil, deps)
+		result, _ := filter([]string{"io.netty@netty-codec-http@4.1.92.Final"})
 		assert.Equal(t, []string{"io.netty@netty-codec-http@4.1.92.Final"}, result)
+	})
+
+	t.Run("never lowers an existing higher pin", func(t *testing.T) {
+		result, _ := filter([]string{"io.netty@netty-codec-http@4.1.118.Final"},
+			scan.SecurityBump{Name: "io.netty:netty-codec-http", FixedVersion: "4.1.94.Final"})
+		assert.Equal(t, []string{"io.netty@netty-codec-http@4.1.118.Final"}, result)
+	})
+
+	t.Run("refuses a major version jump", func(t *testing.T) {
+		bump := scan.SecurityBump{Name: "io.netty:netty-codec-http", FixedVersion: "5.0.0.Alpha2", VulnIDs: []string{"GHSA-x"}}
+		result, held := filter(nil, bump)
+		assert.Empty(t, result)
+		require.Len(t, held, 1)
+		assert.Equal(t, bump, held[0].Bump)
+		assert.Equal(t, "fix 5.0.0.Alpha2 is a major version upgrade from declared 4.1.90.Final", held[0].Reason)
 	})
 }
 

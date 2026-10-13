@@ -33,15 +33,16 @@ type UpdateSummary struct {
 	Manual            int `json:"manual" yaml:"manual"`
 }
 
-// GoBumpResponse wraps gobump command results with summary metadata
-type GoBumpResponse struct {
-	Results map[string]*gobump.GoBumpResult `json:"results" yaml:"results"`
-	Summary GoBumpSummary                   `json:"summary" yaml:"summary"`
+// BumpResponse wraps gobump command results (keyed by file path) with
+// summary metadata
+type BumpResponse struct {
+	Results map[string]*gobump.Result `json:"results" yaml:"results"`
+	Summary BumpSummary               `json:"summary" yaml:"summary"`
 }
 
-// GoBumpSummary provides aggregate statistics for gobump command. Vuln
+// BumpSummary provides aggregate statistics for gobump command. Vuln
 // counts are advisories; TotalModulesBumped counts changed dependency entries.
-type GoBumpSummary struct {
+type BumpSummary struct {
 	TotalPackages       int `json:"total_packages" yaml:"total_packages"`
 	PackagesWithVulns   int `json:"packages_with_vulns" yaml:"packages_with_vulns"`
 	PackagesFixed       int `json:"packages_fixed" yaml:"packages_fixed"`
@@ -54,7 +55,13 @@ type GoBumpSummary struct {
 	// linked into any build artifact (informational; not fixed, not residual).
 	TotalVulnsUnreachable int `json:"total_vulns_unreachable" yaml:"total_vulns_unreachable"`
 	TotalModulesBumped    int `json:"total_modules_bumped" yaml:"total_modules_bumped"`
-	Errors                int `json:"errors" yaml:"errors"`
+	// TotalHygieneModulesBumped counts scanner-hygiene entries written (see
+	// Result.HygieneBumps) - never part of TotalModulesBumped.
+	TotalHygieneModulesBumped int `json:"total_hygiene_modules_bumped,omitempty" yaml:"total_hygiene_modules_bumped,omitempty"`
+	Errors                    int `json:"errors" yaml:"errors"`
+	// PackagesSkipped counts files (or parts of files) not analyzed - see
+	// Result.SkipReasons.
+	PackagesSkipped int `json:"packages_skipped" yaml:"packages_skipped"`
 
 	// PackagesStdlibStale counts files with at least one distinct fixable
 	// stdlib vulnerability ID (see DistinctStdlibVulnIDs); TotalStdlibVulns

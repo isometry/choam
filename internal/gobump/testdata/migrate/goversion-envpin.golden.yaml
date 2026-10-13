@@ -1,0 +1,28 @@
+package:
+  name: example
+  version: "1.0.0"
+  epoch: 0
+
+environment:
+  contents:
+    packages:
+      - build-base
+      - go-1.26
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.56.0
+      language: go
+
+  - uses: patch
+    # comment on the patch step
+    with:
+      patches: fix.patch
+  - runs: make build

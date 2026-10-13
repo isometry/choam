@@ -1,0 +1,38 @@
+package:
+  name: example
+  version: "1.0.0"
+  epoch: 0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  - uses: go/bump
+    with:
+      modroot: api
+      deps: |-
+        golang.org/x/net@v0.55.0
+
+  - uses: go/bump
+    with:
+      modroot: cli
+      deps: |-
+        golang.org/x/text@v0.38.0
+
+  - uses: go/build
+    with:
+      modroot: api
+      packages: .
+
+subpackages:
+  - name: example-extra
+    pipeline:
+      - uses: go/bump
+        with:
+          deps: |-
+            golang.org/x/net@v0.55.0
+      - uses: go/build
+        with:
+          packages: ./extra

@@ -1,15 +1,39 @@
 package gobump
 
 import (
+	"context"
 	"testing"
 
 	"github.com/isometry/choam/internal/processor"
+	"github.com/isometry/choam/internal/scan"
 	"github.com/isometry/choam/internal/simulate"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestNewGoBumpProcessor(t *testing.T) {
+func TestAsBump(t *testing.T) {
+	gp := NewProcessor("test.yaml", "test", "1.0.0", 0)
+	got, err := asBump(gp)
+	require.NoError(t, err)
+	assert.Same(t, gp, got)
+
+	_, err = asBump(processor.NewBaseProcessor("test.yaml", "test", "1.0.0", 0))
+	assert.EqualError(t, err, "expected Processor, got *processor.BaseProcessor")
+}
+
+func TestCancelledOr(t *testing.T) {
+	degraded := false
+	require.NoError(t, cancelledOr(t.Context(), func() { degraded = true }))
+	assert.True(t, degraded, "a live context runs the fallback")
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	degraded = false
+	assert.ErrorIs(t, cancelledOr(ctx, func() { degraded = true }), context.Canceled)
+	assert.False(t, degraded, "a cancellation must not be reported as a degrade")
+}
+
+func TestNewProcessor(t *testing.T) {
 	tests := []struct {
 		name           string
 		filePath       string
@@ -42,7 +66,7 @@ func TestNewGoBumpProcessor(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			proc := NewGoBumpProcessor(tt.filePath, tt.packageName, tt.currentVersion, tt.currentEpoch)
+			proc := NewProcessor(tt.filePath, tt.packageName, tt.currentVersion, tt.currentEpoch)
 
 			require.NotNil(t, proc)
 			require.NotNil(t, proc.BaseProcessor)
@@ -58,7 +82,7 @@ func TestNewGoBumpProcessor(t *testing.T) {
 	}
 }
 
-func TestGoBumpProcessor_AddSecurityFix(t *testing.T) {
+func TestProcessor_AddSecurityFix(t *testing.T) {
 	tests := []struct {
 		name          string
 		fixes         []SecurityFix
@@ -126,7 +150,7 @@ func TestGoBumpProcessor_AddSecurityFix(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			proc := NewGoBumpProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
+			proc := NewProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
 
 			for _, fix := range tt.fixes {
 				proc.AddSecurityFix(fix)
@@ -153,8 +177,8 @@ func TestGoBumpProcessor_AddSecurityFix(t *testing.T) {
 	}
 }
 
-func TestGoBumpProcessor_AddSecurityFix_Changes(t *testing.T) {
-	proc := NewGoBumpProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
+func TestProcessor_AddSecurityFix_Changes(t *testing.T) {
+	proc := NewProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
 
 	fix := SecurityFix{
 		Module:        "golang.org/x/crypto",
@@ -182,8 +206,8 @@ func TestGoBumpProcessor_AddSecurityFix_Changes(t *testing.T) {
 	assert.Contains(t, change.Reason, "high")
 }
 
-func TestGoBumpProcessor_MarkActualChangesApplied(t *testing.T) {
-	proc := NewGoBumpProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
+func TestProcessor_MarkActualChangesApplied(t *testing.T) {
+	proc := NewProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
 
 	// Initially false
 	assert.False(t, proc.ActualChangesApplied)
@@ -199,15 +223,15 @@ func TestGoBumpProcessor_MarkActualChangesApplied(t *testing.T) {
 	assert.True(t, proc.ActualChangesApplied)
 }
 
-func TestGoBumpProcessor_HasActualChanges(t *testing.T) {
+func TestProcessor_HasActualChanges(t *testing.T) {
 	tests := []struct {
 		name                 string
-		setupProc            func(*GoBumpProcessor)
+		setupProc            func(*Processor)
 		wantHasActualChanges bool
 	}{
 		{
 			name: "no changes - neither flag nor YAML",
-			setupProc: func(proc *GoBumpProcessor) {
+			setupProc: func(proc *Processor) {
 				proc.OriginalYAML = []byte("original yaml content")
 				proc.CurrentYAML = []byte("original yaml content")
 				proc.ActualChangesApplied = false
@@ -216,7 +240,7 @@ func TestGoBumpProcessor_HasActualChanges(t *testing.T) {
 		},
 		{
 			name: "flag set - has actual changes",
-			setupProc: func(proc *GoBumpProcessor) {
+			setupProc: func(proc *Processor) {
 				proc.OriginalYAML = []byte("original yaml content")
 				proc.CurrentYAML = []byte("original yaml content")
 				proc.ActualChangesApplied = true
@@ -225,7 +249,7 @@ func TestGoBumpProcessor_HasActualChanges(t *testing.T) {
 		},
 		{
 			name: "YAML changed - has actual changes",
-			setupProc: func(proc *GoBumpProcessor) {
+			setupProc: func(proc *Processor) {
 				proc.OriginalYAML = []byte("original yaml content")
 				proc.CurrentYAML = []byte("modified yaml content")
 				proc.ActualChangesApplied = false
@@ -234,7 +258,7 @@ func TestGoBumpProcessor_HasActualChanges(t *testing.T) {
 		},
 		{
 			name: "both flag and YAML changed",
-			setupProc: func(proc *GoBumpProcessor) {
+			setupProc: func(proc *Processor) {
 				proc.OriginalYAML = []byte("original yaml content")
 				proc.CurrentYAML = []byte("modified yaml content")
 				proc.ActualChangesApplied = true
@@ -243,7 +267,7 @@ func TestGoBumpProcessor_HasActualChanges(t *testing.T) {
 		},
 		{
 			name: "nil YAML - considered different",
-			setupProc: func(proc *GoBumpProcessor) {
+			setupProc: func(proc *Processor) {
 				proc.OriginalYAML = nil
 				proc.CurrentYAML = []byte("some content")
 				proc.ActualChangesApplied = false
@@ -252,7 +276,7 @@ func TestGoBumpProcessor_HasActualChanges(t *testing.T) {
 		},
 		{
 			name: "empty YAML vs nil - considered same by bytes.Equal",
-			setupProc: func(proc *GoBumpProcessor) {
+			setupProc: func(proc *Processor) {
 				proc.OriginalYAML = []byte("")
 				proc.CurrentYAML = nil
 				proc.ActualChangesApplied = false
@@ -263,7 +287,7 @@ func TestGoBumpProcessor_HasActualChanges(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			proc := NewGoBumpProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
+			proc := NewProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
 			tt.setupProc(proc)
 
 			result := proc.HasActualChanges()
@@ -272,10 +296,10 @@ func TestGoBumpProcessor_HasActualChanges(t *testing.T) {
 	}
 }
 
-func TestGoBumpProcessor_ToResult(t *testing.T) {
+func TestProcessor_ToResult(t *testing.T) {
 	tests := []struct {
 		name                string
-		setupProc           func(*GoBumpProcessor)
+		setupProc           func(*Processor)
 		wantVulnsFound      int
 		wantVulnsFixed      int
 		wantSecurityFixes   int
@@ -291,7 +315,7 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 	}{
 		{
 			name: "no vulnerabilities - clean state",
-			setupProc: func(proc *GoBumpProcessor) {
+			setupProc: func(proc *Processor) {
 				// Default state - no vulnerabilities
 			},
 			wantVulnsFound:      0,
@@ -309,7 +333,7 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 		},
 		{
 			name: "vulnerabilities found and fixed",
-			setupProc: func(proc *GoBumpProcessor) {
+			setupProc: func(proc *Processor) {
 				proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 					VulnerabilitiesFound: 3,
 					BumpActions: []BumpAction{
@@ -350,7 +374,7 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 		},
 		{
 			name: "epoch changed with fixes",
-			setupProc: func(proc *GoBumpProcessor) {
+			setupProc: func(proc *Processor) {
 				proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 					VulnerabilitiesFound: 1,
 					BumpActions: []BumpAction{
@@ -383,7 +407,7 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 		},
 		{
 			name: "error during processing",
-			setupProc: func(proc *GoBumpProcessor) {
+			setupProc: func(proc *Processor) {
 				proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 					VulnerabilitiesFound: 2,
 				}
@@ -405,7 +429,7 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 		},
 		{
 			name: "vulnerabilities found but no actual changes",
-			setupProc: func(proc *GoBumpProcessor) {
+			setupProc: func(proc *Processor) {
 				proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 					VulnerabilitiesFound: 2,
 					BumpActions: []BumpAction{
@@ -432,7 +456,7 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 		},
 		{
 			name: "multiple messages and fixes",
-			setupProc: func(proc *GoBumpProcessor) {
+			setupProc: func(proc *Processor) {
 				proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 					VulnerabilitiesFound: 5,
 					BumpActions: []BumpAction{
@@ -472,7 +496,7 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			proc := NewGoBumpProcessor(tt.validateFilePath, tt.validatePackageName, "1.0.0", tt.wantOldEpoch)
+			proc := NewProcessor(tt.validateFilePath, tt.validatePackageName, "1.0.0", tt.wantOldEpoch)
 			tt.setupProc(proc)
 
 			result := proc.ToResult()
@@ -497,8 +521,8 @@ func TestGoBumpProcessor_ToResult(t *testing.T) {
 // Validated-path advisory accounting: residual IDs are deduplicated across
 // entries, and residuals the bump itself INTRODUCED (advisories absent from
 // the baseline scan) must not subtract from the baseline found count.
-func TestGoBumpProcessor_ToResult_IntroducedResidualAccounting(t *testing.T) {
-	proc := NewGoBumpProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
+func TestProcessor_ToResult_IntroducedResidualAccounting(t *testing.T) {
+	proc := NewProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
 	proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{VulnerabilitiesFound: 4}
 	proc.Validated = true
 	proc.AddResiduals([]simulate.Residual{
@@ -516,20 +540,72 @@ func TestGoBumpProcessor_ToResult_IntroducedResidualAccounting(t *testing.T) {
 		"found(4) - baseline residual IDs(2); introduced GO-9 must not subtract")
 }
 
-func TestGoBumpProcessor_Integration(t *testing.T) {
+// analysisWith builds a one-modroot analysis carrying vulns.
+func analysisWith(vulns ...scan.Vulnerability) *VulnerabilityAnalysis {
+	return &VulnerabilityAnalysis{
+		VulnerabilitiesFound: len(vulns),
+		ByLanguage: []LanguageAnalysis{{Language: "go", ByModroot: []ModrootAnalysis{
+			{Modroot: ".", ScanResult: &scan.ScanResult{Vulnerabilities: vulns}},
+		}}},
+	}
+}
+
+// TestProcessor_ToResult_SeverityFixed: CriticalFixed/HighFixed count
+// the fixed advisories (validated: found - residual - unlinked) by the
+// analysis scan's severity.
+func TestProcessor_ToResult_SeverityFixed(t *testing.T) {
+	proc := NewProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
+	proc.VulnerabilityAnalysis = analysisWith(
+		scan.Vulnerability{ID: "GO-C1", Module: "a", Severity: "CRITICAL", FixedVersion: "v1"},
+		scan.Vulnerability{ID: "GO-C2", Module: "b", Severity: "CRITICAL", FixedVersion: "v1"},
+		scan.Vulnerability{ID: "GO-H1", Module: "c", Severity: "HIGH", FixedVersion: "v1"},
+		scan.Vulnerability{ID: "GO-H2", Module: "d", Severity: "HIGH", FixedVersion: "v1"},
+		scan.Vulnerability{ID: "GO-L1", Module: "e", Severity: "LOW", FixedVersion: "v1"},
+	)
+	proc.Validated = true
+	proc.AddResiduals([]simulate.Residual{{Module: "b", VulnIDs: []string{"GO-C2"}, Reason: "breaks compile"}})
+	proc.AddUnreachableVulnIDs([]string{"GO-H2"})
+
+	result := proc.ToResult()
+	assert.Equal(t, 3, result.VulnerabilitiesFixed)
+	assert.Equal(t, 1, result.CriticalFixed)
+	assert.Equal(t, 1, result.HighFixed)
+}
+
+// TestProcessor_ToResult_UnvalidatedNoFixIsResidual: without a
+// simulation, an advisory with no released fix is residual (so the package
+// reads NO-FIX, never UP-TO-DATE); a validated run relies on its rescan.
+func TestProcessor_ToResult_UnvalidatedNoFixIsResidual(t *testing.T) {
+	vulns := []scan.Vulnerability{
+		{ID: "GO-N1", Module: "example.com/nofix", CurrentVersion: "v1.0.0"},
+		{ID: "GO-N2", Module: "example.com/nofix", CurrentVersion: "v1.0.0"},
+		{ID: "GO-F1", Module: "example.com/fix", FixedVersion: "v1.1.0"},
+	}
+	proc := NewProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
+	proc.VulnerabilityAnalysis = analysisWith(vulns...)
+
+	result := proc.ToResult()
+	assert.Equal(t, 2, result.VulnerabilitiesResidual)
+	require.Len(t, result.Residuals, 1)
+	assert.Equal(t, simulate.Residual{Module: "example.com/nofix", ResolvedVersion: "v1.0.0", VulnIDs: []string{"GO-N1", "GO-N2"}, Reason: "no released fix"}, result.Residuals[0])
+	assert.Empty(t, proc.Residuals, "ToResult must not mutate the processor")
+
+	proc.Validated = true
+	assert.Zero(t, proc.ToResult().VulnerabilitiesResidual, "validated: the rescan owns residuals")
+}
+
+func TestProcessor_Integration(t *testing.T) {
 	tests := []struct {
 		name           string
-		scenario       func(*GoBumpProcessor)
-		validateResult func(*testing.T, *GoBumpResult)
+		scenario       func(*Processor)
+		validateResult func(*testing.T, *Result)
 	}{
 		{
 			name: "complete vulnerability fix workflow",
-			scenario: func(proc *GoBumpProcessor) {
+			scenario: func(proc *Processor) {
 				// Set up vulnerability analysis
 				proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 					VulnerabilitiesFound: 3,
-					CriticalCount:        1,
-					HighCount:            2,
 					BumpActions: []BumpAction{
 						{
 							Action:       "update",
@@ -574,7 +650,7 @@ func TestGoBumpProcessor_Integration(t *testing.T) {
 				proc.AddMessage("Fixed 2 critical/high vulnerabilities")
 				proc.AddMessage("Updated go/bump pipelines")
 			},
-			validateResult: func(t *testing.T, result *GoBumpResult) {
+			validateResult: func(t *testing.T, result *Result) {
 				assert.Equal(t, 3, result.VulnerabilitiesFound)
 				assert.Equal(t, 2, result.VulnerabilitiesFixed)
 				assert.Equal(t, 2, len(result.SecurityFixes))
@@ -595,7 +671,7 @@ func TestGoBumpProcessor_Integration(t *testing.T) {
 		},
 		{
 			name: "vulnerabilities found but already fixed",
-			scenario: func(proc *GoBumpProcessor) {
+			scenario: func(proc *Processor) {
 				proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 					VulnerabilitiesFound: 2,
 					BumpActions: []BumpAction{
@@ -610,7 +686,7 @@ func TestGoBumpProcessor_Integration(t *testing.T) {
 
 				proc.AddMessage("No updates needed - all dependencies at secure versions")
 			},
-			validateResult: func(t *testing.T, result *GoBumpResult) {
+			validateResult: func(t *testing.T, result *Result) {
 				assert.Equal(t, 2, result.VulnerabilitiesFound)
 				assert.Equal(t, 0, result.VulnerabilitiesFixed)
 				assert.Equal(t, 0, len(result.SecurityFixes))
@@ -622,7 +698,7 @@ func TestGoBumpProcessor_Integration(t *testing.T) {
 		},
 		{
 			name: "error during vulnerability scan",
-			scenario: func(proc *GoBumpProcessor) {
+			scenario: func(proc *Processor) {
 				proc.VulnerabilityAnalysis = &VulnerabilityAnalysis{
 					VulnerabilitiesFound: 0,
 				}
@@ -630,7 +706,7 @@ func TestGoBumpProcessor_Integration(t *testing.T) {
 				proc.AddError(assert.AnError)
 				proc.AddMessage("Vulnerability scan failed")
 			},
-			validateResult: func(t *testing.T, result *GoBumpResult) {
+			validateResult: func(t *testing.T, result *Result) {
 				assert.Equal(t, 0, result.VulnerabilitiesFound)
 				assert.Equal(t, 0, result.VulnerabilitiesFixed)
 				assert.NotEmpty(t, result.Error)
@@ -641,7 +717,7 @@ func TestGoBumpProcessor_Integration(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			proc := NewGoBumpProcessor("/test/package.yaml", "test-package", "1.2.3", 5)
+			proc := NewProcessor("/test/package.yaml", "test-package", "1.2.3", 5)
 			tt.scenario(proc)
 
 			result := proc.ToResult()
@@ -656,8 +732,8 @@ func TestGoBumpProcessor_Integration(t *testing.T) {
 	}
 }
 
-func TestGoBumpProcessor_BaseProcessorIntegration(t *testing.T) {
-	proc := NewGoBumpProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
+func TestProcessor_BaseProcessorIntegration(t *testing.T) {
+	proc := NewProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
 
 	// Test that BaseProcessor methods work
 	proc.AddMessage("Test message 1")
@@ -702,8 +778,8 @@ func TestGoBumpProcessor_BaseProcessorIntegration(t *testing.T) {
 	assert.True(t, proc.GetOptions().DryRun)
 }
 
-func TestGoBumpProcessor_ChangeTracking(t *testing.T) {
-	proc := NewGoBumpProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
+func TestProcessor_ChangeTracking(t *testing.T) {
+	proc := NewProcessor("/test/path.yaml", "test-pkg", "1.0.0", 0)
 
 	// Add multiple security fixes
 	fixes := []SecurityFix{

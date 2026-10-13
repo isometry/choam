@@ -41,9 +41,8 @@ type PipelineChange struct {
 
 // ProcessorOptions configures processor behavior
 type ProcessorOptions struct {
-	DryRun        bool   `json:"dry_run" yaml:"dry_run"`
-	Force         bool   `json:"force" yaml:"force"`
-	SharedUpdates bool   `json:"shared_updates" yaml:"shared_updates"`
-	BackupSuffix  string `json:"backup_suffix" yaml:"backup_suffix"`
-	TempDir       string `json:"temp_dir" yaml:"temp_dir"`
+	DryRun       bool   `json:"dry_run" yaml:"dry_run"`
+	Force        bool   `json:"force" yaml:"force"`
+	BackupSuffix string `json:"backup_suffix" yaml:"backup_suffix"`
+	TempDir      string `json:"temp_dir" yaml:"temp_dir"`
 }

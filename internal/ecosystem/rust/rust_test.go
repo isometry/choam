@@ -72,36 +72,78 @@ func TestEcosystem_FilterBumps(t *testing.T) {
 	eco := New()
 	deps := &ecosystem.ModuleDeps{
 		Deps: []ecosystem.Dep{
-			{Name: "serde", Version: "1.0.100"},
-			{Name: "serde", Version: "1.0.150"}, // multiple locked versions - max wins
+			{Name: "serde", Version: "1.0.150"},
+			{Name: "hyper", Version: "0.14.20"},
+			{Name: "ring", Version: "0.0.3"},
+			{Name: "rand", Version: "0.7.3"},
+			{Name: "rand", Version: "0.8.5"}, // locked at two versions
 		},
 	}
+	filter := func(existing []string, bumps ...scan.SecurityBump) ([]string, []ecosystem.HeldBump) {
+		return eco.FilterBumps(context.Background(), existing, bumps, deps)
+	}
 
-	t.Run("keeps bump newer than max locked version", func(t *testing.T) {
-		result := eco.FilterBumps(context.Background(), nil, []scan.SecurityBump{
-			{Name: "serde", FixedVersion: "1.0.200"},
-		}, deps)
+	t.Run("keeps bump newer than the locked version", func(t *testing.T) {
+		result, held := filter(nil, scan.SecurityBump{Name: "serde", FixedVersion: "1.0.200"})
 		assert.Equal(t, []string{"serde@1.0.200"}, result)
+		assert.Empty(t, held)
 	})
 
-	t.Run("drops bump not newer than max locked version", func(t *testing.T) {
-		result := eco.FilterBumps(context.Background(), nil, []scan.SecurityBump{
-			{Name: "serde", FixedVersion: "1.0.120"}, // older than the 1.0.150 already locked
-		}, deps)
+	t.Run("drops bump not newer than the locked version", func(t *testing.T) {
+		result, held := filter(nil, scan.SecurityBump{Name: "serde", FixedVersion: "1.0.120"})
 		assert.Empty(t, result)
+		assert.Empty(t, held)
 	})
 
 	t.Run("drops bump for crate absent from Cargo.lock", func(t *testing.T) {
-		result := eco.FilterBumps(context.Background(), nil, []scan.SecurityBump{
-			{Name: "not-locked", FixedVersion: "1.0.0"},
-		}, deps)
+		result, held := filter(nil, scan.SecurityBump{Name: "not-locked", FixedVersion: "1.0.0"})
 		assert.Empty(t, result)
+		assert.Empty(t, held)
 	})
 
 	t.Run("existing entries pass through the same filter", func(t *testing.T) {
-		result := eco.FilterBumps(context.Background(), []string{"serde@1.0.190"}, nil, deps)
+		result, _ := filter([]string{"serde@1.0.190"})
 		assert.Equal(t, []string{"serde@1.0.190"}, result)
 	})
+
+	t.Run("never lowers an existing higher pin", func(t *testing.T) {
+		result, held := filter([]string{"serde@1.0.210"}, scan.SecurityBump{Name: "serde", FixedVersion: "1.0.200"})
+		assert.Equal(t, []string{"serde@1.0.210"}, result)
+		assert.Empty(t, held)
+	})
+
+	t.Run("refuses semver-incompatible jumps", func(t *testing.T) {
+		for _, bump := range []scan.SecurityBump{
+			{Name: "serde", FixedVersion: "2.0.0", VulnIDs: []string{"RUSTSEC-1"}}, // major
+			{Name: "hyper", FixedVersion: "0.16.0"},                                // 0.x minor
+			{Name: "ring", FixedVersion: "0.0.4"},                                  // 0.0.x patch
+		} {
+			result, held := filter(nil, bump)
+			assert.Empty(t, result, bump.Name)
+			require.Len(t, held, 1, bump.Name)
+			assert.Equal(t, bump, held[0].Bump)
+			assert.Contains(t, held[0].Reason, "semver-incompatible")
+		}
+		result, held := filter(nil, scan.SecurityBump{Name: "hyper", FixedVersion: "0.14.28"})
+		assert.Equal(t, []string{"hyper@0.14.28"}, result, "a compatible 0.x patch is applied")
+		assert.Empty(t, held)
+	})
+
+	t.Run("skips crates locked at multiple versions", func(t *testing.T) {
+		result, held := filter(nil, scan.SecurityBump{Name: "rand", FixedVersion: "0.8.6"})
+		assert.Empty(t, result)
+		require.Len(t, held, 1)
+		assert.Equal(t, "crate locked at multiple versions (0.7.3, 0.8.5): one bump entry cannot target a single one", held[0].Reason)
+	})
+}
+
+func TestCargoCompatible(t *testing.T) {
+	assert.True(t, cargoCompatible("1.2.3", "1.9.0"))
+	assert.False(t, cargoCompatible("1.2.3", "2.0.0"))
+	assert.True(t, cargoCompatible("0.12.1", "0.12.9"))
+	assert.False(t, cargoCompatible("0.12.1", "0.14.0"))
+	assert.True(t, cargoCompatible("0.0.3", "0.0.3"))
+	assert.False(t, cargoCompatible("0.0.3", "0.0.4"))
 }
 
 func TestEcosystem_BumpCoords_Identity(t *testing.T) {

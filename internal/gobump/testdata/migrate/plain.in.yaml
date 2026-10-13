@@ -1,0 +1,29 @@
+package:
+  name: example
+  version: "1.0.0"
+  epoch: 3 # keep this comment
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  - uses: patch
+    with:
+      patches: fix.patch
+
+  # bump vulnerable deps
+  - uses: go/bump # legacy wrapper
+    with:
+      deps: |-
+        golang.org/x/net@v0.55.0
+        golang.org/x/text@v0.38.0
+
+  - runs: |
+      echo "unrelated"
+
+  - uses: go/build
+    with:
+      packages: .
+      output: example
