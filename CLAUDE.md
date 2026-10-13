@@ -115,8 +115,8 @@ For development, build from source. For users/deployment:
 
 ```bash
 # Homebrew (recommended for macOS/Linux)
-brew tap isometry/tap
-brew install choam
+brew trust isometry/tap   # once, required on Homebrew >= 6
+brew install isometry/tap/choam
 
 # Go install
 go install github.com/isometry/choam@latest

@@ -32,17 +32,3 @@ changelog:
     exclude:
       - "^docs:"
       - "^test:"
-homebrew_casks:
-  - name: choam
-    description: Track updates for melange build specification files
-    homepage: https://just.breathe.io/project/choam/
-    repository:
-      owner: isometry
-      name: homebrew-tap
-      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    hooks:
-      post:
-        install: |
-          if OS.mac?
-            system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/choam"]
-          end
