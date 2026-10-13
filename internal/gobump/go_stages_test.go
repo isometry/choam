@@ -41,6 +41,7 @@ func TestNewPipeline_StageOrder(t *testing.T) {
 		"bump_apply",
 		"go_package_pins",
 		"stdlib_check",
+		"apk_advisories",
 		"epoch",
 		"validation",
 		"file_writer",

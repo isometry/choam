@@ -112,10 +112,11 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 		Now:                time.Now(),
 	}
 
-	bumps, messages, err := evaluateStdlibStaleness(ctx, s.index, s.scanner, in)
+	eval, err := runStdlibEvaluation(ctx, s.index, s.scanner, in)
 	if err != nil {
 		return cancelledOr(ctx, func() { s.skipWarn(ctx, gp, fmt.Sprintf("stdlib: staleness check unavailable (%v) - skipping", err)) })
 	}
+	bumps, messages := eval.bumps, eval.messages
 
 	// Fallback checkout: only worth a clone when the preliminary unfiltered
 	// evaluation actually found fixable advisories to validate against the
@@ -127,6 +128,9 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 	}
 
 	gp.StdlibChecked = true
+	if !eval.rebuildUnknown {
+		gp.StdlibRebuildGoVersions = eval.rebuildVersions
+	}
 	gp.StdlibBumps = append(gp.StdlibBumps, bumps...)
 	for _, msg := range messages {
 		gp.AddMessage(msg)

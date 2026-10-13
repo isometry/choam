@@ -42,7 +42,7 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `cmd/root.go:55` - `collectMelangeFiles()` YAML discovery
 - `cmd/check.go:15` - `NewCheckCmd()` update detection command
 - `cmd/update.go:16` - `NewUpdateCmd()` apply updates command
-- `cmd/bump.go:19` - `NewBumpCmd()` vulnerability-bump command (`gobump` alias; flags: `--dry-run`, `--format`, `--backup-suffix`, `--no-validate`, `--simulation-timeout`, `--no-stdlib`, `--fail-on-residual`)
+- `cmd/bump.go:19` - `NewBumpCmd()` vulnerability-bump command (`gobump` alias; flags: `--dry-run`, `--format`, `--backup-suffix`, `--no-validate`, `--simulation-timeout`, `--no-stdlib`, `--no-apk-advisories`, `--fail-on-residual`)
 - `cmd/bump.go:51` - `runBump()` vulnerability scan/apply logic; exits non-zero (`ErrBumpFailed`) when any file errors; `summarizeBumpResults()` feeds both table and JSON/YAML (results keyed by file path)
 
 ### Core Processing Architecture
@@ -70,6 +70,8 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `internal/gobump/go_migrate.go` - automatic `uses: go/bump` -> `uses: bump` migration planning and editing (drops `go-version`, adds `go-package` pins; skipped for `work: true`/unvalidated steps)
 - `internal/gobump/go_pin.go` + `internal/gobump/go_pin_stage.go` - `go-package` toolchain pin parsing and raising on `go/build`/`go/install` steps
 - `internal/gobump/go_version_fallback.go` + `internal/gobump/go_fallback_stage.go` - best-effort `go-version` proxy fallback used under `--no-validate`
+- `internal/gobump/apk_advisory.go` - apk-advisory pure logic: fixed-epoch (`-rN`) parsing, proven/first-party classification, epoch target
+- `internal/gobump/apk_advisory_stage.go` - `apk_advisories` stage: queries the package's own Chainguard/Wolfi advisories, aligns the epoch, records first-party alerts (`PATCH-NEEDED`)
 - `internal/gobump/go_stdlib.go` + `internal/gobump/go_stdlib_stage.go` - Go stdlib staleness check and epoch-bump trigger (`--no-stdlib` to disable)
 - `internal/gorelease/` - Go release index (latest stable release as-of a time / available now), backed by the module proxy's `golang.org/toolchain` pseudo-module
 - `internal/goversion/` - bare Go version comparison/parsing helpers shared across the above
@@ -184,6 +186,7 @@ make fmt && make lint && make test
 ./choam bump ./packages/                  # Scan and fix (simulation needs a go toolchain)
 ./choam bump --no-validate ./packages/    # Skip simulation (no toolchain required)
 ./choam bump --no-stdlib ./packages/      # Skip the Go stdlib staleness/epoch-bump check
+./choam bump --no-apk-advisories ./packages/  # Skip the Chainguard/Wolfi apk advisory epoch alignment
 
 # Verbosity control (available for all commands)
 ./choam check -v ./packages/              # Info level
@@ -254,6 +257,7 @@ make fmt && make lint && make test
 - Security is highest priority
 - OSV database integration via `internal/scan/vulnerability.go`
 - Minimal fix strategy to reduce update impact
+- Reported advisory IDs are CVE-first (`scan.PreferredID`; `Vulnerability.Aliases` retained); the epoch is aligned to proven Chainguard/Wolfi apk advisories (`--no-apk-advisories` to disable) and never raised past a first-party advisory's `-rN`
 - Epoch management tied to actual fixes (security fixes, scanner-hygiene bumps or stdlib rebuilds)
 - A module's security target is the highest fix among its LINKED advisories;
   advisories in unlinked packages of a linked module are info (UNLINKED) and

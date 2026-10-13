@@ -109,22 +109,24 @@ func NewPipeline(analyzer *Analyzer, opts Options) *processor.Pipeline {
 		// stage's ShouldRun independently), because the fix IS the rebuild.
 		NewStdlibStage(analyzer, opts),
 
+		// Chainguard/Wolfi APK-advisory alignment: after every stage that can
+		// trigger an epoch bump (it reports against the final epoch).
+		NewApkAdvisoryStage(analyzer, opts),
+
 		// Epoch handling - ONLY bump if actual changes were applied
 		// This is the critical fix that solves the issue described in the implementation plan
 		stages.NewEpochStage(&stages.BumpOnSecurityFixStrategy{
 			CheckFunc: func(p processor.Processor) bool {
 				if gp, ok := p.(*Processor); ok {
-					// Dependency changes only count when actual changes were
-					// applied AND they include security fixes (the critical
-					// fix) or scanner-hygiene bumps (the rebuild is what
-					// clears the scanner finding). A stdlib staleness finding
-					// justifies a bump on its own - the epoch bump itself is
-					// what triggers the fixing rebuild, with zero dependency
-					// changes.
-					return (gp.ActualChangesApplied && (len(gp.SecurityFixes) > 0 || len(gp.HygieneBumps) > 0)) ||
-						len(gp.StdlibBumps) > 0
+					return epochTriggers(gp) || gp.ApkEpochTarget > gp.GetCurrentEpoch()
 				}
 				return false
+			},
+			EpochFunc: func(p processor.Processor) int64 {
+				if gp, ok := p.(*Processor); ok {
+					return apkNewEpoch(gp)
+				}
+				return p.GetCurrentEpoch() + 1
 			},
 			CommentFunc: func(p processor.Processor) string {
 				if gp, ok := p.(*Processor); ok {
@@ -145,6 +147,28 @@ func NewPipeline(analyzer *Analyzer, opts Options) *processor.Pipeline {
 	return pipeline
 }
 
+// epochTriggers reports whether this run's own fixes justify an epoch bump.
+// Dependency changes only count when actual changes were applied AND they
+// include security fixes (the critical fix) or scanner-hygiene bumps (the
+// rebuild is what clears the scanner finding). A stdlib staleness finding
+// justifies a bump on its own - the epoch bump itself is what triggers the
+// fixing rebuild, with zero dependency changes.
+func epochTriggers(gp *Processor) bool {
+	return (gp.ActualChangesApplied && (len(gp.SecurityFixes) > 0 || len(gp.HygieneBumps) > 0)) ||
+		len(gp.StdlibBumps) > 0
+}
+
+// apkNewEpoch is the epoch this run ends at: the ordinary +1 when
+// epochTriggers fired, raised to the APK-advisory target (whose cap only
+// limits that raise - fixes must still ship).
+func apkNewEpoch(gp *Processor) int64 {
+	epoch := gp.GetCurrentEpoch()
+	if epochTriggers(gp) {
+		epoch++
+	}
+	return max(epoch, gp.ApkEpochTarget)
+}
+
 // epochCommentMaxIDs caps the fixes list in the epoch intent comment: the
 // most critical advisories lead, the rest collapse to "+N more" (the full
 // list is always in choam's own output).
@@ -153,8 +177,9 @@ const epochCommentMaxIDs = 5
 // epochComment composes the inline intent comment the epoch stage writes on
 // the epoch line: which action(s) triggered the rebuild ("updated bumps",
 // "updated bumps (scanner hygiene)" when only hygiene entries changed,
-// "rebuild with go<V>"), the advisories it fixes and those its hygiene
-// bumps clear for scanners, most critical first. The clause conditions
+// "rebuild with go<V>", "align with chainguard apk -r<N>"), the advisories
+// it fixes, those its hygiene bumps clear for scanners and the APK advisories
+// it aligns with, most critical first. The clause conditions
 // mirror the epoch CheckFunc exactly, so the comment always states why the
 // epoch actually bumped.
 func epochComment(gp *Processor) string {
@@ -170,6 +195,10 @@ func epochComment(gp *Processor) string {
 	if versions := stdlibRebuildVersions(gp.StdlibBumps); len(versions) > 0 {
 		clauses = append(clauses, "rebuild with "+strings.Join(versions, ", "))
 	}
+	apk := gp.ApkEpochTarget > gp.GetCurrentEpoch()
+	if apk {
+		clauses = append(clauses, fmt.Sprintf("align with chainguard apk -r%d", gp.ApkEpochTarget))
+	}
 	if len(clauses) == 0 {
 		return ""
 	}
@@ -182,6 +211,11 @@ func epochComment(gp *Processor) string {
 	if hygiene {
 		if list := renderFixList(slices.Sorted(maps.Keys(fixVulnIDs(gp.HygieneBumps))), severities); list != "" {
 			comment += "; hygiene: " + list
+		}
+	}
+	if apk {
+		if list := renderFixList(apkAlignedVulnIDs(gp), severities); list != "" {
+			comment += "; apk: " + list
 		}
 	}
 	return comment
@@ -202,6 +236,18 @@ func epochFixedVulnIDs(gp *Processor) []string {
 	for _, bump := range gp.StdlibBumps {
 		for _, id := range bump.VulnIDs {
 			ids[id] = struct{}{}
+		}
+	}
+	return slices.Sorted(maps.Keys(ids))
+}
+
+// apkAlignedVulnIDs are the (CVE-first) IDs of the proven APK advisories the
+// epoch target clears.
+func apkAlignedVulnIDs(gp *Processor) []string {
+	ids := make(map[string]struct{})
+	for _, adv := range gp.ApkAdvisories {
+		if adv.Status == apkProven && adv.FixedEpoch > 0 && adv.FixedEpoch <= gp.ApkEpochTarget {
+			ids[apkDisplayID(adv)] = struct{}{}
 		}
 	}
 	return slices.Sorted(maps.Keys(ids))

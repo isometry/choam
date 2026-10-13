@@ -56,6 +56,17 @@ type Processor struct {
 	StdlibBumps   []StdlibBump `json:"stdlib_bumps,omitempty"`
 	StdlibChecked bool         `json:"stdlib_checked"`
 
+	// StdlibRebuildGoVersions are the Go releases the next build resolves to,
+	// one per go-package constraint (see StdlibStage); nil = unknown (stage
+	// skipped, or a constraint deferred), so stdlib fixes are unprovable.
+	StdlibRebuildGoVersions []string `json:"-"`
+
+	// ApkAdvisories, ApkEpochTarget and FirstPartyVulnIDs are the APK-advisory
+	// alignment outcome (see ApkAdvisoryStage and Result).
+	ApkAdvisories     []ApkAdvisory `json:"apk_advisories,omitempty"`
+	ApkEpochTarget    int64         `json:"apk_epoch_target,omitempty"`
+	FirstPartyVulnIDs []string      `json:"first_party_vuln_ids,omitempty"`
+
 	// LinkedStdPackages is the union, across simulated Go modroots, of
 	// standard-library import paths linked into the build artifacts
 	// (GOOS=linux; see simulate.ModrootResult.StdPackages). Non-nil only
@@ -347,6 +358,9 @@ func (p *Processor) ToResult() *Result {
 		Notes:                      p.Notes,
 		StdlibBumps:                p.StdlibBumps,
 		StdlibChecked:              p.StdlibChecked,
+		ApkAdvisories:              p.ApkAdvisories,
+		ApkEpochTarget:             p.ApkEpochTarget,
+		FirstPartyVulnIDs:          p.FirstPartyVulnIDs,
 		SecurityFixes:              p.SecurityFixes,
 		HygieneBumps:               p.HygieneBumps,
 		HygieneModulesBumped:       hygieneBumped,

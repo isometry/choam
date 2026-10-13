@@ -69,6 +69,23 @@ func TestBuildBumpProcessorOptions_StdlibCheck(t *testing.T) {
 	assert.False(t, buildBumpProcessorOptions().StdlibCheck, "--no-stdlib disables StdlibCheck")
 }
 
+// TestBuildBumpProcessorOptions_ApkAdvisoryCheck verifies --no-apk-advisories
+// is registered and plumbs through (inverted) to Options.ApkAdvisoryCheck.
+func TestBuildBumpProcessorOptions_ApkAdvisoryCheck(t *testing.T) {
+	orig := noApkAdvisories
+	t.Cleanup(func() { noApkAdvisories = orig })
+
+	flag := NewBumpCmd().Flags().Lookup("no-apk-advisories")
+	require.NotNil(t, flag, "--no-apk-advisories should be registered")
+	assert.Equal(t, "false", flag.DefValue)
+
+	noApkAdvisories = false
+	assert.True(t, buildBumpProcessorOptions().ApkAdvisoryCheck, "ApkAdvisoryCheck defaults on")
+
+	noApkAdvisories = true
+	assert.False(t, buildBumpProcessorOptions().ApkAdvisoryCheck, "--no-apk-advisories disables it")
+}
+
 // TestBuildBumpProcessorOptions_Compile verifies --no-compile (and
 // --no-validate, which skips simulation entirely) disable the compile gate.
 func TestBuildBumpProcessorOptions_Compile(t *testing.T) {
@@ -479,4 +496,45 @@ func TestNewBumpCmd_FailOnResidualFlag(t *testing.T) {
 	flag := NewBumpCmd().Flags().Lookup("fail-on-residual")
 	require.NotNil(t, flag)
 	assert.Equal(t, "false", flag.DefValue)
+	assert.Contains(t, flag.Usage, "first-party")
+}
+
+// TestBumpOutput_FirstPartyAlerts: first-party apk advisories are counted in
+// the summary, shown in the footer and as default-verbosity ALERT notes.
+func TestBumpOutput_FirstPartyAlerts(t *testing.T) {
+	results := []*gobump.Result{
+		{FilePath: "a.yaml", PackageName: "a", FirstPartyVulnIDs: []string{"CVE-2026-1", "CVE-2026-2"}, Notes: []string{"ALERT: needs a source patch"}},
+		{FilePath: "b.yaml", PackageName: "b"},
+	}
+	s := summarizeBumpResults(results)
+	assert.Equal(t, 1, s.PackagesPatchNeeded)
+	assert.Equal(t, 2, s.TotalFirstPartyVulns)
+
+	saved := verbosity
+	verbosity = 0
+	t.Cleanup(func() { verbosity = saved })
+	table := captureStdout(t, func() { require.NoError(t, outputBumpTable(results)) })
+	assert.Contains(t, table, "PATCH-NEEDED")
+	assert.Contains(t, table, "Note a: ALERT: needs a source patch")
+	assert.Contains(t, table, ", 1 needs a first-party patch")
+
+	js := captureStdout(t, func() { require.NoError(t, outputBumpStructured(results, "json")) })
+	assert.Contains(t, js, `"packages_patch_needed": 1`)
+	assert.Contains(t, js, `"total_first_party_vulns": 2`)
+}
+
+// TestRunBump_FailOnResidualFirstPartyExitsNonZero: with --fail-on-residual a
+// first-party apk advisory fails the run; without it the run succeeds.
+func TestRunBump_FailOnResidualFirstPartyExitsNonZero(t *testing.T) {
+	summary := summarizeBumpResults([]*gobump.Result{{FilePath: "a.yaml", FirstPartyVulnIDs: []string{"CVE-2026-1"}}})
+	orig := failOnResidual
+	t.Cleanup(func() { failOnResidual = orig })
+
+	failOnResidual = false
+	assert.NoError(t, bumpExitError(summary))
+
+	failOnResidual = true
+	err := bumpExitError(summary)
+	require.ErrorIs(t, err, ErrBumpFailed)
+	assert.Contains(t, err.Error(), "first-party")
 }

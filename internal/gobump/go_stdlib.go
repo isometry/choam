@@ -83,6 +83,16 @@ type stdlibInput struct {
 // plus human-readable messages; any index/scan failure returns an error for the
 // caller to degrade on.
 func evaluateStdlibStaleness(ctx context.Context, index goReleaseIndex, scanner simulate.Scanner, in stdlibInput) ([]StdlibBump, []string, error) {
+	e, err := runStdlibEvaluation(ctx, index, scanner, in)
+	if err != nil {
+		return nil, nil, err
+	}
+	return e.bumps, e.messages, nil
+}
+
+// runStdlibEvaluation is evaluateStdlibStaleness, returning the whole
+// evaluation (its rebuild versions included).
+func runStdlibEvaluation(ctx context.Context, index goReleaseIndex, scanner simulate.Scanner, in stdlibInput) (*stdlibEvaluation, error) {
 	now := in.Now
 	if now.IsZero() {
 		now = time.Now()
@@ -96,10 +106,10 @@ func evaluateStdlibStaleness(ctx context.Context, index goReleaseIndex, scanner 
 	}
 	for _, constraint := range in.Constraints {
 		if err := e.evaluateConstraint(ctx, constraint); err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 	}
-	return e.bumps, e.messages, nil
+	return e, nil
 }
 
 // stdlibEvaluation is one evaluateStdlibStaleness run: its inputs, the
@@ -119,6 +129,11 @@ type stdlibEvaluation struct {
 
 	bumps    []StdlibBump
 	messages []string
+
+	// rebuildVersions are the resolved rebuild releases, one per constraint;
+	// rebuildUnknown is set when any constraint's rebuild went unresolved.
+	rebuildVersions []string
+	rebuildUnknown  bool
 }
 
 // stdlibTargets are one constraint's resolved releases: the assumed
@@ -134,6 +149,11 @@ type stdlibTargets struct {
 // its bump (if any) and messages.
 func (e *stdlibEvaluation) evaluateConstraint(ctx context.Context, constraint string) error {
 	t, ok, err := e.resolveTargets(ctx, constraint)
+	if t.rebuild == "" {
+		e.rebuildUnknown = true
+	} else {
+		e.rebuildVersions = append(e.rebuildVersions, t.rebuild)
+	}
 	if err != nil || !ok {
 		return err
 	}

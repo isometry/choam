@@ -64,10 +64,52 @@ func TestEpochComment(t *testing.T) {
 		gp := NewProcessor("/t.yaml", "pkg", "1.0.0", 1)
 		gp.ActualChangesApplied = true
 		gp.Validated = true
-		gp.AddSecurityFix(SecurityFix{Module: "m", Vulnerability: "GHSA-crit"})
-		gp.VulnerabilityAnalysis = analysisWith(scan.Vulnerability{ID: "GHSA-crit", Severity: "CRITICAL"})
+		gp.AddSecurityFix(SecurityFix{Module: "m", Vulnerability: "CVE-2026-0001"})
+		gp.VulnerabilityAnalysis = analysisWith(scan.Vulnerability{ID: "CVE-2026-0001", Severity: "CRITICAL", Aliases: []string{"GHSA-crit", "GO-2026-0001"}})
 		gp.StdlibBumps = []StdlibBump{{RebuildGoVersion: "1.26.5", VulnIDs: []string{"GO-2026-4970"}}}
-		assert.Equal(t, "updated bumps, rebuild with go1.26.5; fixes: GHSA-crit, GO-2026-4970", epochComment(gp))
+		assert.Equal(t, "updated bumps, rebuild with go1.26.5; fixes: CVE-2026-0001, GO-2026-4970", epochComment(gp))
+	})
+
+	apkProvenAt := func(n int64, upstream ...string) ApkAdvisory {
+		return ApkAdvisory{ID: "CGA-" + upstream[0], Upstream: upstream, FixedEpoch: n, Status: apkProven}
+	}
+
+	t.Run("apk only, CVE first", func(t *testing.T) {
+		gp := NewProcessor("/t.yaml", "pkg", "1.0.0", 1)
+		gp.ApkEpochTarget = 2
+		gp.ApkAdvisories = []ApkAdvisory{
+			apkProvenAt(2, "GO-2026-0001", "CVE-2026-0002", "GHSA-xxxx"),
+			apkProvenAt(3, "CVE-2026-0003"), // beyond the (capped) target
+			{ID: "CGA-u", Upstream: []string{"CVE-2026-0004"}, FixedEpoch: 2, Status: apkUnproven},
+		}
+		assert.Equal(t, "align with chainguard apk -r2; apk: CVE-2026-0002", epochComment(gp))
+	})
+
+	t.Run("apk + deps", func(t *testing.T) {
+		gp := NewProcessor("/t.yaml", "pkg", "1.0.0", 1)
+		gp.ActualChangesApplied = true
+		gp.Validated = true
+		gp.AddSecurityFix(SecurityFix{Module: "m", Vulnerability: "CVE-2026-0001"})
+		gp.VulnerabilityAnalysis = analysisWith(scan.Vulnerability{ID: "CVE-2026-0001", Severity: "HIGH"})
+		gp.ApkEpochTarget = 3
+		gp.ApkAdvisories = []ApkAdvisory{apkProvenAt(3, "CVE-2026-0001")}
+		assert.Equal(t, "updated bumps, align with chainguard apk -r3; fixes: CVE-2026-0001; apk: CVE-2026-0001", epochComment(gp))
+	})
+
+	t.Run("apk truncates after five", func(t *testing.T) {
+		gp := NewProcessor("/t.yaml", "pkg", "1.0.0", 1)
+		gp.ApkEpochTarget = 2
+		for _, id := range []string{"CVE-1", "CVE-2", "CVE-3", "CVE-4", "CVE-5", "CVE-6"} {
+			gp.ApkAdvisories = append(gp.ApkAdvisories, apkProvenAt(2, id))
+		}
+		assert.Equal(t, "align with chainguard apk -r2; apk: CVE-1, CVE-2, CVE-3, CVE-4, CVE-5, +1 more", epochComment(gp))
+	})
+
+	t.Run("apk target at or below the epoch adds nothing", func(t *testing.T) {
+		gp := NewProcessor("/t.yaml", "pkg", "1.0.0", 2)
+		gp.ApkEpochTarget = 2
+		gp.ApkAdvisories = []ApkAdvisory{apkProvenAt(2, "CVE-2026-0002")}
+		assert.Empty(t, epochComment(gp))
 	})
 
 	t.Run("truncates after five with +N more", func(t *testing.T) {

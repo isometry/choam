@@ -38,8 +38,9 @@ Path can be a single file or a directory containing .yaml files.`,
 	cmd.Flags().BoolVar(&noValidate, "no-validate", false, "Skip bump simulation (writes deps lists without proving they resolve or cover all advisories, and skips artifact-reachability filtering; go.sum narrowing still applies); requires a go toolchain otherwise")
 	cmd.Flags().DurationVar(&simulationTimeout, "simulation-timeout", 10*time.Minute, "Per-package budget for bump simulation")
 	cmd.Flags().BoolVar(&noCompile, "no-compile", false, "Skip the simulation's compile gate (validated deps are then only proven to resolve, not to compile the go/build packages); implied by --no-validate")
-	cmd.Flags().BoolVar(&failOnResidual, "fail-on-residual", false, "Exit non-zero when any advisory remains residual (files that error always exit non-zero)")
+	cmd.Flags().BoolVar(&failOnResidual, "fail-on-residual", false, "Exit non-zero when any advisory remains residual or a first-party apk advisory needs a patch (files that error always exit non-zero)")
 	cmd.Flags().BoolVar(&noStdlib, "no-stdlib", false, "Skip the Go stdlib staleness check (no epoch bump for toolchain-fixed vulnerabilities). The check is also skipped automatically for files with uncommitted changes.")
+	cmd.Flags().BoolVar(&noApkAdvisories, "no-apk-advisories", false, "Skip the Chainguard/Wolfi apk advisory check (no epoch alignment with published apk advisories, no first-party patch alerts)")
 
 	return cmd
 }
@@ -110,12 +111,18 @@ func runBump(cmd *cobra.Command, args []string) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("bump cancelled after %d of %d file(s): %w", len(results), len(files), err)
 	}
-	summary := summarizeBumpResults(results)
+	return bumpExitError(summarizeBumpResults(results))
+}
+
+// bumpExitError maps the run summary to the command's exit status.
+func bumpExitError(summary output.BumpSummary) error {
 	switch {
 	case summary.Errors > 0:
 		return fmt.Errorf("%w: %d of %d file(s) errored", ErrBumpFailed, summary.Errors, summary.TotalPackages)
 	case failOnResidual && summary.TotalVulnsResidual > 0:
 		return fmt.Errorf("%w: %d residual advisory(ies) in %d file(s) (--fail-on-residual)", ErrBumpFailed, summary.TotalVulnsResidual, summary.PackagesPartial)
+	case failOnResidual && summary.TotalFirstPartyVulns > 0:
+		return fmt.Errorf("%w: %d first-party apk advisory(ies) need a patch in %d file(s) (--fail-on-residual)", ErrBumpFailed, summary.TotalFirstPartyVulns, summary.PackagesPatchNeeded)
 	}
 	return nil
 }
@@ -135,6 +142,7 @@ func buildBumpProcessorOptions() gobump.Options {
 		SimulationTimeout: simulationTimeout,
 		Compile:           !noValidate && !noCompile,
 		StdlibCheck:       !noStdlib,
+		ApkAdvisoryCheck:  !noApkAdvisories,
 	}
 }
 
@@ -168,6 +176,10 @@ func summarizeBumpResults(results []*gobump.Result) output.BumpSummary {
 		}
 		if len(r.SkipReasons) > 0 {
 			summary.PackagesSkipped++
+		}
+		if n := len(r.FirstPartyVulnIDs); n > 0 {
+			summary.PackagesPatchNeeded++
+			summary.TotalFirstPartyVulns += n
 		}
 		summary.TotalModulesBumped += r.ModulesBumped
 		summary.TotalHygieneModulesBumped += r.HygieneModulesBumped
@@ -291,6 +303,9 @@ func outputBumpTable(results []*gobump.Result) error {
 	if s.PackagesSkipped > 0 {
 		footer += fmt.Sprintf(", %d skipped", s.PackagesSkipped)
 	}
+	if s.PackagesPatchNeeded > 0 {
+		footer += fmt.Sprintf(", %d needs a first-party patch", s.PackagesPatchNeeded)
+	}
 	if s.TotalVulnsFound > 0 {
 		footer += fmt.Sprintf(" (%d advisories found, %d fixed, %d residual, %d in unlinked modules; %d modules bumped)",
 			s.TotalVulnsFound, s.TotalVulnsFixed, s.TotalVulnsResidual, s.TotalVulnsUnreachable, s.TotalModulesBumped)
@@ -316,6 +331,10 @@ func outputBumpTable(results []*gobump.Result) error {
 //
 //	ERROR          the file failed (partial counts shown)
 //	SKIPPED        not analyzed (see SkipReasons) and nothing found
+//	PATCH-NEEDED   a first-party apk advisory (no dependency fix) needs a
+//	               source patch; wins over every success status below
+//	APK-ALIGN      epoch raised only to align with a proven apk advisory
+//	               (no module bumps, stdlib fixes or residuals)
 //	UNVALIDATED    fixes written but not proven by simulation
 //	PARTIAL        fixed some, residual advisories remain
 //	FIXED          fixed, nothing residual
@@ -332,6 +351,12 @@ func bumpRowStatus(result *gobump.Result, stdlibVulns int) string {
 		return "ERROR"
 	case len(result.SkipReasons) > 0 && result.VulnerabilitiesFound == 0:
 		return "SKIPPED"
+	case len(result.FirstPartyVulnIDs) > 0:
+		return "PATCH-NEEDED"
+	case result.EpochChanged && result.ApkEpochTarget > 0 && result.ApkEpochTarget == result.NewEpoch &&
+		result.ModulesBumped == 0 && result.HygieneModulesBumped == 0 &&
+		stdlibVulns == 0 && result.VulnerabilitiesResidual == 0:
+		return "APK-ALIGN"
 	case result.VulnerabilitiesFound > 0:
 		switch {
 		case fixed && !result.Validated:

@@ -174,6 +174,15 @@ func TestBumpOnSecurityFixStrategy_CalculateNewEpoch(t *testing.T) {
 	}
 }
 
+// TestBumpOnSecurityFixStrategy_EpochFunc tests the epoch override hook.
+func TestBumpOnSecurityFixStrategy_EpochFunc(t *testing.T) {
+	strategy := &BumpOnSecurityFixStrategy{EpochFunc: func(p processor.Processor) int64 {
+		return p.GetCurrentEpoch() + 3
+	}}
+	proc := newMockProcessor("test-pkg", "1.0.0", 1, processor.ProcessorOptions{})
+	assert.Equal(t, int64(4), strategy.CalculateNewEpoch(proc))
+}
+
 // TestBumpOnSecurityFixStrategy_GetReason tests reason message
 func TestBumpOnSecurityFixStrategy_GetReason(t *testing.T) {
 	strategy := &BumpOnSecurityFixStrategy{}

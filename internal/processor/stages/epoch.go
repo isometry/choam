@@ -46,6 +46,8 @@ type BumpOnSecurityFixStrategy struct {
 	// the epoch line (e.g. "updated bumps; fixes: ..."). Empty result or nil
 	// func leaves the epoch line comment-free.
 	CommentFunc func(p processor.Processor) string
+	// EpochFunc, when set, computes the new epoch; nil means current + 1.
+	EpochFunc func(p processor.Processor) int64
 }
 
 // EpochComment implements epochCommenter.
@@ -70,6 +72,9 @@ func (b *BumpOnSecurityFixStrategy) ShouldUpdateEpoch(p processor.Processor) boo
 }
 
 func (b *BumpOnSecurityFixStrategy) CalculateNewEpoch(p processor.Processor) int64 {
+	if b.EpochFunc != nil {
+		return b.EpochFunc(p)
+	}
 	return p.GetCurrentEpoch() + 1
 }
 
@@ -105,21 +110,24 @@ func (e *EpochStage) Apply(ctx context.Context, p processor.Processor) error {
 	oldEpoch := p.GetCurrentEpoch()
 	reason := e.Strategy.GetReason()
 
-	if p.GetOptions().DryRun {
-		logger.Info("Dry run - would update epoch",
-			"old", oldEpoch, "new", newEpoch, "reason", reason)
-		p.SetEpochUpdate(oldEpoch, newEpoch)
-		p.AddMessage(fmt.Sprintf("would update epoch: %d -> %d (%s)",
-			oldEpoch, newEpoch, reason))
-		return nil
-	}
-
-	// Actually update the YAML, with an inline intent comment when the
-	// strategy can compose one.
+	// Inline intent comment when the strategy can compose one.
 	var comment string
 	if commenter, ok := e.Strategy.(epochCommenter); ok {
 		comment = commenter.EpochComment(p)
 	}
+
+	if p.GetOptions().DryRun {
+		logger.Info("Dry run - would update epoch",
+			"old", oldEpoch, "new", newEpoch, "reason", reason)
+		p.SetEpochUpdate(oldEpoch, newEpoch)
+		msg := fmt.Sprintf("would update epoch: %d -> %d (%s)", oldEpoch, newEpoch, reason)
+		if comment != "" {
+			msg += ": " + comment
+		}
+		p.AddMessage(msg)
+		return nil
+	}
+
 	loader := melangeConfig.NewLoader()
 	updatedYAML, err := loader.SetEpochWithComment(p.GetCurrentYAML(), newEpoch, comment)
 	if err != nil {

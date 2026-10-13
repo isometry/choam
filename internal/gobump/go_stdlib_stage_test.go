@@ -131,6 +131,49 @@ func TestStdlibStage_RecordsBump(t *testing.T) {
 	assert.Empty(t, gp.GetErrors())
 }
 
+// TestStdlibStage_RebuildGoVersions: the resolved rebuild releases are the
+// APK-advisory stage's stdlib proof - recorded only when every constraint's
+// rebuild resolved.
+func TestStdlibStage_RebuildGoVersions(t *testing.T) {
+	t.Run("recorded", func(t *testing.T) {
+		gp := newStdlibTestProcessor()
+		require.NoError(t, newStdlibTestStage(Options{StdlibCheck: true}, staleIndex(), fixableScanner()).Apply(t.Context(), gp))
+		assert.Equal(t, []string{"1.24.5"}, gp.StdlibRebuildGoVersions)
+	})
+
+	t.Run("recorded when already current", func(t *testing.T) {
+		index := &fakeReleaseIndex{asOf: map[string]string{"": "1.24.5"}, available: map[string]string{"": "1.24.5"}}
+		gp := newStdlibTestProcessor()
+		require.NoError(t, newStdlibTestStage(Options{StdlibCheck: true}, index, fixableScanner()).Apply(t.Context(), gp))
+		assert.Equal(t, []string{"1.24.5"}, gp.StdlibRebuildGoVersions)
+	})
+
+	t.Run("deferred constraint leaves it nil", func(t *testing.T) {
+		index := staleIndex()
+		index.availableAsOf = map[string]string{} // only release within the margin
+		gp := newStdlibTestProcessor()
+		require.NoError(t, newStdlibTestStage(Options{StdlibCheck: true}, index, fixableScanner()).Apply(t.Context(), gp))
+		assert.True(t, gp.StdlibChecked)
+		assert.Nil(t, gp.StdlibRebuildGoVersions)
+	})
+
+	t.Run("dirty file leaves it nil", func(t *testing.T) {
+		stage := newStdlibTestStage(Options{StdlibCheck: true}, staleIndex(), fixableScanner())
+		stage.lastCommit = func(context.Context, string) (*git.FileCommitInfo, error) {
+			return &git.FileCommitInfo{Time: stdlibCommitTime, Dirty: true}, nil
+		}
+		gp := newStdlibTestProcessor()
+		require.NoError(t, stage.Apply(t.Context(), gp))
+		assert.Nil(t, gp.StdlibRebuildGoVersions)
+	})
+
+	t.Run("--no-stdlib never runs the stage", func(t *testing.T) {
+		ok, err := newStdlibTestStage(Options{}, staleIndex(), fixableScanner()).ShouldRun(t.Context(), newStdlibTestProcessor())
+		require.NoError(t, err)
+		assert.False(t, ok, "so StdlibRebuildGoVersions stays nil")
+	})
+}
+
 // TestStdlibStage_RebuildSideReflectsSameRunPinRaise: when this run's applier
 // raised a go-package pin (recorded on the processor), the stdlib check's
 // rebuild target must come from the RAISED pin while the assumed side stays on

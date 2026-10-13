@@ -39,6 +39,20 @@ type StdlibBump struct {
 	Validated           bool     `json:"validated" yaml:"validated"` // linked-import filtering applied
 }
 
+// ApkAdvisory is one Chainguard/Wolfi OSV advisory (CGA-) affecting the
+// package's own APK name at its pristine version-epoch, classified by whether
+// this build provably fixes its upstream issue (see classifyApk).
+type ApkAdvisory struct {
+	ID           string   `json:"id" yaml:"id"`             // the CGA- record ID
+	Upstream     []string `json:"upstream" yaml:"upstream"` // CVE-/GHSA-/GO- IDs it covers
+	FixedVersion string   `json:"fixed_version,omitempty" yaml:"fixed_version,omitempty"`
+	// FixedEpoch is N when the fix is exactly "<version>-r<N>" above the
+	// pristine epoch (epoch-addressable); 0 otherwise.
+	FixedEpoch int64    `json:"fixed_epoch,omitempty" yaml:"fixed_epoch,omitempty"`
+	Status     string   `json:"status" yaml:"status"`                       // proven, unproven, first-party
+	Modules    []string `json:"modules,omitempty" yaml:"modules,omitempty"` // affected modules, from the upstream records
+}
+
 // SecurityFix represents a security vulnerability fix applied
 type SecurityFix struct {
 	Module        string `json:"module" yaml:"module"`               // affected package
@@ -93,6 +107,13 @@ type Result struct {
 	// to completion (false when disabled, inapplicable, or skipped).
 	StdlibBumps   []StdlibBump `json:"stdlib_bumps,omitempty" yaml:"stdlib_bumps,omitempty"`
 	StdlibChecked bool         `json:"stdlib_checked" yaml:"stdlib_checked"`
+	// ApkAdvisories are the Chainguard/Wolfi advisories for this package's
+	// own APK name and version (see ApkAdvisoryStage); ApkEpochTarget is the
+	// lowest epoch clearing the proven ones (0 = no raise); FirstPartyVulnIDs
+	// are those matching no dependency or stdlib advisory.
+	ApkAdvisories     []ApkAdvisory `json:"apk_advisories,omitempty" yaml:"apk_advisories,omitempty"`
+	ApkEpochTarget    int64         `json:"apk_epoch_target,omitempty" yaml:"apk_epoch_target,omitempty"`
+	FirstPartyVulnIDs []string      `json:"first_party_vuln_ids,omitempty" yaml:"first_party_vuln_ids,omitempty"`
 
 	OldEpoch       int64    `json:"old_epoch" yaml:"old_epoch"`
 	NewEpoch       int64    `json:"new_epoch" yaml:"new_epoch"`
@@ -247,4 +268,8 @@ type Options struct {
 	// epoch when a rebuild with the newest allowed Go release would fix
 	// stdlib vulnerabilities. On by default at the CLI.
 	StdlibCheck bool `json:"stdlib_check" yaml:"stdlib_check"`
+
+	// ApkAdvisoryCheck enables the Chainguard/Wolfi APK-advisory epoch
+	// alignment (see ApkAdvisoryStage). On by default at the CLI.
+	ApkAdvisoryCheck bool `json:"apk_advisory_check" yaml:"apk_advisory_check"`
 }

@@ -71,4 +71,10 @@ type BumpSummary struct {
 	// can carry stdlib fixes with zero dependency vulnerabilities found.
 	PackagesStdlibStale int `json:"packages_stdlib_stale" yaml:"packages_stdlib_stale"`
 	TotalStdlibVulns    int `json:"total_stdlib_vulns" yaml:"total_stdlib_vulns"`
+
+	// PackagesPatchNeeded counts files with at least one first-party apk
+	// advisory (see Result.FirstPartyVulnIDs); TotalFirstPartyVulns sums
+	// those IDs. Not dependency fixes: they need a source patch.
+	PackagesPatchNeeded  int `json:"packages_patch_needed" yaml:"packages_patch_needed"`
+	TotalFirstPartyVulns int `json:"total_first_party_vulns" yaml:"total_first_party_vulns"`
 }
