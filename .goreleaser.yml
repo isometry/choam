@@ -40,9 +40,21 @@ homebrew_casks:
       owner: isometry
       name: homebrew-tap
       token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
-    hooks:
-      post:
-        install: |
+    # GoReleaser's hook renderer emits deprecated flight blocks. Use the
+    # declarative API when available and preserve older Homebrew support.
+    custom_block: |
+      # Older Homebrew reports unknown DSL methods through respond_to_missing?.
+      if self.class.method_defined?(:postflight_steps)
+        postflight_steps do
+          on_macos do
+            run "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "{{ "{{staged_path}}" }}/choam"]
+          end
+        end
+      else
+        # Bind the legacy DSL only on Homebrew versions that need it.
+        method(:postflight).call do
           if OS.mac?
             system_command "/usr/bin/xattr", args: ["-dr", "com.apple.quarantine", "#{staged_path}/choam"]
           end
+        end
+      end
