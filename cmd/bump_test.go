@@ -385,6 +385,35 @@ func TestBumpOutput_HygieneColumn(t *testing.T) {
 	assert.NotContains(t, plain, "hygiene")
 }
 
+// TestBumpOutput_Notes: notes are printed at default verbosity (table
+// layout unchanged) and published under the new "notes" key, absent when
+// there are none.
+func TestBumpOutput_Notes(t *testing.T) {
+	note := "artifact linkage unavailable (GOARCH=amd64: go list -deps: package example.com/gen: build constraints exclude all Go files) - unlinked/hygiene classification and stdlib filtering skipped"
+	results := []*gobump.Result{{FilePath: "f.yaml", PackageName: "flux", VulnerabilitiesFound: 1, Validated: true, Notes: []string{note}}}
+
+	saved := verbosity
+	verbosity = 0 // default verbosity: Messages are not printed, notes are
+	t.Cleanup(func() { verbosity = saved })
+	table := captureStdout(t, func() { require.NoError(t, outputBumpTable(results)) })
+	assert.Contains(t, table, "\nNote flux: "+note+"\n")
+	header := strings.Fields(strings.ReplaceAll(strings.SplitN(table, "\n", 2)[0], "│", " "))
+	assert.Equal(t, []string{"PACKAGE", "FOUND", "FIXED", "RESIDUAL", "UNLINKED", "HYGIENE", "BUMPED", "STDLIB", "OLD", "EPOCH", "NEW", "EPOCH", "STATUS"}, header)
+
+	stdout := captureStdout(t, func() { require.NoError(t, outputBumpStructured(results, "json")) })
+	var resp struct {
+		Results map[string]map[string]any `json:"results"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(stdout), &resp))
+	assert.Equal(t, []any{note}, resp.Results["f.yaml"]["notes"])
+	yamlOut := captureStdout(t, func() { require.NoError(t, outputBumpStructured(results, "yaml")) })
+	assert.Contains(t, yamlOut, "notes:")
+
+	plain := []*gobump.Result{{FilePath: "p.yaml", PackageName: "plain"}}
+	assert.NotContains(t, captureStdout(t, func() { require.NoError(t, outputBumpTable(plain)) }), "Note ")
+	assert.NotContains(t, captureStdout(t, func() { require.NoError(t, outputBumpStructured(plain, "json")) }), `"notes"`)
+}
+
 // TestOutputBumpStructured_KeyedByFullPath: two files sharing a basename in
 // different directories must both appear.
 func TestOutputBumpStructured_KeyedByFullPath(t *testing.T) {

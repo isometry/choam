@@ -85,6 +85,9 @@ type Result struct {
 	// SkipReasons say why (part of) the package was not analyzed (status
 	// SKIPPED; see Processor.SkipReasons).
 	SkipReasons []string `json:"skip_reasons,omitempty" yaml:"skip_reasons,omitempty"`
+	// Notes are degradations shown at default verbosity (see
+	// Processor.Notes); they do not change the row's status.
+	Notes []string `json:"notes,omitempty" yaml:"notes,omitempty"`
 	// StdlibBumps are the Go stdlib staleness findings that (each) justify
 	// an epoch bump; StdlibChecked reports whether the staleness check ran
 	// to completion (false when disabled, inapplicable, or skipped).

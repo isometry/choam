@@ -44,6 +44,11 @@ type Processor struct {
 	// result is SKIPPED, never clean.
 	SkipReasons []string `json:"skip_reasons,omitempty"`
 
+	// Notes are degradations of an otherwise complete analysis that the
+	// user must see at default verbosity (e.g. artifact linkage unavailable,
+	// so reachability classification was skipped); see AddNote.
+	Notes []string `json:"notes,omitempty"`
+
 	// StdlibBumps are the Go stdlib staleness findings (see StdlibStage) -
 	// each justifies an epoch bump on its own, independent of dependency
 	// changes. StdlibChecked is true when the staleness check ran to
@@ -134,6 +139,13 @@ func (p *Processor) AddHygieneBump(fix SecurityFix) {
 func (p *Processor) Skip(ctx context.Context, reason string) {
 	logging.From(ctx).Info("skipped", "reason", reason)
 	p.SkipReasons = append(p.SkipReasons, reason)
+}
+
+// AddNote records a default-verbosity note (see Notes), deduplicated.
+func (p *Processor) AddNote(note string) {
+	if !slices.Contains(p.Notes, note) {
+		p.Notes = append(p.Notes, note)
+	}
 }
 
 // AddResiduals aggregates per-modroot simulation residuals, deduplicated by
@@ -332,6 +344,7 @@ func (p *Processor) ToResult() *Result {
 		CriticalFixed:              criticalFixed,
 		HighFixed:                  highFixed,
 		SkipReasons:                p.SkipReasons,
+		Notes:                      p.Notes,
 		StdlibBumps:                p.StdlibBumps,
 		StdlibChecked:              p.StdlibChecked,
 		SecurityFixes:              p.SecurityFixes,

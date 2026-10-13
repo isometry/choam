@@ -67,6 +67,8 @@ type fakeToolchain struct {
 	linked     []string
 	linkedPkgs []string
 	linkedErr  error
+	// embeds are the tolerated go:embed gaps Linked reports.
+	embeds []UnmatchedEmbed
 	// linkedPkgsFn, when set, takes priority over linkedPkgs and computes
 	// the package-level set from the current attempt's applied set (the
 	// import graph changes with versions).
@@ -98,7 +100,15 @@ type fakeToolchain struct {
 	editLog  []string
 }
 
-func (f *fakeToolchain) Linked(ctx context.Context, dir string, _ BuildTarget) (map[string]struct{}, map[string]struct{}, error) {
+func (f *fakeToolchain) Linked(ctx context.Context, dir string, _ BuildTarget) (Linkage, error) {
+	modules, packages, err := f.linkedSets(ctx, dir)
+	if err != nil {
+		return Linkage{}, err
+	}
+	return Linkage{Modules: modules, Packages: packages, Embeds: f.embeds}, nil
+}
+
+func (f *fakeToolchain) linkedSets(ctx context.Context, dir string) (map[string]struct{}, map[string]struct{}, error) {
 	if f.linkedErr != nil {
 		return nil, nil, f.linkedErr
 	}
@@ -1473,6 +1483,20 @@ func TestRunLoop_ReachabilityFailureFailsOpen(t *testing.T) {
 	assert.Equal(t, []string{"example.com/mod@v1.2.0"}, result.FinalDeps)
 	assert.Empty(t, result.Dropped)
 	assert.Nil(t, result.Linked, "failed reachability reports no linked set")
+	assert.Equal(t, "go list: build constraints exclude all Go files", result.LinkageError, "the cause is reported")
+	assert.Empty(t, result.UnmatchedEmbeds)
+}
+
+// TestRunLoop_ReportsUnmatchedEmbeds: the final Linked query's tolerated
+// embed gaps reach the result; reachability stays known.
+func TestRunLoop_ReportsUnmatchedEmbeds(t *testing.T) {
+	embeds := []UnmatchedEmbed{{Package: "example.com/app", Pattern: "gen/*.txt"}}
+	tc := &fakeToolchain{base: map[string]string{"example.com/mod": "v1.0.0"}, embeds: embeds}
+	result, err := RunLoop(t.Context(), tc, &fakeScanner{}, newTestModuleDir(t), ModrootRequest{Modroot: "."}, Options{})
+	require.NoError(t, err)
+	assert.Equal(t, embeds, result.UnmatchedEmbeds)
+	assert.Empty(t, result.LinkageError)
+	assert.NotNil(t, result.Linked)
 }
 
 // TestRunLoop_ReachableModuleStillRaised: regression guard - with an

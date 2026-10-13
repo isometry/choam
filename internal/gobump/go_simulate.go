@@ -259,6 +259,40 @@ func adoptResult(gp *Processor, m *ModrootAnalysis, result *simulate.ModrootResu
 	return unlinkedHere
 }
 
+// reportBlindSpots surfaces what the simulation could not see in one
+// modroot: unavailable artifact linkage as a default-verbosity note (every
+// reachability verdict was skipped - fail open), and at -v the tolerated
+// unmatched //go:embed patterns and the packages the compile gate cannot
+// check because they already fail to build at baseline.
+func reportBlindSpots(gp *Processor, modroot string, result *simulate.ModrootResult) {
+	if result.LinkageError != "" {
+		prefix := ""
+		if modroot != "." {
+			prefix = "modroot " + modroot + ": "
+		}
+		cause, _, _ := strings.Cut(result.LinkageError, "\n")
+		gp.AddNote(fmt.Sprintf("%sartifact linkage unavailable (%s) - unlinked/hygiene classification and stdlib filtering skipped",
+			prefix, cause))
+	}
+	if len(result.UnmatchedEmbeds) > 0 {
+		var byPackage []string
+		var patterns []string
+		for i, e := range result.UnmatchedEmbeds {
+			patterns = append(patterns, e.Pattern)
+			if i+1 == len(result.UnmatchedEmbeds) || result.UnmatchedEmbeds[i+1].Package != e.Package {
+				byPackage = append(byPackage, fmt.Sprintf("%s (%s)", e.Package, strings.Join(patterns, ", ")))
+				patterns = nil
+			}
+		}
+		gp.AddMessage(fmt.Sprintf("modroot %s: tolerated unmatched go:embed pattern(s) in %s (generated at build time): linkage computed from imports",
+			modroot, strings.Join(byPackage, ", ")))
+	}
+	if result.GateUnchecked > 0 {
+		gp.AddMessage(fmt.Sprintf("modroot %s: compile gate cannot check %d package(s) that fail to build at baseline (first: %s)",
+			modroot, result.GateUnchecked, result.GateUncheckedFirst))
+	}
+}
+
 // reportModrootResult reports one simulated modroot's outcome: the summary
 // line, redundant and hygiene drops, proposed hygiene bumps (recorded into
 // hygieneProposed for reportUnreachable) and residual advisories.
@@ -291,6 +325,7 @@ func reportModrootResult(ctx context.Context, gp *Processor, m *ModrootAnalysis,
 	if result.HygieneSkipped != "" {
 		gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: scanner-hygiene bumps not evaluated: %s", m.Modroot, result.HygieneSkipped))
 	}
+	reportBlindSpots(gp, m.Modroot, result)
 	for _, residual := range result.Residuals {
 		logging.From(ctx).Warn("residual vulnerability after simulation",
 			"module", residual.Module,

@@ -319,82 +319,171 @@ func (t *GoToolchain) DepGoVersions(ctx context.Context, dir string) (map[string
 // built for ships. Deliberate choices:
 //   - Test-only imports are excluded BY DESIGN (no -test flag): they never
 //     ship in the artifact, which is precisely the narrowing this exists for.
-//   - No -e flag: a package-load error (on any arch) fails the whole call so
-//     the caller fails OPEN (no filtering); -e, or a partial union, would
-//     silently under-report the import graph and wrongly drop real fixes -
-//     the one unacceptable failure mode.
+//   - -e with per-package error inspection (see parseDeps): an unmatched
+//     //go:embed pattern (generated files absent from the checkout) is
+//     tolerated and reported in Linkage.Embeds - it cannot change the import
+//     graph. Any other package-load error (on any arch) fails the whole call
+//     so the caller fails OPEN (no filtering): the listing may then
+//     under-report the import graph and wrongly drop real fixes - the one
+//     unacceptable failure mode.
 //   - Replace directives resolve to the replacement path, matching
 //     ListModules' identity space (scan findings name the replacement).
 //   - The build environment and tags are targetBuildEnv's and the target's,
 //     shared with Compile, so the linked set and the compile gate judge the
 //     same files (CGO aside: see targetBuildEnv).
-func (t *GoToolchain) Linked(ctx context.Context, dir string, target BuildTarget) (modules, packages map[string]struct{}, err error) {
-	const tmpl = `{{if and .Module (not .Standard)}}{{.ImportPath}} {{if .Module.Replace}}{{.Module.Replace.Path}}{{else}}{{.Module.Path}}{{end}}{{end}}`
-	outputs, err := t.listDeps(ctx, dir, target, tmpl)
+func (t *GoToolchain) Linked(ctx context.Context, dir string, target BuildTarget) (Linkage, error) {
+	pkgs, embeds, err := t.listDeps(ctx, dir, target)
 	if err != nil {
-		return nil, nil, err
+		return Linkage{}, err
 	}
+	return linkageOf(pkgs, embeds), nil
+}
 
-	modules = make(map[string]struct{})
-	packages = make(map[string]struct{})
-	for _, output := range outputs {
-		for line := range strings.SplitSeq(string(output), "\n") {
-			pkg, module, found := strings.Cut(strings.TrimSpace(line), " ")
-			if !found {
-				continue
-			}
-			packages[pkg] = struct{}{}
-			modules[module] = struct{}{}
+// linkageOf selects the module (non-standard) packages of a deps walk, each
+// module named by its replacement when replaced.
+func linkageOf(pkgs []goListPackage, embeds []UnmatchedEmbed) Linkage {
+	linkage := Linkage{Modules: make(map[string]struct{}), Packages: make(map[string]struct{}), Embeds: embeds}
+	for _, pkg := range pkgs {
+		if pkg.Module == nil || pkg.Standard {
+			continue
 		}
+		module := pkg.Module.Path
+		if pkg.Module.Replace != nil {
+			module = pkg.Module.Replace.Path
+		}
+		linkage.Packages[pkg.ImportPath] = struct{}{}
+		linkage.Modules[module] = struct{}{}
 	}
-	return modules, packages, nil
+	return linkage
 }
 
 // LinkedStd returns the set of standard-library import paths in the
 // transitive non-test import graph of the target's build patterns, with the
-// same arch union and walk semantics as Linked (inverted filter: standard
-// library packages instead of non-standard ones).
+// same arch union, walk and error semantics as Linked (inverted filter:
+// standard library packages instead of non-standard ones; tolerated embed
+// gaps are Linked's to report).
 func (t *GoToolchain) LinkedStd(ctx context.Context, dir string, target BuildTarget) (map[string]struct{}, error) {
-	const tmpl = `{{if .Standard}}{{.ImportPath}}{{end}}`
-	outputs, err := t.listDeps(ctx, dir, target, tmpl)
+	pkgs, _, err := t.listDeps(ctx, dir, target)
 	if err != nil {
 		return nil, err
 	}
-
-	std := make(map[string]struct{})
-	for _, output := range outputs {
-		for line := range strings.SplitSeq(string(output), "\n") {
-			if pkg := strings.TrimSpace(line); pkg != "" {
-				std[pkg] = struct{}{}
-			}
-		}
-	}
-	return std, nil
+	return stdOf(pkgs), nil
 }
 
-// listDeps runs `go list -deps -f tmpl` for every target arch concurrently,
-// returning the outputs in arch order. Every walk runs to completion (a
-// failing arch does not cancel the others), so the error reported is that of
-// the first failing arch in arch order whatever the timing; a cancellation
-// of ctx stops them all.
-func (t *GoToolchain) listDeps(ctx context.Context, dir string, target BuildTarget, tmpl string) ([][]byte, error) {
+// stdOf selects the standard-library packages of a deps walk.
+func stdOf(pkgs []goListPackage) map[string]struct{} {
+	std := make(map[string]struct{})
+	for _, pkg := range pkgs {
+		if pkg.Standard {
+			std[pkg.ImportPath] = struct{}{}
+		}
+	}
+	return std
+}
+
+// depsFields are the go list -json fields listDeps decodes. EmbedFiles is
+// requested (not decoded) because without it go list skips resolving
+// //go:embed patterns altogether, hiding the gaps Linked reports.
+const depsFields = "ImportPath,Standard,Module,Incomplete,Error,DepsErrors,EmbedPatterns,EmbedFiles"
+
+// listDeps runs `go list -e -deps -json` for every target arch concurrently,
+// returning the decoded packages of all arches (arch order) and the
+// tolerated embed gaps (sorted, deduplicated). Every walk runs to completion
+// (a failing arch does not cancel the others), so the error reported is that
+// of the first failing arch in arch order whatever the timing; a
+// cancellation of ctx stops them all.
+func (t *GoToolchain) listDeps(ctx context.Context, dir string, target BuildTarget) ([]goListPackage, []UnmatchedEmbed, error) {
 	arches := TargetArches(target.Arches)
-	args := targetListArgs([]string{"list", "-deps", "-f", tmpl}, target.Patterns, target.Tags)
-	outputs := make([][]byte, len(arches))
+	args := targetListArgs([]string{"list", "-e", "-deps", "-json=" + depsFields}, target.Patterns, target.Tags)
+	pkgs := make([][]goListPackage, len(arches))
+	embeds := make([][]UnmatchedEmbed, len(arches))
 	errs := make([]error, len(arches))
 	var wg sync.WaitGroup
 	for i, arch := range arches {
 		wg.Go(func() {
-			outputs[i], errs[i] = t.runEnv(ctx, dir, targetBuildEnv(arch, target.Env, false), args...)
+			output, err := t.runEnv(ctx, dir, targetBuildEnv(arch, target.Env, false), args...)
+			if err == nil {
+				pkgs[i], embeds[i], err = parseDeps(output)
+			}
+			errs[i] = err
 		})
 	}
 	wg.Wait()
 	for i, err := range errs {
 		if err != nil {
-			return nil, fmt.Errorf("GOARCH=%s: %w", arches[i], err)
+			return nil, nil, fmt.Errorf("GOARCH=%s: %w", arches[i], err)
 		}
 	}
-	return outputs, nil
+	return slices.Concat(pkgs...), mergeEmbeds(embeds), nil
+}
+
+// mergeEmbeds unions per-arch embed gaps, sorted and deduplicated.
+func mergeEmbeds(perArch [][]UnmatchedEmbed) []UnmatchedEmbed {
+	merged := slices.Concat(perArch...)
+	slices.SortFunc(merged, func(a, b UnmatchedEmbed) int {
+		return cmp.Or(strings.Compare(a.Package, b.Package), strings.Compare(a.Pattern, b.Pattern))
+	})
+	return slices.Compact(merged)
+}
+
+// parseDeps decodes a `go list -e -deps -json` object stream, inspecting
+// every package's errors: an unmatched go:embed pattern of the package's own
+// (see unmatchedEmbed) is tolerated and returned as a gap; any other Error
+// or DepsErrors entry - a missing or unresolvable import, excluded or
+// unparsable files, missing generated Go source - means the listed imports
+// may be incomplete, so the first such package fails the parse.
+func parseDeps(output []byte) ([]goListPackage, []UnmatchedEmbed, error) {
+	var pkgs []goListPackage
+	var embeds []UnmatchedEmbed
+	decoder := json.NewDecoder(bytes.NewReader(output))
+	for {
+		var pkg goListPackage
+		if err := decoder.Decode(&pkg); err != nil {
+			if err == io.EOF {
+				return pkgs, embeds, nil
+			}
+			return nil, nil, fmt.Errorf("parsing go list -deps -json output: %w", err)
+		}
+		if pkg.Error != nil {
+			pattern, ok := unmatchedEmbed(pkg.Error.Err)
+			if !ok || !slices.Contains(pkg.EmbedPatterns, pattern) {
+				return nil, nil, fmt.Errorf("go list -deps: package %s: %s", pkg.ImportPath, firstLine(pkg.Error.Err))
+			}
+			embeds = append(embeds, UnmatchedEmbed{Package: pkg.ImportPath, Pattern: pattern})
+		}
+		for _, depErr := range pkg.DepsErrors {
+			// A dependency's embed gap is judged on that package's own entry.
+			if _, ok := unmatchedEmbed(depErr.Err); !ok {
+				return nil, nil, fmt.Errorf("go list -deps: package %s: dependency error: %s", pkg.ImportPath, firstLine(depErr.Err))
+			}
+		}
+		if pkg.Incomplete && pkg.Error == nil && len(pkg.DepsErrors) == 0 {
+			return nil, nil, fmt.Errorf("go list -deps: package %s: incomplete, no error reported", pkg.ImportPath)
+		}
+		pkgs = append(pkgs, pkg)
+	}
+}
+
+// unmatchedEmbed recognizes the go command's errors for a //go:embed pattern
+// that matched no embeddable file (cmd/go/internal/load's EmbedError: "pattern
+// <p>: no matching files found", or "pattern <p>: cannot embed directory <d>:
+// contains no embeddable files"), returning the pattern. Other embed errors
+// (invalid pattern, file outside the module, irregular file) are spec or
+// source defects, not missing generated files, and are not recognized.
+func unmatchedEmbed(errText string) (pattern string, ok bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(errText), "pattern ")
+	if !ok {
+		return "", false
+	}
+	if pattern, ok := strings.CutSuffix(rest, ": no matching files found"); ok {
+		return pattern, pattern != ""
+	}
+	if head, ok := strings.CutSuffix(rest, ": contains no embeddable files"); ok {
+		if i := strings.LastIndex(head, ": cannot embed directory "); i > 0 {
+			return head[:i], true
+		}
+	}
+	return "", false
 }
 
 // defaultArches are the GOARCHes melange builds Wolfi packages for when the
@@ -470,16 +559,23 @@ func targetListArgs(args, patterns, tags []string) []string {
 // maxCompileErrorLines caps the error lines kept per failing package.
 const maxCompileErrorLines = 5
 
-// goListPackage is the subset of `go list -json` package output Compile
-// needs.
+// goListPackage is the subset of `go list -json` package output Compile and
+// listDeps need.
 type goListPackage struct {
 	ImportPath string
 	Standard   bool
 	Module     *goListModule
 	Imports    []string
-	Error      *struct {
-		Err string
-	}
+	Error      *goListError
+	// Decoded by listDeps only (Compile does not request them).
+	Incomplete    bool
+	DepsErrors    []*goListError
+	EmbedPatterns []string
+}
+
+// goListError is go list's PackageError (message only).
+type goListError struct {
+	Err string
 }
 
 // Compile type-checks and compiles (without linking) every non-test package

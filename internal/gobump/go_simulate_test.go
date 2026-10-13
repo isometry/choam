@@ -1053,3 +1053,39 @@ func TestVulnImports(t *testing.T) {
 	}})
 	assert.Equal(t, map[string][]scan.VulnerableImport{"GO-A": {windows, pathless}}, got)
 }
+
+// TestSimulationStage_ReportsBlindSpots: unavailable linkage is a
+// default-verbosity note (Result.Notes); tolerated embed gaps and the
+// compile gate's baseline blind spot are -v messages.
+func TestSimulationStage_ReportsBlindSpots(t *testing.T) {
+	cause := "GOARCH=amd64: go list -deps: package example.com/gen: build constraints exclude all Go files"
+	run := func(result *simulate.ModrootResult) *Processor {
+		t.Helper()
+		result.Modroot, result.Converged = ".", true
+		stage := newStageWithFake(&fakeBumpSimulator{results: map[string]*simulate.ModrootResult{".": result}})
+		gp := newSimulationProcessor()
+		require.NoError(t, stage.Apply(t.Context(), gp))
+		return gp
+	}
+
+	degraded := run(&simulate.ModrootResult{LinkageError: cause + "\nsecond line"})
+	assert.Equal(t, []string{"artifact linkage unavailable (" + cause + ") - unlinked/hygiene classification and stdlib filtering skipped"},
+		degraded.Notes)
+	assert.Equal(t, degraded.Notes, degraded.ToResult().Notes)
+
+	gaps := run(&simulate.ModrootResult{
+		Linked: map[string]struct{}{"example.com/old": {}},
+		UnmatchedEmbeds: []simulate.UnmatchedEmbed{
+			{Package: "example.com/app/cmd/flux", Pattern: "manifests/*.yaml"},
+			{Package: "example.com/app/cmd/flux", Pattern: "static/*"},
+			{Package: "example.com/app/web", Pattern: "dist"},
+		},
+		GateUnchecked:      2,
+		GateUncheckedFirst: "example.com/app/cmd/flux: pattern manifests/*.yaml: no matching files found",
+	})
+	assert.Empty(t, gaps.Notes)
+	assert.Contains(t, gaps.GetMessages(), "modroot .: tolerated unmatched go:embed pattern(s) in example.com/app/cmd/flux (manifests/*.yaml, static/*), "+
+		"example.com/app/web (dist) (generated at build time): linkage computed from imports")
+	assert.Contains(t, gaps.GetMessages(), "modroot .: compile gate cannot check 2 package(s) that fail to build at baseline "+
+		"(first: example.com/app/cmd/flux: pattern manifests/*.yaml: no matching files found)")
+}

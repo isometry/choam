@@ -103,6 +103,10 @@ type loop struct {
 	linked         map[string]struct{}
 	linkedPackages map[string]struct{}
 	linkedWarned   bool
+	// linkedErr is the last Linked query's error, embeds its tolerated
+	// embed gaps (see Linkage.Embeds).
+	linkedErr error
+	embeds    []UnmatchedEmbed
 
 	// Degraded module-level reachability (see degradedUnlinked): tidiedModern
 	// tracks whether the current on-disk go.mod's go directive is >= 1.17 -
@@ -123,6 +127,9 @@ type loop struct {
 	baselineFailed     map[string]struct{}
 	archBaselineFailed map[string]map[string]struct{}
 	baselineResolved   map[string]string
+	// baselineFirst is the first baselineFailed package's first error line
+	// ("pkg: line"; see ModrootResult.GateUncheckedFirst).
+	baselineFirst string
 	// gateRejected maps a module to why the gate rejected its higher rung,
 	// across gate rounds; revived marks candidates shed as unlinked that a
 	// gate round brought back because the gated graph links them again
@@ -421,6 +428,11 @@ func (l *loop) buildResult(ctx context.Context, resolved map[string]string, resu
 	result.Resolved = resolved
 	result.Linked = l.linked
 	result.LinkedPackages = l.linkedPackages
+	if l.linkedErr != nil {
+		result.LinkageError = l.linkedErr.Error()
+	}
+	result.UnmatchedEmbeds = l.embeds
+	result.GateUnchecked, result.GateUncheckedFirst = len(l.baselineFailed), l.baselineFirst
 	result.Requires = l.requirements
 	result.UnrequiredModules = l.unrequiredModules(resolved)
 	result.FinalDeps, result.FinalReplaces, result.CVEBackedModules = l.finalOutputs(resolved)

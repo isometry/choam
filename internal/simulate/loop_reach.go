@@ -20,19 +20,20 @@ import (
 // membership can drift as versions move (a raised module can import new
 // modules - the genproto-split family is exactly this shape). Failure fails
 // OPEN: both sets become nil and no reachability filtering happens (warned
-// once per loop).
+// once per loop; the last error is kept for ModrootResult.LinkageError).
 func (l *loop) refreshLinked(ctx context.Context) {
-	linked, linkedPackages, err := l.tc.Linked(ctx, l.dir, l.target)
+	linkage, err := l.tc.Linked(ctx, l.dir, l.target)
+	l.linkedErr = err
 	if err != nil {
 		if !l.linkedWarned {
 			logging.From(ctx).Warn("artifact reachability unavailable - not filtering",
 				"modroot", l.req.Modroot, "packages", strings.Join(l.target.Patterns, " "), "error", err)
 			l.linkedWarned = true
 		}
-		l.linked, l.linkedPackages = nil, nil
+		l.linked, l.linkedPackages, l.embeds = nil, nil, nil
 		return
 	}
-	l.linked, l.linkedPackages = linked, linkedPackages
+	l.linked, l.linkedPackages, l.embeds = linkage.Modules, linkage.Packages, linkage.Embeds
 }
 
 // maxDepGoVersion computes the highest go directive across the current

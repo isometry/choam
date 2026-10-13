@@ -50,7 +50,8 @@ type Toolchain interface {
 	// binary's buildinfo, i.e. what actually ships, plus the package-level
 	// detail for checking advisories' vulnerable import paths. Errors make
 	// reachability filtering fail OPEN (treat everything as linked).
-	Linked(ctx context.Context, dir string, target BuildTarget) (modules, packages map[string]struct{}, err error)
+	// Unmatched go:embed patterns are tolerated and reported (see Linkage).
+	Linked(ctx context.Context, dir string, target BuildTarget) (Linkage, error)
 	// LinkedStd returns the set of standard-library import paths in the
 	// transitive non-test import graph of the target (same arch union and
 	// walk semantics as Linked, inverted filter).
@@ -93,6 +94,23 @@ type BuildEnv struct {
 	CGO string
 	// GOExperiment is the GOEXPERIMENT the build runs with ("" for none).
 	GOExperiment string
+}
+
+// Linkage is one Toolchain.Linked walk: the linked modules and packages, and
+// the go:embed gaps tolerated while computing them.
+type Linkage struct {
+	Modules, Packages map[string]struct{}
+	// Embeds are the packages whose //go:embed patterns matched no files in
+	// the checkout (typically files generated at build time - see
+	// unmatchedEmbed), sorted and deduplicated across arches. They do not
+	// affect the import graph, so the sets above are complete regardless.
+	Embeds []UnmatchedEmbed
+}
+
+// UnmatchedEmbed is a //go:embed pattern of Package that matched no files.
+type UnmatchedEmbed struct {
+	Package string
+	Pattern string
 }
 
 // CompileReport is the outcome of one Compiler.Compile.
@@ -297,6 +315,20 @@ type ModrootResult struct {
 	// paths in the artifact's non-test import graph, for checking an
 	// advisory's vulnerable import paths (nil when unavailable - fail open).
 	LinkedPackages map[string]struct{} `json:"-" yaml:"-"`
+
+	// LinkageError says why Linked is nil (the last Toolchain.Linked query
+	// failed and reachability failed open); empty when it is known.
+	LinkageError string `json:"-" yaml:"-"`
+
+	// UnmatchedEmbeds are the go:embed gaps tolerated computing Linked (see
+	// Linkage.Embeds).
+	UnmatchedEmbeds []UnmatchedEmbed `json:"-" yaml:"-"`
+
+	// GateUnchecked counts the packages the compile gate excluded because
+	// they already fail to compile in the pristine checkout (primary arch) -
+	// its blind spot; GateUncheckedFirst is the first one's "pkg: error".
+	GateUnchecked      int    `json:"-" yaml:"-"`
+	GateUncheckedFirst string `json:"-" yaml:"-"`
 
 	// Requires are the final tidied go.mod require entries (module ->
 	// version) - the sustainability contract melange's gobump verifies

@@ -138,8 +138,10 @@ func TestGoToolchain_LinkedModules(t *testing.T) {
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, err, string(out))
 
-	linked, linkedPackages, err := toolchain.Linked(t.Context(), dir, BuildTarget{}) // nil -> ./...
+	linkage, err := toolchain.Linked(t.Context(), dir, BuildTarget{}) // nil -> ./...
 	require.NoError(t, err)
+	linked, linkedPackages := linkage.Modules, linkage.Packages
+	assert.Empty(t, linkage.Embeds)
 
 	assert.Contains(t, linked, "golang.org/x/text", "main-linked module must be reachable")
 	assert.NotContains(t, linked, "github.com/google/go-cmp",
@@ -238,10 +240,10 @@ func TestGoToolchain_LinkedUsesTargetBuildEnv(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, exp, "encoding/csv", "the spec's GOEXPERIMENT changes build constraints")
 
-	modules, packages, err := toolchain.Linked(ctx, dir, BuildTarget{Tags: []string{"choamtag"}})
+	linkage, err := toolchain.Linked(ctx, dir, BuildTarget{Tags: []string{"choamtag"}})
 	require.NoError(t, err)
-	assert.Equal(t, map[string]struct{}{"example.com/targetfixture": {}}, modules, "stdlib-only fixture: only the main module")
-	assert.Equal(t, map[string]struct{}{"example.com/targetfixture": {}}, packages)
+	assert.Equal(t, map[string]struct{}{"example.com/targetfixture": {}}, linkage.Modules, "stdlib-only fixture: only the main module")
+	assert.Equal(t, map[string]struct{}{"example.com/targetfixture": {}}, linkage.Packages)
 
 	// Compile shares the environment; CGO off keeps it host-independent (a
 	// real cgo compile needs a linux C toolchain).
@@ -261,6 +263,26 @@ func TestGoToolchain_LinkedUsesTargetBuildEnv(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, std, again, "run %d", i)
 	}
+
+	// -e: per-arch unmatched go:embed patterns are tolerated, merged across
+	// the arch union and reported; the walk is otherwise unchanged.
+	for name, content := range map[string]string{
+		"g_embed_amd64.go": "package main\n\nimport _ \"embed\"\n\n//go:embed gen/amd64/*\nvar amd64Gen string\n",
+		"g_embed_arm64.go": "package main\n\nimport _ \"embed\"\n\n//go:embed gen/arm64/*\nvar arm64Gen string\n",
+	} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644))
+	}
+	linkage, err = toolchain.Linked(ctx, dir, BuildTarget{Tags: []string{"choamtag"}})
+	require.NoError(t, err)
+	assert.Equal(t, []UnmatchedEmbed{
+		{Package: "example.com/targetfixture", Pattern: "gen/amd64/*"},
+		{Package: "example.com/targetfixture", Pattern: "gen/arm64/*"},
+	}, linkage.Embeds)
+	assert.Equal(t, map[string]struct{}{"example.com/targetfixture": {}}, linkage.Packages)
+	withEmbeds, err := toolchain.LinkedStd(ctx, dir, BuildTarget{Tags: []string{"choamtag"}})
+	require.NoError(t, err)
+	delete(withEmbeds, "embed")
+	assert.Equal(t, std, withEmbeds, "the gaps do not change the import graph")
 }
 
 // writeFileProxy builds a file:// GOPROXY serving the given module versions

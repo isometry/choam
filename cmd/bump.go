@@ -238,15 +238,18 @@ func outputBumpTable(results []*gobump.Result) error {
 	}
 	t.Render()
 
-	// Errors, skips, residuals and validation warnings are always shown - a
-	// package that was not (fully) analyzed or still carries advisories must
-	// never silently read as clean.
+	// Errors, skips, notes, residuals and validation warnings are always
+	// shown - a package that was not (fully) analyzed or still carries
+	// advisories must never silently read as clean.
 	for _, result := range results {
 		if result.Error != "" {
 			fmt.Printf("\nError for %s: %s\n", result.PackageName, result.Error)
 		}
 		if len(result.SkipReasons) > 0 {
 			fmt.Printf("\nSkipped %s: %s\n", result.PackageName, strings.Join(result.SkipReasons, "; "))
+		}
+		for _, note := range result.Notes {
+			fmt.Printf("\nNote %s: %s\n", result.PackageName, note)
 		}
 		if len(result.Residuals) > 0 {
 			fmt.Printf("\nResidual vulnerabilities for %s (no reachable zero-vulnerability state):\n", result.PackageName)

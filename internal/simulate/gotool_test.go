@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -142,4 +143,144 @@ func TestLostCacheEntry(t *testing.T) {
 	assert.False(t, tc.lostCacheEntry("p.go:3:2: undefined: api.KeyValue"))
 	assert.False(t, tc.lostCacheEntry("p.go:3:2: open /elsewhere/x: no such file or directory"))
 	assert.False(t, (&GoToolchain{}).lostCacheEntry(lost), "unknown GOCACHE: never assumed")
+}
+
+// depsJSON renders go list -json package objects as one stream.
+func depsJSON(objects ...string) []byte { return []byte(strings.Join(objects, "\n")) }
+
+func TestParseDeps_FiltersAndReplace(t *testing.T) {
+	output := depsJSON(
+		`{"ImportPath":"fmt","Standard":true}`,
+		`{"ImportPath":"example.com/app","Module":{"Path":"example.com/app","Main":true}}`,
+		`{"ImportPath":"example.com/dep/sub","Module":{"Path":"example.com/dep","Version":"v1.0.0"}}`,
+		`{"ImportPath":"example.com/old/pkg","Module":{"Path":"example.com/old","Version":"v1.0.0","Replace":{"Path":"example.com/new","Version":"v1.2.0"}}}`,
+		`{"ImportPath":"example.com/local","Module":{"Path":"example.com/local","Replace":{"Path":"../local"}}}`,
+		`{"ImportPath":"example.com/vendored"}`,
+	)
+	pkgs, embeds, err := parseDeps(output)
+	require.NoError(t, err)
+	assert.Empty(t, embeds)
+	require.Len(t, pkgs, 6)
+
+	linkage := linkageOf(pkgs, nil)
+	assert.Equal(t, map[string]struct{}{
+		"example.com/app": {}, "example.com/dep/sub": {}, "example.com/old/pkg": {}, "example.com/local": {},
+	}, linkage.Packages, "module packages only: no stdlib, no module-less package")
+	assert.Equal(t, map[string]struct{}{
+		"example.com/app": {}, "example.com/dep": {}, "example.com/new": {}, "../local": {},
+	}, linkage.Modules, "a replaced module is named by its replacement (local paths too, as the template did)")
+	assert.Equal(t, map[string]struct{}{"fmt": {}}, stdOf(pkgs))
+}
+
+func TestParseDeps_ErrorClassification(t *testing.T) {
+	embedPkg := func(pattern, errText string) string {
+		return `{"ImportPath":"example.com/app/cmd","Module":{"Path":"example.com/app"},"Incomplete":true,` +
+			`"EmbedPatterns":["` + pattern + `"],"Error":{"Pos":"cmd/embed.go:27:12","Err":"` + errText + `"}}`
+	}
+	importer := func(errText string) string {
+		return `{"ImportPath":"example.com/app","Module":{"Path":"example.com/app"},"Incomplete":true,` +
+			`"DepsErrors":[{"ImportStack":["example.com/app","example.com/app/cmd"],"Err":"` + errText + `"}]}`
+	}
+	cases := []struct {
+		name    string
+		objects []string
+		embeds  []UnmatchedEmbed
+		err     string // "" = tolerated
+	}{
+		{name: "no matching files", objects: []string{
+			embedPkg("manifests/*.yaml", "pattern manifests/*.yaml: no matching files found"),
+			importer("pattern manifests/*.yaml: no matching files found"),
+		}, embeds: []UnmatchedEmbed{{Package: "example.com/app/cmd", Pattern: "manifests/*.yaml"}}},
+		{name: "empty directory", objects: []string{
+			embedPkg("all:dist", "pattern all:dist: cannot embed directory dist: contains no embeddable files"),
+		}, embeds: []UnmatchedEmbed{{Package: "example.com/app/cmd", Pattern: "all:dist"}}},
+		{name: "embed text for an undeclared pattern", objects: []string{
+			embedPkg("other/*", "pattern gen/*.txt: no matching files found"),
+		}, err: "package example.com/app/cmd: pattern gen/*.txt"},
+		{name: "invalid embed pattern", objects: []string{
+			embedPkg("../x", "pattern ../x: invalid pattern syntax"),
+		}, err: "invalid pattern syntax"},
+		{name: "embed outside module", objects: []string{
+			embedPkg("vendor/x", "pattern vendor/x: cannot embed directory vendor/x: in different module"),
+		}, err: "in different module"},
+		{name: "missing module", objects: []string{
+			`{"ImportPath":"example.com/missing","Incomplete":true,"Error":{"Err":"no required module provides package example.com/missing; to add it:\n\tgo get example.com/missing"}}`,
+		}, err: "go list -deps: package example.com/missing: no required module provides package example.com/missing; to add it:"},
+		{name: "cannot find package", objects: []string{
+			`{"ImportPath":"example.com/app/gen","Incomplete":true,"Error":{"Err":"cannot find package \"example.com/app/gen\""}}`,
+		}, err: "package example.com/app/gen: cannot find package"},
+		{name: "build constraints", objects: []string{
+			`{"ImportPath":"example.com/win","Module":{"Path":"example.com/win"},"Incomplete":true,"Error":{"Err":"build constraints exclude all Go files in /x/win"}}`,
+		}, err: "package example.com/win: build constraints exclude all Go files"},
+		{name: "parse error", objects: []string{
+			`{"ImportPath":"example.com/app","Module":{"Path":"example.com/app"},"Incomplete":true,"Error":{"Err":"main.go:3:1: expected declaration, found oops"}}`,
+		}, err: "expected declaration"},
+		{name: "dependency error only", objects: []string{
+			importer("no required module provides package example.com/gen"),
+		}, err: "package example.com/app: dependency error: no required module provides package example.com/gen"},
+		{name: "incomplete without detail", objects: []string{
+			`{"ImportPath":"example.com/app","Module":{"Path":"example.com/app"},"Incomplete":true}`,
+		}, err: "package example.com/app: incomplete, no error reported"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pkgs, embeds, err := parseDeps(depsJSON(tc.objects...))
+			if tc.err != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tc.err)
+				assert.NotContains(t, err.Error(), "\n", "one-line cause")
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tc.embeds, embeds)
+			assert.Len(t, pkgs, len(tc.objects), "a tolerated package keeps its place in the graph")
+		})
+	}
+}
+
+func TestParseDeps_Malformed(t *testing.T) {
+	_, _, err := parseDeps([]byte(`{"ImportPath":"a"} {`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing go list -deps -json output")
+}
+
+func TestUnmatchedEmbed(t *testing.T) {
+	for text, want := range map[string]string{
+		"pattern manifests/*.yaml: no matching files found":                         "manifests/*.yaml",
+		"pattern all:static: no matching files found":                               "all:static",
+		"pattern web: cannot embed directory web: contains no embeddable files":     "web",
+		"pattern a b: cannot embed directory a b: contains no embeddable files":     "a b",
+		"pattern x: cannot embed irregular file x":                                  "",
+		"pattern x: cannot embed file x: invalid name .git":                         "",
+		"pattern : no matching files found":                                         "",
+		"no matching files found":                                                   "",
+		"cannot embed directory web: contains no embeddable files":                  "",
+		"no required module provides package example.com/x; to add it:\n\tgo get x": "",
+	} {
+		got, ok := unmatchedEmbed(text)
+		assert.Equal(t, want, got, text)
+		assert.Equal(t, want != "", ok, text)
+	}
+}
+
+// TestParseDeps_Deterministic: the embed gaps are sorted and deduplicated
+// across arches whatever the object order.
+func TestParseDeps_Deterministic(t *testing.T) {
+	objects := []string{
+		`{"ImportPath":"example.com/b","Module":{"Path":"example.com/m"},"Incomplete":true,"EmbedPatterns":["z/*","a/*"],"Error":{"Err":"pattern z/*: no matching files found"}}`,
+		`{"ImportPath":"example.com/a","Module":{"Path":"example.com/m"},"Incomplete":true,"EmbedPatterns":["gen/*"],"Error":{"Err":"pattern gen/*: no matching files found"}}`,
+		`{"ImportPath":"example.com/c","Module":{"Path":"example.com/m"}}`,
+	}
+	want := []UnmatchedEmbed{{Package: "example.com/a", Pattern: "gen/*"}, {Package: "example.com/b", Pattern: "z/*"}}
+	for i := range 20 {
+		shuffled := slices.Clone(objects)
+		rand.Shuffle(len(shuffled), func(a, b int) { shuffled[a], shuffled[b] = shuffled[b], shuffled[a] })
+		var perArch [][]UnmatchedEmbed
+		for range 2 { // two arches, same gaps
+			_, embeds, err := parseDeps(depsJSON(shuffled...))
+			require.NoError(t, err)
+			perArch = append(perArch, embeds)
+		}
+		assert.Equal(t, want, mergeEmbeds(perArch), "run %d", i)
+	}
 }

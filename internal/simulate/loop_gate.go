@@ -86,6 +86,9 @@ func (l *loop) compileBaseline(ctx context.Context) error {
 		arch := l.target.Arches[i]
 		if i == 0 {
 			l.baselineFailed = failed
+			if len(failed) > 0 {
+				l.baselineFirst = firstCompileError(report.Failed)
+			}
 		} else {
 			l.archBaselineFailed[arch] = failed
 		}
