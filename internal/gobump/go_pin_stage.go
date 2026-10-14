@@ -43,8 +43,7 @@ func (s *GoPackagePinStage) ShouldRun(_ context.Context, p processor.Processor) 
 	return goPackagePinsPending(gp), nil
 }
 
-// Apply reconciles the pins, then reports the apply phase's outcome (pin
-// raises are applied changes too - see Applier.Apply).
+// Apply reconciles the pins.
 func (s *GoPackagePinStage) Apply(ctx context.Context, p processor.Processor) error {
 	gp, err := asBump(p)
 	if err != nil {
@@ -53,6 +52,5 @@ func (s *GoPackagePinStage) Apply(ctx context.Context, p processor.Processor) er
 	if err := s.reconcileGoPackagePins(ctx, gp, goPinFloors(gp.VulnerabilityAnalysis)); err != nil {
 		return fmt.Errorf("reconciling go-package pins: %w", err)
 	}
-	reportApplyOutcome(gp)
 	return nil
 }

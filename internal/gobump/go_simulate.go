@@ -183,7 +183,6 @@ func (s *SimulationStage) buildRequests(ctx context.Context, gp *Processor, lang
 	if omnibumpRoots > 0 {
 		version := simulate.OmnibumpVersion()
 		logging.From(ctx).Debug("simulating uses: bump steps with omnibump", "omnibump", version, "modroots", omnibumpRoots)
-		gp.AddMessage(fmt.Sprintf("simulation: uses: bump applied with omnibump %s", version))
 	}
 	return reqs
 }
@@ -388,21 +387,21 @@ func reportUnreachable(ctx context.Context, gp *Processor, reach *reachabilityDi
 		var msg string
 		switch {
 		case module.moduleLinked && hygieneProposed[module.name]:
-			msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - scanner hygiene bump proposed, not a security fix",
+			msg = fmt.Sprintf("%s (%s) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - scanner hygiene bump proposed, not a security fix",
 				module.name, strings.Join(module.vulnIDs, ", "))
 		case module.moduleLinked:
 			// Precise, package-only: the module IS in the artifact, the
 			// vulnerable packages are not.
-			msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - no bump proposed",
+			msg = fmt.Sprintf("%s (%s) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - no bump proposed",
 				module.name, strings.Join(module.vulnIDs, ", "))
 		case module.degraded:
 			// Degraded module-level signal: precise reachability was
 			// unavailable, but the tidied go.mod's require block proves
 			// the module unlinkable.
-			msg = fmt.Sprintf("info: %s (%s) vulnerable but not required by the tidied go.mod - cannot be linked into build artifacts - no bump proposed (module-level signal; package import graph unavailable)",
+			msg = fmt.Sprintf("%s (%s) vulnerable but not required by the tidied go.mod - cannot be linked into build artifacts - no bump proposed (module-level signal; package import graph unavailable)",
 				module.name, strings.Join(module.vulnIDs, ", "))
 		default:
-			msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts - no bump proposed",
+			msg = fmt.Sprintf("%s (%s) vulnerable but not linked into build artifacts - no bump proposed",
 				module.name, strings.Join(module.vulnIDs, ", "))
 		}
 		gp.AddMessage(msg)

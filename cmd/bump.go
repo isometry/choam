@@ -242,12 +242,7 @@ func outputBumpTable(results []*gobump.Result) error {
 
 	if verbosity > 0 {
 		for _, result := range results {
-			if len(result.Messages) > 0 {
-				fmt.Printf("\nMessages for %s:\n", result.PackageName)
-				for _, message := range result.Messages {
-					fmt.Printf("  - %s\n", message)
-				}
-			}
+			renderDetails(result)
 		}
 	}
 
@@ -266,6 +261,147 @@ func pluralWord(n int, one, many string) string {
 		return one
 	}
 	return many
+}
+
+// detailSections is the -v details' section order (gobump.SectionHidden
+// messages are not shown).
+var detailSections = []string{gobump.SectionChanges, gobump.SectionAdvisories, gobump.SectionApk, gobump.SectionStdlib, gobump.SectionOther}
+
+// renderDetails prints a file's -v narrative, grouped by section: Changes
+// leads with the structured fixes and hygiene bumps, apk is rendered from
+// the structured alignment; each section then lists its tagged messages.
+func renderDetails(result *gobump.Result) {
+	lines := make(map[string][]string)
+	for _, fix := range result.SecurityFixes {
+		lines[gobump.SectionChanges] = append(lines[gobump.SectionChanges], fixLine(fix))
+	}
+	for _, fix := range result.HygieneBumps {
+		lines[gobump.SectionChanges] = append(lines[gobump.SectionChanges], "hygiene: "+fixLine(fix))
+	}
+	lines[gobump.SectionApk] = apkDetailLines(result)
+	for i, message := range result.Messages {
+		section := gobump.SectionOther
+		if i < len(result.MessageSections) {
+			section = result.MessageSections[i]
+		}
+		lines[section] = append(lines[section], message)
+	}
+	var out strings.Builder
+	for _, section := range detailSections {
+		if len(lines[section]) == 0 {
+			continue
+		}
+		fmt.Fprintf(&out, "  %s:\n", section)
+		for _, line := range lines[section] {
+			fmt.Fprintf(&out, "    - %s\n", line)
+		}
+	}
+	if out.Len() > 0 {
+		fmt.Printf("\nDetails for %s:\n%s", result.PackageName, out.String())
+	}
+}
+
+// fixLine renders a dependency change as "module old -> new [IDs]", CVE IDs
+// first.
+func fixLine(fix gobump.SecurityFix) string {
+	var ids []string
+	for id := range strings.SplitSeq(fix.Vulnerability, ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	slices.SortFunc(ids, func(a, b string) int {
+		return cmp.Or(cmp.Compare(cveRank(a), cveRank(b)), strings.Compare(a, b))
+	})
+	line := fmt.Sprintf("%s %s -> %s", fix.Module, fix.OldVersion, fix.NewVersion)
+	if len(ids) > 0 {
+		line += " [" + strings.Join(ids, ", ") + "]"
+	}
+	return line
+}
+
+func cveRank(id string) int {
+	if strings.HasPrefix(id, "CVE-") {
+		return 0
+	}
+	return 1
+}
+
+// apkDetailMaxIDs caps the proven-advisory list.
+const apkDetailMaxIDs = 5
+
+// apkDetailLines renders the apk alignment: one counts line, the proven
+// advisories, then by fix epoch one line per cause of the unproven ones and
+// one per first-party advisory (one entry per display ID and fix, as the
+// counts are).
+func apkDetailLines(result *gobump.Result) []string {
+	apk := result.ApkAlignment
+	if apk == nil {
+		return nil
+	}
+	if apk.HighestFixedEpoch == 0 && apk.Ignored == 0 {
+		return []string{apk.Version + ": no apk advisories"}
+	}
+	ignored := fmt.Sprintf("%d ignored", apk.Ignored)
+	if apk.Uncorrelated > 0 {
+		ignored += fmt.Sprintf(" (%d without an upstream ID)", apk.Uncorrelated)
+	}
+	counts := fmt.Sprintf("%s: %d proven, %d unproven, %d first-party, %s", apk.Version, apk.Proven, apk.Unproven, apk.FirstParty, ignored)
+	if apk.HighestFixedEpoch > 0 {
+		counts += fmt.Sprintf("; reached -r%d of highest -r%d", result.NewEpoch, apk.HighestFixedEpoch)
+	}
+	lines := []string{counts}
+	var proven []string
+	var open []gobump.ApkAdvisory
+	seen := make(map[string]bool)
+	for _, adv := range result.ApkAdvisories {
+		id := adv.DisplayID()
+		key := id + "|" + adv.FixedVersion
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if adv.Status == "proven" { // gobump's apkProven
+			if !slices.Contains(proven, id) {
+				proven = append(proven, id)
+			}
+			continue
+		}
+		open = append(open, adv)
+	}
+	if len(proven) > 0 {
+		slices.SortFunc(proven, func(a, b string) int {
+			return cmp.Or(cmp.Compare(cveRank(a), cveRank(b)), strings.Compare(a, b))
+		})
+		list := strings.Join(proven[:min(len(proven), apkDetailMaxIDs)], ", ")
+		if len(proven) > apkDetailMaxIDs {
+			list += fmt.Sprintf(" (+%d)", len(proven)-apkDetailMaxIDs)
+		}
+		lines = append(lines, "proven: "+list)
+	}
+	slices.SortFunc(open, func(a, b gobump.ApkAdvisory) int {
+		return cmp.Or(cmp.Compare(a.FixedEpoch, b.FixedEpoch), cmp.Compare(cveRank(a.DisplayID()), cveRank(b.DisplayID())), strings.Compare(a.DisplayID(), b.DisplayID()))
+	})
+	// Unproven advisories group by (fix epoch, cause) - open is sorted, so a
+	// group is a run of equal keys once sorted by cause too; first-party ones
+	// stay one line each.
+	slices.SortStableFunc(open, func(a, b gobump.ApkAdvisory) int {
+		return cmp.Or(cmp.Compare(a.FixedEpoch, b.FixedEpoch), strings.Compare(a.Status, b.Status), strings.Compare(a.Reason, b.Reason))
+	})
+	for i := 0; i < len(open); {
+		adv := open[i]
+		if adv.Status != "unproven" { // gobump's apkUnproven
+			lines = append(lines, fmt.Sprintf("%s %s (%s, fixed in %s): %s", adv.Status, adv.DisplayID(), adv.ID, adv.FixedVersion, adv.Reason))
+			i++
+			continue
+		}
+		var ids []string
+		for ; i < len(open) && open[i].Status == adv.Status && open[i].FixedEpoch == adv.FixedEpoch && open[i].Reason == adv.Reason; i++ {
+			ids = append(ids, fmt.Sprintf("%s (%s)", open[i].DisplayID(), open[i].ID))
+		}
+		lines = append(lines, fmt.Sprintf("unproven in -r%d (%d): %s: %s", adv.FixedEpoch, len(ids), strings.Join(ids, ", "), adv.Reason))
+	}
+	return lines
 }
 
 // renderBumpTable prints one row per file.
@@ -459,11 +595,13 @@ func renderInfo(results []*gobump.Result) {
 //	               (no module bumps, stdlib fixes or residuals)
 //	UNVALIDATED    fixes written but not proven by simulation
 //	PARTIAL        fixed some, residual advisories remain
-//	FIXED          fixed, nothing residual
+//	FIXED          fixed by this run (modules or hygiene bumped, file
+//	               written or epoch changed), nothing residual
 //	NO-FIX         nothing fixed, residual advisories remain (simulated or
 //	               not - e.g. no released fix)
 //	UPDATED        file rewritten without fixing anything
 //	UP-TO-DATE     advisories found, all handled by the existing deps list
+//	               (incl. proven fixed with nothing changed by this run)
 //	STDLIB-REBUILD no dependency advisories; epoch bumped for a stdlib fix
 //	NO VULNS       nothing found
 func bumpRowStatus(result *gobump.Result, stdlibVulns int) string {
@@ -485,6 +623,8 @@ func bumpRowStatus(result *gobump.Result, stdlibVulns int) string {
 			return "UNVALIDATED"
 		case fixed && result.VulnerabilitiesResidual > 0:
 			return "PARTIAL"
+		case fixed && !result.EpochChanged && !result.FileWasWritten && result.ModulesBumped == 0 && result.HygieneModulesBumped == 0:
+			return "UP-TO-DATE" // proven fixed by deps an earlier run wrote
 		case fixed:
 			return "FIXED"
 		case result.VulnerabilitiesResidual > 0:

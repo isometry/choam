@@ -56,24 +56,7 @@ func (g *Applier) Apply(ctx context.Context, p processor.Processor) error {
 		return err
 	}
 
-	// A go-package pin raise is an applied change too: when the pin stage
-	// follows, it reports the apply phase's outcome once it has run.
-	if !goPackagePinsPending(gp) {
-		reportApplyOutcome(gp)
-	}
-
 	return nil
-}
-
-// reportApplyOutcome emits the apply phase's one-line outcome, once every
-// stage of the phase that can change the YAML has run (see
-// Applier.Apply and GoPackagePinStage.Apply).
-func reportApplyOutcome(gp *Processor) {
-	if gp.ActualChangesApplied {
-		gp.AddMessage("bump changes applied")
-	} else {
-		gp.AddMessage("no bump changes needed")
-	}
 }
 
 // NewPipeline creates the gobump pipeline with the critical fix

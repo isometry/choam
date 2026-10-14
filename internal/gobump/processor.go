@@ -79,6 +79,10 @@ type Processor struct {
 	FirstPartyVulnIDs []string      `json:"first_party_vuln_ids,omitempty"`
 	ApkAlignment      *ApkAlignment `json:"apk_alignment,omitempty"`
 
+	// MessageSections parallels the messages: the report section of each
+	// (see TagMessages).
+	MessageSections []string `json:"-"`
+
 	// ActionsNeeded are the stage-recorded actions (see AddAction); ToResult
 	// adds those derived from the final state.
 	ActionsNeeded []NeededAction `json:"actions_needed,omitempty"`
@@ -172,6 +176,49 @@ func (p *Processor) Skip(ctx context.Context, reason string) {
 func (p *Processor) AddNote(note string) {
 	if !slices.Contains(p.Notes, note) {
 		p.Notes = append(p.Notes, note)
+	}
+}
+
+// Report sections of the -v details, in display order; SectionHidden
+// messages (epoch, validation, file writing) are not rendered by bump but
+// stay in Messages, which update matches on.
+const (
+	SectionChanges    = "Changes"
+	SectionAdvisories = "Advisories"
+	SectionApk        = "apk"
+	SectionStdlib     = "stdlib"
+	SectionOther      = "Other"
+	SectionHidden     = "hidden"
+)
+
+// stageSections maps a pipeline stage to its messages' section; any other
+// stage is SectionOther.
+var stageSections = map[string]string{
+	"vulnerability_check": SectionAdvisories,
+	"bump_simulation":     SectionAdvisories,
+	"go_version_fallback": SectionChanges,
+	"bump_apply":          SectionChanges,
+	"go_package_pins":     SectionChanges,
+	"stdlib_check":        SectionStdlib,
+	"apk_advisories":      SectionApk,
+	"epoch":               SectionHidden,
+	"validation":          SectionHidden,
+	"file_writer":         SectionHidden,
+}
+
+// TagMessages assigns the messages from index from onwards to stage's
+// section (processor.MessageTagger); earlier untagged messages, added
+// outside any stage, are SectionOther.
+func (p *Processor) TagMessages(stage string, from int) {
+	for len(p.MessageSections) < from {
+		p.MessageSections = append(p.MessageSections, SectionOther)
+	}
+	section, ok := stageSections[stage]
+	if !ok {
+		section = SectionOther
+	}
+	for len(p.MessageSections) < len(p.GetMessages()) {
+		p.MessageSections = append(p.MessageSections, section)
 	}
 }
 
@@ -421,6 +468,7 @@ func (p *Processor) ToResult() *Result {
 		EpochChanged:               p.IsEpochChanged(),
 		FileWasWritten:             p.HasFileChanges(),
 		Messages:                   p.GetMessages(),
+		MessageSections:            p.MessageSections,
 		Error:                      errorStr,
 	}
 	result.ActionsNeeded = append(slices.Clone(p.ActionsNeeded), resultActions(result)...)

@@ -81,7 +81,8 @@ type EpochReason struct {
 // epoch aligned to (Result.ApkEpochTarget); HighestFixedEpoch the highest
 // fix epoch among addressable advisories; BlockedAt the lowest non-proven
 // fix epoch (0 = none); the counts are per display ID and fix; Ignored counts
-// the advisories no epoch can clear or that cannot be correlated.
+// the advisories no epoch can clear or that cannot be correlated, of which
+// Uncorrelated those without an upstream CVE/GHSA/GO ID.
 type ApkAlignment struct {
 	Version           string `json:"version" yaml:"version"`
 	TargetEpoch       int64  `json:"target_epoch" yaml:"target_epoch"`
@@ -91,6 +92,7 @@ type ApkAlignment struct {
 	Unproven          int    `json:"unproven" yaml:"unproven"`
 	FirstParty        int    `json:"first_party" yaml:"first_party"`
 	Ignored           int    `json:"ignored" yaml:"ignored"`
+	Uncorrelated      int    `json:"uncorrelated,omitempty" yaml:"uncorrelated,omitempty"`
 }
 
 // SecurityFix represents a security vulnerability fix applied
@@ -167,7 +169,10 @@ type Result struct {
 	EpochChanged   bool     `json:"epoch_changed" yaml:"epoch_changed"`
 	FileWasWritten bool     `json:"file_was_written" yaml:"file_was_written"`
 	Messages       []string `json:"messages" yaml:"messages"`
-	Error          string   `json:"error,omitempty" yaml:"error,omitempty"`
+	// MessageSections parallels Messages (see Processor.TagMessages); a
+	// message beyond its end is SectionOther.
+	MessageSections []string `json:"-" yaml:"-"`
+	Error           string   `json:"error,omitempty" yaml:"error,omitempty"`
 }
 
 // ModrootAnalysis contains the dependency analysis for a single module root.

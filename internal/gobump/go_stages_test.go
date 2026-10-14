@@ -142,10 +142,9 @@ func runApplyStages(t *testing.T, gp *Processor) {
 	}
 }
 
-// TestApplyPhase_OutcomeMessageLast: the apply phase's outcome message is
-// reported once, after the pin stage's messages when that stage runs (a pin
-// raise alone is an applied change) and by the applier otherwise.
-func TestApplyPhase_OutcomeMessageLast(t *testing.T) {
+// TestApplyPhase_PinRaiseApplied: a pin raise alone is an applied change
+// (deps unchanged), and without a pin stage the applier's edit stands.
+func TestApplyPhase_PinRaiseApplied(t *testing.T) {
 	t.Run("go: after the pin raise", func(t *testing.T) {
 		const yamlContent = `package:
   name: example
@@ -180,9 +179,9 @@ pipeline:
 		runApplyStages(t, gp)
 
 		messages := gp.GetMessages()
-		require.GreaterOrEqual(t, len(messages), 2)
-		assert.Contains(t, messages[len(messages)-2], "raised go-package pin go-1.22 -> go-1.26")
-		assert.Equal(t, "bump changes applied", messages[len(messages)-1], "deps unchanged: the pin raise alone is the applied change")
+		require.NotEmpty(t, messages)
+		assert.Contains(t, messages[len(messages)-1], "raised go-package pin go-1.22 -> go-1.26")
+		assert.True(t, gp.ActualChangesApplied, "deps unchanged: the pin raise alone is the applied change")
 		assert.Contains(t, string(gp.GetCurrentYAML()), "go-package: go-1.26")
 	})
 
@@ -212,21 +211,7 @@ pipeline:
 		})
 		runApplyStages(t, gp)
 
-		messages := gp.GetMessages()
-		require.NotEmpty(t, messages)
-		assert.Equal(t, "bump changes applied", messages[len(messages)-1])
-		assert.Equal(t, 1, countMessage(messages, "bump changes applied"))
 		assert.Contains(t, string(gp.GetCurrentYAML()), "serde@1.0.2")
 		assert.Nil(t, gp.RaisedPinMinors, "the pin stage did not run")
 	})
-}
-
-func countMessage(messages []string, want string) int {
-	n := 0
-	for _, m := range messages {
-		if m == want {
-			n++
-		}
-	}
-	return n
 }

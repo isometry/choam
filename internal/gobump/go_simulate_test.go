@@ -708,9 +708,9 @@ func TestSimulationStage_HygieneOutcomes(t *testing.T) {
 
 	messages := strings.Join(gp.GetMessages(), "\n")
 	assert.Contains(t, messages, "modroot .: hygiene: golang.org/x/text@v0.36.0 proposed for scanners (GO-2026-5970; vulnerable package not linked, not a security fix)")
-	assert.Contains(t, messages, "info: golang.org/x/text (GO-2026-5970) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - scanner hygiene bump proposed, not a security fix")
+	assert.Contains(t, messages, "golang.org/x/text (GO-2026-5970) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - scanner hygiene bump proposed, not a security fix")
 	assert.Contains(t, messages, "modroot .: hygiene: scanner hygiene pin golang.org/x/net@v0.45.0 not free (raises dependency Go 1.24->1.25) - no bump proposed")
-	assert.Contains(t, messages, "info: golang.org/x/net (GO-2026-0001) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - no bump proposed")
+	assert.Contains(t, messages, "golang.org/x/net (GO-2026-0001) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - no bump proposed")
 }
 
 // newTwoModrootSimulationProcessor builds a VulnerabilityAnalysis with two Go
@@ -1039,7 +1039,6 @@ func TestSimulationStage_ThreadsEngine(t *testing.T) {
 	assert.Equal(t, simulate.EngineOmnibump, fake.gotReqs[0].Engine)
 	assert.True(t, fake.gotReqs[0].NoTidy)
 	assert.Equal(t, "", fake.gotReqs[0].GoVersion, "no go-package pin: the host go")
-	assert.Contains(t, gp.GetMessages(), "simulation: uses: bump applied with omnibump "+simulate.OmnibumpVersion())
 }
 
 // TestVulnImports: the seed-side projection keeps every import entry (the

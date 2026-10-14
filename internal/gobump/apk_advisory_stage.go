@@ -158,13 +158,6 @@ func (s *ApkAdvisoryStage) classify(ctx context.Context, gp *Processor) ([]ApkAd
 		advs = append(advs, adv)
 		components = append(components, comps)
 	}
-	if notAddressable > 0 {
-		gp.AddMessage(fmt.Sprintf("apk: %d %s with no fix at %s-r<N> (no fix, or fixed in another version) - ignored", notAddressable, pluralize(notAddressable, "advisory", "advisories"), version))
-	}
-	if uncorrelated > 0 {
-		gp.AddMessage(fmt.Sprintf("apk: %d %s without an upstream CVE/GHSA/GO ID, cannot correlate - ignored", uncorrelated, pluralize(uncorrelated, "advisory", "advisories")))
-	}
-
 	// Stdlib proof: what still affects Go at every recorded rebuild version.
 	stdlib := slices.ContainsFunc(components, func(cs []apkComponent) bool {
 		return slices.ContainsFunc(cs, func(c apkComponent) bool { return c.kind == apkStdlib })
@@ -188,7 +181,7 @@ func (s *ApkAdvisoryStage) classify(ctx context.Context, gp *Processor) ([]ApkAd
 	for i := range advs {
 		advs[i].Status, advs[i].Reason = classifyApk(components[i], ev)
 	}
-	gp.ApkAlignment = &ApkAlignment{Version: fmt.Sprintf("%s-r%d", version, epoch), Ignored: notAddressable + uncorrelated}
+	gp.ApkAlignment = &ApkAlignment{Version: fmt.Sprintf("%s-r%d", version, epoch), Ignored: notAddressable + uncorrelated, Uncorrelated: uncorrelated}
 	return advs, nil
 }
 
@@ -325,13 +318,13 @@ func analysisMainModules(gp *Processor) []string {
 // are review actions, except those held only for want of
 // a rebuild toolchain, which collapse into one rerun action naming why
 // (unresolved); non-proven advisories the epoch reaches anyway are review
-// actions; the rest are messages. One entry per display ID and fix
+// actions; the rest are only in ApkAdvisories (the -v detail). One entry per display ID and fix
 // (Chainguard publishes a record per ecosystem for the same issue), which is
 // also what ApkAlignment counts.
 func reportApk(gp *Processor, advs []ApkAdvisory, unresolved string) {
 	newEpoch := apkNewEpoch(gp)
-	if gp.ApkAlignment == nil {
-		gp.ApkAlignment = &ApkAlignment{}
+	if gp.ApkAlignment == nil { // no advisory at all
+		gp.ApkAlignment = &ApkAlignment{Version: fmt.Sprintf("%s-r%d", gp.GetCurrentVersion(), gp.GetCurrentEpoch())}
 	}
 	align := gp.ApkAlignment
 	align.TargetEpoch = gp.ApkEpochTarget
@@ -385,12 +378,9 @@ func reportApk(gp *Processor, advs []ApkAdvisory, unresolved string) {
 				if !slices.Contains(blockers[k], id) {
 					blockers[k] = append(blockers[k], id)
 				}
-			default:
-				gp.AddMessage(fmt.Sprintf("apk: %s not proven fixed here (%s)", subject, adv.Reason))
 			}
 		default:
 			align.Proven++
-			gp.AddMessage(fmt.Sprintf("apk: %s proven fixed here", subject))
 		}
 	}
 	for _, k := range slices.SortedFunc(maps.Keys(blockers), func(a, b apkBlockerKey) int {
@@ -428,6 +418,9 @@ type apkBlockerKey struct {
 	epoch int64
 	cause string
 }
+
+// DisplayID is the advisory's report ID (see apkDisplayID).
+func (a ApkAdvisory) DisplayID() string { return apkDisplayID(a) }
 
 // apkDisplayID reports an advisory by its upstream issue, CVE first (see
 // scan.PreferredID); the CGA- ID only when it lists no upstream ID.

@@ -883,3 +883,26 @@ func TestProcessor_AddAction_Dedup(t *testing.T) {
 	p.AddAction(ActionAccept, "s", "other kind")
 	assert.Equal(t, []NeededAction{{Kind: ActionReview, Subject: "s", Detail: "first"}, {Kind: ActionAccept, Subject: "s", Detail: "other kind"}}, p.ActionsNeeded)
 }
+
+// TestProcessor_TagMessages: messages take their stage's section, unknown
+// stages and messages added outside a stage are Other, and the sections
+// reach the result alongside the (unchanged) messages.
+func TestProcessor_TagMessages(t *testing.T) {
+	p := NewProcessor("/t.yaml", "pkg", "1.0.0", 1)
+	p.AddMessage("before any stage")
+	from := len(p.GetMessages())
+	p.AddMessage("found")
+	p.TagMessages("vulnerability_check", from)
+	p.TagMessages("bump_apply", len(p.GetMessages())) // added nothing
+	from = len(p.GetMessages())
+	p.AddMessage("epoch bumped")
+	p.TagMessages("epoch", from)
+	from = len(p.GetMessages())
+	p.AddMessage("custom")
+	p.TagMessages("some_new_stage", from)
+	p.AddMessage("after the pipeline")
+
+	result := p.ToResult()
+	assert.Equal(t, []string{"before any stage", "found", "epoch bumped", "custom", "after the pipeline"}, result.Messages)
+	assert.Equal(t, []string{SectionOther, SectionAdvisories, SectionHidden, SectionOther}, result.MessageSections)
+}

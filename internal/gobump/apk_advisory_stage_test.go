@@ -164,7 +164,8 @@ func TestApkAdvisoryStage_Apply(t *testing.T) {
 		assert.Equal(t, int64(2), gp.ApkEpochTarget)
 		assert.Equal(t, int64(2), apkNewEpoch(gp))
 		assert.Empty(t, gp.Notes)
-		messagesContain(t, gp, "apk: CVE-A (CGA-a, fixed in 3.6.0-r2) proven fixed here")
+		assert.Empty(t, gp.GetMessages(), "the detail is structured (ApkAdvisories/ApkAlignment), not messages")
+		assert.Equal(t, &ApkAlignment{Version: "3.6.0-r1", TargetEpoch: 2, HighestFixedEpoch: 2, Proven: 1}, gp.ApkAlignment)
 	})
 
 	t.Run("tofu-controller shape: grpc r6/r7 proven, r9 stdlib+x/net without stdlib proof", func(t *testing.T) {
@@ -231,14 +232,16 @@ func TestApkAdvisoryStage_Apply(t *testing.T) {
 		actionsContain(t, gp, ActionRerun, "stdlib check disabled by --no-stdlib")
 	})
 
-	t.Run("non-proven above every proven one - the blocker is reviewed, the rest are messages", func(t *testing.T) {
+	t.Run("non-proven above every proven one - the blocker is reviewed, the rest only recorded", func(t *testing.T) {
 		gp := newApkTestProcessor()
 		run(t, gp, nil, provenR2, apkRecord("CGA-b", []string{"CVE-B", "GO-B"}, "3.6.0-r3"), apkRecord("CGA-x", []string{"CVE-X", "GHSA-x"}, "3.6.0-r4"))
 		assert.Equal(t, int64(2), gp.ApkEpochTarget)
 		assert.Empty(t, gp.Notes)
 		actionsContain(t, gp, ActionReview, "1 apk advisory fixed in -r3 (CVE-B): not proven fixed here")
 		assert.Len(t, gp.ActionsNeeded, 1)
-		messagesContain(t, gp, "apk: CVE-X (CGA-x, fixed in 3.6.0-r4) not proven fixed here")
+		assert.Equal(t, apkUnproven, gp.ApkAdvisories[2].Status)
+		assert.Equal(t, "module github.com/example/pkg not in the analysed graph", gp.ApkAdvisories[2].Reason)
+		assert.Equal(t, 2, gp.ApkAlignment.Unproven)
 	})
 
 	t.Run("ordinary bump reaching a non-proven fix says so", func(t *testing.T) {
@@ -299,16 +302,16 @@ func TestApkAdvisoryStage_Apply(t *testing.T) {
 		assert.Empty(t, gp.ApkAdvisories)
 		assert.Empty(t, gp.Notes)
 		assert.Zero(t, gp.ApkEpochTarget)
-		assert.Equal(t, 3, gp.ApkAlignment.Ignored)
-		messagesContain(t, gp, "apk: 2 advisories with no fix at 3.6.0-r<N> (no fix, or fixed in another version) - ignored")
-		messagesContain(t, gp, "apk: 1 advisory without an upstream CVE/GHSA/GO ID, cannot correlate - ignored")
+		assert.Equal(t, &ApkAlignment{Version: "3.6.0-r1", Ignored: 3, Uncorrelated: 1}, gp.ApkAlignment)
+		assert.Empty(t, gp.GetMessages())
 	})
 
 	t.Run("display ID from upstream only", func(t *testing.T) {
 		gp := newApkTestProcessor()
 		run(t, gp, nil, apkRecord("CGA-a", []string{"GO-A"}, "3.6.0-r2"), apkRecord("CGA-a2", []string{"GHSA-a", "GO-A", "CVE-A"}, "3.6.0-r3"))
-		messagesContain(t, gp, "apk: GO-A (CGA-a, fixed in 3.6.0-r2)")
-		messagesContain(t, gp, "apk: CVE-A (CGA-a2, fixed in 3.6.0-r3)")
+		require.Len(t, gp.ApkAdvisories, 2)
+		assert.Equal(t, "GO-A", gp.ApkAdvisories[0].DisplayID())
+		assert.Equal(t, "CVE-A", gp.ApkAdvisories[1].DisplayID())
 	})
 
 	t.Run("pristine advisory fixed by an earlier run, unvalidated - unproven, never first-party", func(t *testing.T) {
@@ -395,6 +398,7 @@ func TestApkAdvisoryStage_Apply(t *testing.T) {
 		assert.Equal(t, "3.6.0-r2", src.queried[0].Version)
 		assert.Empty(t, gp.ApkAdvisories)
 		assert.Zero(t, gp.ApkEpochTarget)
+		assert.Equal(t, &ApkAlignment{Version: "3.6.0-r2"}, gp.ApkAlignment, "no advisory at the target")
 	})
 }
 
