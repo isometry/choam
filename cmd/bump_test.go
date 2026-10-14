@@ -430,7 +430,7 @@ func TestBumpOutput_Notes(t *testing.T) {
 	verbosity = 0 // default verbosity: Messages are not printed, notes are
 	t.Cleanup(func() { verbosity = saved })
 	table := captureStdout(t, func() { require.NoError(t, outputBumpTable(results)) })
-	assert.Contains(t, table, "\nNote flux: "+note+"\n")
+	assert.Contains(t, table, "\nNote flux: artifact linkage unavailable (GOARCH=amd64: go list -deps: package example.com/gen: build\n  constraints exclude all Go files) - unlinked/hygiene classification and stdlib filtering skipped\n")
 	header := strings.Fields(strings.ReplaceAll(strings.SplitN(table, "\n", 2)[0], "│", " "))
 	assert.Equal(t, []string{"PACKAGE", "FOUND", "FIXED", "RESIDUAL", "UNLINKED", "HYGIENE", "BUMPED", "STDLIB", "EPOCH", "STATUS"}, header)
 
@@ -521,7 +521,8 @@ func TestRenderWhy(t *testing.T) {
 	out := captureStdout(t, func() { renderWhy(results) })
 	assert.Equal(t, `
 Why:
-  tofu: updated bumps (2), align with chainguard apk -r9 (1); apk: -r9 is the highest Wolfi advisory fix epoch for 0.16.5
+  tofu: updated bumps (2), align with chainguard apk -r9 (1); apk: -r9 is the highest Wolfi advisory
+    fix epoch for 0.16.5
   held: align with chainguard apk -r9 (1); apk: held at -r7, -r9 advisory not proven (see actions)
   build: updated build inputs
 `, out)
@@ -716,4 +717,40 @@ Details for tofu:
 	assert.Contains(t, captureStdout(t, func() {
 		renderDetails(&gobump.Result{PackageName: "none", ApkAlignment: &gobump.ApkAlignment{Version: "1.0-r2"}})
 	}), "    - 1.0-r2: no apk advisories\n")
+}
+
+// TestWrapAt: words break only at spaces at the width boundary, an
+// unbreakable token stays whole on its own line, and continuation lines take
+// the requested indent (-1: under the first character after the prefix).
+func TestWrapAt(t *testing.T) {
+	words := strings.Fields("aaaa bbbb cccc")
+	assert.Equal(t, "  X aaaa bbbb cccc", wrapAt(18, "  X ", -1, words), "exactly at the width: one line")
+	assert.Equal(t, "  X aaaa bbbb\n    cccc", wrapAt(17, "  X ", -1, words), "one past: wrap, indented under the text")
+	assert.Equal(t, "  X aaaa\n  bbbb\n  cccc", wrapAt(10, "  X ", 2, words))
+	assert.Equal(t, "  X aaaa\n    golang.org/x/a-very-long-unbreakable-token\n    bbbb",
+		wrapAt(12, "  X ", -1, strings.Fields("aaaa golang.org/x/a-very-long-unbreakable-token bbbb")), "never split a token")
+	assert.Equal(t, "  X golang.org/x/a-very-long-unbreakable-token", wrapAt(10, "  X ", -1, strings.Fields("golang.org/x/a-very-long-unbreakable-token")))
+}
+
+// TestRenderActions_WrapsLongLines: a long action wraps under the text after
+// the verb, and the package list wraps at commas keeping "+N more" whole.
+func TestRenderActions_WrapsLongLines(t *testing.T) {
+	action := gobump.NeededAction{Kind: gobump.ActionReview,
+		Subject: "5 apk advisories fixed in -r9 (CVE-2026-78659, CVE-2026-78660, CVE-2026-78663, CVE-2026-78669, CVE-2026-97032)",
+		Detail:  "not proven fixed here (module golang.org/x/net residual, unlinked or not proven fixed) - holds the epoch below -r9"}
+	var results []*gobump.Result
+	for _, name := range []string{"aws-load-balancer-controller", "tofu-controller", "cert-manager-webhook", "external-dns"} {
+		results = append(results, &gobump.Result{PackageName: name, ActionsNeeded: []gobump.NeededAction{action}})
+	}
+	out := captureStdout(t, func() { renderActions(results) })
+	assert.Equal(t, `
+Action needed:
+  REVIEW  5 apk advisories fixed in -r9 (CVE-2026-78659, CVE-2026-78660, CVE-2026-78663,
+          CVE-2026-78669, CVE-2026-97032): not proven fixed here (module golang.org/x/net residual,
+          unlinked or not proven fixed) - holds the epoch below -r9 - aws-load-balancer-controller,
+          tofu-controller, cert-manager-webhook, +1 more
+`, out)
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
+		assert.LessOrEqual(t, len(line), defaultWrapWidth)
+	}
 }

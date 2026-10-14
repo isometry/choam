@@ -315,10 +315,10 @@ func analysisMainModules(gp *Processor) []string {
 // reportApk renders the classification: first-party advisories are patch
 // actions; non-proven advisories holding the epoch down (at or below the
 // highest proven -rN, or the lowest non-proven one, where the epoch stops)
-// are review actions, except those held only for want of
-// a rebuild toolchain, which collapse into one rerun action naming why
-// (unresolved); non-proven advisories the epoch reaches anyway are review
-// actions; the rest are only in ApkAdvisories (the -v detail). One entry per display ID and fix
+// are review actions grouped per fix epoch and cause, except those held only
+// for want of a rebuild toolchain, which collapse into one rerun action
+// naming why (unresolved); non-proven advisories the epoch reaches anyway
+// are review actions grouped the same way; the rest are only in ApkAdvisories (the -v detail). One entry per display ID and fix
 // (Chainguard publishes a record per ecosystem for the same issue), which is
 // also what ApkAlignment counts.
 func reportApk(gp *Processor, advs []ApkAdvisory, unresolved string) {
@@ -339,7 +339,7 @@ func reportApk(gp *Processor, advs []ApkAdvisory, unresolved string) {
 	}
 	var noToolchain int
 	var noToolchainBelow int64
-	blockers := make(map[apkBlockerKey][]string) // display IDs per (fix epoch, cause)
+	blockers := make(map[apkBlockerKey][]string) // display IDs per (fix epoch, cause, reached)
 	seen := make(map[string]bool)
 	for _, adv := range advs {
 		id := apkDisplayID(adv)
@@ -366,15 +366,17 @@ func reportApk(gp *Processor, advs []ApkAdvisory, unresolved string) {
 			align.Unproven++
 			switch {
 			case newEpoch >= adv.FixedEpoch:
-				gp.AddAction(ActionReview, subject, fmt.Sprintf("not proven fixed here (%s) - epoch %d reaches -r%d anyway, hiding it from distro-aware scanners",
-					adv.Reason, newEpoch, adv.FixedEpoch))
+				k := apkBlockerKey{adv.FixedEpoch, adv.Reason, true}
+				if !slices.Contains(blockers[k], id) {
+					blockers[k] = append(blockers[k], id)
+				}
 			case blocking && adv.Reason == apkCauseNoRebuildToolchain:
 				noToolchain++
 				if noToolchainBelow == 0 || adv.FixedEpoch < noToolchainBelow {
 					noToolchainBelow = adv.FixedEpoch
 				}
 			case blocking:
-				k := apkBlockerKey{adv.FixedEpoch, adv.Reason}
+				k := apkBlockerKey{adv.FixedEpoch, adv.Reason, false}
 				if !slices.Contains(blockers[k], id) {
 					blockers[k] = append(blockers[k], id)
 				}
@@ -384,7 +386,7 @@ func reportApk(gp *Processor, advs []ApkAdvisory, unresolved string) {
 		}
 	}
 	for _, k := range slices.SortedFunc(maps.Keys(blockers), func(a, b apkBlockerKey) int {
-		return cmp.Or(cmp.Compare(a.epoch, b.epoch), strings.Compare(a.cause, b.cause))
+		return cmp.Or(cmp.Compare(a.epoch, b.epoch), strings.Compare(a.cause, b.cause), cmp.Compare(boolRank(a.reached), boolRank(b.reached)))
 	}) {
 		ids := blockers[k]
 		slices.SortFunc(ids, func(a, b string) int {
@@ -394,9 +396,13 @@ func reportApk(gp *Processor, advs []ApkAdvisory, unresolved string) {
 		if len(ids) > epochCommentMaxIDs {
 			list += fmt.Sprintf(", +%d more", len(ids)-epochCommentMaxIDs)
 		}
+		detail := fmt.Sprintf("not proven fixed here (%s) - holds the epoch below -r%d", k.cause, k.epoch)
+		if k.reached {
+			detail = fmt.Sprintf("not proven fixed here (%s) - epoch %d reaches -r%d anyway, hiding %s from distro-aware scanners",
+				k.cause, newEpoch, k.epoch, pluralize(len(ids), "it", "them"))
+		}
 		gp.AddAction(ActionReview,
-			fmt.Sprintf("%d apk %s fixed in -r%d (%s)", len(ids), pluralize(len(ids), "advisory", "advisories"), k.epoch, list),
-			fmt.Sprintf("not proven fixed here (%s) - holds the epoch below -r%d", k.cause, k.epoch))
+			fmt.Sprintf("%d apk %s fixed in -r%d (%s)", len(ids), pluralize(len(ids), "advisory", "advisories"), k.epoch, list), detail)
 	}
 	if noToolchain > 0 {
 		gp.AddAction(ActionRerun, fmt.Sprintf("stdlib rebuild toolchain unavailable (%s)", unresolved),
@@ -412,11 +418,20 @@ func cveLast(id string) int {
 	return 1
 }
 
-// apkBlockerKey groups the non-proven advisories holding the epoch into one
-// review action per fix epoch and cause.
+// apkBlockerKey groups the non-proven advisories holding the epoch (or, when
+// reached, that the epoch reaches anyway) into one review action per fix
+// epoch and cause.
 type apkBlockerKey struct {
-	epoch int64
-	cause string
+	epoch   int64
+	cause   string
+	reached bool
+}
+
+func boolRank(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // DisplayID is the advisory's report ID (see apkDisplayID).

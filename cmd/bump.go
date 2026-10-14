@@ -17,6 +17,7 @@ import (
 	"github.com/isometry/choam/internal/output"
 	"github.com/isometry/choam/internal/processor"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 func NewBumpCmd() *cobra.Command {
@@ -450,7 +451,7 @@ func renderWhy(results []*gobump.Result) {
 			continue
 		}
 		if why := whyLine(result); why != "" {
-			lines = append(lines, fmt.Sprintf("  %s: %s", result.PackageName, why))
+			lines = append(lines, wrapWords(fmt.Sprintf("  %s: ", result.PackageName), 4, strings.Fields(why)))
 		}
 	}
 	if len(lines) > 0 {
@@ -485,6 +486,51 @@ func whyLine(result *gobump.Result) string {
 		why += line
 	}
 	return why
+}
+
+// defaultWrapWidth is the report's wrap width when stdout is not a terminal.
+const defaultWrapWidth = 100
+
+// wrapWidth is the column the report wraps at: the terminal's width when
+// stdout is one, else defaultWrapWidth (stable for pipes, files and tests).
+func wrapWidth() int {
+	if fd := int(os.Stdout.Fd()); term.IsTerminal(fd) {
+		if width, _, err := term.GetSize(fd); err == nil && width > 0 {
+			return width
+		}
+	}
+	return defaultWrapWidth
+}
+
+// wrapWords joins words after prefix, breaking only between words at
+// wrapWidth; continuation lines are indented by indent columns (-1: the
+// prefix's width). A word longer than a line stays whole on its own line.
+func wrapWords(prefix string, indent int, words []string) string {
+	return wrapAt(wrapWidth(), prefix, indent, words)
+}
+
+func wrapAt(width int, prefix string, indentWidth int, words []string) string {
+	if indentWidth < 0 {
+		indentWidth = len(prefix)
+	}
+	indent := strings.Repeat(" ", indentWidth)
+	var out strings.Builder
+	out.WriteString(prefix)
+	col, empty := len(prefix), true
+	for _, word := range words {
+		if !empty && col+1+len(word) > width {
+			out.WriteString("\n" + indent)
+			col, empty = len(indent), true
+		}
+		if !empty {
+			out.WriteByte(' ')
+			col++
+		}
+		out.WriteString(word)
+		col += len(word)
+		empty = false
+	}
+	return out.String()
 }
 
 // actionOrder ranks action kinds for display; errors come from Result.Error.
@@ -528,12 +574,24 @@ func renderActions(results []*gobump.Result) {
 		if action.Detail != "" {
 			line += ": " + action.Detail
 		}
+		// The package list is its own trailing segment: "- a," "b," "+N more"
+		// tokens, so it wraps at commas and never splits "+N more".
 		pkgs := packages[action]
-		names := strings.Join(pkgs[:min(len(pkgs), actionMaxPackages)], ", ")
-		if len(pkgs) > actionMaxPackages {
-			names += fmt.Sprintf(", +%d more", len(pkgs)-actionMaxPackages)
+		shown := pkgs[:min(len(pkgs), actionMaxPackages)]
+		words := strings.Fields(line)
+		for i, pkg := range shown {
+			if i == 0 {
+				pkg = "- " + pkg
+			}
+			if i < len(shown)-1 || len(pkgs) > len(shown) {
+				pkg += ","
+			}
+			words = append(words, pkg)
 		}
-		fmt.Printf("  %-7s %s - %s\n", strings.ToUpper(action.Kind), line, names)
+		if len(pkgs) > len(shown) {
+			words = append(words, fmt.Sprintf("+%d more", len(pkgs)-len(shown)))
+		}
+		fmt.Println(wrapWords(fmt.Sprintf("  %-7s ", strings.ToUpper(action.Kind)), -1, words))
 	}
 }
 
@@ -568,7 +626,7 @@ func renderInfo(results []*gobump.Result) {
 	var notes []string
 	for _, result := range results {
 		for _, note := range result.Notes {
-			notes = append(notes, fmt.Sprintf("Note %s: %s", result.PackageName, note))
+			notes = append(notes, wrapWords(fmt.Sprintf("Note %s: ", result.PackageName), 2, strings.Fields(note)))
 		}
 	}
 	if len(counts) == 0 && len(notes) == 0 {
@@ -576,7 +634,7 @@ func renderInfo(results []*gobump.Result) {
 	}
 	fmt.Println()
 	if len(counts) > 0 {
-		fmt.Printf("Info (-v for detail): %s\n", strings.Join(counts, ", "))
+		fmt.Println(wrapWords("Info (-v for detail): ", 2, strings.Fields(strings.Join(counts, ", "))))
 	}
 	for _, note := range notes {
 		fmt.Println(note)

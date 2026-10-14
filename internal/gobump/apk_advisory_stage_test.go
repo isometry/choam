@@ -252,6 +252,18 @@ func TestApkAdvisoryStage_Apply(t *testing.T) {
 		actionsContain(t, gp, ActionReview, "epoch 2 reaches -r2 anyway, hiding it from distro-aware scanners")
 	})
 
+	t.Run("advisories the epoch reaches anyway group by fix epoch and cause", func(t *testing.T) {
+		gp := newApkTestProcessor()
+		gp.StdlibBumps = []StdlibBump{{RebuildGoVersion: "1.24.5"}}
+		run(t, gp, nil,
+			apkRecord("CGA-b1", []string{"CVE-B", "GO-B"}, "3.6.0-r2"), apkRecord("CGA-b2", []string{"GO-B"}, "3.6.0-r2"),
+			apkRecord("CGA-x", []string{"CVE-X", "GHSA-x"}, "3.6.0-r2"))
+		assert.Equal(t, []NeededAction{
+			{Kind: ActionReview, Subject: "2 apk advisories fixed in -r2 (CVE-B, GO-B)", Detail: "not proven fixed here (module example.com/b residual, unlinked or not proven fixed) - epoch 2 reaches -r2 anyway, hiding them from distro-aware scanners"},
+			{Kind: ActionReview, Subject: "1 apk advisory fixed in -r2 (CVE-X)", Detail: "not proven fixed here (module github.com/example/pkg not in the analysed graph) - epoch 2 reaches -r2 anyway, hiding it from distro-aware scanners"},
+		}, gp.ActionsNeeded)
+	})
+
 	t.Run("root-module record - first-party, holds the epoch", func(t *testing.T) {
 		gp := newApkTestProcessor()
 		run(t, gp, nil, apkRecord("CGA-m", []string{"CVE-M", "GO-M"}, "3.6.0-r2"), apkRecord("CGA-a", []string{"CVE-A", "GO-A"}, "3.6.0-r3"))
