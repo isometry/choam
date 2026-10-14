@@ -331,7 +331,7 @@ func outputBumpTable(results []*gobump.Result) error {
 //
 //	ERROR          the file failed (partial counts shown)
 //	SKIPPED        not analyzed (see SkipReasons) and nothing found
-//	PATCH-NEEDED   a first-party apk advisory (no dependency fix) needs a
+//	PATCH-NEEDED   a first-party apk advisory (own module affected) needs a
 //	               source patch; wins over every success status below
 //	APK-ALIGN      epoch raised only to align with a proven apk advisory
 //	               (no module bumps, stdlib fixes or residuals)

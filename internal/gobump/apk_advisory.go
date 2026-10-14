@@ -11,9 +11,9 @@ import (
 
 // ApkAdvisory.Status values.
 const (
-	apkProven     = "proven"      // its upstream issue is provably fixed in this build
-	apkUnproven   = "unproven"    // possibly still present (residual, unlinked, stdlib, or no fix recorded)
-	apkFirstParty = "first-party" // matches no dependency or stdlib advisory we know of
+	apkProven     = "proven"      // every component its upstream records affect is provably fixed here
+	apkUnproven   = "unproven"    // some component is still open, or cannot be verified
+	apkFirstParty = "first-party" // an upstream record affects this package's own module
 )
 
 // apkEcosystems are the OSV ecosystems Chainguard publishes APK advisories
@@ -22,33 +22,25 @@ var apkEcosystems = []string{"Wolfi", "Chainguard"}
 
 // apkFixedEpoch reads rec's fix for the APK name at version: ok when some
 // Wolfi/Chainguard fixed event is exactly "<version>-r<N>" with N > epoch,
-// returning the smallest such N (the advisory is epoch-addressable). fixed is
-// that event, or else the first fixed event seen ("" = no fix).
-func apkFixedEpoch(rec *osvschema.Vulnerability, name, version string, epoch int64) (n int64, ok bool, fixed string) {
+// returning the smallest such N (the advisory is epoch-addressable).
+func apkFixedEpoch(rec *osvschema.Vulnerability, name, version string, epoch int64) (n int64, ok bool) {
 	for _, affected := range rec.GetAffected() {
 		if pkg := affected.GetPackage(); pkg.GetName() != name || !slices.Contains(apkEcosystems, pkg.GetEcosystem()) {
 			continue
 		}
 		for _, r := range affected.GetRanges() {
 			for _, event := range r.GetEvents() {
-				f := event.GetFixed()
-				if f == "" {
-					continue
-				}
-				if fixed == "" {
-					fixed = f
-				}
-				rest, found := strings.CutPrefix(f, version+"-r")
+				rest, found := strings.CutPrefix(event.GetFixed(), version+"-r")
 				if !found {
 					continue
 				}
 				if m, err := strconv.ParseInt(rest, 10, 64); err == nil && m > epoch && (!ok || m < n) {
-					n, ok, fixed = m, true, f
+					n, ok = m, true
 				}
 			}
 		}
 	}
-	return n, ok, fixed
+	return n, ok
 }
 
 // analysisAliases maps every advisory ID the analysis scan found to its
@@ -83,39 +75,71 @@ func aliasExpand(ids []string, aliasesOf map[string][]string) map[string]struct{
 	return set
 }
 
-// apkEvidence is what classifyApk weighs an advisory's upstream IDs against,
-// every set alias-expanded.
+// apkComponent kinds: what one affected entry of an upstream record names.
+const (
+	apkRoot     = "root"     // an analysed main module (the package's own code)
+	apkStdlib   = "stdlib"   // the Go stdlib/toolchain
+	apkModule   = "module"   // a package the pristine dependency scan queried
+	apkOutside  = "outside"  // a package outside the analysed dependency graph
+	apkNoRecord = "norecord" // no upstream record could be fetched
+)
+
+// apkComponent is one thing an advisory's upstream records say is affected:
+// its kind, the IDs that identify the issue (upstream IDs plus the record's
+// own aliases) and the affected package.
+type apkComponent struct {
+	kind   string
+	ids    []string
+	module string
+}
+
+// apkEvidence is what classifyApk weighs components against.
 type apkEvidence struct {
-	pristine map[string]struct{} // every advisory the pristine dependency scans found
-	fixed    map[string]struct{} // proven fixed by this build's deps (and hygiene bumps)
-	unfixed  map[string]struct{} // residual, no-fix residual, or unlinked and not hygiene-bumped
-	stdlib   map[string]struct{} // upstream GO- IDs whose record affects the Go stdlib/toolchain
-	modules  map[string]struct{} // upstream GO- IDs whose record affects a (non-stdlib) module
+	// open are the dependency advisories this build leaves open: unfixed
+	// (residual, no-fix, unlinked and not hygiene-bumped) plus every pristine
+	// advisory not proven fixed, alias-expanded.
+	open    map[string]struct{}
+	scanned map[string]struct{} // "ecosystem|name" of every package the pristine scan queried
+	mains   []string            // analysed Go main module paths
 	// stdlibRemaining are the stdlib advisories (IDs and aliases) still
 	// affecting Go at a recorded rebuild version; nil = no stdlib proof.
 	stdlibRemaining map[string]struct{}
 }
 
-// classifyApk gives an advisory with the given upstream IDs its status.
-// First-party: no stdlib component and no pristine dependency advisory.
-// Otherwise every component must be proven: the dependency side (any
-// non-stdlib advisory, or a stdlib+module record whose CVE is in our graph)
-// needs an upstream ID fixed and none unfixed; the stdlib side needs no
-// upstream ID still affecting Go at a recorded rebuild version.
-func classifyApk(upstream []string, ev apkEvidence) string {
-	stdlib, pristine := anyIn(upstream, ev.stdlib), anyIn(upstream, ev.pristine)
-	if !stdlib && !pristine {
-		return apkFirstParty
+// classifyApk gives an advisory its status and, unless proven, the cause:
+// first-party when any component is the package's own module, otherwise
+// proven only when it has components and every one is proven - a stdlib one
+// not affecting Go at the recorded rebuild versions, a scanned module not
+// open (fixed here, or never affected at the version shipped).
+func classifyApk(components []apkComponent, ev apkEvidence) (status, cause string) {
+	if len(components) == 0 {
+		return apkUnproven, "no upstream advisory record"
 	}
-	if !stdlib || (pristine && anyIn(upstream, ev.modules)) {
-		if anyIn(upstream, ev.unfixed) || !anyIn(upstream, ev.fixed) {
-			return apkUnproven
+	for _, c := range components {
+		if c.kind == apkRoot {
+			return apkFirstParty, "affects " + c.module + ", this package's own module"
 		}
 	}
-	if stdlib && (ev.stdlibRemaining == nil || anyIn(upstream, ev.stdlibRemaining)) {
-		return apkUnproven
+	for _, c := range components {
+		switch c.kind {
+		case apkStdlib:
+			if ev.stdlibRemaining == nil {
+				return apkUnproven, "stdlib: no rebuild Go version recorded, rerun on a clean tree"
+			}
+			if anyIn(c.ids, ev.stdlibRemaining) {
+				return apkUnproven, "stdlib: still affected at the rebuild Go version"
+			}
+		case apkModule:
+			if anyIn(c.ids, ev.open) {
+				return apkUnproven, "module " + c.module + " residual, unlinked or not proven fixed"
+			}
+		case apkOutside:
+			return apkUnproven, "module " + c.module + " not in the analysed graph"
+		default:
+			return apkUnproven, "no upstream advisory record"
+		}
 	}
-	return apkProven
+	return apkProven, ""
 }
 
 // anyIn reports whether any of ids is in set.
@@ -126,22 +150,21 @@ func anyIn(ids []string, set map[string]struct{}) bool {
 	})
 }
 
-// apkEpochTarget is the lowest epoch clearing every epoch-addressable proven
-// advisory (the floor), held below the lowest first-party one (the cap): the
-// package-name match is often a first-party issue's only downstream signal.
-// 0 when nothing proven is addressable.
+// apkEpochTarget is the highest -rN such that every addressable advisory at
+// or below it is proven: the epoch stops below the lowest non-proven one.
+// 0 when no proven advisory sits below every non-proven one.
 func apkEpochTarget(advs []ApkAdvisory) int64 {
-	floor, ceiling := int64(0), int64(math.MaxInt64)
+	blocker := int64(math.MaxInt64)
 	for _, adv := range advs {
-		if adv.FixedEpoch == 0 {
-			continue
-		}
-		switch adv.Status {
-		case apkProven:
-			floor = max(floor, adv.FixedEpoch)
-		case apkFirstParty:
-			ceiling = min(ceiling, adv.FixedEpoch-1)
+		if adv.Status != apkProven {
+			blocker = min(blocker, adv.FixedEpoch)
 		}
 	}
-	return min(floor, ceiling)
+	var target int64
+	for _, adv := range advs {
+		if adv.Status == apkProven && adv.FixedEpoch < blocker {
+			target = max(target, adv.FixedEpoch)
+		}
+	}
+	return target
 }

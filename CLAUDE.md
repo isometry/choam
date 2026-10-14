@@ -257,7 +257,7 @@ make fmt && make lint && make test
 - Security is highest priority
 - OSV database integration via `internal/scan/vulnerability.go`
 - Minimal fix strategy to reduce update impact
-- Reported advisory IDs are CVE-first (`scan.PreferredID`; `Vulnerability.Aliases` retained); the epoch is aligned to proven Chainguard/Wolfi apk advisories (`--no-apk-advisories` to disable) and never raised past a first-party advisory's `-rN`
+- Reported advisory IDs are CVE-first (`scan.PreferredID`; `Vulnerability.Aliases` retained); the epoch is aligned to proven Chainguard/Wolfi apk advisories (`--no-apk-advisories` to disable) and never raised past an advisory not proven fixed
 - Epoch management tied to actual fixes (security fixes, scanner-hygiene bumps or stdlib rebuilds)
 - A module's security target is the highest fix among its LINKED advisories;
   advisories in unlinked packages of a linked module are info (UNLINKED) and

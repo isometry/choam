@@ -342,19 +342,20 @@ func (v *VulnerabilityChecker) analyzeModroot(ctx context.Context, eco ecosystem
 	sort.Strings(securityBumpModules)
 
 	return ModrootAnalysis{
-		Modroot:        root,
-		BuildPackages:  unit.Packages,
-		BuildTags:      unit.Tags,
-		BuildArches:    unit.Arches,
-		BuildEnv:       unit.Env,
-		BumpEngine:     unit.Engine,
-		BumpMigrating:  unit.Migrating,
-		BumpNoTidy:     unit.NoTidy,
-		GoPackageMinor: unit.GoMinor,
-		Deps:           deps,
-		ScanResult:     scanResult,
-		ExistingDeps:   existingDeps,
-		DesiredDeps:    desiredDeps,
+		Modroot:         root,
+		BuildPackages:   unit.Packages,
+		BuildTags:       unit.Tags,
+		BuildArches:     unit.Arches,
+		BuildEnv:        unit.Env,
+		BumpEngine:      unit.Engine,
+		BumpMigrating:   unit.Migrating,
+		BumpNoTidy:      unit.NoTidy,
+		GoPackageMinor:  unit.GoMinor,
+		Deps:            deps,
+		ScannedPackages: pkgs,
+		ScanResult:      scanResult,
+		ExistingDeps:    existingDeps,
+		DesiredDeps:     desiredDeps,
 		// Analysis never invents replaces - it carries existing ones
 		// forward (the simulation may raise or retire them, never add
 		// any). This also keeps the --no-validate degrade path a

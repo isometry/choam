@@ -39,18 +39,18 @@ type StdlibBump struct {
 	Validated           bool     `json:"validated" yaml:"validated"` // linked-import filtering applied
 }
 
-// ApkAdvisory is one Chainguard/Wolfi OSV advisory (CGA-) affecting the
-// package's own APK name at its pristine version-epoch, classified by whether
-// this build provably fixes its upstream issue (see classifyApk).
+// ApkAdvisory is one epoch-addressable Chainguard/Wolfi OSV advisory (CGA-)
+// affecting the package's own APK name at its pristine version-epoch,
+// classified by whether this build provably fixes every component its
+// upstream records affect (see classifyApk).
 type ApkAdvisory struct {
-	ID           string   `json:"id" yaml:"id"`             // the CGA- record ID
-	Upstream     []string `json:"upstream" yaml:"upstream"` // CVE-/GHSA-/GO- IDs it covers
-	FixedVersion string   `json:"fixed_version,omitempty" yaml:"fixed_version,omitempty"`
-	// FixedEpoch is N when the fix is exactly "<version>-r<N>" above the
-	// pristine epoch (epoch-addressable); 0 otherwise.
-	FixedEpoch int64    `json:"fixed_epoch,omitempty" yaml:"fixed_epoch,omitempty"`
-	Status     string   `json:"status" yaml:"status"`                       // proven, unproven, first-party
-	Modules    []string `json:"modules,omitempty" yaml:"modules,omitempty"` // affected modules, from the upstream records
+	ID           string   `json:"id" yaml:"id"`                               // the CGA- record ID
+	Upstream     []string `json:"upstream" yaml:"upstream"`                   // CVE-/GHSA-/GO- IDs it covers
+	FixedVersion string   `json:"fixed_version" yaml:"fixed_version"`         // "<version>-r<FixedEpoch>"
+	FixedEpoch   int64    `json:"fixed_epoch" yaml:"fixed_epoch"`             // N > the pristine epoch
+	Status       string   `json:"status" yaml:"status"`                       // proven, unproven, first-party
+	Reason       string   `json:"reason,omitempty" yaml:"reason,omitempty"`   // why not proven
+	Modules      []string `json:"modules,omitempty" yaml:"modules,omitempty"` // affected modules, from the upstream records
 }
 
 // SecurityFix represents a security vulnerability fix applied
@@ -161,10 +161,14 @@ type ModrootAnalysis struct {
 	GoPackageMinor string          `json:"-" yaml:"-"`
 	BaselineTidies bool            `json:"-" yaml:"-"`
 
-	Deps         *ecosystem.ModuleDeps `json:"-" yaml:"-"` // ecosystem-internal, not serialized
-	ScanResult   *scan.ScanResult      `json:"scan_result" yaml:"scan_result"`
-	ExistingDeps []string              `json:"existing_deps" yaml:"existing_deps"` // deps currently declared for this root
-	DesiredDeps  []string              `json:"desired_deps" yaml:"desired_deps"`   // deps this root should end up declaring
+	Deps *ecosystem.ModuleDeps `json:"-" yaml:"-"` // ecosystem-internal, not serialized
+	// ScannedPackages are the packages (at their pristine versions) the
+	// analysis scan queried OSV for: an advisory absent from ScanResult but
+	// affecting one of them does not affect the version shipped.
+	ScannedPackages []scan.Package   `json:"-" yaml:"-"`
+	ScanResult      *scan.ScanResult `json:"scan_result" yaml:"scan_result"`
+	ExistingDeps    []string         `json:"existing_deps" yaml:"existing_deps"` // deps currently declared for this root
+	DesiredDeps     []string         `json:"desired_deps" yaml:"desired_deps"`   // deps this root should end up declaring
 
 	// Replace directives ("old=new@version", Go only): what the root's bump
 	// steps currently declare, and what they should end up declaring.
