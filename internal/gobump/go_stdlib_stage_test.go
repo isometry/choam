@@ -157,14 +157,34 @@ func TestStdlibStage_RebuildGoVersions(t *testing.T) {
 		assert.Nil(t, gp.StdlibRebuildGoVersions)
 	})
 
-	t.Run("dirty file leaves it nil", func(t *testing.T) {
+	t.Run("dirty file still records it, without a bump", func(t *testing.T) {
 		stage := newStdlibTestStage(Options{StdlibCheck: true}, staleIndex(), fixableScanner())
 		stage.lastCommit = func(context.Context, string) (*git.FileCommitInfo, error) {
 			return &git.FileCommitInfo{Time: stdlibCommitTime, Dirty: true}, nil
 		}
 		gp := newStdlibTestProcessor()
 		require.NoError(t, stage.Apply(t.Context(), gp))
+		assert.Equal(t, []string{"1.24.5"}, gp.StdlibRebuildGoVersions)
+		assert.Empty(t, gp.StdlibBumps)
+	})
+
+	t.Run("index error leaves it nil and skips", func(t *testing.T) {
+		index := staleIndex()
+		index.availableErr = errors.New("proxy down")
+		gp := newStdlibTestProcessor()
+		require.NoError(t, newStdlibTestStage(Options{StdlibCheck: true}, index, fixableScanner()).Apply(t.Context(), gp))
 		assert.Nil(t, gp.StdlibRebuildGoVersions)
+		assert.False(t, gp.StdlibChecked)
+		messagesContain(t, gp, "stdlib: staleness check unavailable")
+	})
+
+	t.Run("cancellation propagates", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		index := staleIndex()
+		index.availableErr = context.Canceled
+		err := newStdlibTestStage(Options{StdlibCheck: true}, index, fixableScanner()).Apply(ctx, newStdlibTestProcessor())
+		assert.ErrorIs(t, err, context.Canceled)
 	})
 
 	t.Run("--no-stdlib never runs the stage", func(t *testing.T) {
@@ -215,17 +235,17 @@ func TestStdlibStage_SkipGates(t *testing.T) {
 		{
 			name:        "dirty file skips (idempotency guard)",
 			commitInfo:  &git.FileCommitInfo{Time: stdlibCommitTime, Dirty: true},
-			wantMessage: "uncommitted changes - skipping stdlib staleness check (a bump may already be pending)",
+			wantMessage: "uncommitted changes - stdlib staleness trigger skipped, a bump may already be pending (rebuild toolchain: go1.24.5)",
 		},
 		{
 			name:        "untracked file skips",
 			commitErr:   git.ErrUntracked,
-			wantMessage: "no commit history - skipping stdlib staleness check",
+			wantMessage: "no commit history - stdlib staleness trigger skipped (rebuild toolchain: go1.24.5)",
 		},
 		{
 			name:        "not in a repository skips",
 			commitErr:   git.ErrNotInRepository,
-			wantMessage: "not in a git repository - skipping stdlib staleness check",
+			wantMessage: "not in a git repository - stdlib staleness trigger skipped (rebuild toolchain: go1.24.5)",
 		},
 		{
 			name:        "unexpected git error skips with warning",
@@ -246,7 +266,8 @@ func TestStdlibStage_SkipGates(t *testing.T) {
 			require.NoError(t, stage.Apply(t.Context(), gp), "the stage must never fail the run")
 			assert.Empty(t, gp.StdlibBumps)
 			assert.False(t, gp.StdlibChecked)
-			assert.Zero(t, index.asOfCalls, "skip must happen before any release lookup")
+			assert.Zero(t, index.asOfCalls, "skip must happen before any staleness lookup")
+			assert.Equal(t, []string{"1.24.5"}, gp.StdlibRebuildGoVersions, "the rebuild toolchain is resolved regardless of git")
 			messagesContain(t, gp, tt.wantMessage)
 		})
 	}

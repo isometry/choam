@@ -19,13 +19,16 @@ import (
 // constraint), diffs OSV stdlib findings against the newest allowed release,
 // and records a StdlibBump when a rebuild would fix advisories - which the
 // epoch stage then turns into an epoch bump, even with ZERO dependency
-// changes (the rebuild itself is the fix).
+// changes (the rebuild itself is the fix). Independently of git, it records
+// the rebuild Go version(s) (StdlibRebuildGoVersions): whatever bumps the
+// epoch, the rebuild uses them, which is the apk stage's stdlib proof.
 //
 // The stage is strictly best-effort: every failure degrades to a
 // skip-with-message and never fails the bump run. The last-commit Dirty gate
-// doubles as the idempotency guard - once this run's epoch bump is written,
-// the file is dirty and subsequent runs skip until the change is committed
-// (in-run dependency edits live only in CurrentYAML, so they never trip it).
+// doubles as the idempotency guard for the staleness trigger - once this
+// run's epoch bump is written, the file is dirty and subsequent runs skip the
+// trigger until the change is committed (in-run dependency edits live only in
+// CurrentYAML, so they never trip it).
 type StdlibStage struct {
 	processor.BaseStage
 	Analyzer *Analyzer
@@ -94,17 +97,11 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 		return nil
 	}
 
-	info, err := s.commitInfo(ctx, gp)
-	if info == nil {
-		return err
-	}
-
 	// Constraints come from the pristine config (the historical truth the
 	// assumed side needs); the rebuild side additionally reflects go-package
 	// pins this same run raised (the applier runs before this stage).
 	constraints := distinctMinorConstraints(goToolchainPins(ctx, gp.Config))
 	in := stdlibInput{
-		CommitTime:         info.Time,
 		Constraints:        constraints,
 		RebuildConstraints: rebuildConstraintsFor(constraints, gp.RaisedPinMinors),
 		Linked:             gp.LinkedStdPackages,
@@ -112,11 +109,27 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 		Now:                time.Now(),
 	}
 
-	eval, err := runStdlibEvaluation(ctx, s.index, s.scanner, in)
+	// The rebuild toolchain first, independent of git: any epoch bump this
+	// run makes rebuilds with it, so it is the stdlib proof the apk stage
+	// needs even when the staleness trigger below is skipped.
+	versions, unknown, err := resolveRebuildVersions(ctx, s.index, in)
 	if err != nil {
 		return cancelledOr(ctx, func() { s.skipWarn(ctx, gp, fmt.Sprintf("stdlib: staleness check unavailable (%v) - skipping", err)) })
 	}
-	bumps, messages := eval.bumps, eval.messages
+	if !unknown {
+		gp.StdlibRebuildGoVersions = versions
+	}
+
+	info, err := s.commitInfo(ctx, gp, rebuildToolchainWord(versions, unknown))
+	if info == nil {
+		return err
+	}
+	in.CommitTime = info.Time
+
+	bumps, messages, err := evaluateStdlibStaleness(ctx, s.index, s.scanner, in)
+	if err != nil {
+		return cancelledOr(ctx, func() { s.skipWarn(ctx, gp, fmt.Sprintf("stdlib: staleness check unavailable (%v) - skipping", err)) })
+	}
 
 	// Fallback checkout: only worth a clone when the preliminary unfiltered
 	// evaluation actually found fixable advisories to validate against the
@@ -128,9 +141,6 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 	}
 
 	gp.StdlibChecked = true
-	if !eval.rebuildUnknown {
-		gp.StdlibRebuildGoVersions = eval.rebuildVersions
-	}
 	gp.StdlibBumps = append(gp.StdlibBumps, bumps...)
 	for _, msg := range messages {
 		gp.AddMessage(msg)
@@ -142,29 +152,29 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 }
 
 // commitInfo looks up the melange file's last commit for the staleness
-// estimate. A nil info means skip: the reason is already reported (a
-// message, or a skip warning), and the error is non-nil only for a
-// cancellation, which must propagate. A shallow history is warned about
-// but proceeds.
-func (s *StdlibStage) commitInfo(ctx context.Context, gp *Processor) (*git.FileCommitInfo, error) {
+// estimate. A nil info means skip the staleness trigger: the reason is already
+// reported (a message naming the rebuild toolchain, or a skip warning), and
+// the error is non-nil only for a cancellation, which must propagate. A
+// shallow history is warned about but proceeds.
+func (s *StdlibStage) commitInfo(ctx context.Context, gp *Processor, toolchain string) (*git.FileCommitInfo, error) {
 	info, err := s.lastCommit(ctx, gp.GetFilePath())
 	switch {
 	case errors.Is(err, git.ErrNotInRepository):
-		gp.AddMessage("stdlib: melange file is not in a git repository - skipping stdlib staleness check")
+		gp.AddMessage("stdlib: melange file is not in a git repository - stdlib staleness trigger skipped (rebuild toolchain: " + toolchain + ")")
 		return nil, nil
 	case errors.Is(err, git.ErrUntracked):
-		gp.AddMessage("stdlib: melange file has no commit history - skipping stdlib staleness check")
+		gp.AddMessage("stdlib: melange file has no commit history - stdlib staleness trigger skipped (rebuild toolchain: " + toolchain + ")")
 		return nil, nil
 	case err != nil:
 		return nil, cancelledOr(ctx, func() {
-			s.skipWarn(ctx, gp, fmt.Sprintf("stdlib: could not determine the melange file's last commit (%v) - skipping stdlib staleness check", err))
+			s.skipWarn(ctx, gp, fmt.Sprintf("stdlib: could not determine the melange file's last commit (%v) - stdlib staleness trigger skipped (rebuild toolchain: %s)", err, toolchain))
 		})
 	}
 	if info.Dirty {
 		// The idempotency guard: an epoch bump this tool wrote on a previous
 		// run (or any other pending edit) makes the file dirty; re-running
-		// must not stack further bumps until the change is committed.
-		gp.AddMessage("stdlib: melange file has uncommitted changes - skipping stdlib staleness check (a bump may already be pending)")
+		// must not stack further stale-only bumps until it is committed.
+		gp.AddMessage("stdlib: melange file has uncommitted changes - stdlib staleness trigger skipped, a bump may already be pending (rebuild toolchain: " + toolchain + ")")
 		return nil, nil
 	}
 	if info.Shallow {
@@ -255,6 +265,15 @@ func (s *StdlibStage) checkoutLinkedStd(ctx context.Context, gp *Processor) (map
 		return nil, fmt.Errorf("no linked stdlib packages found (empty import graph)")
 	}
 	return union, nil
+}
+
+// rebuildToolchainWord renders the resolved rebuild Go version(s) for
+// messages.
+func rebuildToolchainWord(versions []string, unknown bool) string {
+	if unknown || len(versions) == 0 {
+		return "unresolved"
+	}
+	return "go" + strings.Join(versions, ", go")
 }
 
 // skipWarn records a degrade-to-skip both in the log and the per-package

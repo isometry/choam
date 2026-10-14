@@ -152,10 +152,13 @@ func NewPipeline(analyzer *Analyzer, opts Options) *processor.Pipeline {
 // include security fixes (the critical fix) or scanner-hygiene bumps (the
 // rebuild is what clears the scanner finding). A stdlib staleness finding
 // justifies a bump on its own - the epoch bump itself is what triggers the
-// fixing rebuild, with zero dependency changes.
+// fixing rebuild, with zero dependency changes. And any other edit this run
+// writes to the build inputs (a go-package pin raise, a go/bump migration, a
+// redundant pin removed, ...) needs one too: a changed spec at an unchanged
+// version-epoch would describe two different builds of one APK.
 func epochTriggers(gp *Processor) bool {
 	return (gp.ActualChangesApplied && (len(gp.SecurityFixes) > 0 || len(gp.HygieneBumps) > 0)) ||
-		len(gp.StdlibBumps) > 0
+		len(gp.StdlibBumps) > 0 || gp.buildInputsChanged()
 }
 
 // apkNewEpoch is the epoch this run ends at: the ordinary +1 when
@@ -198,6 +201,9 @@ func epochComment(gp *Processor) string {
 	apk := gp.ApkEpochTarget > gp.GetCurrentEpoch()
 	if apk {
 		clauses = append(clauses, fmt.Sprintf("align with chainguard apk -r%d", gp.ApkEpochTarget))
+	}
+	if len(clauses) == 0 && gp.buildInputsChanged() {
+		clauses = append(clauses, "updated build inputs")
 	}
 	if len(clauses) == 0 {
 		return ""

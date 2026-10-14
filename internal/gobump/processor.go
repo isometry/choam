@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
+
+	"github.com/goccy/go-yaml"
 
 	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/processor"
@@ -202,6 +205,32 @@ func (p *Processor) MarkActualChangesApplied() {
 func (p *Processor) HasActualChanges() bool {
 	// Check if YAML content actually changed
 	return !bytes.Equal(p.GetOriginalYAML(), p.GetCurrentYAML()) || p.ActualChangesApplied
+}
+
+// buildInputsChanged reports whether this run edited what the build uses:
+// the parsed original and current YAML differ beyond package.epoch (the
+// epoch stage runs last, so the difference is exactly this run's edits;
+// comment- and formatting-only rewrites parse identically). Unparseable YAML
+// falls back to a byte comparison.
+func (p *Processor) buildInputsChanged() bool {
+	original, err1 := parseWithoutEpoch(p.GetOriginalYAML())
+	current, err2 := parseWithoutEpoch(p.GetCurrentYAML())
+	if err1 != nil || err2 != nil {
+		return p.HasFileChanges()
+	}
+	return !reflect.DeepEqual(original, current)
+}
+
+// parseWithoutEpoch parses a melange YAML document, minus package.epoch.
+func parseWithoutEpoch(content []byte) (map[string]any, error) {
+	var doc map[string]any
+	if err := yaml.Unmarshal(content, &doc); err != nil {
+		return nil, err
+	}
+	if pkg, ok := doc["package"].(map[string]any); ok {
+		delete(pkg, "epoch")
+	}
+	return doc, nil
 }
 
 // fixedVulnIDs is the one definition of the dependency advisories this

@@ -75,6 +75,11 @@ func aliasExpand(ids []string, aliasesOf map[string][]string) map[string]struct{
 	return set
 }
 
+// apkCauseNoRebuildToolchain is the cause of a stdlib component left
+// unproven because the stdlib stage resolved no rebuild Go version (disabled
+// by --no-stdlib, a deferred release, or a release-index failure).
+const apkCauseNoRebuildToolchain = "stdlib: the rebuild Go toolchain could not be resolved"
+
 // apkComponent kinds: what one affected entry of an upstream record names.
 const (
 	apkRoot     = "root"     // an analysed main module (the package's own code)
@@ -124,7 +129,7 @@ func classifyApk(components []apkComponent, ev apkEvidence) (status, cause strin
 		switch c.kind {
 		case apkStdlib:
 			if ev.stdlibRemaining == nil {
-				return apkUnproven, "stdlib: no rebuild Go version recorded, rerun on a clean tree"
+				return apkUnproven, apkCauseNoRebuildToolchain
 			}
 			if anyIn(c.ids, ev.stdlibRemaining) {
 				return apkUnproven, "stdlib: still affected at the rebuild Go version"

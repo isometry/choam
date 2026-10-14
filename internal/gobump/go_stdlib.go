@@ -83,33 +83,82 @@ type stdlibInput struct {
 // plus human-readable messages; any index/scan failure returns an error for the
 // caller to degrade on.
 func evaluateStdlibStaleness(ctx context.Context, index goReleaseIndex, scanner simulate.Scanner, in stdlibInput) ([]StdlibBump, []string, error) {
-	e, err := runStdlibEvaluation(ctx, index, scanner, in)
-	if err != nil {
-		return nil, nil, err
-	}
-	return e.bumps, e.messages, nil
-}
-
-// runStdlibEvaluation is evaluateStdlibStaleness, returning the whole
-// evaluation (its rebuild versions included).
-func runStdlibEvaluation(ctx context.Context, index goReleaseIndex, scanner simulate.Scanner, in stdlibInput) (*stdlibEvaluation, error) {
-	now := in.Now
-	if now.IsZero() {
-		now = time.Now()
-	}
 	e := &stdlibEvaluation{
 		index:         index,
 		scanner:       scanner,
 		in:            in,
 		filter:        in.Linked != nil && in.Validated,
-		rebuildCutoff: now.Add(-stdlibToolchainLagMargin),
+		rebuildCutoff: rebuildCutoff(in),
 	}
 	for _, constraint := range in.Constraints {
 		if err := e.evaluateConstraint(ctx, constraint); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
-	return e, nil
+	return e.bumps, e.messages, nil
+}
+
+// resolveRebuildVersions resolves the Go release the next build uses, per
+// constraint (the rebuild side of evaluateStdlibStaleness, see
+// resolveRebuild): it needs neither the commit time nor any scan, so the
+// rebuild toolchain is known even when the staleness trigger is skipped.
+// unknown is set when the publication-age margin defers any constraint.
+func resolveRebuildVersions(ctx context.Context, index goReleaseIndex, in stdlibInput) (versions []string, unknown bool, err error) {
+	cutoff := rebuildCutoff(in)
+	for _, constraint := range in.Constraints {
+		rebuild, _, err := resolveRebuild(ctx, index, cutoff, rebuildConstraintOf(in, constraint))
+		if err != nil {
+			return nil, false, err
+		}
+		if rebuild == "" {
+			unknown = true
+			continue
+		}
+		versions = append(versions, rebuild)
+	}
+	return versions, unknown, nil
+}
+
+// rebuildCutoff is the newest publication time a rebuild target may have:
+// in.Now (default now) minus the publication-age margin.
+func rebuildCutoff(in stdlibInput) time.Time {
+	now := in.Now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return now.Add(-stdlibToolchainLagMargin)
+}
+
+// rebuildConstraintOf maps a pristine constraint to the one the next build
+// uses (a same-run go-package pin raise, see stdlibInput.RebuildConstraints).
+func rebuildConstraintOf(in stdlibInput, constraint string) string {
+	if mapped, ok := in.RebuildConstraints[constraint]; ok && mapped != "" {
+		return mapped
+	}
+	return constraint
+}
+
+// resolveRebuild resolves one rebuild constraint's target: the newest release
+// published on or before cutoff, plus the newest available overall (to name
+// a release the margin defers). rebuild is "" (nil error) when every release
+// of the constraint falls inside the margin.
+func resolveRebuild(ctx context.Context, index goReleaseIndex, cutoff time.Time, constraint string) (rebuild, latestAvailable string, err error) {
+	// LatestAvailable first so an unknown pin still hard-errors (and to name
+	// the fresher release the margin might defer)...
+	latestAvailable, err = index.LatestAvailable(ctx, constraint)
+	if err != nil {
+		return "", "", fmt.Errorf("resolving latest available Go release (pin %s): %w", pinWord(constraint), err)
+	}
+	// ...then age the actual rebuild target back behind the publication-age
+	// margin: the distro toolchain package trails the module proxy.
+	rebuild, err = index.LatestAvailableAsOf(ctx, cutoff, constraint)
+	if errors.Is(err, gorelease.ErrNoReleases) {
+		return "", latestAvailable, nil
+	}
+	if err != nil {
+		return "", "", fmt.Errorf("resolving latest available Go release within publication-age margin (pin %s): %w", pinWord(constraint), err)
+	}
+	return rebuild, latestAvailable, nil
 }
 
 // stdlibEvaluation is one evaluateStdlibStaleness run: its inputs, the
@@ -129,11 +178,6 @@ type stdlibEvaluation struct {
 
 	bumps    []StdlibBump
 	messages []string
-
-	// rebuildVersions are the resolved rebuild releases, one per constraint;
-	// rebuildUnknown is set when any constraint's rebuild went unresolved.
-	rebuildVersions []string
-	rebuildUnknown  bool
 }
 
 // stdlibTargets are one constraint's resolved releases: the assumed
@@ -149,11 +193,6 @@ type stdlibTargets struct {
 // its bump (if any) and messages.
 func (e *stdlibEvaluation) evaluateConstraint(ctx context.Context, constraint string) error {
 	t, ok, err := e.resolveTargets(ctx, constraint)
-	if t.rebuild == "" {
-		e.rebuildUnknown = true
-	} else {
-		e.rebuildVersions = append(e.rebuildVersions, t.rebuild)
-	}
 	if err != nil || !ok {
 		return err
 	}
@@ -188,10 +227,7 @@ func (e *stdlibEvaluation) evaluateConstraint(ctx context.Context, constraint st
 // ok=false (with a nil error) skips the constraint: the rebuild target is
 // deferred by the publication-age margin, or a rebuild changes nothing.
 func (e *stdlibEvaluation) resolveTargets(ctx context.Context, constraint string) (stdlibTargets, bool, error) {
-	t := stdlibTargets{rebuildConstraint: constraint}
-	if mapped, ok := e.in.RebuildConstraints[constraint]; ok && mapped != "" {
-		t.rebuildConstraint = mapped
-	}
+	t := stdlibTargets{rebuildConstraint: rebuildConstraintOf(e.in, constraint)}
 
 	// Assumed side: subtract the lag margin from the commit time. This
 	// over-detects only (a slightly older toolchain than reality), which is
@@ -203,25 +239,17 @@ func (e *stdlibEvaluation) resolveTargets(ctx context.Context, constraint string
 	}
 	t.assumed = assumed
 
-	// Rebuild side: LatestAvailable first so an unknown pin still hard-errors
-	// (and to name the fresher release the margin might defer)...
-	latestAvailable, err := e.index.LatestAvailable(ctx, t.rebuildConstraint)
+	rebuild, latestAvailable, err := resolveRebuild(ctx, e.index, e.rebuildCutoff, t.rebuildConstraint)
 	if err != nil {
-		return t, false, fmt.Errorf("resolving latest available Go release (pin %s): %w", pinWord(t.rebuildConstraint), err)
+		return t, false, err
 	}
-	// ...then age the actual rebuild target back behind the publication-age
-	// margin: the distro toolchain package trails the module proxy.
-	rebuild, err := e.index.LatestAvailableAsOf(ctx, e.rebuildCutoff, t.rebuildConstraint)
-	if err != nil {
-		if errors.Is(err, gorelease.ErrNoReleases) {
-			// A brand-new minor whose only release(s) fall entirely inside
-			// the margin: nothing publication-aged enough to rebuild against
-			// yet. Skip with a message rather than bump or error.
-			e.messages = append(e.messages, fmt.Sprintf("info: latest go%s release (pin %s) is within the %d-day publication-age margin - deferring the stdlib rebuild target until a release is old enough",
-				latestAvailable, pinWord(t.rebuildConstraint), marginDays()))
-			return t, false, nil
-		}
-		return t, false, fmt.Errorf("resolving latest available Go release within publication-age margin (pin %s): %w", pinWord(t.rebuildConstraint), err)
+	if rebuild == "" {
+		// A brand-new minor whose only release(s) fall entirely inside the
+		// margin: nothing publication-aged enough to rebuild against yet.
+		// Skip with a message rather than bump or error.
+		e.messages = append(e.messages, fmt.Sprintf("info: latest go%s release (pin %s) is within the %d-day publication-age margin - deferring the stdlib rebuild target until a release is old enough",
+			latestAvailable, pinWord(t.rebuildConstraint), marginDays()))
+		return t, false, nil
 	}
 	t.rebuild = rebuild
 	if goversion.Compare(latestAvailable, rebuild) > 0 {

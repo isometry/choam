@@ -97,7 +97,8 @@ func runApplier(t *testing.T, yamlContent string, analysis *VulnerabilityAnalysi
 // byte-for-byte with <case>.golden.yaml (go test -run TestMigration_Matrix
 // -update rewrites them). Every golden file shows comments, unrelated steps
 // and subpackages untouched; each case also checks its messages, that the
-// rewrite alone never bumps the epoch, and that a second run is a no-op.
+// rewrite alone bumps the epoch (it changes the build inputs), and that a
+// second run is a no-op.
 func TestMigration_Matrix(t *testing.T) {
 	cases := []struct {
 		name           string
@@ -154,11 +155,12 @@ func TestMigration_Matrix(t *testing.T) {
 			_, err = melange.ParseConfiguration(t.Context(), outPath)
 			require.NoError(t, err)
 
-			// No advisory was credited (no SecurityBumpModules): the rewrite
-			// - migration included - must not bump the epoch.
+			// No advisory was credited (no SecurityBumpModules), but the
+			// rewrite - migration included - changes the build inputs, so it
+			// bumps the epoch.
 			assert.True(t, gp.ActualChangesApplied)
 			assert.Empty(t, gp.SecurityFixes)
-			assert.False(t, epochWouldBump(t, gp), "a rewrite without fixes never bumps the epoch")
+			assert.True(t, epochWouldBump(t, gp), "a build-input rewrite bumps the epoch")
 
 			// Second run over the written file: nothing left to change.
 			again, cfg2 := migrationAnalysis(t, string(out), func(s string) string { return s }, tc.baselineTidies)

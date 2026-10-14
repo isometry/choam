@@ -1,6 +1,7 @@
 package gobump
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/isometry/choam/internal/scan"
@@ -129,6 +130,16 @@ func TestEpochComment(t *testing.T) {
 		assert.Equal(t, "updated bumps; fixes: GHSA-aaaa, GHSA-bbbb", epochComment(gp))
 	})
 
+	t.Run("build-input edit alone", func(t *testing.T) {
+		gp := NewProcessor("/t.yaml", "pkg", "1.0.0", 1)
+		gp.OriginalYAML = []byte("pipeline:\n  - uses: go/build\n    with:\n      go-package: go-1.24\n")
+		gp.CurrentYAML = []byte("pipeline:\n  - uses: go/build\n    with:\n      go-package: go-1.25\n")
+		assert.Equal(t, "updated build inputs", epochComment(gp))
+
+		gp.StdlibBumps = []StdlibBump{{RebuildGoVersion: "1.26.5", VulnIDs: []string{"GO-1"}}}
+		assert.Equal(t, "rebuild with go1.26.5; fixes: GO-1", epochComment(gp), "an existing clause already explains the bump")
+	})
+
 	t.Run("no trigger yields empty comment", func(t *testing.T) {
 		gp := NewProcessor("/t.yaml", "pkg", "1.0.0", 1)
 		assert.Empty(t, epochComment(gp))
@@ -164,4 +175,70 @@ func TestEpochComment(t *testing.T) {
 		gp.HygieneBumps = []SecurityFix{{Module: "m", Vulnerability: "GO-1"}}
 		assert.Empty(t, epochComment(gp))
 	})
+}
+
+// TestEpochTriggers_Matrix audits what bumps the epoch. wasBumping records
+// the rule before build-input diffs counted (security/hygiene fixes with
+// changes applied, or a stdlib staleness finding); every real edit to the
+// build inputs now bumps too, comment-only and epoch-only edits never do.
+func TestEpochTriggers_Matrix(t *testing.T) {
+	const base = `package:
+  name: pkg
+  version: 1.0.0
+  epoch: 1
+pipeline:
+  - uses: go/bump
+    with:
+      deps: example.com/a@v1.0.0 example.com/redundant@v1.2.0
+      go-version: "1.24"
+  - uses: go/build
+    with:
+      packages: ./cmd
+      go-package: go-1.24
+`
+	edit := func(old, new string) string { return strings.Replace(base, old, new, 1) }
+	tests := []struct {
+		name       string
+		current    string
+		state      func(gp *Processor)
+		wasBumping bool
+		want       bool
+	}{
+		{"security fix", edit("a@v1.0.0", "a@v1.0.1"), func(gp *Processor) {
+			gp.ActualChangesApplied = true
+			gp.SecurityFixes = []SecurityFix{{Module: "example.com/a", Vulnerability: "CVE-1"}}
+		}, true, true},
+		{"hygiene only", edit("a@v1.0.0", "a@v1.0.1"), func(gp *Processor) {
+			gp.ActualChangesApplied = true
+			gp.HygieneBumps = []SecurityFix{{Module: "example.com/a", Vulnerability: "CVE-1"}}
+		}, true, true},
+		{"stdlib stale only (clean file)", base, func(gp *Processor) { gp.StdlibBumps = []StdlibBump{{RebuildGoVersion: "1.24.5"}} }, true, true},
+		{"stdlib stale on a dirty file (trigger skipped)", base, func(*Processor) {}, false, false},
+		{"go-package pin raise only", edit("go-package: go-1.24", "go-package: go-1.25"), func(gp *Processor) { gp.ActualChangesApplied = true }, false, true},
+		{"go/bump -> bump migration", edit("  - uses: go/bump\n    with:\n      deps: example.com/a@v1.0.0 example.com/redundant@v1.2.0\n      go-version: \"1.24\"",
+			"  - uses: bump\n    with:\n      deps: example.com/a@v1.0.0 example.com/redundant@v1.2.0"), func(gp *Processor) { gp.ActualChangesApplied = true }, false, true},
+		{"redundant pin removed", edit(" example.com/redundant@v1.2.0", ""), func(gp *Processor) { gp.ActualChangesApplied = true }, false, true},
+		{"go-version fallback (--no-validate)", edit(`go-version: "1.24"`, `go-version: "1.25"`), func(gp *Processor) { gp.ActualChangesApplied = true }, false, true},
+		{"bump-step entry without a CVE", edit("redundant@v1.2.0", "redundant@v1.2.0 example.com/coherence@v0.3.0"), func(gp *Processor) { gp.ActualChangesApplied = true }, false, true},
+		{"comment-only rewrite", edit("  - uses: go/build", "  # build it\n  - uses: go/build"), func(gp *Processor) { gp.ActualChangesApplied = true }, false, false},
+		{"epoch line only", edit("epoch: 1", "epoch: 2 # bumped"), func(*Processor) {}, false, false},
+		{"nothing", base, func(*Processor) {}, false, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gp := NewProcessor("/t.yaml", "pkg", "1.0.0", 1)
+			gp.OriginalYAML, gp.CurrentYAML = []byte(base), []byte(tt.current)
+			tt.state(gp)
+			was := (gp.ActualChangesApplied && (len(gp.SecurityFixes) > 0 || len(gp.HygieneBumps) > 0)) || len(gp.StdlibBumps) > 0
+			assert.Equal(t, tt.wasBumping, was, "audit: the previous rule")
+			assert.Equal(t, tt.want, epochTriggers(gp))
+			wantEpoch := int64(1)
+			if tt.want {
+				wantEpoch = 2
+			}
+			assert.Equal(t, wantEpoch, apkNewEpoch(gp))
+			gp.ApkEpochTarget = 4
+			assert.Equal(t, int64(4), apkNewEpoch(gp), "the apk target still wins when higher")
+		})
+	}
 }

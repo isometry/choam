@@ -15,6 +15,7 @@ import (
 
 	"github.com/isometry/choam/internal/ecosystem"
 	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
+	"github.com/isometry/choam/internal/git"
 	"github.com/isometry/choam/internal/scan"
 	"github.com/isometry/choam/internal/simulate"
 )
@@ -169,7 +170,25 @@ func TestApkAdvisoryStage_Apply(t *testing.T) {
 		assert.Equal(t, int64(7), gp.ApkEpochTarget)
 		assert.Empty(t, gp.FirstPartyVulnIDs, "no PATCH-NEEDED")
 		assert.Empty(t, gp.Notes, "r9 sits above every proven advisory")
-		messagesContain(t, gp, "apk: CVE-N9 (CGA-n9, fixed in 3.6.0-r9) not proven fixed here (stdlib: no rebuild Go version recorded, rerun on a clean tree)")
+		messagesContain(t, gp, "apk: CVE-N9 (CGA-n9, fixed in 3.6.0-r9) not proven fixed here ("+apkCauseNoRebuildToolchain+")")
+	})
+
+	t.Run("tofu-controller shape on a dirty file: the rebuild toolchain proves r9", func(t *testing.T) {
+		gp := newApkTestProcessor()
+		gp.Config = stdlibTestConfig()
+		stdlib := newStdlibTestStage(Options{StdlibCheck: true}, staleIndex(), fixableScanner())
+		stdlib.lastCommit = func(context.Context, string) (*git.FileCommitInfo, error) {
+			return &git.FileCommitInfo{Time: stdlibCommitTime, Dirty: true}, nil
+		}
+		require.NoError(t, stdlib.Apply(t.Context(), gp))
+		require.Empty(t, gp.StdlibBumps, "the staleness trigger is skipped on a dirty file")
+
+		run(t, gp, clean(),
+			apkRecord("CGA-g6", []string{"CVE-G6", "GO-G6"}, "3.6.0-r6"),
+			apkRecord("CGA-g7", []string{"CVE-G7", "GHSA-g7"}, "3.6.0-r7"),
+			apkRecord("CGA-n9", []string{"CVE-N9", "GO-N9"}, "3.6.0-r9"))
+		assert.Equal(t, int64(9), gp.ApkEpochTarget)
+		assert.Equal(t, int64(9), apkNewEpoch(gp))
 	})
 
 	t.Run("non-proven below a proven advisory holds the epoch, with a note", func(t *testing.T) {

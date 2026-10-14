@@ -72,10 +72,10 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `internal/gobump/go_version_fallback.go` + `internal/gobump/go_fallback_stage.go` - best-effort `go-version` proxy fallback used under `--no-validate`
 - `internal/gobump/apk_advisory.go` - apk-advisory pure logic: fixed-epoch (`-rN`) parsing, proven/first-party classification, epoch target
 - `internal/gobump/apk_advisory_stage.go` - `apk_advisories` stage: queries the package's own Chainguard/Wolfi advisories, aligns the epoch, records first-party alerts (`PATCH-NEEDED`)
-- `internal/gobump/go_stdlib.go` + `internal/gobump/go_stdlib_stage.go` - Go stdlib staleness check and epoch-bump trigger (`--no-stdlib` to disable)
+- `internal/gobump/go_stdlib.go` + `internal/gobump/go_stdlib_stage.go` - Go stdlib staleness check and epoch-bump trigger (`--no-stdlib` to disable); `resolveRebuildVersions()` resolves the rebuild Go toolchain independently of git (`StdlibRebuildGoVersions`, the apk stage's stdlib proof)
 - `internal/gorelease/` - Go release index (latest stable release as-of a time / available now), backed by the module proxy's `golang.org/toolchain` pseudo-module
 - `internal/goversion/` - bare Go version comparison/parsing helpers shared across the above
-- `internal/git/local.go` - `LastCommitInfo()` last-commit-time/dirty/shallow lookup used by the stdlib staleness idempotency guard
+- `internal/git/local.go` - `LastCommitInfo()` last-commit-time/dirty/shallow lookup used by the stdlib staleness idempotency guard (a dirty/untracked/non-git file skips only the staleness trigger, not the rebuild-toolchain resolution)
 - `internal/ecosystem/` - per-language `Ecosystem` implementations (`golang/`, `rust/`, `java/`) behind a self-registering plugin registry
 - `internal/ecosystem/fetcher.go` - remote manifest fetching (go.mod/Cargo.lock/pom.xml)
 - `internal/scan/vulnerability.go` - `NewVulnerabilityScanner()` OSV scanner (language-agnostic `ScanPackages`; fails closed on incomplete pages or advisory lookups)
@@ -258,7 +258,7 @@ make fmt && make lint && make test
 - OSV database integration via `internal/scan/vulnerability.go`
 - Minimal fix strategy to reduce update impact
 - Reported advisory IDs are CVE-first (`scan.PreferredID`; `Vulnerability.Aliases` retained); the epoch is aligned to proven Chainguard/Wolfi apk advisories (`--no-apk-advisories` to disable) and never raised past an advisory not proven fixed
-- Epoch management tied to actual fixes (security fixes, scanner-hygiene bumps or stdlib rebuilds)
+- Epoch management tied to actual fixes (security fixes, scanner-hygiene bumps or stdlib rebuilds) and to any other edit this run writes to the build inputs (`Processor.buildInputsChanged`: parsed original vs current YAML minus `package.epoch`; comment-only rewrites do not count)
 - A module's security target is the highest fix among its LINKED advisories;
   advisories in unlinked packages of a linked module are info (UNLINKED) and
   at most a scanner-hygiene bump (`internal/simulate/hygiene.go`), never a

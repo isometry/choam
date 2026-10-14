@@ -87,7 +87,7 @@ func TestClassifyApk(t *testing.T) {
 		{"module not open", []apkComponent{module("CVE-1", "GO-1")}, ev, apkProven, ""},
 		{"module open via alias", []apkComponent{module("CVE-1", "GO-OPEN")}, ev, apkUnproven, "module golang.org/x/net residual, unlinked or not proven fixed"},
 		{"module outside the graph", []apkComponent{{kind: apkOutside, module: "example.com/other"}}, ev, apkUnproven, "module example.com/other not in the analysed graph"},
-		{"stdlib without proof", []apkComponent{stdlib("CVE-1")}, ev, apkUnproven, "stdlib: no rebuild Go version recorded, rerun on a clean tree"},
+		{"stdlib without proof", []apkComponent{stdlib("CVE-1")}, ev, apkUnproven, apkCauseNoRebuildToolchain},
 		{"stdlib proven", []apkComponent{stdlib("CVE-1")}, proof, apkProven, ""},
 		{"stdlib still affected", []apkComponent{stdlib("CVE-STILL")}, proof, apkUnproven, "stdlib: still affected at the rebuild Go version"},
 		{"stdlib proven, empty remaining", []apkComponent{stdlib("CVE-1")}, apkEvidence{stdlibRemaining: idSet()}, apkProven, ""},
@@ -96,7 +96,7 @@ func TestClassifyApk(t *testing.T) {
 		{"dual: both proven", []apkComponent{stdlib("CVE-1"), module("CVE-1")}, proof, apkProven, ""},
 		{"dual: module open", []apkComponent{stdlib("CVE-OPEN"), module("CVE-OPEN")}, proof, apkUnproven, "module golang.org/x/net residual, unlinked or not proven fixed"},
 		{"dual: stdlib remaining", []apkComponent{stdlib("CVE-STILL"), module("CVE-STILL")}, proof, apkUnproven, "stdlib: still affected at the rebuild Go version"},
-		{"dual: no stdlib proof", []apkComponent{module("CVE-1"), stdlib("CVE-1")}, ev, apkUnproven, "stdlib: no rebuild Go version recorded, rerun on a clean tree"},
+		{"dual: no stdlib proof", []apkComponent{module("CVE-1"), stdlib("CVE-1")}, ev, apkUnproven, apkCauseNoRebuildToolchain},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
