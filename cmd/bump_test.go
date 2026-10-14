@@ -675,13 +675,13 @@ func TestRenderDetails(t *testing.T) {
 			{Module: "golang.org/x/net", OldVersion: "v0.1.0", NewVersion: "v0.2.0", Vulnerability: "GO-2026-1, CVE-2026-1"},
 		},
 		HygieneBumps: []gobump.SecurityFix{{Module: "golang.org/x/text", OldVersion: "v0.1.0", NewVersion: "v0.3.0", Vulnerability: "GO-2026-9"}},
-		ApkAlignment: &gobump.ApkAlignment{Version: "0.16.5-r1", TargetEpoch: 7, HighestFixedEpoch: 9, BlockedAt: 9, Proven: 2, Unproven: 1, Ignored: 2, Uncorrelated: 1},
+		ApkAlignment: &gobump.ApkAlignment{Version: "0.16.5-r1", TargetEpoch: 7, HighestFixedEpoch: 9, BlockedAt: 9, Proven: 2, Unproven: 1, NotApplicable: 1, Ignored: 2, Uncorrelated: 1},
 		ApkAdvisories: []gobump.ApkAdvisory{
 			{ID: "CGA-g7", Upstream: []string{"GHSA-g7", "CVE-G7"}, FixedVersion: "0.16.5-r7", FixedEpoch: 7, Status: "proven"},
 			{ID: "CGA-g7b", Upstream: []string{"CVE-G7"}, FixedVersion: "0.16.5-r7", FixedEpoch: 7, Status: "proven"}, // same issue, other ecosystem
 			{ID: "CGA-g6", Upstream: []string{"GO-G6"}, FixedVersion: "0.16.5-r6", FixedEpoch: 6, Status: "proven"},
 			{ID: "CGA-m9", Upstream: []string{"CVE-M9"}, FixedVersion: "0.16.5-r9", FixedEpoch: 9, Status: "first-party", Reason: "affects example.com/self, this package's own module"},
-			{ID: "CGA-x9", Upstream: []string{"CVE-X9"}, FixedVersion: "0.16.5-r9", FixedEpoch: 9, Status: "unproven", Reason: "module example.com/x not in the analysed graph"},
+			{ID: "CGA-x9", Upstream: []string{"CVE-X9"}, FixedVersion: "0.16.5-r9", FixedEpoch: 9, Status: "not-applicable", Reason: "module example.com/x not in the dependency graph"},
 			{ID: "CGA-n9b", Upstream: []string{"CVE-N9b"}, FixedVersion: "0.16.5-r9", FixedEpoch: 9, Status: "unproven", Reason: "stdlib: the rebuild Go toolchain could not be resolved"},
 			{ID: "CGA-n9", Upstream: []string{"CVE-N9"}, FixedVersion: "0.16.5-r9", FixedEpoch: 9, Status: "unproven", Reason: "stdlib: the rebuild Go toolchain could not be resolved"},
 		},
@@ -698,10 +698,10 @@ Details for tofu:
   Advisories:
     - golang.org/x/crypto (GO-2) vulnerable but not linked
   apk:
-    - 0.16.5-r1: 2 proven, 1 unproven, 0 first-party, 2 ignored (1 without an upstream ID); reached -r7 of highest -r9
+    - 0.16.5-r1: 2 proven, 1 unproven, 0 first-party, 1 not applicable, 2 ignored (1 without an upstream ID); reached -r7 of highest -r9
     - proven: CVE-G7, GO-G6
     - first-party CVE-M9 (CGA-m9, fixed in 0.16.5-r9): affects example.com/self, this package's own module
-    - unproven in -r9 (1): CVE-X9 (CGA-x9): module example.com/x not in the analysed graph
+    - not applicable in -r9 (1): CVE-X9 (CGA-x9): module example.com/x not in the dependency graph
     - unproven in -r9 (2): CVE-N9 (CGA-n9), CVE-N9b (CGA-n9b): stdlib: the rebuild Go toolchain could not be resolved
   stdlib:
     - stdlib: trigger skipped
@@ -711,6 +711,8 @@ Details for tofu:
 
 	js := captureStdout(t, func() { require.NoError(t, outputBumpStructured([]*gobump.Result{result}, "json")) })
 	assert.Contains(t, js, `"YAML validation passed"`, "hidden messages stay in the JSON")
+	assert.Contains(t, js, `"status": "not-applicable"`)
+	assert.Contains(t, js, `"not_applicable": 1`)
 	assert.NotContains(t, js, "message_sections")
 
 	assert.Empty(t, captureStdout(t, func() { renderDetails(&gobump.Result{PackageName: "quiet"}) }))

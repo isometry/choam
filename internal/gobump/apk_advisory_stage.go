@@ -328,11 +328,11 @@ func reportApk(gp *Processor, advs []ApkAdvisory, unresolved string) {
 	}
 	align := gp.ApkAlignment
 	align.TargetEpoch = gp.ApkEpochTarget
-	var highestProven int64
+	var highestClearable int64 // proven or not-applicable
 	for _, adv := range advs {
 		align.HighestFixedEpoch = max(align.HighestFixedEpoch, adv.FixedEpoch)
-		if adv.Status == apkProven {
-			highestProven = max(highestProven, adv.FixedEpoch)
+		if apkClearable(adv.Status) {
+			highestClearable = max(highestClearable, adv.FixedEpoch)
 		} else if align.BlockedAt == 0 || adv.FixedEpoch < align.BlockedAt {
 			align.BlockedAt = adv.FixedEpoch
 		}
@@ -348,7 +348,7 @@ func reportApk(gp *Processor, advs []ApkAdvisory, unresolved string) {
 			continue
 		}
 		seen[key] = true
-		blocking := adv.FixedEpoch <= highestProven || adv.FixedEpoch == align.BlockedAt
+		blocking := adv.FixedEpoch <= highestClearable || adv.FixedEpoch == align.BlockedAt
 		subject := fmt.Sprintf("%s (%s, fixed in %s)", id, adv.ID, adv.FixedVersion)
 		switch adv.Status {
 		case apkFirstParty:
@@ -381,6 +381,8 @@ func reportApk(gp *Processor, advs []ApkAdvisory, unresolved string) {
 					blockers[k] = append(blockers[k], id)
 				}
 			}
+		case apkNotApplicable:
+			align.NotApplicable++ // never blocks, never an action
 		default:
 			align.Proven++
 		}

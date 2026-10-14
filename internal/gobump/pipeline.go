@@ -242,16 +242,28 @@ func epochFixedVulnIDs(gp *Processor) []string {
 	return slices.Sorted(maps.Keys(ids))
 }
 
-// apkAlignedVulnIDs are the (CVE-first) IDs of the proven APK advisories the
-// epoch target clears.
+// apkAlignedVulnIDs are the (CVE-first) IDs of the APK advisories the epoch
+// target clears: the proven ones, then the not-applicable ones.
 func apkAlignedVulnIDs(gp *Processor) []string {
-	ids := make(map[string]struct{})
+	proven, notApplicable := make(map[string]struct{}), make(map[string]struct{})
 	for _, adv := range gp.ApkAdvisories {
-		if adv.Status == apkProven && adv.FixedEpoch > 0 && adv.FixedEpoch <= gp.ApkEpochTarget {
-			ids[apkDisplayID(adv)] = struct{}{}
+		if adv.FixedEpoch == 0 || adv.FixedEpoch > gp.ApkEpochTarget {
+			continue
+		}
+		switch adv.Status {
+		case apkProven:
+			proven[apkDisplayID(adv)] = struct{}{}
+		case apkNotApplicable:
+			notApplicable[apkDisplayID(adv)] = struct{}{}
 		}
 	}
-	return slices.Sorted(maps.Keys(ids))
+	ids := slices.Sorted(maps.Keys(proven))
+	for _, id := range slices.Sorted(maps.Keys(notApplicable)) {
+		if _, ok := proven[id]; !ok {
+			ids = append(ids, id)
+		}
+	}
+	return ids
 }
 
 // analysisSeverities maps every advisory ID the analysis scan found to its

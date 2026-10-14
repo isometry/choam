@@ -86,7 +86,11 @@ func TestClassifyApk(t *testing.T) {
 		{"root module", []apkComponent{module("CVE-1"), {kind: apkRoot, module: "example.com/self"}}, ev, apkFirstParty, "affects example.com/self, this package's own module"},
 		{"module not open", []apkComponent{module("CVE-1", "GO-1")}, ev, apkProven, ""},
 		{"module open via alias", []apkComponent{module("CVE-1", "GO-OPEN")}, ev, apkUnproven, "module golang.org/x/net residual, unlinked or not proven fixed"},
-		{"module outside the graph", []apkComponent{{kind: apkOutside, module: "example.com/other"}}, ev, apkUnproven, "module example.com/other not in the analysed graph"},
+		{"outside the graph only", []apkComponent{{kind: apkOutside, module: "example.com/other"}, {kind: apkOutside, module: "example.com/more"}, {kind: apkOutside, module: "example.com/other"}}, ev, apkNotApplicable, "modules example.com/other, example.com/more not in the dependency graph"},
+		{"outside + proven module", []apkComponent{{kind: apkOutside, module: "example.com/other"}, module("CVE-1")}, ev, apkProven, ""},
+		{"outside + open module", []apkComponent{{kind: apkOutside, module: "example.com/other"}, module("CVE-OPEN")}, ev, apkUnproven, "module golang.org/x/net residual, unlinked or not proven fixed"},
+		{"outside + root", []apkComponent{{kind: apkOutside, module: "example.com/other"}, {kind: apkRoot, module: "example.com/self"}}, ev, apkFirstParty, "affects example.com/self, this package's own module"},
+		{"outside + stdlib proven", []apkComponent{{kind: apkOutside, module: "example.com/other"}, stdlib("CVE-1")}, proof, apkProven, ""},
 		{"stdlib without proof", []apkComponent{stdlib("CVE-1")}, ev, apkUnproven, apkCauseNoRebuildToolchain},
 		{"stdlib proven", []apkComponent{stdlib("CVE-1")}, proof, apkProven, ""},
 		{"stdlib still affected", []apkComponent{stdlib("CVE-STILL")}, proof, apkUnproven, "stdlib: still affected at the rebuild Go version"},
@@ -155,6 +159,10 @@ func TestApkEpochTarget(t *testing.T) {
 		{"r6 and r7 proven, r9 unproven", []ApkAdvisory{adv(apkProven, 7), adv(apkUnproven, 9), adv(apkProven, 6)}, 7},
 		{"same N proven and unproven", []ApkAdvisory{adv(apkProven, 2), adv(apkUnproven, 2)}, 0},
 		{"all proven", []ApkAdvisory{adv(apkProven, 2), adv(apkProven, 4)}, 4},
+		{"r6 n/a, r7 n/a, r8 proven, r9 proven", []ApkAdvisory{adv(apkNotApplicable, 6), adv(apkNotApplicable, 7), adv(apkProven, 8), adv(apkProven, 9)}, 9},
+		{"only n/a at r6", []ApkAdvisory{adv(apkNotApplicable, 6)}, 6},
+		{"r6 unproven, r7 n/a", []ApkAdvisory{adv(apkUnproven, 6), adv(apkNotApplicable, 7)}, 0},
+		{"n/a above a blocker not reached", []ApkAdvisory{adv(apkProven, 2), adv(apkFirstParty, 3), adv(apkNotApplicable, 4)}, 2},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

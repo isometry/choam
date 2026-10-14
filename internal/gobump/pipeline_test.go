@@ -272,6 +272,19 @@ func TestEpochReasons(t *testing.T) {
 				{Kind: "apk", Text: "align with chainguard apk -r3", VulnIDs: []string{"CVE-A"}},
 			},
 		},
+		"apk with not-applicable advisories": {
+			setup: func(gp *Processor) {
+				gp.ApkEpochTarget = 9
+				gp.ApkAdvisories = []ApkAdvisory{
+					{ID: "CGA-z6", Upstream: []string{"CVE-Z"}, FixedEpoch: 6, Status: apkNotApplicable},
+					{ID: "CGA-z7", Upstream: []string{"CVE-Z"}, FixedEpoch: 7, Status: apkNotApplicable},
+					{ID: "CGA-b", Upstream: []string{"CVE-B"}, FixedEpoch: 9, Status: apkProven},
+					{ID: "CGA-a", Upstream: []string{"CVE-A"}, FixedEpoch: 8, Status: apkProven},
+					{ID: "CGA-u", Upstream: []string{"CVE-U"}, FixedEpoch: 11, Status: apkNotApplicable}, // above the target
+				}
+			},
+			want: []EpochReason{{Kind: "apk", Text: "align with chainguard apk -r9", VulnIDs: []string{"CVE-A", "CVE-B", "CVE-Z"}}},
+		},
 		"hygiene only": {
 			setup: func(gp *Processor) {
 				gp.ActualChangesApplied = true

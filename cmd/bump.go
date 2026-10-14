@@ -347,7 +347,11 @@ func apkDetailLines(result *gobump.Result) []string {
 	if apk.Uncorrelated > 0 {
 		ignored += fmt.Sprintf(" (%d without an upstream ID)", apk.Uncorrelated)
 	}
-	counts := fmt.Sprintf("%s: %d proven, %d unproven, %d first-party, %s", apk.Version, apk.Proven, apk.Unproven, apk.FirstParty, ignored)
+	counts := fmt.Sprintf("%s: %d proven, %d unproven, %d first-party, ", apk.Version, apk.Proven, apk.Unproven, apk.FirstParty)
+	if apk.NotApplicable > 0 {
+		counts += fmt.Sprintf("%d not applicable, ", apk.NotApplicable)
+	}
+	counts += ignored
 	if apk.HighestFixedEpoch > 0 {
 		counts += fmt.Sprintf("; reached -r%d of highest -r%d", result.NewEpoch, apk.HighestFixedEpoch)
 	}
@@ -383,15 +387,15 @@ func apkDetailLines(result *gobump.Result) []string {
 	slices.SortFunc(open, func(a, b gobump.ApkAdvisory) int {
 		return cmp.Or(cmp.Compare(a.FixedEpoch, b.FixedEpoch), cmp.Compare(cveRank(a.DisplayID()), cveRank(b.DisplayID())), strings.Compare(a.DisplayID(), b.DisplayID()))
 	})
-	// Unproven advisories group by (fix epoch, cause) - open is sorted, so a
-	// group is a run of equal keys once sorted by cause too; first-party ones
-	// stay one line each.
+	// Unproven and not-applicable advisories group by (fix epoch, status,
+	// cause) - open is sorted, so a group is a run of equal keys once sorted
+	// by cause too; first-party ones stay one line each.
 	slices.SortStableFunc(open, func(a, b gobump.ApkAdvisory) int {
 		return cmp.Or(cmp.Compare(a.FixedEpoch, b.FixedEpoch), strings.Compare(a.Status, b.Status), strings.Compare(a.Reason, b.Reason))
 	})
 	for i := 0; i < len(open); {
 		adv := open[i]
-		if adv.Status != "unproven" { // gobump's apkUnproven
+		if adv.Status != "unproven" && adv.Status != "not-applicable" { // gobump's apkUnproven, apkNotApplicable
 			lines = append(lines, fmt.Sprintf("%s %s (%s, fixed in %s): %s", adv.Status, adv.DisplayID(), adv.ID, adv.FixedVersion, adv.Reason))
 			i++
 			continue
@@ -400,7 +404,7 @@ func apkDetailLines(result *gobump.Result) []string {
 		for ; i < len(open) && open[i].Status == adv.Status && open[i].FixedEpoch == adv.FixedEpoch && open[i].Reason == adv.Reason; i++ {
 			ids = append(ids, fmt.Sprintf("%s (%s)", open[i].DisplayID(), open[i].ID))
 		}
-		lines = append(lines, fmt.Sprintf("unproven in -r%d (%d): %s: %s", adv.FixedEpoch, len(ids), strings.Join(ids, ", "), adv.Reason))
+		lines = append(lines, fmt.Sprintf("%s in -r%d (%d): %s: %s", strings.ReplaceAll(adv.Status, "-", " "), adv.FixedEpoch, len(ids), strings.Join(ids, ", "), adv.Reason))
 	}
 	return lines
 }

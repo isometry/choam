@@ -48,7 +48,7 @@ type ApkAdvisory struct {
 	Upstream     []string `json:"upstream" yaml:"upstream"`                   // CVE-/GHSA-/GO- IDs it covers
 	FixedVersion string   `json:"fixed_version" yaml:"fixed_version"`         // "<version>-r<FixedEpoch>"
 	FixedEpoch   int64    `json:"fixed_epoch" yaml:"fixed_epoch"`             // N > the pristine epoch
-	Status       string   `json:"status" yaml:"status"`                       // proven, unproven, first-party
+	Status       string   `json:"status" yaml:"status"`                       // proven, unproven, first-party, not-applicable
 	Reason       string   `json:"reason,omitempty" yaml:"reason,omitempty"`   // why not proven
 	Modules      []string `json:"modules,omitempty" yaml:"modules,omitempty"` // affected modules, from the upstream records
 }
@@ -80,7 +80,8 @@ type EpochReason struct {
 // Version is the pristine "<version>-r<epoch>" queried; TargetEpoch the
 // epoch aligned to (Result.ApkEpochTarget); HighestFixedEpoch the highest
 // fix epoch among addressable advisories; BlockedAt the lowest non-proven
-// fix epoch (0 = none); the counts are per display ID and fix; Ignored counts
+// fix epoch other than not-applicable ones (0 = none); the counts are per
+// display ID and fix; Ignored counts
 // the advisories no epoch can clear or that cannot be correlated, of which
 // Uncorrelated those without an upstream CVE/GHSA/GO ID.
 type ApkAlignment struct {
@@ -91,6 +92,7 @@ type ApkAlignment struct {
 	Proven            int    `json:"proven" yaml:"proven"`
 	Unproven          int    `json:"unproven" yaml:"unproven"`
 	FirstParty        int    `json:"first_party" yaml:"first_party"`
+	NotApplicable     int    `json:"not_applicable,omitempty" yaml:"not_applicable,omitempty"`
 	Ignored           int    `json:"ignored" yaml:"ignored"`
 	Uncorrelated      int    `json:"uncorrelated,omitempty" yaml:"uncorrelated,omitempty"`
 }

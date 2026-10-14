@@ -14,6 +14,10 @@ const (
 	apkProven     = "proven"      // every component its upstream records affect is provably fixed here
 	apkUnproven   = "unproven"    // some component is still open, or cannot be verified
 	apkFirstParty = "first-party" // an upstream record affects this package's own module
+	// apkNotApplicable: every affected package is outside the analysed
+	// dependency graph, so the shipped artifact cannot contain it - a scanner
+	// hit on our APK is a false positive the matching epoch clears.
+	apkNotApplicable = "not-applicable"
 )
 
 // apkEcosystems are the OSV ecosystems Chainguard publishes APK advisories
@@ -112,10 +116,13 @@ type apkEvidence struct {
 }
 
 // classifyApk gives an advisory its status and, unless proven, the cause:
-// first-party when any component is the package's own module, otherwise
-// proven only when it has components and every one is proven - a stdlib one
-// not affecting Go at the recorded rebuild versions, a scanned module not
-// open (fixed here, or never affected at the version shipped).
+// first-party when any component is the package's own module; unproven when
+// any component is open or unverifiable (a stdlib one still affecting Go at
+// the recorded rebuild versions or without one, a scanned module open, no
+// record); otherwise proven when some component is proven (a stdlib one
+// clear at the rebuild versions, a scanned module fixed here or never
+// affected at the version shipped), ignoring components outside the graph;
+// not-applicable when every component is outside the graph.
 func classifyApk(components []apkComponent, ev apkEvidence) (status, cause string) {
 	if len(components) == 0 {
 		return apkUnproven, "no upstream advisory record"
@@ -125,6 +132,7 @@ func classifyApk(components []apkComponent, ev apkEvidence) (status, cause strin
 			return apkFirstParty, "affects " + c.module + ", this package's own module"
 		}
 	}
+	var outside []string
 	for _, c := range components {
 		switch c.kind {
 		case apkStdlib:
@@ -139,10 +147,15 @@ func classifyApk(components []apkComponent, ev apkEvidence) (status, cause strin
 				return apkUnproven, "module " + c.module + " residual, unlinked or not proven fixed"
 			}
 		case apkOutside:
-			return apkUnproven, "module " + c.module + " not in the analysed graph"
+			if !slices.Contains(outside, c.module) {
+				outside = append(outside, c.module)
+			}
 		default:
 			return apkUnproven, "no upstream advisory record"
 		}
+	}
+	if !slices.ContainsFunc(components, func(c apkComponent) bool { return c.kind != apkOutside }) {
+		return apkNotApplicable, pluralize(len(outside), "module ", "modules ") + strings.Join(outside, ", ") + " not in the dependency graph"
 	}
 	return apkProven, ""
 }
@@ -156,20 +169,27 @@ func anyIn(ids []string, set map[string]struct{}) bool {
 }
 
 // apkEpochTarget is the highest -rN such that every addressable advisory at
-// or below it is proven: the epoch stops below the lowest non-proven one.
-// 0 when no proven advisory sits below every non-proven one.
+// or below it is proven or not applicable: the epoch stops below the lowest
+// other (unproven or first-party) one. 0 when nothing clearable sits below
+// every blocker.
 func apkEpochTarget(advs []ApkAdvisory) int64 {
 	blocker := int64(math.MaxInt64)
 	for _, adv := range advs {
-		if adv.Status != apkProven {
+		if !apkClearable(adv.Status) {
 			blocker = min(blocker, adv.FixedEpoch)
 		}
 	}
 	var target int64
 	for _, adv := range advs {
-		if adv.Status == apkProven && adv.FixedEpoch < blocker {
+		if apkClearable(adv.Status) && adv.FixedEpoch < blocker {
 			target = max(target, adv.FixedEpoch)
 		}
 	}
 	return target
+}
+
+// apkClearable reports whether an advisory with status may be cleared by the
+// epoch: proven fixed here, or not applicable to what ships.
+func apkClearable(status string) bool {
+	return status == apkProven || status == apkNotApplicable
 }
