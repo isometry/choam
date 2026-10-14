@@ -315,7 +315,7 @@ func reportModrootResult(ctx context.Context, gp *Processor, m *ModrootAnalysis,
 			gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s@%s %s - no bump proposed",
 				m.Modroot, dropped.Module, dropped.Version, strings.TrimPrefix(dropped.Reason, "scanner hygiene: ")))
 		}
-		logging.From(ctx).Info("bump candidate dropped by simulation",
+		logging.From(ctx).Debug("bump candidate dropped by simulation",
 			"module", dropped.Module, "version", dropped.Version, "reason", dropped.Reason)
 	}
 	for _, h := range result.HygieneModules {
@@ -328,7 +328,7 @@ func reportModrootResult(ctx context.Context, gp *Processor, m *ModrootAnalysis,
 	}
 	reportBlindSpots(gp, m.Modroot, result)
 	for _, residual := range result.Residuals {
-		logging.From(ctx).Warn("residual vulnerability after simulation",
+		logging.From(ctx).Debug("residual vulnerability after simulation",
 			"module", residual.Module,
 			"resolved", residual.ResolvedVersion, "fix", residual.FixedVersion,
 			"vulns", strings.Join(residual.VulnIDs, ","), "reason", residual.Reason)
@@ -406,7 +406,7 @@ func reportUnreachable(ctx context.Context, gp *Processor, reach *reachabilityDi
 				module.name, strings.Join(module.vulnIDs, ", "))
 		}
 		gp.AddMessage(msg)
-		logging.From(ctx).Info("advisory in unlinked code - no bump proposed",
+		logging.From(ctx).Debug("advisory in unlinked code - no bump proposed",
 			"module", module.name, "module_linked", module.moduleLinked, "degraded", module.degraded, "vulns", strings.Join(module.vulnIDs, ","))
 	}
 }
@@ -445,8 +445,8 @@ func (s *SimulationStage) failClosed(err error) bool {
 // degrade and write an unvalidated result as if simulation had merely failed.
 func (s *SimulationStage) degrade(ctx context.Context, gp *Processor, err error) {
 	gp.Validated = false
-	logging.From(ctx).Warn("bump simulation unavailable - proceeding with UNVALIDATED deps", "error", err)
-	gp.AddMessage(fmt.Sprintf("WARNING: deps list NOT validated - simulation unavailable: %v", err))
+	gp.SimulationError = err.Error()
+	logging.From(ctx).Info("bump simulation unavailable - proceeding with UNVALIDATED deps", "error", err)
 }
 
 // seedCandidates converts a modroot's post-FilterBumps desired deps and its

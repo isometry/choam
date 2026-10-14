@@ -327,7 +327,7 @@ func (v *VulnerabilityChecker) analyzeModroot(ctx context.Context, eco ecosystem
 			VulnIDs:         h.Bump.VulnIDs,
 			Reason:          h.Reason,
 		})
-		logging.From(ctx).Warn("fix held back", "module", h.Bump.Name, "fix", h.Bump.FixedVersion, "reason", h.Reason)
+		logging.From(ctx).Debug("fix held back", "module", h.Bump.Name, "fix", h.Bump.FixedVersion, "reason", h.Reason)
 	}
 	gp.AddResiduals(heldResiduals)
 

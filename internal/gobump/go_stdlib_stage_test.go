@@ -175,7 +175,7 @@ func TestStdlibStage_RebuildGoVersions(t *testing.T) {
 		require.NoError(t, newStdlibTestStage(Options{StdlibCheck: true}, index, fixableScanner()).Apply(t.Context(), gp))
 		assert.Nil(t, gp.StdlibRebuildGoVersions)
 		assert.False(t, gp.StdlibChecked)
-		messagesContain(t, gp, "stdlib: staleness check unavailable")
+		notesContain(t, gp, "stdlib: staleness check unavailable")
 	})
 
 	t.Run("cancellation propagates", func(t *testing.T) {
@@ -231,6 +231,7 @@ func TestStdlibStage_SkipGates(t *testing.T) {
 		commitInfo  *git.FileCommitInfo
 		commitErr   error
 		wantMessage string
+		wantNote    bool // recorded via skipWarn (a default-verbosity note), not a message
 	}{
 		{
 			name:        "dirty file skips (idempotency guard)",
@@ -251,6 +252,7 @@ func TestStdlibStage_SkipGates(t *testing.T) {
 			name:        "unexpected git error skips with warning",
 			commitErr:   errors.New("index corrupt"),
 			wantMessage: "could not determine the melange file's last commit",
+			wantNote:    true,
 		},
 	}
 
@@ -268,7 +270,11 @@ func TestStdlibStage_SkipGates(t *testing.T) {
 			assert.False(t, gp.StdlibChecked)
 			assert.Zero(t, index.asOfCalls, "skip must happen before any staleness lookup")
 			assert.Equal(t, []string{"1.24.5"}, gp.StdlibRebuildGoVersions, "the rebuild toolchain is resolved regardless of git")
-			messagesContain(t, gp, tt.wantMessage)
+			if tt.wantNote {
+				notesContain(t, gp, tt.wantMessage)
+			} else {
+				messagesContain(t, gp, tt.wantMessage)
+			}
 		})
 	}
 }
@@ -283,7 +289,7 @@ func TestStdlibStage_ShallowWarnsAndContinues(t *testing.T) {
 
 	require.NoError(t, stage.Apply(t.Context(), gp))
 	require.Len(t, gp.StdlibBumps, 1, "shallow history warns but must not skip")
-	messagesContain(t, gp, "repository history is shallow")
+	notesContain(t, gp, "repository history is shallow")
 }
 
 func TestStdlibStage_IndexFailureDegradesToSkip(t *testing.T) {
@@ -294,7 +300,7 @@ func TestStdlibStage_IndexFailureDegradesToSkip(t *testing.T) {
 	require.NoError(t, stage.Apply(t.Context(), gp), "index failure must degrade, never error")
 	assert.Empty(t, gp.StdlibBumps)
 	assert.False(t, gp.StdlibChecked)
-	messagesContain(t, gp, "staleness check unavailable")
+	notesContain(t, gp, "staleness check unavailable")
 	assert.Empty(t, gp.GetErrors())
 }
 
@@ -308,7 +314,7 @@ func TestStdlibStage_NilIndexDegradesToSkip(t *testing.T) {
 
 	require.NoError(t, stage.Apply(t.Context(), gp))
 	assert.Empty(t, gp.StdlibBumps)
-	messagesContain(t, gp, "release index/scanner unavailable")
+	notesContain(t, gp, "release index/scanner unavailable")
 }
 
 func TestStdlibStage_ReusesSimulationLinkedSet(t *testing.T) {
@@ -393,7 +399,7 @@ func TestStdlibStage_FallbackCloneOnlyWhenFixableVulnsFound(t *testing.T) {
 		require.NoError(t, stage.Apply(t.Context(), gp))
 		require.Len(t, gp.StdlibBumps, 1, "unfiltered findings must stand when the clone fails")
 		assert.False(t, gp.StdlibBumps[0].Validated)
-		messagesContain(t, gp, "not filtered by artifact reachability")
+		notesContain(t, gp, "not filtered by artifact reachability")
 	})
 }
 

@@ -745,3 +745,29 @@ func TestEpochStage_Apply_InlineComment(t *testing.T) {
 		assert.NotContains(t, string(proc.CurrentYAML), "epoch: 0 #")
 	})
 }
+
+// TestEpochStage_Apply_CommentIsReason: when the strategy provides an epoch
+// comment it replaces GetReason in the message (dry run and real), with no
+// ": <comment>" suffix; the words `update` greps for stay in the wording.
+func TestEpochStage_Apply_CommentIsReason(t *testing.T) {
+	const comment = "updated bumps; fixes: GHSA-xxxx"
+	testYAML := "package:\n  name: test-package\n  version: \"1.2.3\"\n  epoch: 1\n"
+	strategy := &BumpOnSecurityFixStrategy{CommentFunc: func(processor.Processor) string { return comment }}
+
+	for _, tt := range []struct {
+		name   string
+		dryRun bool
+		want   string
+	}{
+		{"dry run", true, "would update epoch: 1 -> 2 (" + comment + ")"},
+		{"real", false, "epoch updated: 1 -> 2 (" + comment + ")"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			proc := newMockProcessor("test-package", "1.2.3", 1, processor.ProcessorOptions{DryRun: tt.dryRun})
+			proc.OriginalYAML, proc.CurrentYAML = []byte(testYAML), []byte(testYAML)
+			proc.Changes = []processor.Change{{Type: "security"}}
+			require.NoError(t, NewEpochStage(strategy).Apply(context.Background(), proc))
+			assert.Equal(t, []string{tt.want}, proc.GetMessages())
+		})
+	}
+}

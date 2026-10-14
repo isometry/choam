@@ -35,6 +35,10 @@ type Processor struct {
 	Validated bool                `json:"validated"`
 	Residuals []simulate.Residual `json:"residuals,omitempty"`
 
+	// SimulationError is why simulation was unavailable (set when the run
+	// degraded to the unvalidated candidate set); "" otherwise.
+	SimulationError string `json:"simulation_error,omitempty"`
+
 	// UnreachableVulnIDs are advisory IDs found by the analysis scan whose
 	// modules are not linked into any build artifact in ANY modroot (see
 	// SimulationStage's reachability diff) - informational: no bump is
@@ -151,7 +155,7 @@ func (p *Processor) AddHygieneBump(fix SecurityFix) {
 // Skip records why (part of) the package was not analyzed: logged now, and
 // reported with the result (see SkipReasons).
 func (p *Processor) Skip(ctx context.Context, reason string) {
-	logging.From(ctx).Info("skipped", "reason", reason)
+	logging.From(ctx).Debug("skipped", "reason", reason)
 	p.SkipReasons = append(p.SkipReasons, reason)
 }
 
@@ -380,6 +384,7 @@ func (p *Processor) ToResult() *Result {
 		UnreachableVulnIDs:         unreachableIDs,
 		ModulesBumped:              modulesBumped,
 		Validated:                  p.Validated,
+		SimulationError:            p.SimulationError,
 		Residuals:                  residuals,
 		CriticalFixed:              criticalFixed,
 		HighFixed:                  highFixed,

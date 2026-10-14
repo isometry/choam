@@ -348,7 +348,7 @@ func TestApkAdvisoryStage_Failures(t *testing.T) {
 		gp := newApkTestProcessor()
 		require.NoError(t, newApkTestStage(&fakeApkSource{err: errors.New("boom")}, &fakeStdlibScanner{}).Apply(t.Context(), gp))
 		assert.Zero(t, gp.ApkEpochTarget)
-		messagesContain(t, gp, "apk: advisory check unavailable (boom) - skipping")
+		notesContain(t, gp, "apk: advisory check unavailable (boom) - skipping")
 	})
 
 	t.Run("upstream record error - skip, no raise", func(t *testing.T) {
@@ -399,6 +399,6 @@ func TestApkAdvisoryStage_Failures(t *testing.T) {
 	t.Run("no source - skip", func(t *testing.T) {
 		gp := newApkTestProcessor()
 		require.NoError(t, NewApkAdvisoryStage(nil, Options{ApkAdvisoryCheck: true}).Apply(t.Context(), gp))
-		messagesContain(t, gp, "apk: advisory source unavailable")
+		notesContain(t, gp, "apk: advisory source unavailable")
 	})
 }

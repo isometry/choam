@@ -108,23 +108,24 @@ func (e *EpochStage) Apply(ctx context.Context, p processor.Processor) error {
 
 	newEpoch := e.Strategy.CalculateNewEpoch(p)
 	oldEpoch := p.GetCurrentEpoch()
-	reason := e.Strategy.GetReason()
 
-	// Inline intent comment when the strategy can compose one.
+	// Inline intent comment when the strategy can compose one; it is also the
+	// reason shown in logs and messages (it states what actually happened,
+	// unlike the per-strategy constant GetReason).
 	var comment string
 	if commenter, ok := e.Strategy.(epochCommenter); ok {
 		comment = commenter.EpochComment(p)
+	}
+	reason := comment
+	if reason == "" {
+		reason = e.Strategy.GetReason()
 	}
 
 	if p.GetOptions().DryRun {
 		logger.Info("Dry run - would update epoch",
 			"old", oldEpoch, "new", newEpoch, "reason", reason)
 		p.SetEpochUpdate(oldEpoch, newEpoch)
-		msg := fmt.Sprintf("would update epoch: %d -> %d (%s)", oldEpoch, newEpoch, reason)
-		if comment != "" {
-			msg += ": " + comment
-		}
-		p.AddMessage(msg)
+		p.AddMessage(fmt.Sprintf("would update epoch: %d -> %d (%s)", oldEpoch, newEpoch, reason))
 		return nil
 	}
 

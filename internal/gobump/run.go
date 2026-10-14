@@ -47,7 +47,7 @@ func ProcessFile(ctx context.Context, filePath string, opts Options, analyzer *A
 	pipeline := NewPipeline(analyzer, opts)
 
 	if err := pipeline.Execute(ctx, goBumpProcessor); err != nil {
-		goBumpProcessor.AddError(err)
+		// The pipeline already recorded (AddError) and logged the failure.
 		return goBumpProcessor.ToResult(), fmt.Errorf("pipeline execution failed: %w", err)
 	}
 

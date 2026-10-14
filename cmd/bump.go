@@ -64,6 +64,9 @@ func runBump(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(files) == 0 {
+		if outputFormat == "json" || outputFormat == "yaml" {
+			return outputBumpStructured(nil, outputFormat) // keep structured stdout parseable
+		}
 		fmt.Println("No melange files found.")
 		return nil
 	}
@@ -72,10 +75,6 @@ func runBump(cmd *cobra.Command, args []string) error {
 
 	// Configure processor options
 	opts := buildBumpProcessorOptions()
-
-	if dryRun {
-		fmt.Println("Dry run mode - no files will be modified")
-	}
 
 	// Create shared HTTP client with custom timeout
 	httpClient := httpclient.NewHTTPClientWithTimeout(httpTimeout)
@@ -91,7 +90,8 @@ func runBump(cmd *cobra.Command, args []string) error {
 
 		result, err := gobump.ProcessFile(ctx, file, opts, analyzer)
 		if err != nil {
-			slog.Error("processing melange file failed", "file", file, "error", err) //nolint:forbidigo // ProcessFile failed before/without seeding a ctx logger
+			// Already logged where it happened (ProcessFile's read/parse
+			// errors, the pipeline's "Stage failed"); recorded in result.Error.
 			if result == nil {
 				// Read/parse failure: no processor, so no partial state.
 				result = &gobump.Result{
@@ -282,7 +282,11 @@ func outputBumpTable(results []*gobump.Result) error {
 			}
 		}
 		if result.Error == "" && result.VulnerabilitiesFound > 0 && !result.Validated && (result.FileWasWritten || result.ModulesBumped > 0) {
-			fmt.Printf("\nWARNING: %s deps list NOT validated - resolvability and completeness unproven\n", result.PackageName)
+			reason := ""
+			if result.SimulationError != "" {
+				reason = ": " + result.SimulationError
+			}
+			fmt.Printf("\nWARNING: %s deps list NOT validated - resolvability and completeness unproven%s\n", result.PackageName, reason)
 		}
 	}
 

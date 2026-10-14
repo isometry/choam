@@ -41,7 +41,7 @@ func (p *Pipeline) AddStages(stages ...Stage) {
 // Execute runs the pipeline on the given processor
 func (p *Pipeline) Execute(ctx context.Context, processor Processor) error {
 	logger := processor.GetLogger().With("pipeline", p.Name)
-	logger.Info("Starting pipeline execution", "stages", len(p.Stages))
+	logger.Debug("Starting pipeline execution", "stages", len(p.Stages))
 
 	// Seed ctx with the same attribution logger carries, so stages that
 	// have no Processor handy (only ctx) can still reach it via
@@ -89,7 +89,7 @@ func (p *Pipeline) Execute(ctx context.Context, processor Processor) error {
 		}
 
 		// Execute the stage based on its interface
-		stageLogger.Info("Executing stage")
+		stageLogger.Debug("Executing stage")
 
 		switch s := stage.(type) {
 		case ExecutableStage:
@@ -111,11 +111,11 @@ func (p *Pipeline) Execute(ctx context.Context, processor Processor) error {
 				return err
 			}
 		} else {
-			stageLogger.Info("Stage completed successfully")
+			stageLogger.Debug("Stage completed successfully")
 		}
 	}
 
-	logger.Info("Pipeline execution completed",
+	logger.Debug("Pipeline execution completed",
 		"total_stages", len(p.Stages),
 		"has_changes", processor.HasChanges(),
 		"has_errors", len(processor.GetErrors()) > 0)

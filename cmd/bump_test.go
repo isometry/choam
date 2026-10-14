@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/goccy/go-yaml"
 	"github.com/isometry/choam/internal/gobump"
 	"github.com/isometry/choam/internal/output"
 	"github.com/stretchr/testify/assert"
@@ -454,6 +455,64 @@ func TestOutputBumpTable_NotValidatedWarning(t *testing.T) {
 
 	written := []*gobump.Result{{PackageName: "loud", VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, ModulesBumped: 1, FileWasWritten: true}}
 	assert.Contains(t, captureStdout(t, func() { require.NoError(t, outputBumpTable(written)) }), "WARNING: loud deps list NOT validated")
+}
+
+// TestOutputBumpTable_NotValidatedWarningAppendsSimulationError: the table
+// WARNING carries the reason simulation was unavailable when one is recorded.
+func TestOutputBumpTable_NotValidatedWarningAppendsSimulationError(t *testing.T) {
+	written := []*gobump.Result{{PackageName: "loud", VulnerabilitiesFound: 1, ModulesBumped: 1, FileWasWritten: true, SimulationError: "clone failed"}}
+	out := captureStdout(t, func() { require.NoError(t, outputBumpTable(written)) })
+	assert.Contains(t, out, "WARNING: loud deps list NOT validated - resolvability and completeness unproven: clone failed")
+}
+
+// TestRunBump_StructuredOutputStaysParseable: with --format json|yaml the
+// stdout must be the document alone - no "No melange files found." line, no
+// dry-run banner - for an empty directory and for a file that cannot be
+// parsed.
+func TestRunBump_StructuredOutputStaysParseable(t *testing.T) {
+	run := func(t *testing.T, args ...string) (string, error) {
+		t.Helper()
+		t.Cleanup(func() { dryRun, outputFormat = false, "table" })
+		cmd := NewBumpCmd()
+		cmd.SilenceUsage, cmd.SilenceErrors = true, true
+		cmd.SetArgs(append([]string{"--dry-run", "--no-validate", "--no-stdlib"}, args...))
+		var err error
+		stdout := captureStdout(t, func() { err = cmd.ExecuteContext(t.Context()) })
+		return stdout, err
+	}
+
+	t.Run("empty directory", func(t *testing.T) {
+		for _, format := range []string{"json", "yaml"} {
+			stdout, err := run(t, "--format", format, t.TempDir())
+			require.NoError(t, err)
+			var resp output.BumpResponse
+			if format == "json" {
+				require.NoError(t, json.Unmarshal([]byte(stdout), &resp), stdout)
+			} else {
+				require.NoError(t, yaml.Unmarshal([]byte(stdout), &resp), stdout)
+			}
+			assert.Empty(t, resp.Results)
+			assert.Zero(t, resp.Summary.TotalPackages)
+		}
+	})
+
+	t.Run("empty directory keeps the text line for table", func(t *testing.T) {
+		stdout, err := run(t, t.TempDir())
+		require.NoError(t, err)
+		assert.Contains(t, stdout, "No melange files found.")
+	})
+
+	t.Run("broken file", func(t *testing.T) {
+		bad := filepath.Join(t.TempDir(), "broken.yaml")
+		require.NoError(t, os.WriteFile(bad, []byte("package: [not valid\n"), 0o644))
+		stdout, err := run(t, "--format", "json", bad)
+		require.ErrorIs(t, err, ErrBumpFailed)
+		var resp output.BumpResponse
+		require.NoError(t, json.Unmarshal([]byte(stdout), &resp), stdout)
+		require.Contains(t, resp.Results, bad)
+		assert.NotEmpty(t, resp.Results[bad].Error)
+		assert.Equal(t, 1, resp.Summary.Errors)
+	})
 }
 
 // TestRunBump_ErroredFileExitsNonZero: a file that cannot be processed is

@@ -364,8 +364,9 @@ func apkDisplayID(adv ApkAdvisory) string {
 	return scan.PreferredID(&osvschema.Vulnerability{Id: adv.Upstream[0], Aliases: adv.Upstream[1:]})
 }
 
-// skipWarn records a degrade-to-skip in the log and the per-package messages.
+// skipWarn records a degrade-to-skip as a default-verbosity note; the log
+// line is Debug so the fact appears once.
 func (s *ApkAdvisoryStage) skipWarn(ctx context.Context, gp *Processor, msg string) {
-	logging.From(ctx).Warn(msg)
-	gp.AddMessage(msg)
+	logging.From(ctx).Debug(msg)
+	gp.AddNote(msg)
 }

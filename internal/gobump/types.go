@@ -84,6 +84,7 @@ type Result struct {
 	UnreachableVulnIDs         []string            `json:"unreachable_vuln_ids,omitempty" yaml:"unreachable_vuln_ids,omitempty"`
 	ModulesBumped              int                 `json:"modules_bumped" yaml:"modules_bumped"`
 	Validated                  bool                `json:"validated" yaml:"validated"`
+	SimulationError            string              `json:"simulation_error,omitempty" yaml:"simulation_error,omitempty"` // why simulation was unavailable (Validated=false)
 	Residuals                  []simulate.Residual `json:"residuals,omitempty" yaml:"residuals,omitempty"`
 	CriticalFixed              int                 `json:"critical_fixed" yaml:"critical_fixed"`
 	HighFixed                  int                 `json:"high_fixed" yaml:"high_fixed"`

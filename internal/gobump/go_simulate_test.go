@@ -146,8 +146,12 @@ func TestSimulationStage_DegradesOnSimulatorError(t *testing.T) {
 	modroot := gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0]
 	assert.Equal(t, []string{"example.com/old@v1.2.0", "example.com/pin@v0.9.0"}, modroot.DesiredDeps)
 	assert.False(t, modroot.Simulated)
-	require.NotEmpty(t, gp.Messages)
-	assert.Contains(t, gp.Messages[len(gp.Messages)-1], "NOT validated")
+	// The failure is recorded once, structurally - no duplicate message.
+	assert.Equal(t, "clone failed", gp.SimulationError)
+	assert.Equal(t, "clone failed", gp.ToResult().SimulationError)
+	for _, msg := range gp.Messages {
+		assert.NotContains(t, msg, "NOT validated")
+	}
 }
 
 // TestSimulationStage_FailsClosedOnCompileGate: a compile-gate failure, a go

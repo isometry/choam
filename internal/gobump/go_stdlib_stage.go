@@ -178,9 +178,9 @@ func (s *StdlibStage) commitInfo(ctx context.Context, gp *Processor, toolchain s
 		return nil, nil
 	}
 	if info.Shallow {
-		logging.From(ctx).Warn("melange repository history is shallow - stdlib staleness estimate may assume a newer toolchain than reality",
+		logging.From(ctx).Debug("melange repository history is shallow - stdlib staleness estimate may assume a newer toolchain than reality",
 			"commit_time", info.Time)
-		gp.AddMessage("stdlib: repository history is shallow - the assumed build toolchain may be newer than reality")
+		gp.AddNote("stdlib: repository history is shallow - the assumed build toolchain may be newer than reality")
 	}
 	return info, nil
 }
@@ -197,8 +197,8 @@ func (s *StdlibStage) filterByLinkedStd(ctx context.Context, gp *Processor, in s
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, nil, cerr
 		}
-		logging.From(ctx).Warn("could not determine linked stdlib packages - stdlib findings remain unfiltered", "error", err)
-		gp.AddMessage(fmt.Sprintf("stdlib: could not determine linked stdlib packages (%v) - findings not filtered by artifact reachability", err))
+		logging.From(ctx).Debug("could not determine linked stdlib packages - stdlib findings remain unfiltered", "error", err)
+		gp.AddNote(fmt.Sprintf("stdlib: could not determine linked stdlib packages (%v) - findings not filtered by artifact reachability", err))
 		return bumps, messages, nil
 	}
 	if linked == nil {
@@ -210,8 +210,8 @@ func (s *StdlibStage) filterByLinkedStd(ctx context.Context, gp *Processor, in s
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, nil, cerr
 		}
-		logging.From(ctx).Warn("linked-import stdlib re-evaluation failed - stdlib findings remain unfiltered", "error", err)
-		gp.AddMessage(fmt.Sprintf("stdlib: linked-import re-evaluation failed (%v) - findings not filtered by artifact reachability", err))
+		logging.From(ctx).Debug("linked-import stdlib re-evaluation failed - stdlib findings remain unfiltered", "error", err)
+		gp.AddNote(fmt.Sprintf("stdlib: linked-import re-evaluation failed (%v) - findings not filtered by artifact reachability", err))
 		return bumps, messages, nil
 	}
 	return filteredBumps, filteredMessages, nil
@@ -276,9 +276,9 @@ func rebuildToolchainWord(versions []string, unknown bool) string {
 	return "go" + strings.Join(versions, ", go")
 }
 
-// skipWarn records a degrade-to-skip both in the log and the per-package
-// messages (this stage never fails the run).
+// skipWarn records a degrade-to-skip as a default-verbosity note (this stage
+// never fails the run); the log line is Debug so the fact appears once.
 func (s *StdlibStage) skipWarn(ctx context.Context, gp *Processor, msg string) {
-	logging.From(ctx).Warn(msg)
-	gp.AddMessage(msg)
+	logging.From(ctx).Debug(msg)
+	gp.AddNote(msg)
 }
