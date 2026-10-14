@@ -785,3 +785,33 @@ func TestEvaluateStdlibStaleness_MessageCarriesCommitDate(t *testing.T) {
 	require.Len(t, messages, 1)
 	assert.True(t, strings.Contains(messages[0], "2024-03-15"), "message %q must carry the commit date", messages[0])
 }
+
+func TestResolveRebuildVersions(t *testing.T) {
+	t.Run("one version per constraint, raised pins mapped", func(t *testing.T) {
+		index := &fakeReleaseIndex{available: map[string]string{"": "1.26.3", "1.25": "1.25.8"}}
+		versions, unknown, err := resolveRebuildVersions(t.Context(), index, stdlibInput{
+			Constraints:        []string{"", "1.21"},
+			RebuildConstraints: map[string]string{"1.21": "1.25"},
+		})
+		require.NoError(t, err)
+		assert.False(t, unknown)
+		assert.Equal(t, []string{"1.26.3", "1.25.8"}, versions)
+		assert.Zero(t, index.asOfCalls, "no commit time needed")
+	})
+
+	t.Run("margin deferral is unknown", func(t *testing.T) {
+		index := &fakeReleaseIndex{
+			available:     map[string]string{"": "1.26.3", "1.27": "1.27.0"},
+			availableAsOf: map[string]string{"": "1.26.2"}, // 1.27.0 is within the margin
+		}
+		versions, unknown, err := resolveRebuildVersions(t.Context(), index, stdlibInput{Constraints: []string{"", "1.27"}})
+		require.NoError(t, err)
+		assert.True(t, unknown)
+		assert.Equal(t, []string{"1.26.2"}, versions, "the margin-aged target, not the newest")
+	})
+
+	t.Run("unknown pin errors", func(t *testing.T) {
+		_, _, err := resolveRebuildVersions(t.Context(), &fakeReleaseIndex{}, stdlibInput{Constraints: []string{"1.99"}})
+		assert.ErrorContains(t, err, "pin 1.99")
+	})
+}

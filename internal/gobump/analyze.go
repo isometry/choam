@@ -107,12 +107,7 @@ func (v *VulnerabilityChecker) Check(ctx context.Context, p processor.Processor)
 	// Note: SecurityFixes are added by the applier when actual changes are made,
 	// not during the check phase. This ensures the count reflects real changes.
 
-	if analysis.VulnerabilitiesFound == 0 {
-		gp.AddMessage("No vulnerabilities found")
-	} else {
-		gp.AddMessage(fmt.Sprintf("Found %d vulnerabilities", analysis.VulnerabilitiesFound))
-	}
-
+	logging.From(ctx).Debug("vulnerability analysis complete", "vulnerabilities", analysis.VulnerabilitiesFound)
 	return nil
 }
 
@@ -188,7 +183,6 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *Pro
 		}
 
 		logging.From(ctx).Debug("analyzing language", "repository", repoURL, "ref", ref, "modroots", modroots)
-		gp.AddMessage(fmt.Sprintf("Analyzing %s dependencies from %s @ %s (modroots: %s)", language, repoURL, ref, strings.Join(modroots, ", ")))
 
 		result, err := v.performAnalysis(ctx, eco, language, repoURL, ref, langUnits, bumpSteps, gp)
 		if err != nil {
@@ -198,14 +192,12 @@ func (v *VulnerabilityChecker) checkVulnerabilities(ctx context.Context, gp *Pro
 		analysis.ByLanguage = append(analysis.ByLanguage, result.Analysis)
 		analysis.BumpActions = append(analysis.BumpActions, result.Actions...)
 		maps.Copy(uniqueVulns, result.Vulns)
-
-		gp.AddMessage(fmt.Sprintf("%s analysis complete: %d modroot(s), %d action(s) needed", language, len(modroots), len(result.Actions)))
+		logging.From(ctx).Debug("language analysis complete", "modroots", len(modroots), "actions", len(result.Actions))
 	}
 
 	analysis.VulnerabilitiesFound = len(uniqueVulns)
 
-	gp.AddMessage(fmt.Sprintf("Analysis complete: %d language(s), %d vulnerabilities, %d action(s) needed",
-		len(analysis.ByLanguage), analysis.VulnerabilitiesFound, len(analysis.BumpActions)))
+	logging.From(ctx).Debug("analysis complete", "languages", len(analysis.ByLanguage), "vulnerabilities", analysis.VulnerabilitiesFound, "actions", len(analysis.BumpActions))
 
 	return analysis, nil
 }
@@ -327,7 +319,7 @@ func (v *VulnerabilityChecker) analyzeModroot(ctx context.Context, eco ecosystem
 			VulnIDs:         h.Bump.VulnIDs,
 			Reason:          h.Reason,
 		})
-		logging.From(ctx).Warn("fix held back", "module", h.Bump.Name, "fix", h.Bump.FixedVersion, "reason", h.Reason)
+		logging.From(ctx).Debug("fix held back", "module", h.Bump.Name, "fix", h.Bump.FixedVersion, "reason", h.Reason)
 	}
 	gp.AddResiduals(heldResiduals)
 
@@ -342,19 +334,20 @@ func (v *VulnerabilityChecker) analyzeModroot(ctx context.Context, eco ecosystem
 	sort.Strings(securityBumpModules)
 
 	return ModrootAnalysis{
-		Modroot:        root,
-		BuildPackages:  unit.Packages,
-		BuildTags:      unit.Tags,
-		BuildArches:    unit.Arches,
-		BuildEnv:       unit.Env,
-		BumpEngine:     unit.Engine,
-		BumpMigrating:  unit.Migrating,
-		BumpNoTidy:     unit.NoTidy,
-		GoPackageMinor: unit.GoMinor,
-		Deps:           deps,
-		ScanResult:     scanResult,
-		ExistingDeps:   existingDeps,
-		DesiredDeps:    desiredDeps,
+		Modroot:         root,
+		BuildPackages:   unit.Packages,
+		BuildTags:       unit.Tags,
+		BuildArches:     unit.Arches,
+		BuildEnv:        unit.Env,
+		BumpEngine:      unit.Engine,
+		BumpMigrating:   unit.Migrating,
+		BumpNoTidy:      unit.NoTidy,
+		GoPackageMinor:  unit.GoMinor,
+		Deps:            deps,
+		ScannedPackages: pkgs,
+		ScanResult:      scanResult,
+		ExistingDeps:    existingDeps,
+		DesiredDeps:     desiredDeps,
 		// Analysis never invents replaces - it carries existing ones
 		// forward (the simulation may raise or retire them, never add
 		// any). This also keeps the --no-validate degrade path a

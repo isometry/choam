@@ -814,6 +814,60 @@ func TestAnalyzer_LogsCarryCtxAttribution(t *testing.T) {
 	}
 }
 
+// TestAnalyzer_DebugTraceOneDecisionPerModule: at Debug, analyzeBumps logs one
+// "analyzing bumps" header and exactly one "bump decision" per unique module,
+// in sorted module order, with no per-step chatter.
+func TestAnalyzer_DebugTraceOneDecisionPerModule(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	ctx := logging.Into(t.Context(), logger)
+
+	goModInfo := &GoModInfo{
+		Requirements: map[string]string{"golang.org/x/net": "v0.50.0"},
+		AllRequirements: map[string]string{
+			"golang.org/x/net":        "v0.50.0",
+			"github.com/cli/go-gh/v2": "v2.0.0",
+			"example.com/same":        "v1.0.0",
+		},
+		Replacements: map[string]*modfile.Replace{},
+	}
+	deps := []string{
+		"golang.org/x/net@v0.60.0",
+		"github.com/cli/go-gh@v2.1.0", // normalized to /v2
+		"example.com/same@v1.0.0",
+		"golang.org/x/net@v0.60.0", // duplicate
+		"example.com/missing@v1.0.0",
+	}
+	newAnalyzer().analyzeBumps(ctx, deps, goModInfo)
+
+	var decisions []string
+	for _, line := range strings.Split(strings.TrimRight(buf.String(), "\n"), "\n") {
+		if !strings.Contains(line, `msg="bump decision"`) {
+			continue
+		}
+		for _, f := range strings.Fields(line) {
+			if v, ok := strings.CutPrefix(f, "module="); ok {
+				decisions = append(decisions, v)
+			}
+		}
+	}
+	want := []string{"example.com/missing", "example.com/same", "github.com/cli/go-gh", "golang.org/x/net"}
+	if !slices.Equal(decisions, want) {
+		t.Errorf("bump decisions = %v, want %v", decisions, want)
+	}
+	if n := strings.Count(buf.String(), `msg="analyzing bumps"`); n != 1 {
+		t.Errorf("analyzing bumps header count = %d, want 1", n)
+	}
+	if !strings.Contains(buf.String(), "normalized=github.com/cli/go-gh/v2") {
+		t.Errorf("expected normalized attribute for the /v2 path:\n%s", buf.String())
+	}
+	for _, chatter := range []string{"normalizing module path", "go.mod lookup", "deduplication phase", "smart ordering"} {
+		if strings.Contains(buf.String(), chatter) {
+			t.Errorf("unexpected per-step chatter %q", chatter)
+		}
+	}
+}
+
 // Helper function to check if a string contains a substring
 func contains(s, substr string) bool {
 	return len(substr) > 0 && len(s) >= len(substr) &&

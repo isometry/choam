@@ -146,8 +146,12 @@ func TestSimulationStage_DegradesOnSimulatorError(t *testing.T) {
 	modroot := gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0]
 	assert.Equal(t, []string{"example.com/old@v1.2.0", "example.com/pin@v0.9.0"}, modroot.DesiredDeps)
 	assert.False(t, modroot.Simulated)
-	require.NotEmpty(t, gp.Messages)
-	assert.Contains(t, gp.Messages[len(gp.Messages)-1], "NOT validated")
+	// The failure is recorded once, structurally - no duplicate message.
+	assert.Equal(t, "clone failed", gp.SimulationError)
+	assert.Equal(t, "clone failed", gp.ToResult().SimulationError)
+	for _, msg := range gp.Messages {
+		assert.NotContains(t, msg, "NOT validated")
+	}
 }
 
 // TestSimulationStage_FailsClosedOnCompileGate: a compile-gate failure, a go
@@ -704,9 +708,9 @@ func TestSimulationStage_HygieneOutcomes(t *testing.T) {
 
 	messages := strings.Join(gp.GetMessages(), "\n")
 	assert.Contains(t, messages, "modroot .: hygiene: golang.org/x/text@v0.36.0 proposed for scanners (GO-2026-5970; vulnerable package not linked, not a security fix)")
-	assert.Contains(t, messages, "info: golang.org/x/text (GO-2026-5970) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - scanner hygiene bump proposed, not a security fix")
+	assert.Contains(t, messages, "golang.org/x/text (GO-2026-5970) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - scanner hygiene bump proposed, not a security fix")
 	assert.Contains(t, messages, "modroot .: hygiene: scanner hygiene pin golang.org/x/net@v0.45.0 not free (raises dependency Go 1.24->1.25) - no bump proposed")
-	assert.Contains(t, messages, "info: golang.org/x/net (GO-2026-0001) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - no bump proposed")
+	assert.Contains(t, messages, "golang.org/x/net (GO-2026-0001) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - no bump proposed")
 }
 
 // newTwoModrootSimulationProcessor builds a VulnerabilityAnalysis with two Go
@@ -1035,7 +1039,6 @@ func TestSimulationStage_ThreadsEngine(t *testing.T) {
 	assert.Equal(t, simulate.EngineOmnibump, fake.gotReqs[0].Engine)
 	assert.True(t, fake.gotReqs[0].NoTidy)
 	assert.Equal(t, "", fake.gotReqs[0].GoVersion, "no go-package pin: the host go")
-	assert.Contains(t, gp.GetMessages(), "simulation: uses: bump applied with omnibump "+simulate.OmnibumpVersion())
 }
 
 // TestVulnImports: the seed-side projection keeps every import entry (the
@@ -1052,6 +1055,34 @@ func TestVulnImports(t *testing.T) {
 		{ID: "GO-NONE"},
 	}})
 	assert.Equal(t, map[string][]scan.VulnerableImport{"GO-A": {windows, pathless}}, got)
+}
+
+// TestImportsByAdvisory: findings in several modules sharing one (CVE-first)
+// ID union their imports, and any finding without metadata makes the ID's
+// imports unknown (empty, fail open) whatever the order.
+func TestImportsByAdvisory(t *testing.T) {
+	x := scan.VulnerableImport{Path: "example.com/a/x"}
+	y := scan.VulnerableImport{Path: "example.com/b/y"}
+	tests := []struct {
+		name  string
+		vulns []scan.Vulnerability
+		want  []scan.VulnerableImport
+	}{
+		{"single", []scan.Vulnerability{{ID: "CVE-1", VulnerableImports: []scan.VulnerableImport{x}}}, []scan.VulnerableImport{x}},
+		{"union", []scan.Vulnerability{{ID: "CVE-1", VulnerableImports: []scan.VulnerableImport{x}}, {ID: "CVE-1", VulnerableImports: []scan.VulnerableImport{y}}}, []scan.VulnerableImport{x, y}},
+		{"unknown after known", []scan.Vulnerability{{ID: "CVE-1", VulnerableImports: []scan.VulnerableImport{x}}, {ID: "CVE-1"}}, nil},
+		{"known after unknown", []scan.Vulnerability{{ID: "CVE-1"}, {ID: "CVE-1", VulnerableImports: []scan.VulnerableImport{x}}}, nil},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := importsByAdvisory(tt.vulns)
+			assert.Equal(t, tt.want, got["CVE-1"])
+			assert.Contains(t, got, "CVE-1")
+		})
+	}
+	assert.Nil(t, vulnImports(&scan.ScanResult{Vulnerabilities: []scan.Vulnerability{
+		{ID: "CVE-1", VulnerableImports: []scan.VulnerableImport{x}}, {ID: "CVE-1"},
+	}}), "an ID with unknown imports is omitted from the seed projection (fail open)")
 }
 
 // TestSimulationStage_ReportsBlindSpots: unavailable linkage is a

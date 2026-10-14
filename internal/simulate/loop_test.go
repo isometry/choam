@@ -3121,6 +3121,25 @@ func TestScanFindings_HygieneSplit(t *testing.T) {
 	})
 }
 
+// TestScanFindings_SharedIDAcrossModules: CVE-first IDs let two modules'
+// findings share one ID; the advisory applies when any of them is linked,
+// whichever order the scan lists them in.
+func TestScanFindings_SharedIDAcrossModules(t *testing.T) {
+	const a, b = "example.com/a", "example.com/b"
+	linked := scan.Vulnerability{ID: "CVE-1", Module: a, FixedVersion: "v1.1.0", VulnerableImports: []scan.VulnerableImport{{Path: a + "/used"}}}
+	unlinked := scan.Vulnerability{ID: "CVE-1", Module: b, VulnerableImports: []scan.VulnerableImport{{Path: b + "/unused"}}}
+	for _, order := range [][]scan.Vulnerability{{linked, unlinked}, {unlinked, linked}} {
+		l := &loop{byModule: map[string]*candState{}, linkedPackages: map[string]struct{}{a + "/used": {}}}
+		raises, _, hygiene := l.scanFindings(&scan.ScanResult{
+			Vulnerabilities: order,
+			SecurityBumps:   []scan.SecurityBump{{Name: a, Ecosystem: "Go", CurrentVersion: "v1.0.0", FixedVersion: "v1.1.0", VulnIDs: []string{"CVE-1"}}},
+		}, map[string]string{a: "v1.0.0", b: "v1.0.0"})
+		require.Len(t, raises, 1, "order %s first", order[0].Module)
+		assert.Equal(t, "v1.1.0", raises[0].version)
+		assert.Empty(t, hygiene)
+	}
+}
+
 // TestSeedVulnPackagesLinked pins the seed-side semantics over
 // scan.ImportsLinked: unknown graph, no IDs and unknown IDs fail open; any
 // linked advisory keeps the seed; a GOOS-excluded entry never counts.

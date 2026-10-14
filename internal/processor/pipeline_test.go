@@ -755,3 +755,39 @@ func BenchmarkPipeline_Execute_MultipleStages(b *testing.B) {
 		_ = pipeline.Execute(ctx, proc)
 	}
 }
+
+// taggingProcessor records every TagMessages call.
+type taggingProcessor struct {
+	*BaseProcessor
+	tags []string
+}
+
+func (p *taggingProcessor) TagMessages(stage string, from int) {
+	p.tags = append(p.tags, fmt.Sprintf("%s:%d-%d", stage, from, len(p.GetMessages())))
+}
+
+// TestPipeline_TagsMessagesPerStage: a MessageTagger hears, after every stage
+// (run, skipped or failed), the message count before it.
+func TestPipeline_TagsMessagesPerStage(t *testing.T) {
+	proc := &taggingProcessor{BaseProcessor: NewBaseProcessor("t.yaml", "pkg", "1.0.0", 0)}
+	adds := func(n int, err error) func(context.Context, Processor) error {
+		return func(_ context.Context, p Processor) error {
+			for range n {
+				p.AddMessage("m")
+			}
+			return err
+		}
+	}
+	pipeline := NewPipeline("test")
+	pipeline.Options.StopOnError = false
+	pipeline.AddStages(
+		&mockExecutableStage{BaseStage: BaseStage{StageName: "a"}, shouldRun: true, executeFunc: adds(2, nil)},
+		&mockExecutableStage{BaseStage: BaseStage{StageName: "skipped"}},
+		&mockExecutableStage{BaseStage: BaseStage{StageName: "b"}, shouldRun: true, executeFunc: adds(1, errors.New("boom"))},
+	)
+	require.NoError(t, pipeline.Execute(t.Context(), proc))
+	assert.Equal(t, []string{"a:0-2", "skipped:2-2", "b:2-3"}, proc.tags)
+
+	// A plain processor is unaffected.
+	require.NoError(t, NewPipeline("plain").Execute(t.Context(), NewBaseProcessor("t.yaml", "pkg", "1.0.0", 0)))
+}

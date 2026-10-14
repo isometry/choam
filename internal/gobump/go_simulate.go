@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -182,7 +183,6 @@ func (s *SimulationStage) buildRequests(ctx context.Context, gp *Processor, lang
 	if omnibumpRoots > 0 {
 		version := simulate.OmnibumpVersion()
 		logging.From(ctx).Debug("simulating uses: bump steps with omnibump", "omnibump", version, "modroots", omnibumpRoots)
-		gp.AddMessage(fmt.Sprintf("simulation: uses: bump applied with omnibump %s", version))
 	}
 	return reqs
 }
@@ -314,7 +314,7 @@ func reportModrootResult(ctx context.Context, gp *Processor, m *ModrootAnalysis,
 			gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s@%s %s - no bump proposed",
 				m.Modroot, dropped.Module, dropped.Version, strings.TrimPrefix(dropped.Reason, "scanner hygiene: ")))
 		}
-		logging.From(ctx).Info("bump candidate dropped by simulation",
+		logging.From(ctx).Debug("bump candidate dropped by simulation",
 			"module", dropped.Module, "version", dropped.Version, "reason", dropped.Reason)
 	}
 	for _, h := range result.HygieneModules {
@@ -327,7 +327,7 @@ func reportModrootResult(ctx context.Context, gp *Processor, m *ModrootAnalysis,
 	}
 	reportBlindSpots(gp, m.Modroot, result)
 	for _, residual := range result.Residuals {
-		logging.From(ctx).Warn("residual vulnerability after simulation",
+		logging.From(ctx).Debug("residual vulnerability after simulation",
 			"module", residual.Module,
 			"resolved", residual.ResolvedVersion, "fix", residual.FixedVersion,
 			"vulns", strings.Join(residual.VulnIDs, ","), "reason", residual.Reason)
@@ -387,25 +387,25 @@ func reportUnreachable(ctx context.Context, gp *Processor, reach *reachabilityDi
 		var msg string
 		switch {
 		case module.moduleLinked && hygieneProposed[module.name]:
-			msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - scanner hygiene bump proposed, not a security fix",
+			msg = fmt.Sprintf("%s (%s) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - scanner hygiene bump proposed, not a security fix",
 				module.name, strings.Join(module.vulnIDs, ", "))
 		case module.moduleLinked:
 			// Precise, package-only: the module IS in the artifact, the
 			// vulnerable packages are not.
-			msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - no bump proposed",
+			msg = fmt.Sprintf("%s (%s) vulnerable but not linked into build artifacts (module is linked; the vulnerable packages are not) - no bump proposed",
 				module.name, strings.Join(module.vulnIDs, ", "))
 		case module.degraded:
 			// Degraded module-level signal: precise reachability was
 			// unavailable, but the tidied go.mod's require block proves
 			// the module unlinkable.
-			msg = fmt.Sprintf("info: %s (%s) vulnerable but not required by the tidied go.mod - cannot be linked into build artifacts - no bump proposed (module-level signal; package import graph unavailable)",
+			msg = fmt.Sprintf("%s (%s) vulnerable but not required by the tidied go.mod - cannot be linked into build artifacts - no bump proposed (module-level signal; package import graph unavailable)",
 				module.name, strings.Join(module.vulnIDs, ", "))
 		default:
-			msg = fmt.Sprintf("info: %s (%s) vulnerable but not linked into build artifacts - no bump proposed",
+			msg = fmt.Sprintf("%s (%s) vulnerable but not linked into build artifacts - no bump proposed",
 				module.name, strings.Join(module.vulnIDs, ", "))
 		}
 		gp.AddMessage(msg)
-		logging.From(ctx).Info("advisory in unlinked code - no bump proposed",
+		logging.From(ctx).Debug("advisory in unlinked code - no bump proposed",
 			"module", module.name, "module_linked", module.moduleLinked, "degraded", module.degraded, "vulns", strings.Join(module.vulnIDs, ","))
 	}
 }
@@ -444,8 +444,8 @@ func (s *SimulationStage) failClosed(err error) bool {
 // degrade and write an unvalidated result as if simulation had merely failed.
 func (s *SimulationStage) degrade(ctx context.Context, gp *Processor, err error) {
 	gp.Validated = false
-	logging.From(ctx).Warn("bump simulation unavailable - proceeding with UNVALIDATED deps", "error", err)
-	gp.AddMessage(fmt.Sprintf("WARNING: deps list NOT validated - simulation unavailable: %v", err))
+	gp.SimulationError = err.Error()
+	logging.From(ctx).Info("bump simulation unavailable - proceeding with UNVALIDATED deps", "error", err)
 }
 
 // seedCandidates converts a modroot's post-FilterBumps desired deps and its
@@ -608,11 +608,9 @@ func (r *reachabilityDiff) observe(m ModrootAnalysis, linkedModules, linkedPacka
 	degradedMode := linkedModules == nil && unrequired != nil
 
 	// Per-advisory vulnerable import paths, from the analysis scan.
-	importsByID := make(map[string][]scan.VulnerableImport)
+	var importsByID map[string][]scan.VulnerableImport
 	if m.ScanResult != nil {
-		for _, vuln := range m.ScanResult.Vulnerabilities {
-			importsByID[vuln.ID] = vuln.VulnerableImports
-		}
+		importsByID = importsByAdvisory(m.ScanResult.Vulnerabilities)
 	}
 
 	record := func(module string, vulnIDs []string) {
@@ -742,14 +740,27 @@ func vulnImports(scanResult *scan.ScanResult) map[string][]scan.VulnerableImport
 	if scanResult == nil {
 		return nil
 	}
-	imports := make(map[string][]scan.VulnerableImport)
-	for _, vuln := range scanResult.Vulnerabilities {
-		if len(vuln.VulnerableImports) > 0 {
-			imports[vuln.ID] = append(imports[vuln.ID], vuln.VulnerableImports...)
-		}
-	}
+	imports := importsByAdvisory(scanResult.Vulnerabilities)
+	maps.DeleteFunc(imports, func(_ string, v []scan.VulnerableImport) bool { return len(v) == 0 })
 	if len(imports) == 0 {
 		return nil
+	}
+	return imports
+}
+
+// importsByAdvisory maps advisory ID -> vulnerable imports. One ID can name
+// findings in several modules (IDs are CVE-first, so two modules' GO- records
+// can share one): their imports union, but a finding without import metadata
+// makes the ID's imports unknown (empty - every consumer fails open).
+func importsByAdvisory(vulns []scan.Vulnerability) map[string][]scan.VulnerableImport {
+	imports := make(map[string][]scan.VulnerableImport, len(vulns))
+	for _, vuln := range vulns {
+		prev, seen := imports[vuln.ID]
+		if seen && (len(prev) == 0 || len(vuln.VulnerableImports) == 0) {
+			imports[vuln.ID] = nil
+			continue
+		}
+		imports[vuln.ID] = append(prev, vuln.VulnerableImports...)
 	}
 	return imports
 }

@@ -39,6 +39,64 @@ type StdlibBump struct {
 	Validated           bool     `json:"validated" yaml:"validated"` // linked-import filtering applied
 }
 
+// ApkAdvisory is one epoch-addressable Chainguard/Wolfi OSV advisory (CGA-)
+// affecting the package's own APK name at its pristine version-epoch,
+// classified by whether this build provably fixes every component its
+// upstream records affect (see classifyApk).
+type ApkAdvisory struct {
+	ID           string   `json:"id" yaml:"id"`                               // the CGA- record ID
+	Upstream     []string `json:"upstream" yaml:"upstream"`                   // CVE-/GHSA-/GO- IDs it covers
+	FixedVersion string   `json:"fixed_version" yaml:"fixed_version"`         // "<version>-r<FixedEpoch>"
+	FixedEpoch   int64    `json:"fixed_epoch" yaml:"fixed_epoch"`             // N > the pristine epoch
+	Status       string   `json:"status" yaml:"status"`                       // proven, unproven, first-party, not-applicable
+	Reason       string   `json:"reason,omitempty" yaml:"reason,omitempty"`   // why not proven
+	Modules      []string `json:"modules,omitempty" yaml:"modules,omitempty"` // affected modules, from the upstream records
+}
+
+// NeededAction kinds, in the order the report lists them.
+const (
+	ActionPatch  = "patch"  // a first-party advisory needs a source patch
+	ActionRerun  = "rerun"  // the result is incomplete; rerun once the cause is gone
+	ActionReview = "review" // a human must decide (a fix exists but was not applied/proven)
+	ActionAccept = "accept" // nothing to do until upstream releases a fix
+)
+
+// NeededAction is one thing the user must do about a package's result.
+type NeededAction struct {
+	Kind    string `json:"kind" yaml:"kind"` // patch, rerun, review, accept
+	Subject string `json:"subject" yaml:"subject"`
+	Detail  string `json:"detail,omitempty" yaml:"detail,omitempty"`
+}
+
+// EpochReason is one clause of why the epoch moved (the epoch comment's
+// wording) with the advisory IDs behind it.
+type EpochReason struct {
+	Kind    string   `json:"kind" yaml:"kind"` // deps, hygiene, stdlib, apk, build
+	Text    string   `json:"text" yaml:"text"`
+	VulnIDs []string `json:"vuln_ids,omitempty" yaml:"vuln_ids,omitempty"`
+}
+
+// ApkAlignment summarizes the apk advisory alignment (see ApkAdvisoryStage):
+// Version is the pristine "<version>-r<epoch>" queried; TargetEpoch the
+// epoch aligned to (Result.ApkEpochTarget); HighestFixedEpoch the highest
+// fix epoch among addressable advisories; BlockedAt the lowest non-proven
+// fix epoch other than not-applicable ones (0 = none); the counts are per
+// display ID and fix; Ignored counts
+// the advisories no epoch can clear or that cannot be correlated, of which
+// Uncorrelated those without an upstream CVE/GHSA/GO ID.
+type ApkAlignment struct {
+	Version           string `json:"version" yaml:"version"`
+	TargetEpoch       int64  `json:"target_epoch" yaml:"target_epoch"`
+	HighestFixedEpoch int64  `json:"highest_fixed_epoch" yaml:"highest_fixed_epoch"`
+	BlockedAt         int64  `json:"blocked_at,omitempty" yaml:"blocked_at,omitempty"`
+	Proven            int    `json:"proven" yaml:"proven"`
+	Unproven          int    `json:"unproven" yaml:"unproven"`
+	FirstParty        int    `json:"first_party" yaml:"first_party"`
+	NotApplicable     int    `json:"not_applicable,omitempty" yaml:"not_applicable,omitempty"`
+	Ignored           int    `json:"ignored" yaml:"ignored"`
+	Uncorrelated      int    `json:"uncorrelated,omitempty" yaml:"uncorrelated,omitempty"`
+}
+
 // SecurityFix represents a security vulnerability fix applied
 type SecurityFix struct {
 	Module        string `json:"module" yaml:"module"`               // affected package
@@ -70,6 +128,7 @@ type Result struct {
 	UnreachableVulnIDs         []string            `json:"unreachable_vuln_ids,omitempty" yaml:"unreachable_vuln_ids,omitempty"`
 	ModulesBumped              int                 `json:"modules_bumped" yaml:"modules_bumped"`
 	Validated                  bool                `json:"validated" yaml:"validated"`
+	SimulationError            string              `json:"simulation_error,omitempty" yaml:"simulation_error,omitempty"` // why simulation was unavailable (Validated=false)
 	Residuals                  []simulate.Residual `json:"residuals,omitempty" yaml:"residuals,omitempty"`
 	CriticalFixed              int                 `json:"critical_fixed" yaml:"critical_fixed"`
 	HighFixed                  int                 `json:"high_fixed" yaml:"high_fixed"`
@@ -93,13 +152,29 @@ type Result struct {
 	// to completion (false when disabled, inapplicable, or skipped).
 	StdlibBumps   []StdlibBump `json:"stdlib_bumps,omitempty" yaml:"stdlib_bumps,omitempty"`
 	StdlibChecked bool         `json:"stdlib_checked" yaml:"stdlib_checked"`
+	// ApkAdvisories are the Chainguard/Wolfi advisories for this package's
+	// own APK name and version (see ApkAdvisoryStage); ApkEpochTarget is the
+	// lowest epoch clearing the proven ones (0 = no raise); FirstPartyVulnIDs
+	// are those matching no dependency or stdlib advisory.
+	ApkAdvisories     []ApkAdvisory `json:"apk_advisories,omitempty" yaml:"apk_advisories,omitempty"`
+	ApkEpochTarget    int64         `json:"apk_epoch_target,omitempty" yaml:"apk_epoch_target,omitempty"`
+	FirstPartyVulnIDs []string      `json:"first_party_vuln_ids,omitempty" yaml:"first_party_vuln_ids,omitempty"`
+	ApkAlignment      *ApkAlignment `json:"apk_alignment,omitempty" yaml:"apk_alignment,omitempty"`
+
+	// ActionsNeeded are what the user must do about this result;
+	// EpochReasons why the epoch moved (set only when it did).
+	ActionsNeeded []NeededAction `json:"actions_needed,omitempty" yaml:"actions_needed,omitempty"`
+	EpochReasons  []EpochReason  `json:"epoch_reasons,omitempty" yaml:"epoch_reasons,omitempty"`
 
 	OldEpoch       int64    `json:"old_epoch" yaml:"old_epoch"`
 	NewEpoch       int64    `json:"new_epoch" yaml:"new_epoch"`
 	EpochChanged   bool     `json:"epoch_changed" yaml:"epoch_changed"`
 	FileWasWritten bool     `json:"file_was_written" yaml:"file_was_written"`
 	Messages       []string `json:"messages" yaml:"messages"`
-	Error          string   `json:"error,omitempty" yaml:"error,omitempty"`
+	// MessageSections parallels Messages (see Processor.TagMessages); a
+	// message beyond its end is SectionOther.
+	MessageSections []string `json:"-" yaml:"-"`
+	Error           string   `json:"error,omitempty" yaml:"error,omitempty"`
 }
 
 // ModrootAnalysis contains the dependency analysis for a single module root.
@@ -140,10 +215,14 @@ type ModrootAnalysis struct {
 	GoPackageMinor string          `json:"-" yaml:"-"`
 	BaselineTidies bool            `json:"-" yaml:"-"`
 
-	Deps         *ecosystem.ModuleDeps `json:"-" yaml:"-"` // ecosystem-internal, not serialized
-	ScanResult   *scan.ScanResult      `json:"scan_result" yaml:"scan_result"`
-	ExistingDeps []string              `json:"existing_deps" yaml:"existing_deps"` // deps currently declared for this root
-	DesiredDeps  []string              `json:"desired_deps" yaml:"desired_deps"`   // deps this root should end up declaring
+	Deps *ecosystem.ModuleDeps `json:"-" yaml:"-"` // ecosystem-internal, not serialized
+	// ScannedPackages are the packages (at their pristine versions) the
+	// analysis scan queried OSV for: an advisory absent from ScanResult but
+	// affecting one of them does not affect the version shipped.
+	ScannedPackages []scan.Package   `json:"-" yaml:"-"`
+	ScanResult      *scan.ScanResult `json:"scan_result" yaml:"scan_result"`
+	ExistingDeps    []string         `json:"existing_deps" yaml:"existing_deps"` // deps currently declared for this root
+	DesiredDeps     []string         `json:"desired_deps" yaml:"desired_deps"`   // deps this root should end up declaring
 
 	// Replace directives ("old=new@version", Go only): what the root's bump
 	// steps currently declare, and what they should end up declaring.
@@ -247,4 +326,8 @@ type Options struct {
 	// epoch when a rebuild with the newest allowed Go release would fix
 	// stdlib vulnerabilities. On by default at the CLI.
 	StdlibCheck bool `json:"stdlib_check" yaml:"stdlib_check"`
+
+	// ApkAdvisoryCheck enables the Chainguard/Wolfi APK-advisory epoch
+	// alignment (see ApkAdvisoryStage). On by default at the CLI.
+	ApkAdvisoryCheck bool `json:"apk_advisory_check" yaml:"apk_advisory_check"`
 }

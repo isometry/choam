@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"reflect"
 	"slices"
 	"strings"
+
+	"github.com/goccy/go-yaml"
 
 	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/processor"
@@ -32,6 +35,10 @@ type Processor struct {
 	Validated bool                `json:"validated"`
 	Residuals []simulate.Residual `json:"residuals,omitempty"`
 
+	// SimulationError is why simulation was unavailable (set when the run
+	// degraded to the unvalidated candidate set); "" otherwise.
+	SimulationError string `json:"simulation_error,omitempty"`
+
 	// UnreachableVulnIDs are advisory IDs found by the analysis scan whose
 	// modules are not linked into any build artifact in ANY modroot (see
 	// SimulationStage's reachability diff) - informational: no bump is
@@ -55,6 +62,30 @@ type Processor struct {
 	// completion (false when skipped or degraded).
 	StdlibBumps   []StdlibBump `json:"stdlib_bumps,omitempty"`
 	StdlibChecked bool         `json:"stdlib_checked"`
+
+	// StdlibRebuildGoVersions are the Go releases the next build resolves to,
+	// one per go-package constraint (see StdlibStage); nil = unknown (stage
+	// skipped, or a constraint deferred), so stdlib fixes are unprovable.
+	StdlibRebuildGoVersions []string `json:"-"`
+
+	// stdlibUnresolved says why StdlibStage left the rebuild toolchain
+	// unresolved ("" when it resolved, or the stage did not run).
+	stdlibUnresolved string
+
+	// ApkAdvisories, ApkEpochTarget, FirstPartyVulnIDs and ApkAlignment are
+	// the APK-advisory alignment outcome (see ApkAdvisoryStage and Result).
+	ApkAdvisories     []ApkAdvisory `json:"apk_advisories,omitempty"`
+	ApkEpochTarget    int64         `json:"apk_epoch_target,omitempty"`
+	FirstPartyVulnIDs []string      `json:"first_party_vuln_ids,omitempty"`
+	ApkAlignment      *ApkAlignment `json:"apk_alignment,omitempty"`
+
+	// MessageSections parallels the messages: the report section of each
+	// (see TagMessages).
+	MessageSections []string `json:"-"`
+
+	// ActionsNeeded are the stage-recorded actions (see AddAction); ToResult
+	// adds those derived from the final state.
+	ActionsNeeded []NeededAction `json:"actions_needed,omitempty"`
 
 	// LinkedStdPackages is the union, across simulated Go modroots, of
 	// standard-library import paths linked into the build artifacts
@@ -137,7 +168,7 @@ func (p *Processor) AddHygieneBump(fix SecurityFix) {
 // Skip records why (part of) the package was not analyzed: logged now, and
 // reported with the result (see SkipReasons).
 func (p *Processor) Skip(ctx context.Context, reason string) {
-	logging.From(ctx).Info("skipped", "reason", reason)
+	logging.From(ctx).Debug("skipped", "reason", reason)
 	p.SkipReasons = append(p.SkipReasons, reason)
 }
 
@@ -145,6 +176,56 @@ func (p *Processor) Skip(ctx context.Context, reason string) {
 func (p *Processor) AddNote(note string) {
 	if !slices.Contains(p.Notes, note) {
 		p.Notes = append(p.Notes, note)
+	}
+}
+
+// Report sections of the -v details, in display order; SectionHidden
+// messages (epoch, validation, file writing) are not rendered by bump but
+// stay in Messages, which update matches on.
+const (
+	SectionChanges    = "Changes"
+	SectionAdvisories = "Advisories"
+	SectionApk        = "apk"
+	SectionStdlib     = "stdlib"
+	SectionOther      = "Other"
+	SectionHidden     = "hidden"
+)
+
+// stageSections maps a pipeline stage to its messages' section; any other
+// stage is SectionOther.
+var stageSections = map[string]string{
+	"vulnerability_check": SectionAdvisories,
+	"bump_simulation":     SectionAdvisories,
+	"go_version_fallback": SectionChanges,
+	"bump_apply":          SectionChanges,
+	"go_package_pins":     SectionChanges,
+	"stdlib_check":        SectionStdlib,
+	"apk_advisories":      SectionApk,
+	"epoch":               SectionHidden,
+	"validation":          SectionHidden,
+	"file_writer":         SectionHidden,
+}
+
+// TagMessages assigns the messages from index from onwards to stage's
+// section (processor.MessageTagger); earlier untagged messages, added
+// outside any stage, are SectionOther.
+func (p *Processor) TagMessages(stage string, from int) {
+	for len(p.MessageSections) < from {
+		p.MessageSections = append(p.MessageSections, SectionOther)
+	}
+	section, ok := stageSections[stage]
+	if !ok {
+		section = SectionOther
+	}
+	for len(p.MessageSections) < len(p.GetMessages()) {
+		p.MessageSections = append(p.MessageSections, section)
+	}
+}
+
+// AddAction records a needed action, deduplicated on kind and subject.
+func (p *Processor) AddAction(kind, subject, detail string) {
+	if !slices.ContainsFunc(p.ActionsNeeded, func(a NeededAction) bool { return a.Kind == kind && a.Subject == subject }) {
+		p.ActionsNeeded = append(p.ActionsNeeded, NeededAction{Kind: kind, Subject: subject, Detail: detail})
 	}
 }
 
@@ -191,6 +272,32 @@ func (p *Processor) MarkActualChangesApplied() {
 func (p *Processor) HasActualChanges() bool {
 	// Check if YAML content actually changed
 	return !bytes.Equal(p.GetOriginalYAML(), p.GetCurrentYAML()) || p.ActualChangesApplied
+}
+
+// buildInputsChanged reports whether this run edited what the build uses:
+// the parsed original and current YAML differ beyond package.epoch (the
+// epoch stage runs last, so the difference is exactly this run's edits;
+// comment- and formatting-only rewrites parse identically). Unparseable YAML
+// falls back to a byte comparison.
+func (p *Processor) buildInputsChanged() bool {
+	original, err1 := parseWithoutEpoch(p.GetOriginalYAML())
+	current, err2 := parseWithoutEpoch(p.GetCurrentYAML())
+	if err1 != nil || err2 != nil {
+		return p.HasFileChanges()
+	}
+	return !reflect.DeepEqual(original, current)
+}
+
+// parseWithoutEpoch parses a melange YAML document, minus package.epoch.
+func parseWithoutEpoch(content []byte) (map[string]any, error) {
+	var doc map[string]any
+	if err := yaml.Unmarshal(content, &doc); err != nil {
+		return nil, err
+	}
+	if pkg, ok := doc["package"].(map[string]any); ok {
+		delete(pkg, "epoch")
+	}
+	return doc, nil
 }
 
 // fixedVulnIDs is the one definition of the dependency advisories this
@@ -330,7 +437,7 @@ func (p *Processor) ToResult() *Result {
 		actionsApplied = p.VulnerabilityAnalysis.BumpActions
 	}
 
-	return &Result{
+	result := &Result{
 		PackageName:                p.GetPackageName(),
 		FilePath:                   p.GetFilePath(),
 		VulnerabilitiesFound:       vulnerabilitiesFound,
@@ -340,6 +447,7 @@ func (p *Processor) ToResult() *Result {
 		UnreachableVulnIDs:         unreachableIDs,
 		ModulesBumped:              modulesBumped,
 		Validated:                  p.Validated,
+		SimulationError:            p.SimulationError,
 		Residuals:                  residuals,
 		CriticalFixed:              criticalFixed,
 		HighFixed:                  highFixed,
@@ -347,6 +455,10 @@ func (p *Processor) ToResult() *Result {
 		Notes:                      p.Notes,
 		StdlibBumps:                p.StdlibBumps,
 		StdlibChecked:              p.StdlibChecked,
+		ApkAdvisories:              p.ApkAdvisories,
+		ApkEpochTarget:             p.ApkEpochTarget,
+		FirstPartyVulnIDs:          p.FirstPartyVulnIDs,
+		ApkAlignment:               p.ApkAlignment,
 		SecurityFixes:              p.SecurityFixes,
 		HygieneBumps:               p.HygieneBumps,
 		HygieneModulesBumped:       hygieneBumped,
@@ -356,8 +468,51 @@ func (p *Processor) ToResult() *Result {
 		EpochChanged:               p.IsEpochChanged(),
 		FileWasWritten:             p.HasFileChanges(),
 		Messages:                   p.GetMessages(),
+		MessageSections:            p.MessageSections,
 		Error:                      errorStr,
 	}
+	result.ActionsNeeded = append(slices.Clone(p.ActionsNeeded), resultActions(result)...)
+	if result.EpochChanged {
+		result.EpochReasons = epochReasons(p)
+	}
+	return result
+}
+
+// resultActions derives the actions the final result needs: rerun when
+// something was written or bumped without simulation proof, review for a
+// residual with a known fix and for each skip reason, accept for a residual
+// with no released fix.
+func resultActions(r *Result) []NeededAction {
+	var actions []NeededAction
+	if r.Error == "" && r.VulnerabilitiesFound > 0 && !r.Validated && (r.FileWasWritten || r.ModulesBumped > 0) {
+		detail := r.SimulationError
+		if detail == "" {
+			detail = "simulation skipped (--no-validate)"
+		}
+		actions = append(actions, NeededAction{Kind: ActionRerun, Subject: "deps list not validated (resolvability and completeness unproven)", Detail: detail})
+	}
+	for _, residual := range r.Residuals {
+		location := residual.Module
+		if residual.ResolvedVersion != "" {
+			location += "@" + residual.ResolvedVersion
+		}
+		if len(residual.VulnIDs) > 0 {
+			location += " " + strings.Join(residual.VulnIDs, ", ")
+		}
+		if residual.FixedVersion == "" {
+			actions = append(actions, NeededAction{Kind: ActionAccept, Subject: residual.Reason, Detail: location})
+			continue
+		}
+		detail := fmt.Sprintf("needs %s: %s", residual.FixedVersion, residual.Reason)
+		if residual.Introduced {
+			detail += " (introduced by this bump)"
+		}
+		actions = append(actions, NeededAction{Kind: ActionReview, Subject: location, Detail: detail})
+	}
+	for _, reason := range r.SkipReasons {
+		actions = append(actions, NeededAction{Kind: ActionReview, Subject: "not analyzed", Detail: reason})
+	}
+	return actions
 }
 
 // residualIDSets collects the advisory IDs of residuals: all of them, and

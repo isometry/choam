@@ -1,11 +1,13 @@
 package cmd
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -15,6 +17,7 @@ import (
 	"github.com/isometry/choam/internal/output"
 	"github.com/isometry/choam/internal/processor"
 	"github.com/spf13/cobra"
+	"golang.org/x/term"
 )
 
 func NewBumpCmd() *cobra.Command {
@@ -38,8 +41,9 @@ Path can be a single file or a directory containing .yaml files.`,
 	cmd.Flags().BoolVar(&noValidate, "no-validate", false, "Skip bump simulation (writes deps lists without proving they resolve or cover all advisories, and skips artifact-reachability filtering; go.sum narrowing still applies); requires a go toolchain otherwise")
 	cmd.Flags().DurationVar(&simulationTimeout, "simulation-timeout", 10*time.Minute, "Per-package budget for bump simulation")
 	cmd.Flags().BoolVar(&noCompile, "no-compile", false, "Skip the simulation's compile gate (validated deps are then only proven to resolve, not to compile the go/build packages); implied by --no-validate")
-	cmd.Flags().BoolVar(&failOnResidual, "fail-on-residual", false, "Exit non-zero when any advisory remains residual (files that error always exit non-zero)")
+	cmd.Flags().BoolVar(&failOnResidual, "fail-on-residual", false, "Exit non-zero when any advisory remains residual or a first-party apk advisory needs a patch (files that error always exit non-zero)")
 	cmd.Flags().BoolVar(&noStdlib, "no-stdlib", false, "Skip the Go stdlib staleness check (no epoch bump for toolchain-fixed vulnerabilities). The check is also skipped automatically for files with uncommitted changes.")
+	cmd.Flags().BoolVar(&noApkAdvisories, "no-apk-advisories", false, "Skip the Chainguard/Wolfi apk advisory check (no epoch alignment with published apk advisories, no first-party patch alerts)")
 
 	return cmd
 }
@@ -63,6 +67,9 @@ func runBump(cmd *cobra.Command, args []string) error {
 	}
 
 	if len(files) == 0 {
+		if outputFormat == "json" || outputFormat == "yaml" {
+			return outputBumpStructured(nil, outputFormat) // keep structured stdout parseable
+		}
 		fmt.Println("No melange files found.")
 		return nil
 	}
@@ -71,10 +78,6 @@ func runBump(cmd *cobra.Command, args []string) error {
 
 	// Configure processor options
 	opts := buildBumpProcessorOptions()
-
-	if dryRun {
-		fmt.Println("Dry run mode - no files will be modified")
-	}
 
 	// Create shared HTTP client with custom timeout
 	httpClient := httpclient.NewHTTPClientWithTimeout(httpTimeout)
@@ -90,7 +93,8 @@ func runBump(cmd *cobra.Command, args []string) error {
 
 		result, err := gobump.ProcessFile(ctx, file, opts, analyzer)
 		if err != nil {
-			slog.Error("processing melange file failed", "file", file, "error", err) //nolint:forbidigo // ProcessFile failed before/without seeding a ctx logger
+			// Already logged where it happened (ProcessFile's read/parse
+			// errors, the pipeline's "Stage failed"); recorded in result.Error.
 			if result == nil {
 				// Read/parse failure: no processor, so no partial state.
 				result = &gobump.Result{
@@ -110,12 +114,18 @@ func runBump(cmd *cobra.Command, args []string) error {
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("bump cancelled after %d of %d file(s): %w", len(results), len(files), err)
 	}
-	summary := summarizeBumpResults(results)
+	return bumpExitError(summarizeBumpResults(results))
+}
+
+// bumpExitError maps the run summary to the command's exit status.
+func bumpExitError(summary output.BumpSummary) error {
 	switch {
 	case summary.Errors > 0:
 		return fmt.Errorf("%w: %d of %d file(s) errored", ErrBumpFailed, summary.Errors, summary.TotalPackages)
 	case failOnResidual && summary.TotalVulnsResidual > 0:
 		return fmt.Errorf("%w: %d residual advisory(ies) in %d file(s) (--fail-on-residual)", ErrBumpFailed, summary.TotalVulnsResidual, summary.PackagesPartial)
+	case failOnResidual && summary.TotalFirstPartyVulns > 0:
+		return fmt.Errorf("%w: %d first-party apk advisory(ies) need a patch in %d file(s) (--fail-on-residual)", ErrBumpFailed, summary.TotalFirstPartyVulns, summary.PackagesPatchNeeded)
 	}
 	return nil
 }
@@ -135,6 +145,7 @@ func buildBumpProcessorOptions() gobump.Options {
 		SimulationTimeout: simulationTimeout,
 		Compile:           !noValidate && !noCompile,
 		StdlibCheck:       !noStdlib,
+		ApkAdvisoryCheck:  !noApkAdvisories,
 	}
 }
 
@@ -162,12 +173,22 @@ func summarizeBumpResults(results []*gobump.Result) output.BumpSummary {
 			summary.PackagesStdlibStale++
 			summary.TotalStdlibVulns += len(distinct)
 		}
+		if r.Error != "" || len(r.ActionsNeeded) > 0 {
+			summary.PackagesActionNeeded++
+		}
 		if r.Error != "" {
 			summary.Errors++
 			continue
 		}
+		if r.EpochChanged || r.FileWasWritten {
+			summary.PackagesChanged++
+		}
 		if len(r.SkipReasons) > 0 {
 			summary.PackagesSkipped++
+		}
+		if n := len(r.FirstPartyVulnIDs); n > 0 {
+			summary.PackagesPatchNeeded++
+			summary.TotalFirstPartyVulns += n
 		}
 		summary.TotalModulesBumped += r.ModulesBumped
 		summary.TotalHygieneModulesBumped += r.HygieneModulesBumped
@@ -209,7 +230,187 @@ func outputBumpStructured(results []*gobump.Result, format string) error {
 	return output.OutputYAML(os.Stdout, response)
 }
 
+// outputBumpTable renders the default report: the results table, why each
+// changed file's epoch moved, the actions needed, one info line plus notes,
+// the -v messages and a short footer. Every error, skip, residual and
+// unvalidated write surfaces as an action - a package that was not (fully)
+// analyzed or still carries advisories never silently reads as clean.
 func outputBumpTable(results []*gobump.Result) error {
+	renderBumpTable(results)
+	renderWhy(results)
+	renderActions(results)
+	renderInfo(results)
+
+	if verbosity > 0 {
+		for _, result := range results {
+			renderDetails(result)
+		}
+	}
+
+	s := summarizeBumpResults(results)
+	fmt.Printf("\nSummary: %d %s, %d changed, %d errors, %d skipped, %d %s\n",
+		s.TotalPackages, pluralWord(s.TotalPackages, "file", "files"), s.PackagesChanged, s.Errors, s.PackagesSkipped,
+		s.PackagesActionNeeded, pluralWord(s.PackagesActionNeeded, "needs action", "need action"))
+	if dryRun {
+		fmt.Println("(Dry run - no files were actually modified)")
+	}
+	return nil
+}
+
+func pluralWord(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// detailSections is the -v details' section order (gobump.SectionHidden
+// messages are not shown).
+var detailSections = []string{gobump.SectionChanges, gobump.SectionAdvisories, gobump.SectionApk, gobump.SectionStdlib, gobump.SectionOther}
+
+// renderDetails prints a file's -v narrative, grouped by section: Changes
+// leads with the structured fixes and hygiene bumps, apk is rendered from
+// the structured alignment; each section then lists its tagged messages.
+func renderDetails(result *gobump.Result) {
+	lines := make(map[string][]string)
+	for _, fix := range result.SecurityFixes {
+		lines[gobump.SectionChanges] = append(lines[gobump.SectionChanges], fixLine(fix))
+	}
+	for _, fix := range result.HygieneBumps {
+		lines[gobump.SectionChanges] = append(lines[gobump.SectionChanges], "hygiene: "+fixLine(fix))
+	}
+	lines[gobump.SectionApk] = apkDetailLines(result)
+	for i, message := range result.Messages {
+		section := gobump.SectionOther
+		if i < len(result.MessageSections) {
+			section = result.MessageSections[i]
+		}
+		lines[section] = append(lines[section], message)
+	}
+	var out strings.Builder
+	for _, section := range detailSections {
+		if len(lines[section]) == 0 {
+			continue
+		}
+		fmt.Fprintf(&out, "  %s:\n", section)
+		for _, line := range lines[section] {
+			fmt.Fprintf(&out, "    - %s\n", line)
+		}
+	}
+	if out.Len() > 0 {
+		fmt.Printf("\nDetails for %s:\n%s", result.PackageName, out.String())
+	}
+}
+
+// fixLine renders a dependency change as "module old -> new [IDs]", CVE IDs
+// first.
+func fixLine(fix gobump.SecurityFix) string {
+	var ids []string
+	for id := range strings.SplitSeq(fix.Vulnerability, ",") {
+		if id = strings.TrimSpace(id); id != "" {
+			ids = append(ids, id)
+		}
+	}
+	slices.SortFunc(ids, func(a, b string) int {
+		return cmp.Or(cmp.Compare(cveRank(a), cveRank(b)), strings.Compare(a, b))
+	})
+	line := fmt.Sprintf("%s %s -> %s", fix.Module, fix.OldVersion, fix.NewVersion)
+	if len(ids) > 0 {
+		line += " [" + strings.Join(ids, ", ") + "]"
+	}
+	return line
+}
+
+func cveRank(id string) int {
+	if strings.HasPrefix(id, "CVE-") {
+		return 0
+	}
+	return 1
+}
+
+// apkDetailMaxIDs caps the proven-advisory list.
+const apkDetailMaxIDs = 5
+
+// apkDetailLines renders the apk alignment: one counts line, the proven
+// advisories, then by fix epoch one line per cause of the unproven ones and
+// one per first-party advisory (one entry per display ID and fix, as the
+// counts are).
+func apkDetailLines(result *gobump.Result) []string {
+	apk := result.ApkAlignment
+	if apk == nil {
+		return nil
+	}
+	if apk.HighestFixedEpoch == 0 && apk.Ignored == 0 {
+		return []string{apk.Version + ": no apk advisories"}
+	}
+	ignored := fmt.Sprintf("%d ignored", apk.Ignored)
+	if apk.Uncorrelated > 0 {
+		ignored += fmt.Sprintf(" (%d without an upstream ID)", apk.Uncorrelated)
+	}
+	counts := fmt.Sprintf("%s: %d proven, %d unproven, %d first-party, ", apk.Version, apk.Proven, apk.Unproven, apk.FirstParty)
+	if apk.NotApplicable > 0 {
+		counts += fmt.Sprintf("%d not applicable, ", apk.NotApplicable)
+	}
+	counts += ignored
+	if apk.HighestFixedEpoch > 0 {
+		counts += fmt.Sprintf("; reached -r%d of highest -r%d", result.NewEpoch, apk.HighestFixedEpoch)
+	}
+	lines := []string{counts}
+	var proven []string
+	var open []gobump.ApkAdvisory
+	seen := make(map[string]bool)
+	for _, adv := range result.ApkAdvisories {
+		id := adv.DisplayID()
+		key := id + "|" + adv.FixedVersion
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		if adv.Status == "proven" { // gobump's apkProven
+			if !slices.Contains(proven, id) {
+				proven = append(proven, id)
+			}
+			continue
+		}
+		open = append(open, adv)
+	}
+	if len(proven) > 0 {
+		slices.SortFunc(proven, func(a, b string) int {
+			return cmp.Or(cmp.Compare(cveRank(a), cveRank(b)), strings.Compare(a, b))
+		})
+		list := strings.Join(proven[:min(len(proven), apkDetailMaxIDs)], ", ")
+		if len(proven) > apkDetailMaxIDs {
+			list += fmt.Sprintf(" (+%d)", len(proven)-apkDetailMaxIDs)
+		}
+		lines = append(lines, "proven: "+list)
+	}
+	slices.SortFunc(open, func(a, b gobump.ApkAdvisory) int {
+		return cmp.Or(cmp.Compare(a.FixedEpoch, b.FixedEpoch), cmp.Compare(cveRank(a.DisplayID()), cveRank(b.DisplayID())), strings.Compare(a.DisplayID(), b.DisplayID()))
+	})
+	// Unproven and not-applicable advisories group by (fix epoch, status,
+	// cause) - open is sorted, so a group is a run of equal keys once sorted
+	// by cause too; first-party ones stay one line each.
+	slices.SortStableFunc(open, func(a, b gobump.ApkAdvisory) int {
+		return cmp.Or(cmp.Compare(a.FixedEpoch, b.FixedEpoch), strings.Compare(a.Status, b.Status), strings.Compare(a.Reason, b.Reason))
+	})
+	for i := 0; i < len(open); {
+		adv := open[i]
+		if adv.Status != "unproven" && adv.Status != "not-applicable" { // gobump's apkUnproven, apkNotApplicable
+			lines = append(lines, fmt.Sprintf("%s %s (%s, fixed in %s): %s", adv.Status, adv.DisplayID(), adv.ID, adv.FixedVersion, adv.Reason))
+			i++
+			continue
+		}
+		var ids []string
+		for ; i < len(open) && open[i].Status == adv.Status && open[i].FixedEpoch == adv.FixedEpoch && open[i].Reason == adv.Reason; i++ {
+			ids = append(ids, fmt.Sprintf("%s (%s)", open[i].DisplayID(), open[i].ID))
+		}
+		lines = append(lines, fmt.Sprintf("%s in -r%d (%d): %s: %s", strings.ReplaceAll(adv.Status, "-", " "), adv.FixedEpoch, len(ids), strings.Join(ids, ", "), adv.Reason))
+	}
+	return lines
+}
+
+// renderBumpTable prints one row per file.
+func renderBumpTable(results []*gobump.Result) {
 	maxPkgLen := len("PACKAGE")
 	for _, result := range results {
 		maxPkgLen = max(maxPkgLen, len(result.PackageName))
@@ -219,9 +420,13 @@ func outputBumpTable(results []*gobump.Result) error {
 	t := table.New(os.Stdout)
 	t.SetRowLines(false)
 	t.SetBorders(false)
-	t.SetHeaders("PACKAGE", "FOUND", "FIXED", "RESIDUAL", "UNLINKED", "HYGIENE", "BUMPED", "STDLIB", "OLD EPOCH", "NEW EPOCH", "STATUS")
+	t.SetHeaders("PACKAGE", "FOUND", "FIXED", "RESIDUAL", "UNLINKED", "HYGIENE", "BUMPED", "STDLIB", "EPOCH", "STATUS")
 	for _, result := range results {
 		stdlibVulns := len(output.DistinctStdlibVulnIDs(result.StdlibBumps))
+		epoch := fmt.Sprintf("%d", result.OldEpoch)
+		if result.NewEpoch != result.OldEpoch {
+			epoch = fmt.Sprintf("%d->%d", result.OldEpoch, result.NewEpoch)
+		}
 		t.AddRow(
 			truncate(result.PackageName, maxPkgLen),
 			fmt.Sprintf("%d", result.VulnerabilitiesFound),
@@ -231,83 +436,213 @@ func outputBumpTable(results []*gobump.Result) error {
 			fmt.Sprintf("%d", result.HygieneModulesBumped),
 			fmt.Sprintf("%d", result.ModulesBumped),
 			stdlibColumnValue(stdlibVulns, result.StdlibChecked),
-			fmt.Sprintf("%d", result.OldEpoch),
-			fmt.Sprintf("%d", result.NewEpoch),
+			epoch,
 			bumpRowStatus(result, stdlibVulns),
 		)
 	}
 	t.Render()
+}
 
-	// Errors, skips, notes, residuals and validation warnings are always
-	// shown - a package that was not (fully) analyzed or still carries
-	// advisories must never silently read as clean.
+// renderWhy prints, per file whose epoch moved (never an ERROR or SKIPPED
+// row), the epoch comment's clauses with their advisory counts and the apk
+// alignment outcome. A block after the table rather than a spanning table
+// row: aquasecurity/table's SetColSpans widens the other columns to fit a
+// long cell (and panics in v1.11.0's auto-merge pass).
+func renderWhy(results []*gobump.Result) {
+	var lines []string
 	for _, result := range results {
-		if result.Error != "" {
-			fmt.Printf("\nError for %s: %s\n", result.PackageName, result.Error)
+		if status := bumpRowStatus(result, len(output.DistinctStdlibVulnIDs(result.StdlibBumps))); !result.EpochChanged || status == "ERROR" || status == "SKIPPED" {
+			continue
 		}
-		if len(result.SkipReasons) > 0 {
-			fmt.Printf("\nSkipped %s: %s\n", result.PackageName, strings.Join(result.SkipReasons, "; "))
+		if why := whyLine(result); why != "" {
+			lines = append(lines, wrapWords(fmt.Sprintf("  %s: ", result.PackageName), 4, strings.Fields(why)))
 		}
+	}
+	if len(lines) > 0 {
+		fmt.Printf("\nWhy:\n%s\n", strings.Join(lines, "\n"))
+	}
+}
+
+// whyLine renders a result's epoch reasons as "text (N)" clauses plus, when
+// apk advisories were aligned with, the apk outcome.
+func whyLine(result *gobump.Result) string {
+	var parts []string
+	for _, reason := range result.EpochReasons {
+		if len(reason.VulnIDs) > 0 {
+			parts = append(parts, fmt.Sprintf("%s (%d)", reason.Text, len(reason.VulnIDs)))
+		} else {
+			parts = append(parts, reason.Text)
+		}
+	}
+	why := strings.Join(parts, ", ")
+	if apk := result.ApkAlignment; apk != nil && apk.HighestFixedEpoch > 0 {
+		version := apk.Version
+		if i := strings.LastIndex(version, "-r"); i >= 0 {
+			version = version[:i]
+		}
+		line := fmt.Sprintf("apk: -r%d is the highest Wolfi advisory fix epoch for %s", apk.HighestFixedEpoch, version)
+		if result.NewEpoch < apk.HighestFixedEpoch {
+			line = fmt.Sprintf("apk: held at -r%d, -r%d advisory not proven (see actions)", result.NewEpoch, apk.BlockedAt)
+		}
+		if why != "" {
+			why += "; "
+		}
+		why += line
+	}
+	return why
+}
+
+// defaultWrapWidth is the report's wrap width when stdout is not a terminal.
+const defaultWrapWidth = 100
+
+// wrapWidth is the column the report wraps at: the terminal's width when
+// stdout is one, else defaultWrapWidth (stable for pipes, files and tests).
+func wrapWidth() int {
+	if fd := int(os.Stdout.Fd()); term.IsTerminal(fd) {
+		if width, _, err := term.GetSize(fd); err == nil && width > 0 {
+			return width
+		}
+	}
+	return defaultWrapWidth
+}
+
+// wrapWords joins words after prefix, breaking only between words at
+// wrapWidth; continuation lines are indented by indent columns (-1: the
+// prefix's width). A word longer than a line stays whole on its own line.
+func wrapWords(prefix string, indent int, words []string) string {
+	return wrapAt(wrapWidth(), prefix, indent, words)
+}
+
+func wrapAt(width int, prefix string, indentWidth int, words []string) string {
+	if indentWidth < 0 {
+		indentWidth = len(prefix)
+	}
+	indent := strings.Repeat(" ", indentWidth)
+	var out strings.Builder
+	out.WriteString(prefix)
+	col, empty := len(prefix), true
+	for _, word := range words {
+		if !empty && col+1+len(word) > width {
+			out.WriteString("\n" + indent)
+			col, empty = len(indent), true
+		}
+		if !empty {
+			out.WriteByte(' ')
+			col++
+		}
+		out.WriteString(word)
+		col += len(word)
+		empty = false
+	}
+	return out.String()
+}
+
+// actionOrder ranks action kinds for display; errors come from Result.Error.
+var actionOrder = map[string]int{"error": 0, gobump.ActionPatch: 1, gobump.ActionRerun: 2, gobump.ActionReview: 3, gobump.ActionAccept: 4}
+
+// actionMaxPackages caps the package names listed per action.
+const actionMaxPackages = 3
+
+// renderActions prints every result's needed actions (and errors) grouped by
+// (kind, subject, detail) across files, most severe kind first, then by
+// subject and detail.
+func renderActions(results []*gobump.Result) {
+	packages := make(map[gobump.NeededAction][]string)
+	var keys []gobump.NeededAction
+	add := func(action gobump.NeededAction, pkg string) {
+		if _, ok := packages[action]; !ok {
+			keys = append(keys, action)
+		}
+		if !slices.Contains(packages[action], pkg) {
+			packages[action] = append(packages[action], pkg)
+		}
+	}
+	for _, result := range results {
+		if result.Error != "" { // its partial state is incomplete: the error is the action
+			add(gobump.NeededAction{Kind: "error", Subject: result.Error}, result.PackageName)
+			continue
+		}
+		for _, action := range result.ActionsNeeded {
+			add(action, result.PackageName)
+		}
+	}
+	if len(keys) == 0 {
+		return
+	}
+	slices.SortFunc(keys, func(a, b gobump.NeededAction) int {
+		return cmp.Or(cmp.Compare(actionOrder[a.Kind], actionOrder[b.Kind]), strings.Compare(a.Subject, b.Subject), strings.Compare(a.Detail, b.Detail))
+	})
+	fmt.Println("\nAction needed:")
+	for _, action := range keys {
+		line := action.Subject
+		if action.Detail != "" {
+			line += ": " + action.Detail
+		}
+		// The package list is its own trailing segment: "- a," "b," "+N more"
+		// tokens, so it wraps at commas and never splits "+N more".
+		pkgs := packages[action]
+		shown := pkgs[:min(len(pkgs), actionMaxPackages)]
+		words := strings.Fields(line)
+		for i, pkg := range shown {
+			if i == 0 {
+				pkg = "- " + pkg
+			}
+			if i < len(shown)-1 || len(pkgs) > len(shown) {
+				pkg += ","
+			}
+			words = append(words, pkg)
+		}
+		if len(pkgs) > len(shown) {
+			words = append(words, fmt.Sprintf("+%d more", len(pkgs)-len(shown)))
+		}
+		fmt.Println(wrapWords(fmt.Sprintf("  %-7s ", strings.ToUpper(action.Kind)), -1, words))
+	}
+}
+
+// renderInfo prints one line of the nonzero informational counts, then each
+// remaining note.
+func renderInfo(results []*gobump.Result) {
+	var unlinked, hygiene, apkIgnored, stdlibSkipped int
+	for _, result := range results {
+		unlinked += result.VulnerabilitiesUnreachable
+		hygiene += result.HygieneModulesBumped
+		if result.ApkAlignment != nil {
+			apkIgnored += result.ApkAlignment.Ignored
+		}
+		if result.Error == "" && !result.StdlibChecked {
+			stdlibSkipped++
+		}
+	}
+	var counts []string
+	for _, c := range []struct {
+		n         int
+		one, many string
+	}{
+		{unlinked, "advisory in unlinked modules", "advisories in unlinked modules"},
+		{hygiene, "hygiene bump", "hygiene bumps"},
+		{apkIgnored, "apk advisory ignored", "apk advisories ignored"},
+		{stdlibSkipped, "stdlib check skipped", "stdlib checks skipped"},
+	} {
+		if c.n > 0 {
+			counts = append(counts, fmt.Sprintf("%d %s", c.n, pluralWord(c.n, c.one, c.many)))
+		}
+	}
+	var notes []string
+	for _, result := range results {
 		for _, note := range result.Notes {
-			fmt.Printf("\nNote %s: %s\n", result.PackageName, note)
-		}
-		if len(result.Residuals) > 0 {
-			fmt.Printf("\nResidual vulnerabilities for %s (no reachable zero-vulnerability state):\n", result.PackageName)
-			for _, residual := range result.Residuals {
-				location := residual.Module
-				if residual.ResolvedVersion != "" {
-					location += "@" + residual.ResolvedVersion
-				}
-				detail := residual.Reason
-				if residual.FixedVersion != "" {
-					detail = fmt.Sprintf("needs %s: %s", residual.FixedVersion, residual.Reason)
-				}
-				vulns := strings.Join(residual.VulnIDs, ", ")
-				if vulns == "" {
-					vulns = "-"
-				}
-				fmt.Printf("  - %s [%s] %s\n", location, vulns, detail)
-			}
-		}
-		if result.Error == "" && result.VulnerabilitiesFound > 0 && !result.Validated && (result.FileWasWritten || result.ModulesBumped > 0) {
-			fmt.Printf("\nWARNING: %s deps list NOT validated - resolvability and completeness unproven\n", result.PackageName)
+			notes = append(notes, wrapWords(fmt.Sprintf("Note %s: ", result.PackageName), 2, strings.Fields(note)))
 		}
 	}
-
-	if verbosity > 0 {
-		for _, result := range results {
-			if len(result.Messages) > 0 {
-				fmt.Printf("\nMessages for %s:\n", result.PackageName)
-				for _, message := range result.Messages {
-					fmt.Printf("  - %s\n", message)
-				}
-			}
-		}
+	if len(counts) == 0 && len(notes) == 0 {
+		return
 	}
-
-	s := summarizeBumpResults(results)
-	footer := fmt.Sprintf("Summary: %d files processed, %d with vulnerabilities, %d fixed, %d errors",
-		s.TotalPackages, s.PackagesWithVulns, s.PackagesFixed, s.Errors)
-	if s.PackagesSkipped > 0 {
-		footer += fmt.Sprintf(", %d skipped", s.PackagesSkipped)
+	fmt.Println()
+	if len(counts) > 0 {
+		fmt.Println(wrapWords("Info (-v for detail): ", 2, strings.Fields(strings.Join(counts, ", "))))
 	}
-	if s.TotalVulnsFound > 0 {
-		footer += fmt.Sprintf(" (%d advisories found, %d fixed, %d residual, %d in unlinked modules; %d modules bumped)",
-			s.TotalVulnsFound, s.TotalVulnsFixed, s.TotalVulnsResidual, s.TotalVulnsUnreachable, s.TotalModulesBumped)
+	for _, note := range notes {
+		fmt.Println(note)
 	}
-	if s.TotalHygieneModulesBumped > 0 {
-		footer += fmt.Sprintf("; %d hygiene bump(s)", s.TotalHygieneModulesBumped)
-	}
-	if s.PackagesStdlibStale > 0 {
-		footer += fmt.Sprintf("; %d stdlib-stale", s.PackagesStdlibStale)
-	}
-	fmt.Printf("\n%s\n", footer)
-
-	if dryRun {
-		fmt.Println("(Dry run - no files were actually modified)")
-	}
-
-	return nil
 }
 
 // bumpRowStatus computes the table STATUS cell for one result. "Fixed"
@@ -316,13 +651,19 @@ func outputBumpTable(results []*gobump.Result) error {
 //
 //	ERROR          the file failed (partial counts shown)
 //	SKIPPED        not analyzed (see SkipReasons) and nothing found
+//	PATCH-NEEDED   a first-party apk advisory (own module affected) needs a
+//	               source patch; wins over every success status below
+//	APK-ALIGN      epoch raised only to align with a proven apk advisory
+//	               (no module bumps, stdlib fixes or residuals)
 //	UNVALIDATED    fixes written but not proven by simulation
 //	PARTIAL        fixed some, residual advisories remain
-//	FIXED          fixed, nothing residual
+//	FIXED          fixed by this run (modules or hygiene bumped, file
+//	               written or epoch changed), nothing residual
 //	NO-FIX         nothing fixed, residual advisories remain (simulated or
 //	               not - e.g. no released fix)
 //	UPDATED        file rewritten without fixing anything
 //	UP-TO-DATE     advisories found, all handled by the existing deps list
+//	               (incl. proven fixed with nothing changed by this run)
 //	STDLIB-REBUILD no dependency advisories; epoch bumped for a stdlib fix
 //	NO VULNS       nothing found
 func bumpRowStatus(result *gobump.Result, stdlibVulns int) string {
@@ -332,12 +673,20 @@ func bumpRowStatus(result *gobump.Result, stdlibVulns int) string {
 		return "ERROR"
 	case len(result.SkipReasons) > 0 && result.VulnerabilitiesFound == 0:
 		return "SKIPPED"
+	case len(result.FirstPartyVulnIDs) > 0:
+		return "PATCH-NEEDED"
+	case result.EpochChanged && result.ApkEpochTarget > 0 && result.ApkEpochTarget == result.NewEpoch &&
+		result.ModulesBumped == 0 && result.HygieneModulesBumped == 0 &&
+		stdlibVulns == 0 && result.VulnerabilitiesResidual == 0:
+		return "APK-ALIGN"
 	case result.VulnerabilitiesFound > 0:
 		switch {
 		case fixed && !result.Validated:
 			return "UNVALIDATED"
 		case fixed && result.VulnerabilitiesResidual > 0:
 			return "PARTIAL"
+		case fixed && !result.EpochChanged && !result.FileWasWritten && result.ModulesBumped == 0 && result.HygieneModulesBumped == 0:
+			return "UP-TO-DATE" // proven fixed by deps an earlier run wrote
 		case fixed:
 			return "FIXED"
 		case result.VulnerabilitiesResidual > 0:

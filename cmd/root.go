@@ -25,6 +25,7 @@ var (
 	noValidate        bool
 	simulationTimeout time.Duration
 	noStdlib          bool
+	noApkAdvisories   bool
 	noCompile         bool
 	failOnResidual    bool
 )

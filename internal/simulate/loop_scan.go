@@ -132,7 +132,8 @@ func (l *loop) upstreamHoldBack(module string) string {
 func (l *loop) scanFindings(scanResult *scan.ScanResult, resolved map[string]string) ([]raise, []Residual, []raise) {
 	applies := make(map[string]bool, len(scanResult.Vulnerabilities))
 	for _, vuln := range scanResult.Vulnerabilities {
-		applies[vuln.ID] = scan.ImportsLinked(vuln.VulnerableImports, l.linkedPackages)
+		// One ID can name findings in several modules (CVE-first IDs): linked if any is.
+		applies[vuln.ID] = applies[vuln.ID] || scan.ImportsLinked(vuln.VulnerableImports, l.linkedPackages)
 	}
 
 	var raises, hygiene []raise
