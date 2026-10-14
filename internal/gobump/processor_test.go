@@ -813,3 +813,73 @@ func TestProcessor_ChangeTracking(t *testing.T) {
 	assert.Contains(t, firstChange.Description, "security fix")
 	assert.Contains(t, firstChange.Reason, "CVE-1")
 }
+
+// TestProcessor_ToResult_Actions: actions derived from the final state, after
+// the stage-recorded ones; epoch reasons only when the epoch moved.
+func TestProcessor_ToResult_Actions(t *testing.T) {
+	tests := []struct {
+		name  string
+		setup func(*Processor)
+		want  []NeededAction
+	}{
+		{name: "clean", setup: func(*Processor) {}},
+		{
+			name: "written without validation - rerun with the simulation error",
+			setup: func(p *Processor) {
+				p.SimulationError = "clone failed"
+				p.CurrentYAML = []byte("changed: true\n")
+			},
+			want: []NeededAction{{Kind: ActionRerun, Subject: "deps list not validated (resolvability and completeness unproven)", Detail: "clone failed"}},
+		},
+		{
+			name: "bumped under --no-validate",
+			setup: func(p *Processor) {
+				p.ActualChangesApplied = true
+				p.SecurityFixes = []SecurityFix{{Module: "m"}}
+			},
+			want: []NeededAction{{Kind: ActionRerun, Subject: "deps list not validated (resolvability and completeness unproven)", Detail: "simulation skipped (--no-validate)"}},
+		},
+		{
+			name: "residuals and skips",
+			setup: func(p *Processor) {
+				p.Validated = true
+				p.AddAction(ActionPatch, "CVE-1 (CGA-1, fixed in 1.0.0-r2)", "own module")
+				p.AddResiduals([]simulate.Residual{
+					{Module: "example.com/a", ResolvedVersion: "v1.0.0", FixedVersion: "v1.2.0", VulnIDs: []string{"GO-A"}, Reason: "held back", Introduced: true},
+					{Module: "example.com/b", ResolvedVersion: "v1.0.0", VulnIDs: []string{"GO-B1", "GO-B2"}, Reason: "no released fix"},
+				})
+				p.SkipReasons = []string{"gradle: unsupported"}
+			},
+			want: []NeededAction{
+				{Kind: ActionPatch, Subject: "CVE-1 (CGA-1, fixed in 1.0.0-r2)", Detail: "own module"},
+				{Kind: ActionReview, Subject: "example.com/a@v1.0.0 GO-A", Detail: "needs v1.2.0: held back (introduced by this bump)"},
+				{Kind: ActionAccept, Subject: "no released fix", Detail: "example.com/b@v1.0.0 GO-B1, GO-B2"},
+				{Kind: ActionReview, Subject: "not analyzed", Detail: "gradle: unsupported"},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewProcessor("/t.yaml", "pkg", "1.0.0", 1)
+			p.VulnerabilityAnalysis = analysisWith(scan.Vulnerability{ID: "GO-X", FixedVersion: "v2"})
+			tt.setup(p)
+			assert.Equal(t, tt.want, p.ToResult().ActionsNeeded)
+		})
+	}
+
+	t.Run("epoch reasons only when the epoch moved", func(t *testing.T) {
+		p := NewProcessor("/t.yaml", "pkg", "1.0.0", 1)
+		p.StdlibBumps = []StdlibBump{{RebuildGoVersion: "1.26.5", VulnIDs: []string{"GO-1"}}}
+		assert.Empty(t, p.ToResult().EpochReasons)
+		p.SetEpochUpdate(1, 2)
+		assert.Equal(t, []EpochReason{{Kind: "stdlib", Text: "rebuild with go1.26.5", VulnIDs: []string{"GO-1"}}}, p.ToResult().EpochReasons)
+	})
+}
+
+func TestProcessor_AddAction_Dedup(t *testing.T) {
+	p := NewProcessor("/t.yaml", "pkg", "1.0.0", 1)
+	p.AddAction(ActionReview, "s", "first")
+	p.AddAction(ActionReview, "s", "second")
+	p.AddAction(ActionAccept, "s", "other kind")
+	assert.Equal(t, []NeededAction{{Kind: ActionReview, Subject: "s", Detail: "first"}, {Kind: ActionAccept, Subject: "s", Detail: "other kind"}}, p.ActionsNeeded)
+}

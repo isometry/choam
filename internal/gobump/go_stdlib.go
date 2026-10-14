@@ -449,3 +449,21 @@ func stdlibRebuildVersions(bumps []StdlibBump) []string {
 	sort.Strings(versions)
 	return versions
 }
+
+// DistinctStdlibVulnIDs returns the sorted, deduplicated vulnerability IDs
+// across a file's stdlib bumps (an ID recurs across go-package pin
+// constraints).
+func DistinctStdlibVulnIDs(bumps []StdlibBump) []string {
+	seen := make(map[string]struct{})
+	var ids []string
+	for _, bump := range bumps {
+		for _, id := range bump.VulnIDs {
+			if _, ok := seen[id]; !ok {
+				seen[id] = struct{}{}
+				ids = append(ids, id)
+			}
+		}
+	}
+	sort.Strings(ids)
+	return ids
+}

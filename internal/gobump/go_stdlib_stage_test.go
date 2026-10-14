@@ -175,6 +175,7 @@ func TestStdlibStage_RebuildGoVersions(t *testing.T) {
 		require.NoError(t, newStdlibTestStage(Options{StdlibCheck: true}, index, fixableScanner()).Apply(t.Context(), gp))
 		assert.Nil(t, gp.StdlibRebuildGoVersions)
 		assert.False(t, gp.StdlibChecked)
+		assert.Equal(t, "Go release index unreachable", gp.stdlibUnresolved)
 		notesContain(t, gp, "stdlib: staleness check unavailable")
 	})
 
@@ -314,6 +315,7 @@ func TestStdlibStage_NilIndexDegradesToSkip(t *testing.T) {
 
 	require.NoError(t, stage.Apply(t.Context(), gp))
 	assert.Empty(t, gp.StdlibBumps)
+	assert.Equal(t, "Go release index unavailable", gp.stdlibUnresolved)
 	notesContain(t, gp, "release index/scanner unavailable")
 }
 

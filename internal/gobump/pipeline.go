@@ -186,28 +186,16 @@ const epochCommentMaxIDs = 5
 // mirror the epoch CheckFunc exactly, so the comment always states why the
 // epoch actually bumped.
 func epochComment(gp *Processor) string {
-	security := gp.ActualChangesApplied && len(gp.SecurityFixes) > 0
-	hygiene := gp.ActualChangesApplied && len(gp.HygieneBumps) > 0
-	var clauses []string
-	switch {
-	case security:
-		clauses = append(clauses, "updated bumps")
-	case hygiene:
-		clauses = append(clauses, "updated bumps (scanner hygiene)")
-	}
-	if versions := stdlibRebuildVersions(gp.StdlibBumps); len(versions) > 0 {
-		clauses = append(clauses, "rebuild with "+strings.Join(versions, ", "))
-	}
-	apk := gp.ApkEpochTarget > gp.GetCurrentEpoch()
-	if apk {
-		clauses = append(clauses, fmt.Sprintf("align with chainguard apk -r%d", gp.ApkEpochTarget))
-	}
-	if len(clauses) == 0 && gp.buildInputsChanged() {
-		clauses = append(clauses, "updated build inputs")
-	}
-	if len(clauses) == 0 {
+	reasons := epochReasons(gp)
+	if len(reasons) == 0 {
 		return ""
 	}
+	clauses := make([]string, len(reasons))
+	for i, r := range reasons {
+		clauses[i] = r.Text
+	}
+	hygiene := gp.ActualChangesApplied && len(gp.HygieneBumps) > 0
+	apk := gp.ApkEpochTarget > gp.GetCurrentEpoch()
 
 	comment := strings.Join(clauses, ", ")
 	severities := analysisSeverities(gp)
@@ -225,6 +213,30 @@ func epochComment(gp *Processor) string {
 		}
 	}
 	return comment
+}
+
+// epochReasons are the epoch comment's clauses (see epochComment), each with
+// the advisory IDs behind it: the dependency fixes, the hygiene-cleared
+// advisories, the distinct stdlib advisories the rebuild fixes and the apk
+// advisories the target aligns with.
+func epochReasons(gp *Processor) []EpochReason {
+	var reasons []EpochReason
+	switch {
+	case gp.ActualChangesApplied && len(gp.SecurityFixes) > 0:
+		reasons = append(reasons, EpochReason{Kind: "deps", Text: "updated bumps", VulnIDs: slices.Sorted(maps.Keys(gp.fixedVulnIDs()))})
+	case gp.ActualChangesApplied && len(gp.HygieneBumps) > 0:
+		reasons = append(reasons, EpochReason{Kind: "hygiene", Text: "updated bumps (scanner hygiene)", VulnIDs: slices.Sorted(maps.Keys(fixVulnIDs(gp.HygieneBumps)))})
+	}
+	if versions := stdlibRebuildVersions(gp.StdlibBumps); len(versions) > 0 {
+		reasons = append(reasons, EpochReason{Kind: "stdlib", Text: "rebuild with " + strings.Join(versions, ", "), VulnIDs: DistinctStdlibVulnIDs(gp.StdlibBumps)})
+	}
+	if gp.ApkEpochTarget > gp.GetCurrentEpoch() {
+		reasons = append(reasons, EpochReason{Kind: "apk", Text: fmt.Sprintf("align with chainguard apk -r%d", gp.ApkEpochTarget), VulnIDs: apkAlignedVulnIDs(gp)})
+	}
+	if len(reasons) == 0 && gp.buildInputsChanged() {
+		reasons = append(reasons, EpochReason{Kind: "build", Text: "updated build inputs"})
+	}
+	return reasons
 }
 
 // epochFixedVulnIDs derives the advisory IDs this epoch bump fixes. For

@@ -242,3 +242,64 @@ pipeline:
 		})
 	}
 }
+
+// TestEpochReasons: the reasons are exactly the epoch comment's clauses (the
+// same conditions, so the why: line and the YAML comment agree), each with
+// its advisory IDs; none exactly when nothing triggers a bump.
+func TestEpochReasons(t *testing.T) {
+	analysis := &VulnerabilityAnalysis{ByLanguage: []LanguageAnalysis{{ByModroot: []ModrootAnalysis{{
+		ScanResult: &scan.ScanResult{Vulnerabilities: []scan.Vulnerability{{ID: "CVE-D"}, {ID: "GO-H"}}},
+	}}}}}
+	cases := map[string]struct {
+		setup func(*Processor)
+		want  []EpochReason
+	}{
+		"nothing": {setup: func(*Processor) {}},
+		"deps, stdlib and apk": {
+			setup: func(gp *Processor) {
+				gp.ActualChangesApplied, gp.Validated = true, true
+				gp.VulnerabilityAnalysis = analysis
+				gp.AddSecurityFix(SecurityFix{Module: "m", Vulnerability: "CVE-D"})
+				gp.AddHygieneBump(SecurityFix{Module: "h", Vulnerability: "GO-H"})
+				gp.AddUnreachableVulnIDs([]string{"GO-H"})
+				gp.StdlibBumps = []StdlibBump{{RebuildGoVersion: "1.26.5", VulnIDs: []string{"GO-S2", "GO-S1"}}, {RebuildGoVersion: "1.26.5", VulnIDs: []string{"GO-S1"}}}
+				gp.ApkEpochTarget = 3
+				gp.ApkAdvisories = []ApkAdvisory{{ID: "CGA-a", Upstream: []string{"CVE-A"}, FixedEpoch: 3, Status: apkProven}}
+			},
+			want: []EpochReason{
+				{Kind: "deps", Text: "updated bumps", VulnIDs: []string{"CVE-D"}},
+				{Kind: "stdlib", Text: "rebuild with go1.26.5", VulnIDs: []string{"GO-S1", "GO-S2"}},
+				{Kind: "apk", Text: "align with chainguard apk -r3", VulnIDs: []string{"CVE-A"}},
+			},
+		},
+		"hygiene only": {
+			setup: func(gp *Processor) {
+				gp.ActualChangesApplied = true
+				gp.AddHygieneBump(SecurityFix{Module: "h", Vulnerability: "GO-H"})
+			},
+			want: []EpochReason{{Kind: "hygiene", Text: "updated bumps (scanner hygiene)", VulnIDs: []string{"GO-H"}}},
+		},
+		"build inputs only": {
+			setup: func(gp *Processor) {
+				gp.OriginalYAML = []byte("pipeline:\n  - uses: go/build\n    with:\n      go-package: go-1.24\n")
+				gp.CurrentYAML = []byte("pipeline:\n  - uses: go/build\n    with:\n      go-package: go-1.25\n")
+			},
+			want: []EpochReason{{Kind: "build", Text: "updated build inputs"}},
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			gp := NewProcessor("/t.yaml", "pkg", "1.0.0", 1)
+			tc.setup(gp)
+			reasons := epochReasons(gp)
+			assert.Equal(t, tc.want, reasons)
+			texts := make([]string, len(reasons))
+			for i, r := range reasons {
+				texts[i] = r.Text
+			}
+			clauses, _, _ := strings.Cut(epochComment(gp), ";")
+			assert.Equal(t, strings.Join(texts, ", "), clauses, "the reasons are the comment's clauses")
+			assert.Equal(t, len(reasons) > 0, epochTriggers(gp) || gp.ApkEpochTarget > gp.GetCurrentEpoch(), "a reason exactly when the epoch bumps")
+		})
+	}
+}

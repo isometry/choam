@@ -236,9 +236,8 @@ func TestStdlibColumnValue(t *testing.T) {
 	}
 }
 
-// TestOutputBumpTable_FooterWithStdlibStale verifies the summary footer
-// appends a stdlib-stale clause when files with stdlib vulnerabilities exist,
-// matching the format "; N stdlib-stale".
+// TestOutputBumpTable_FooterWithStdlibStale: stdlib-stale files show their
+// distinct stdlib counts in the STDLIB column; the short footer counts files.
 func TestOutputBumpTable_FooterWithStdlibStale(t *testing.T) {
 	results := []*gobump.Result{
 		{
@@ -269,12 +268,13 @@ func TestOutputBumpTable_FooterWithStdlibStale(t *testing.T) {
 		require.NoError(t, outputBumpTable(results))
 	})
 
-	// Should show 2 stdlib-stale files in footer
-	assert.Contains(t, stdout, "; 2 stdlib-stale", "Footer should report 2 stdlib-stale files")
+	assert.Regexp(t, `pkg-a\s.*│ 2\s+│ 0\s+│ NO VULNS`, stdout)
+	assert.Regexp(t, `pkg-c\s.*│ -\s+│ 0\s+│ NO VULNS`, stdout)
+	assert.Contains(t, stdout, "\nSummary: 3 files, 0 changed, 0 errors, 0 skipped, 0 need action\n")
 }
 
-// TestOutputBumpTable_FooterWithoutStdlibStale verifies the summary footer
-// does not include a stdlib-stale clause when no files have stdlib vulnerabilities.
+// TestOutputBumpTable_FooterWithoutStdlibStale: a clean run prints the table
+// and the footer alone - no actions, no info line.
 func TestOutputBumpTable_FooterWithoutStdlibStale(t *testing.T) {
 	results := []*gobump.Result{
 		{
@@ -295,8 +295,9 @@ func TestOutputBumpTable_FooterWithoutStdlibStale(t *testing.T) {
 		require.NoError(t, outputBumpTable(results))
 	})
 
-	// Footer should not contain stdlib-stale clause
-	assert.NotContains(t, stdout, "stdlib-stale", "Footer should not mention stdlib-stale when no files are stdlib-stale")
+	assert.NotContains(t, stdout, "Action needed")
+	assert.NotContains(t, stdout, "Info")
+	assert.Contains(t, stdout, "\nSummary: 2 files, 0 changed, 0 errors, 0 skipped, 0 need action\n")
 }
 
 // TestOutputBumpStructured_StdlibSummary exercises the real
@@ -351,39 +352,44 @@ func TestOutputBumpStructured_StdlibSummary(t *testing.T) {
 // TestSummarizeBumpResults pins the one summary definition shared by the
 // table footer and the structured output: errored files count only as
 // errors, "fixed" means VulnerabilitiesFixed > 0 (a file that only moved
-// modules is not fixed), skips are counted.
+// modules is not fixed), skips are counted, changed means the epoch moved or
+// the file was rewritten, and action-needed covers errors and actions.
 func TestSummarizeBumpResults(t *testing.T) {
 	results := []*gobump.Result{
 		{FilePath: "a.yaml", VulnerabilitiesFound: 3, VulnerabilitiesFixed: 2, VulnerabilitiesResidual: 1, ModulesBumped: 2, Validated: true},
 		{FilePath: "b.yaml", VulnerabilitiesFound: 1, ModulesBumped: 1, Validated: true, VulnerabilitiesResidual: 1},
 		{FilePath: "c.yaml", PackageName: "c", VulnerabilitiesFound: 5, VulnerabilitiesFixed: 5, Error: "fetch failed"},
-		{FilePath: "d.yaml", PackageName: "d", SkipReasons: []string{"unsupported repository"}},
-		{FilePath: "e.yaml", VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, ModulesBumped: 1},
+		{FilePath: "d.yaml", PackageName: "d", SkipReasons: []string{"unsupported repository"},
+			ActionsNeeded: []gobump.NeededAction{{Kind: gobump.ActionReview, Subject: "not analyzed", Detail: "unsupported repository"}}},
+		{FilePath: "e.yaml", VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, ModulesBumped: 1, EpochChanged: true, OldEpoch: 1, NewEpoch: 2},
 	}
 	s := summarizeBumpResults(results)
 	assert.Equal(t, output.BumpSummary{
-		TotalPackages:       5,
-		PackagesWithVulns:   3,
-		PackagesFixed:       2,
-		PackagesPartial:     2,
-		PackagesUnvalidated: 1,
-		TotalVulnsFound:     5,
-		TotalVulnsFixed:     3,
-		TotalVulnsResidual:  2,
-		TotalModulesBumped:  4,
-		Errors:              1,
-		PackagesSkipped:     1,
+		TotalPackages:        5,
+		PackagesWithVulns:    3,
+		PackagesFixed:        2,
+		PackagesPartial:      2,
+		PackagesUnvalidated:  1,
+		TotalVulnsFound:      5,
+		TotalVulnsFixed:      3,
+		TotalVulnsResidual:   2,
+		TotalModulesBumped:   4,
+		Errors:               1,
+		PackagesSkipped:      1,
+		PackagesChanged:      1,
+		PackagesActionNeeded: 2,
 	}, s)
 
 	table := captureStdout(t, func() { require.NoError(t, outputBumpTable(results)) })
-	assert.Contains(t, table, "Summary: 5 files processed, 3 with vulnerabilities, 2 fixed, 1 errors, 1 skipped (5 advisories found, 3 fixed, 2 residual")
-	assert.Contains(t, table, "Error for c: fetch failed", "errors are shown at default verbosity")
-	assert.Contains(t, table, "Skipped d: unsupported repository", "skip reasons are shown at default verbosity")
+	assert.Contains(t, table, "\nSummary: 5 files, 1 changed, 1 errors, 1 skipped, 2 need action\n")
+	assert.Contains(t, table, "\n  ERROR   fetch failed - c\n", "errors are shown at default verbosity")
+	assert.Contains(t, table, "\n  REVIEW  not analyzed: unsupported repository - d\n", "skip reasons are shown at default verbosity")
+	assert.Regexp(t, `│ 1->2\s+│ UNVALIDATED`, table, "merged EPOCH cell")
 }
 
 // TestBumpOutput_HygieneColumn: hygiene bumps get their own table column
-// (after UNLINKED; BUMPED stays security-only), footer clause and summary
-// key, all absent when there are none.
+// (after UNLINKED; BUMPED stays security-only), info count and summary key,
+// all absent when there are none.
 func TestBumpOutput_HygieneColumn(t *testing.T) {
 	results := []*gobump.Result{
 		{FilePath: "k.yaml", PackageName: "kubeconform", VulnerabilitiesFound: 2, VulnerabilitiesUnreachable: 2, Validated: true,
@@ -392,7 +398,7 @@ func TestBumpOutput_HygieneColumn(t *testing.T) {
 	table := captureStdout(t, func() { require.NoError(t, outputBumpTable(results)) })
 	header := strings.Fields(strings.ReplaceAll(strings.SplitN(table, "\n", 2)[0], "│", " "))
 	assert.Equal(t, []string{"PACKAGE", "FOUND", "FIXED", "RESIDUAL", "UNLINKED", "HYGIENE", "BUMPED"}, header[:7])
-	assert.Contains(t, table, "2 in unlinked modules; 0 modules bumped); 1 hygiene bump(s)")
+	assert.Contains(t, table, "\nInfo (-v for detail): 2 advisories in unlinked modules, 1 hygiene bump, 1 stdlib check skipped\n")
 
 	stdout := captureStdout(t, func() { require.NoError(t, outputBumpStructured(results, "json")) })
 	assert.Contains(t, stdout, `"total_hygiene_modules_bumped": 1`)
@@ -416,7 +422,7 @@ func TestBumpOutput_Notes(t *testing.T) {
 	table := captureStdout(t, func() { require.NoError(t, outputBumpTable(results)) })
 	assert.Contains(t, table, "\nNote flux: "+note+"\n")
 	header := strings.Fields(strings.ReplaceAll(strings.SplitN(table, "\n", 2)[0], "│", " "))
-	assert.Equal(t, []string{"PACKAGE", "FOUND", "FIXED", "RESIDUAL", "UNLINKED", "HYGIENE", "BUMPED", "STDLIB", "OLD", "EPOCH", "NEW", "EPOCH", "STATUS"}, header)
+	assert.Equal(t, []string{"PACKAGE", "FOUND", "FIXED", "RESIDUAL", "UNLINKED", "HYGIENE", "BUMPED", "STDLIB", "EPOCH", "STATUS"}, header)
 
 	stdout := captureStdout(t, func() { require.NoError(t, outputBumpStructured(results, "json")) })
 	var resp struct {
@@ -447,22 +453,68 @@ func TestOutputBumpStructured_KeyedByFullPath(t *testing.T) {
 	assert.Contains(t, resp.Results, "y/pkg.yaml")
 }
 
-// TestOutputBumpTable_NotValidatedWarning fires only when something was
-// written or bumped without proof, never for an untouched package.
-func TestOutputBumpTable_NotValidatedWarning(t *testing.T) {
+// TestOutputBumpTable_NotValidatedRerun: an unvalidated write is a RERUN
+// action carrying the simulation error (derived in gobump's ToResult).
+func TestOutputBumpTable_NotValidatedRerun(t *testing.T) {
 	untouched := []*gobump.Result{{PackageName: "quiet", VulnerabilitiesFound: 1}}
-	assert.NotContains(t, captureStdout(t, func() { require.NoError(t, outputBumpTable(untouched)) }), "NOT validated")
+	assert.NotContains(t, captureStdout(t, func() { require.NoError(t, outputBumpTable(untouched)) }), "RERUN")
 
-	written := []*gobump.Result{{PackageName: "loud", VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, ModulesBumped: 1, FileWasWritten: true}}
-	assert.Contains(t, captureStdout(t, func() { require.NoError(t, outputBumpTable(written)) }), "WARNING: loud deps list NOT validated")
+	written := []*gobump.Result{{PackageName: "loud", VulnerabilitiesFound: 1, ModulesBumped: 1, FileWasWritten: true, SimulationError: "clone failed",
+		ActionsNeeded: []gobump.NeededAction{{Kind: gobump.ActionRerun, Subject: "deps list not validated (resolvability and completeness unproven)", Detail: "clone failed"}}}}
+	out := captureStdout(t, func() { require.NoError(t, outputBumpTable(written)) })
+	assert.Contains(t, out, "\n  RERUN   deps list not validated (resolvability and completeness unproven): clone failed - loud\n")
+	assert.Contains(t, out, "1 needs action")
 }
 
-// TestOutputBumpTable_NotValidatedWarningAppendsSimulationError: the table
-// WARNING carries the reason simulation was unavailable when one is recorded.
-func TestOutputBumpTable_NotValidatedWarningAppendsSimulationError(t *testing.T) {
-	written := []*gobump.Result{{PackageName: "loud", VulnerabilitiesFound: 1, ModulesBumped: 1, FileWasWritten: true, SimulationError: "clone failed"}}
-	out := captureStdout(t, func() { require.NoError(t, outputBumpTable(written)) })
-	assert.Contains(t, out, "WARNING: loud deps list NOT validated - resolvability and completeness unproven: clone failed")
+// TestRenderActions_GroupsAndOrders: actions group across files on (kind,
+// subject, detail), list most severe first (error, patch, rerun, review,
+// accept) then by subject, and cut the package list after three names.
+func TestRenderActions_GroupsAndOrders(t *testing.T) {
+	accept := gobump.NeededAction{Kind: gobump.ActionAccept, Subject: "no released fix", Detail: "golang.org/x/crypto@v0.1.0 GO-2026-5932"}
+	review := gobump.NeededAction{Kind: gobump.ActionReview, Subject: "not analyzed", Detail: "no git-checkout step"}
+	results := []*gobump.Result{
+		{PackageName: "a", ActionsNeeded: []gobump.NeededAction{accept, review}},
+		{PackageName: "b", ActionsNeeded: []gobump.NeededAction{accept, {Kind: gobump.ActionPatch, Subject: "CVE-2026-1 (CGA-1, fixed in 1.0-r2)", Detail: "own module"}}},
+		{PackageName: "c", ActionsNeeded: []gobump.NeededAction{review}},
+		{PackageName: "d", ActionsNeeded: []gobump.NeededAction{review}},
+		{PackageName: "e", ActionsNeeded: []gobump.NeededAction{review}},
+		{PackageName: "f", Error: "boom", ActionsNeeded: []gobump.NeededAction{accept}},
+	}
+	out := captureStdout(t, func() { renderActions(results) })
+	assert.Equal(t, `
+Action needed:
+  ERROR   boom - f
+  PATCH   CVE-2026-1 (CGA-1, fixed in 1.0-r2): own module - b
+  REVIEW  not analyzed: no git-checkout step - a, c, d, +1 more
+  ACCEPT  no released fix: golang.org/x/crypto@v0.1.0 GO-2026-5932 - a, b
+`, out, "an errored file shows only its error")
+
+	assert.Empty(t, captureStdout(t, func() { renderActions([]*gobump.Result{{PackageName: "clean"}}) }))
+}
+
+// TestRenderWhy: changed rows get a why line (reason clauses with advisory
+// counts, then the apk outcome); unchanged, ERROR and SKIPPED rows get none.
+func TestRenderWhy(t *testing.T) {
+	reasons := []gobump.EpochReason{
+		{Kind: "deps", Text: "updated bumps", VulnIDs: []string{"CVE-1", "CVE-2"}},
+		{Kind: "apk", Text: "align with chainguard apk -r9", VulnIDs: []string{"CVE-3"}},
+	}
+	results := []*gobump.Result{
+		{PackageName: "tofu", EpochChanged: true, OldEpoch: 1, NewEpoch: 9, EpochReasons: reasons,
+			ApkAlignment: &gobump.ApkAlignment{Version: "0.16.5-r1", TargetEpoch: 9, HighestFixedEpoch: 9}},
+		{PackageName: "held", EpochChanged: true, OldEpoch: 1, NewEpoch: 7, EpochReasons: reasons[1:],
+			ApkAlignment: &gobump.ApkAlignment{Version: "2.0-r1", TargetEpoch: 7, HighestFixedEpoch: 11, BlockedAt: 9}},
+		{PackageName: "build", EpochChanged: true, OldEpoch: 1, NewEpoch: 2, EpochReasons: []gobump.EpochReason{{Kind: "build", Text: "updated build inputs"}}},
+		{PackageName: "same", EpochReasons: reasons},
+		{PackageName: "broken", Error: "boom", EpochChanged: true, EpochReasons: reasons},
+	}
+	out := captureStdout(t, func() { renderWhy(results) })
+	assert.Equal(t, `
+Why:
+  tofu: updated bumps (2), align with chainguard apk -r9 (1); apk: -r9 is the highest Wolfi advisory fix epoch for 0.16.5
+  held: align with chainguard apk -r9 (1); apk: held at -r7, -r9 advisory not proven (see actions)
+  build: updated build inputs
+`, out)
 }
 
 // TestRunBump_StructuredOutputStaysParseable: with --format json|yaml the
@@ -548,7 +600,7 @@ func TestRunBump_CancelledPrintsPartialResults(t *testing.T) {
 	stdout := captureStdout(t, func() { err = cmd.ExecuteContext(ctx) })
 
 	require.ErrorIs(t, err, context.Canceled)
-	assert.Contains(t, stdout, "Summary: 0 files processed")
+	assert.Contains(t, stdout, "Summary: 0 files,")
 }
 
 func TestNewBumpCmd_FailOnResidualFlag(t *testing.T) {
@@ -559,10 +611,11 @@ func TestNewBumpCmd_FailOnResidualFlag(t *testing.T) {
 }
 
 // TestBumpOutput_FirstPartyAlerts: first-party apk advisories are counted in
-// the summary, shown in the footer and as default-verbosity ALERT notes.
+// the summary and shown as default-verbosity PATCH actions.
 func TestBumpOutput_FirstPartyAlerts(t *testing.T) {
 	results := []*gobump.Result{
-		{FilePath: "a.yaml", PackageName: "a", FirstPartyVulnIDs: []string{"CVE-2026-1", "CVE-2026-2"}, Notes: []string{"ALERT: needs a source patch"}},
+		{FilePath: "a.yaml", PackageName: "a", FirstPartyVulnIDs: []string{"CVE-2026-1", "CVE-2026-2"},
+			ActionsNeeded: []gobump.NeededAction{{Kind: gobump.ActionPatch, Subject: "CVE-2026-1 (CGA-1, fixed in 1.0-r2)", Detail: "needs a patch"}}},
 		{FilePath: "b.yaml", PackageName: "b"},
 	}
 	s := summarizeBumpResults(results)
@@ -574,8 +627,8 @@ func TestBumpOutput_FirstPartyAlerts(t *testing.T) {
 	t.Cleanup(func() { verbosity = saved })
 	table := captureStdout(t, func() { require.NoError(t, outputBumpTable(results)) })
 	assert.Contains(t, table, "PATCH-NEEDED")
-	assert.Contains(t, table, "Note a: ALERT: needs a source patch")
-	assert.Contains(t, table, ", 1 needs a first-party patch")
+	assert.Contains(t, table, "\n  PATCH   CVE-2026-1 (CGA-1, fixed in 1.0-r2): needs a patch - a\n")
+	assert.Contains(t, table, ", 1 needs action\n")
 
 	js := captureStdout(t, func() { require.NoError(t, outputBumpStructured(results, "json")) })
 	assert.Contains(t, js, `"packages_patch_needed": 1`)

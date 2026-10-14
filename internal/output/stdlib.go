@@ -1,10 +1,6 @@
 package output
 
-import (
-	"sort"
-
-	"github.com/isometry/choam/internal/gobump"
-)
+import "github.com/isometry/choam/internal/gobump"
 
 // DistinctStdlibVulnIDs returns a file's distinct fixable stdlib
 // vulnerability IDs across all of its StdlibBump entries, sorted for
@@ -15,20 +11,5 @@ import (
 // list stdlib vulnerabilities per file must dedupe via this function rather
 // than summing len(bump.VulnIDs) across bumps.
 func DistinctStdlibVulnIDs(bumps []gobump.StdlibBump) []string {
-	if len(bumps) == 0 {
-		return nil
-	}
-	seen := make(map[string]struct{})
-	var ids []string
-	for _, bump := range bumps {
-		for _, id := range bump.VulnIDs {
-			if _, ok := seen[id]; ok {
-				continue
-			}
-			seen[id] = struct{}{}
-			ids = append(ids, id)
-		}
-	}
-	sort.Strings(ids)
-	return ids
+	return gobump.DistinctStdlibVulnIDs(bumps)
 }

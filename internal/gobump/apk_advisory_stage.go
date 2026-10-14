@@ -1,6 +1,7 @@
 package gobump
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"maps"
@@ -91,7 +92,7 @@ func (s *ApkAdvisoryStage) Apply(ctx context.Context, p processor.Processor) err
 	}
 	gp.ApkAdvisories = advs
 	gp.ApkEpochTarget = apkEpochTarget(advs)
-	reportApk(gp, advs)
+	reportApk(gp, advs, s.rebuildUnresolved(gp))
 	logging.From(ctx).Debug("apk advisories classified", "advisories", len(advs), "target_epoch", gp.ApkEpochTarget)
 	return nil
 }
@@ -187,7 +188,21 @@ func (s *ApkAdvisoryStage) classify(ctx context.Context, gp *Processor) ([]ApkAd
 	for i := range advs {
 		advs[i].Status, advs[i].Reason = classifyApk(components[i], ev)
 	}
+	gp.ApkAlignment = &ApkAlignment{Version: fmt.Sprintf("%s-r%d", version, epoch), Ignored: notAddressable + uncorrelated}
 	return advs, nil
+}
+
+// rebuildUnresolved says why no rebuild Go toolchain is known for the
+// stdlib proof (see Processor.stdlibUnresolved).
+func (s *ApkAdvisoryStage) rebuildUnresolved(gp *Processor) string {
+	switch {
+	case gp.stdlibUnresolved != "":
+		return gp.stdlibUnresolved
+	case !s.Options.StdlibCheck:
+		return "stdlib check disabled by --no-stdlib"
+	default:
+		return "stdlib check did not run"
+	}
 }
 
 // components fetches an advisory's upstream records - every GO- one, the
@@ -304,19 +319,34 @@ func analysisMainModules(gp *Processor) []string {
 	return mains
 }
 
-// reportApk renders the classification. First-party advisories are ALERT
-// notes; non-proven advisories holding the epoch down (at or below the
-// highest proven -rN), or that the epoch reaches anyway, are notes naming
-// the cause; the rest are messages. One line per display ID and fix
-// (Chainguard publishes a record per ecosystem for the same issue).
-func reportApk(gp *Processor, advs []ApkAdvisory) {
+// reportApk renders the classification: first-party advisories are patch
+// actions; non-proven advisories holding the epoch down (at or below the
+// highest proven -rN, or the lowest non-proven one, where the epoch stops)
+// are review actions, except those held only for want of
+// a rebuild toolchain, which collapse into one rerun action naming why
+// (unresolved); non-proven advisories the epoch reaches anyway are review
+// actions; the rest are messages. One entry per display ID and fix
+// (Chainguard publishes a record per ecosystem for the same issue), which is
+// also what ApkAlignment counts.
+func reportApk(gp *Processor, advs []ApkAdvisory, unresolved string) {
 	newEpoch := apkNewEpoch(gp)
+	if gp.ApkAlignment == nil {
+		gp.ApkAlignment = &ApkAlignment{}
+	}
+	align := gp.ApkAlignment
+	align.TargetEpoch = gp.ApkEpochTarget
 	var highestProven int64
 	for _, adv := range advs {
+		align.HighestFixedEpoch = max(align.HighestFixedEpoch, adv.FixedEpoch)
 		if adv.Status == apkProven {
 			highestProven = max(highestProven, adv.FixedEpoch)
+		} else if align.BlockedAt == 0 || adv.FixedEpoch < align.BlockedAt {
+			align.BlockedAt = adv.FixedEpoch
 		}
 	}
+	var noToolchain int
+	var noToolchainBelow int64
+	blockers := make(map[apkBlockerKey][]string) // display IDs per (fix epoch, cause)
 	seen := make(map[string]bool)
 	for _, adv := range advs {
 		id := apkDisplayID(adv)
@@ -325,34 +355,78 @@ func reportApk(gp *Processor, advs []ApkAdvisory) {
 			continue
 		}
 		seen[key] = true
-		blocking := adv.FixedEpoch <= highestProven
+		blocking := adv.FixedEpoch <= highestProven || adv.FixedEpoch == align.BlockedAt
+		subject := fmt.Sprintf("%s (%s, fixed in %s)", id, adv.ID, adv.FixedVersion)
 		switch adv.Status {
 		case apkFirstParty:
+			align.FirstParty++
 			gp.FirstPartyVulnIDs = append(gp.FirstPartyVulnIDs, id)
-			note := fmt.Sprintf("ALERT apk: %s (%s, fixed in %s) %s - possible first-party vulnerability; needs a patch, not a dependency bump",
-				id, adv.ID, adv.FixedVersion, adv.Reason)
+			detail := adv.Reason + " - possible first-party vulnerability; needs a patch, not a dependency bump"
 			switch {
 			case newEpoch >= adv.FixedEpoch:
-				note += fmt.Sprintf("; epoch %d reaches -r%d, so scanners will now treat it as fixed", newEpoch, adv.FixedEpoch)
+				detail += fmt.Sprintf("; epoch %d reaches -r%d, so scanners will now treat it as fixed", newEpoch, adv.FixedEpoch)
 			case blocking:
-				note += fmt.Sprintf("; holds the epoch below -r%d", adv.FixedEpoch)
+				detail += fmt.Sprintf("; holds the epoch below -r%d", adv.FixedEpoch)
 			}
-			gp.AddNote(note)
+			gp.AddAction(ActionPatch, subject, detail)
 		case apkUnproven:
+			align.Unproven++
 			switch {
 			case newEpoch >= adv.FixedEpoch:
-				gp.AddNote(fmt.Sprintf("apk: %s (%s, fixed in %s) not proven fixed here (%s) - epoch %d reaches -r%d anyway, hiding it from distro-aware scanners",
-					id, adv.ID, adv.FixedVersion, adv.Reason, newEpoch, adv.FixedEpoch))
+				gp.AddAction(ActionReview, subject, fmt.Sprintf("not proven fixed here (%s) - epoch %d reaches -r%d anyway, hiding it from distro-aware scanners",
+					adv.Reason, newEpoch, adv.FixedEpoch))
+			case blocking && adv.Reason == apkCauseNoRebuildToolchain:
+				noToolchain++
+				if noToolchainBelow == 0 || adv.FixedEpoch < noToolchainBelow {
+					noToolchainBelow = adv.FixedEpoch
+				}
 			case blocking:
-				gp.AddNote(fmt.Sprintf("apk: %s (%s, fixed in %s) not proven fixed here (%s) - holds the epoch below -r%d",
-					id, adv.ID, adv.FixedVersion, adv.Reason, adv.FixedEpoch))
+				k := apkBlockerKey{adv.FixedEpoch, adv.Reason}
+				if !slices.Contains(blockers[k], id) {
+					blockers[k] = append(blockers[k], id)
+				}
 			default:
-				gp.AddMessage(fmt.Sprintf("apk: %s (%s, fixed in %s) not proven fixed here (%s)", id, adv.ID, adv.FixedVersion, adv.Reason))
+				gp.AddMessage(fmt.Sprintf("apk: %s not proven fixed here (%s)", subject, adv.Reason))
 			}
 		default:
-			gp.AddMessage(fmt.Sprintf("apk: %s (%s, fixed in %s) proven fixed here", id, adv.ID, adv.FixedVersion))
+			align.Proven++
+			gp.AddMessage(fmt.Sprintf("apk: %s proven fixed here", subject))
 		}
 	}
+	for _, k := range slices.SortedFunc(maps.Keys(blockers), func(a, b apkBlockerKey) int {
+		return cmp.Or(cmp.Compare(a.epoch, b.epoch), strings.Compare(a.cause, b.cause))
+	}) {
+		ids := blockers[k]
+		slices.SortFunc(ids, func(a, b string) int {
+			return cmp.Or(cmp.Compare(cveLast(a), cveLast(b)), strings.Compare(a, b))
+		})
+		list := strings.Join(ids[:min(len(ids), epochCommentMaxIDs)], ", ")
+		if len(ids) > epochCommentMaxIDs {
+			list += fmt.Sprintf(", +%d more", len(ids)-epochCommentMaxIDs)
+		}
+		gp.AddAction(ActionReview,
+			fmt.Sprintf("%d apk %s fixed in -r%d (%s)", len(ids), pluralize(len(ids), "advisory", "advisories"), k.epoch, list),
+			fmt.Sprintf("not proven fixed here (%s) - holds the epoch below -r%d", k.cause, k.epoch))
+	}
+	if noToolchain > 0 {
+		gp.AddAction(ActionRerun, fmt.Sprintf("stdlib rebuild toolchain unavailable (%s)", unresolved),
+			fmt.Sprintf("holds the apk epoch below -r%d (%d %s)", noToolchainBelow, noToolchain, pluralize(noToolchain, "advisory", "advisories")))
+	}
+}
+
+// cveLast ranks CVE IDs ahead of the others (0) for display.
+func cveLast(id string) int {
+	if strings.HasPrefix(id, "CVE-") {
+		return 0
+	}
+	return 1
+}
+
+// apkBlockerKey groups the non-proven advisories holding the epoch into one
+// review action per fix epoch and cause.
+type apkBlockerKey struct {
+	epoch int64
+	cause string
 }
 
 // apkDisplayID reports an advisory by its upstream issue, CVE first (see

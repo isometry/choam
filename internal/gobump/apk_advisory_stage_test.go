@@ -90,6 +90,17 @@ func notesContain(t *testing.T, gp *Processor, want string) {
 	t.Errorf("expected a note containing %q, got %v", want, gp.Notes)
 }
 
+// actionsContain asserts an action of kind whose "subject: detail" contains want.
+func actionsContain(t *testing.T, gp *Processor, kind, want string) {
+	t.Helper()
+	for _, a := range gp.ActionsNeeded {
+		if a.Kind == kind && strings.Contains(a.Subject+": "+a.Detail, want) {
+			return
+		}
+	}
+	t.Errorf("expected a %s action containing %q, got %v", kind, want, gp.ActionsNeeded)
+}
+
 var apkTestRecords = map[string]*osvschema.Vulnerability{
 	"GO-A":   goRecord("GO-A", "Go", "golang.org/x/net"),
 	"GO-B":   goRecord("GO-B", "Go", "example.com/b"),
@@ -169,8 +180,10 @@ func TestApkAdvisoryStage_Apply(t *testing.T) {
 		assert.Equal(t, map[string]string{"CGA-g6": apkProven, "CGA-g7": apkProven, "CGA-n9": apkUnproven}, statuses)
 		assert.Equal(t, int64(7), gp.ApkEpochTarget)
 		assert.Empty(t, gp.FirstPartyVulnIDs, "no PATCH-NEEDED")
-		assert.Empty(t, gp.Notes, "r9 sits above every proven advisory")
-		messagesContain(t, gp, "apk: CVE-N9 (CGA-n9, fixed in 3.6.0-r9) not proven fixed here ("+apkCauseNoRebuildToolchain+")")
+		assert.Empty(t, gp.Notes)
+		assert.Equal(t, []NeededAction{{Kind: ActionRerun, Subject: "stdlib rebuild toolchain unavailable (stdlib check disabled by --no-stdlib)", Detail: "holds the apk epoch below -r9 (1 advisory)"}}, gp.ActionsNeeded,
+			"r9 is where the epoch stops")
+		assert.Equal(t, &ApkAlignment{Version: "3.6.0-r1", TargetEpoch: 7, HighestFixedEpoch: 9, BlockedAt: 9, Proven: 2, Unproven: 1}, gp.ApkAlignment)
 	})
 
 	t.Run("tofu-controller shape on a dirty file: the rebuild toolchain proves r9", func(t *testing.T) {
@@ -189,21 +202,43 @@ func TestApkAdvisoryStage_Apply(t *testing.T) {
 			apkRecord("CGA-n9", []string{"CVE-N9", "GO-N9"}, "3.6.0-r9"))
 		assert.Equal(t, int64(9), gp.ApkEpochTarget)
 		assert.Equal(t, int64(9), apkNewEpoch(gp))
+		// r10/r11 carry no advisory: r9 is the highest fix epoch, and reached.
+		assert.Equal(t, &ApkAlignment{Version: "3.6.0-r1", TargetEpoch: 9, HighestFixedEpoch: 9, Proven: 3}, gp.ApkAlignment)
+		assert.Empty(t, gp.ActionsNeeded)
 	})
 
-	t.Run("non-proven below a proven advisory holds the epoch, with a note", func(t *testing.T) {
+	t.Run("non-proven below a proven advisory holds the epoch, with a review action", func(t *testing.T) {
 		gp := newApkTestProcessor()
 		run(t, gp, nil, apkRecord("CGA-b", []string{"CVE-B", "GO-B"}, "3.6.0-r2"), apkRecord("CGA-a", []string{"CVE-A", "GO-A"}, "3.6.0-r3"))
 		assert.Zero(t, gp.ApkEpochTarget)
-		notesContain(t, gp, "apk: CVE-B (CGA-b, fixed in 3.6.0-r2) not proven fixed here (module example.com/b residual, unlinked or not proven fixed) - holds the epoch below -r2")
+		assert.Empty(t, gp.Notes)
+		actionsContain(t, gp, ActionReview, "1 apk advisory fixed in -r2 (CVE-B): not proven fixed here (module example.com/b residual, unlinked or not proven fixed) - holds the epoch below -r2")
+		assert.Equal(t, &ApkAlignment{Version: "3.6.0-r1", TargetEpoch: 0, HighestFixedEpoch: 3, BlockedAt: 2, Proven: 1, Unproven: 1}, gp.ApkAlignment)
 	})
 
-	t.Run("non-proven above every proven one - no note", func(t *testing.T) {
+	t.Run("stdlib blocker without a rebuild toolchain - one rerun action naming why", func(t *testing.T) {
 		gp := newApkTestProcessor()
-		run(t, gp, nil, provenR2, apkRecord("CGA-b", []string{"CVE-B", "GO-B"}, "3.6.0-r3"))
+		gp.stdlibUnresolved = "Go release index unreachable"
+		run(t, gp, nil,
+			apkRecord("CGA-s", []string{"CVE-S", "GO-S"}, "3.6.0-r2"), apkRecord("CGA-n9", []string{"CVE-N9", "GO-N9"}, "3.6.0-r3"),
+			apkRecord("CGA-a", []string{"CVE-A", "GO-A"}, "3.6.0-r4"))
+		assert.Zero(t, gp.ApkEpochTarget)
+		assert.Equal(t, []NeededAction{{Kind: ActionRerun, Subject: "stdlib rebuild toolchain unavailable (Go release index unreachable)", Detail: "holds the apk epoch below -r2 (2 advisories)"}}, gp.ActionsNeeded)
+		assert.Equal(t, int64(2), gp.ApkAlignment.BlockedAt)
+
+		gp = newApkTestProcessor()
+		run(t, gp, nil, apkRecord("CGA-s", []string{"CVE-S", "GO-S"}, "3.6.0-r2"), apkRecord("CGA-a", []string{"CVE-A", "GO-A"}, "3.6.0-r3"))
+		actionsContain(t, gp, ActionRerun, "stdlib check disabled by --no-stdlib")
+	})
+
+	t.Run("non-proven above every proven one - the blocker is reviewed, the rest are messages", func(t *testing.T) {
+		gp := newApkTestProcessor()
+		run(t, gp, nil, provenR2, apkRecord("CGA-b", []string{"CVE-B", "GO-B"}, "3.6.0-r3"), apkRecord("CGA-x", []string{"CVE-X", "GHSA-x"}, "3.6.0-r4"))
 		assert.Equal(t, int64(2), gp.ApkEpochTarget)
 		assert.Empty(t, gp.Notes)
-		messagesContain(t, gp, "apk: CVE-B (CGA-b, fixed in 3.6.0-r3) not proven fixed here")
+		actionsContain(t, gp, ActionReview, "1 apk advisory fixed in -r3 (CVE-B): not proven fixed here")
+		assert.Len(t, gp.ActionsNeeded, 1)
+		messagesContain(t, gp, "apk: CVE-X (CGA-x, fixed in 3.6.0-r4) not proven fixed here")
 	})
 
 	t.Run("ordinary bump reaching a non-proven fix says so", func(t *testing.T) {
@@ -211,7 +246,7 @@ func TestApkAdvisoryStage_Apply(t *testing.T) {
 		gp.StdlibBumps = []StdlibBump{{RebuildGoVersion: "1.24.5"}}
 		run(t, gp, nil, apkRecord("CGA-b", []string{"CVE-B", "GO-B"}, "3.6.0-r2"))
 		assert.Equal(t, int64(2), apkNewEpoch(gp))
-		notesContain(t, gp, "epoch 2 reaches -r2 anyway, hiding it from distro-aware scanners")
+		actionsContain(t, gp, ActionReview, "epoch 2 reaches -r2 anyway, hiding it from distro-aware scanners")
 	})
 
 	t.Run("root-module record - first-party, holds the epoch", func(t *testing.T) {
@@ -219,7 +254,25 @@ func TestApkAdvisoryStage_Apply(t *testing.T) {
 		run(t, gp, nil, apkRecord("CGA-m", []string{"CVE-M", "GO-M"}, "3.6.0-r2"), apkRecord("CGA-a", []string{"CVE-A", "GO-A"}, "3.6.0-r3"))
 		assert.Equal(t, []string{"CVE-M"}, gp.FirstPartyVulnIDs)
 		assert.Zero(t, gp.ApkEpochTarget)
-		notesContain(t, gp, "ALERT apk: CVE-M (CGA-m, fixed in 3.6.0-r2) affects github.com/example/self, this package's own module - possible first-party vulnerability; needs a patch, not a dependency bump; holds the epoch below -r2")
+		assert.Empty(t, gp.Notes, "the patch action replaces the ALERT note")
+		actionsContain(t, gp, ActionPatch, "CVE-M (CGA-m, fixed in 3.6.0-r2): affects github.com/example/self, this package's own module - possible first-party vulnerability; needs a patch, not a dependency bump; holds the epoch below -r2")
+		assert.Equal(t, 1, gp.ApkAlignment.FirstParty)
+	})
+
+	t.Run("blockers group by fix epoch and cause, CVE first, no CGA IDs", func(t *testing.T) {
+		gp := newApkTestProcessor()
+		run(t, gp, nil,
+			apkRecord("CGA-b1", []string{"GO-B"}, "3.6.0-r2"),           // example.com/b residual, r2
+			apkRecord("CGA-b2", []string{"CVE-B", "GO-B"}, "3.6.0-r2"),  // same cause and epoch
+			apkRecord("CGA-b3", []string{"CVE-B", "GO-B"}, "3.6.0-r3"),  // same cause, another epoch
+			apkRecord("CGA-x", []string{"CVE-X", "GHSA-x"}, "3.6.0-r2"), // another cause
+			apkRecord("CGA-a", []string{"CVE-A", "GO-A"}, "3.6.0-r4"))
+		residual := "not proven fixed here (module example.com/b residual, unlinked or not proven fixed)"
+		assert.Equal(t, []NeededAction{
+			{Kind: ActionReview, Subject: "2 apk advisories fixed in -r2 (CVE-B, GO-B)", Detail: residual + " - holds the epoch below -r2"},
+			{Kind: ActionReview, Subject: "1 apk advisory fixed in -r2 (CVE-X)", Detail: "not proven fixed here (module github.com/example/pkg not in the analysed graph) - holds the epoch below -r2"},
+			{Kind: ActionReview, Subject: "1 apk advisory fixed in -r3 (CVE-B)", Detail: residual + " - holds the epoch below -r3"},
+		}, gp.ActionsNeeded)
 	})
 
 	t.Run("module not in the graph - unproven with its reason", func(t *testing.T) {
@@ -227,7 +280,7 @@ func TestApkAdvisoryStage_Apply(t *testing.T) {
 		run(t, gp, nil, apkRecord("CGA-x", []string{"CVE-X", "GHSA-x"}, "3.6.0-r2"), apkRecord("CGA-a", []string{"CVE-A", "GO-A"}, "3.6.0-r3"))
 		assert.Equal(t, apkUnproven, gp.ApkAdvisories[0].Status)
 		assert.Empty(t, gp.FirstPartyVulnIDs)
-		notesContain(t, gp, "not proven fixed here (module github.com/example/pkg not in the analysed graph) - holds the epoch below -r2")
+		actionsContain(t, gp, ActionReview, "not proven fixed here (module github.com/example/pkg not in the analysed graph) - holds the epoch below -r2")
 	})
 
 	t.Run("no fetchable record - unproven", func(t *testing.T) {
@@ -246,6 +299,7 @@ func TestApkAdvisoryStage_Apply(t *testing.T) {
 		assert.Empty(t, gp.ApkAdvisories)
 		assert.Empty(t, gp.Notes)
 		assert.Zero(t, gp.ApkEpochTarget)
+		assert.Equal(t, 3, gp.ApkAlignment.Ignored)
 		messagesContain(t, gp, "apk: 2 advisories with no fix at 3.6.0-r<N> (no fix, or fixed in another version) - ignored")
 		messagesContain(t, gp, "apk: 1 advisory without an upstream CVE/GHSA/GO ID, cannot correlate - ignored")
 	})
@@ -320,13 +374,16 @@ func TestApkAdvisoryStage_Apply(t *testing.T) {
 		assert.Equal(t, apkProven, gp.ApkAdvisories[0].Status, "x/net present and never affected, stdlib clean")
 	})
 
-	t.Run("one note per CVE and fix across both ecosystems' records", func(t *testing.T) {
+	t.Run("one action per CVE and fix across both ecosystems' records", func(t *testing.T) {
 		gp := newApkTestProcessor()
 		run(t, gp, nil,
 			apkRecord("CGA-b1", []string{"CVE-B", "GO-B"}, "3.6.0-r2"), apkRecord("CGA-b2", []string{"CVE-B", "GO-B"}, "3.6.0-r2"),
 			apkRecord("CGA-m1", []string{"CVE-M", "GO-M"}, "3.6.0-r2"), apkRecord("CGA-m2", []string{"CVE-M", "GO-M"}, "3.6.0-r2"),
 			apkRecord("CGA-a", []string{"CVE-A", "GO-A"}, "3.6.0-r3"))
-		assert.Len(t, gp.Notes, 2, "one blocker note, one ALERT: %v", gp.Notes)
+		assert.Len(t, gp.ActionsNeeded, 2, "one blocker review, one patch: %v", gp.ActionsNeeded)
+		assert.Equal(t, 1, gp.ApkAlignment.Unproven)
+		assert.Equal(t, 1, gp.ApkAlignment.FirstParty)
+		assert.Equal(t, 1, gp.ApkAlignment.Proven)
 		assert.Equal(t, []string{"CVE-M"}, gp.FirstPartyVulnIDs)
 		assert.Len(t, gp.ApkAdvisories, 5, "every record is still reported")
 	})

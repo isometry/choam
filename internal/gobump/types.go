@@ -53,6 +53,46 @@ type ApkAdvisory struct {
 	Modules      []string `json:"modules,omitempty" yaml:"modules,omitempty"` // affected modules, from the upstream records
 }
 
+// NeededAction kinds, in the order the report lists them.
+const (
+	ActionPatch  = "patch"  // a first-party advisory needs a source patch
+	ActionRerun  = "rerun"  // the result is incomplete; rerun once the cause is gone
+	ActionReview = "review" // a human must decide (a fix exists but was not applied/proven)
+	ActionAccept = "accept" // nothing to do until upstream releases a fix
+)
+
+// NeededAction is one thing the user must do about a package's result.
+type NeededAction struct {
+	Kind    string `json:"kind" yaml:"kind"` // patch, rerun, review, accept
+	Subject string `json:"subject" yaml:"subject"`
+	Detail  string `json:"detail,omitempty" yaml:"detail,omitempty"`
+}
+
+// EpochReason is one clause of why the epoch moved (the epoch comment's
+// wording) with the advisory IDs behind it.
+type EpochReason struct {
+	Kind    string   `json:"kind" yaml:"kind"` // deps, hygiene, stdlib, apk, build
+	Text    string   `json:"text" yaml:"text"`
+	VulnIDs []string `json:"vuln_ids,omitempty" yaml:"vuln_ids,omitempty"`
+}
+
+// ApkAlignment summarizes the apk advisory alignment (see ApkAdvisoryStage):
+// Version is the pristine "<version>-r<epoch>" queried; TargetEpoch the
+// epoch aligned to (Result.ApkEpochTarget); HighestFixedEpoch the highest
+// fix epoch among addressable advisories; BlockedAt the lowest non-proven
+// fix epoch (0 = none); the counts are per display ID and fix; Ignored counts
+// the advisories no epoch can clear or that cannot be correlated.
+type ApkAlignment struct {
+	Version           string `json:"version" yaml:"version"`
+	TargetEpoch       int64  `json:"target_epoch" yaml:"target_epoch"`
+	HighestFixedEpoch int64  `json:"highest_fixed_epoch" yaml:"highest_fixed_epoch"`
+	BlockedAt         int64  `json:"blocked_at,omitempty" yaml:"blocked_at,omitempty"`
+	Proven            int    `json:"proven" yaml:"proven"`
+	Unproven          int    `json:"unproven" yaml:"unproven"`
+	FirstParty        int    `json:"first_party" yaml:"first_party"`
+	Ignored           int    `json:"ignored" yaml:"ignored"`
+}
+
 // SecurityFix represents a security vulnerability fix applied
 type SecurityFix struct {
 	Module        string `json:"module" yaml:"module"`               // affected package
@@ -115,6 +155,12 @@ type Result struct {
 	ApkAdvisories     []ApkAdvisory `json:"apk_advisories,omitempty" yaml:"apk_advisories,omitempty"`
 	ApkEpochTarget    int64         `json:"apk_epoch_target,omitempty" yaml:"apk_epoch_target,omitempty"`
 	FirstPartyVulnIDs []string      `json:"first_party_vuln_ids,omitempty" yaml:"first_party_vuln_ids,omitempty"`
+	ApkAlignment      *ApkAlignment `json:"apk_alignment,omitempty" yaml:"apk_alignment,omitempty"`
+
+	// ActionsNeeded are what the user must do about this result;
+	// EpochReasons why the epoch moved (set only when it did).
+	ActionsNeeded []NeededAction `json:"actions_needed,omitempty" yaml:"actions_needed,omitempty"`
+	EpochReasons  []EpochReason  `json:"epoch_reasons,omitempty" yaml:"epoch_reasons,omitempty"`
 
 	OldEpoch       int64    `json:"old_epoch" yaml:"old_epoch"`
 	NewEpoch       int64    `json:"new_epoch" yaml:"new_epoch"`

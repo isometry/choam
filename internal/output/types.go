@@ -77,4 +77,9 @@ type BumpSummary struct {
 	// those IDs. Not dependency fixes: they need a source patch.
 	PackagesPatchNeeded  int `json:"packages_patch_needed" yaml:"packages_patch_needed"`
 	TotalFirstPartyVulns int `json:"total_first_party_vulns" yaml:"total_first_party_vulns"`
+
+	// PackagesChanged counts files whose epoch moved or that were rewritten;
+	// PackagesActionNeeded files that errored or carry Result.ActionsNeeded.
+	PackagesChanged      int `json:"packages_changed" yaml:"packages_changed"`
+	PackagesActionNeeded int `json:"packages_action_needed" yaml:"packages_action_needed"`
 }

@@ -93,6 +93,7 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 	}
 
 	if s.index == nil || s.scanner == nil {
+		gp.stdlibUnresolved = "Go release index unavailable"
 		s.skipWarn(ctx, gp, "stdlib: release index/scanner unavailable - skipping stdlib staleness check")
 		return nil
 	}
@@ -114,9 +115,12 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 	// needs even when the staleness trigger below is skipped.
 	versions, unknown, err := resolveRebuildVersions(ctx, s.index, in)
 	if err != nil {
+		gp.stdlibUnresolved = "Go release index unreachable"
 		return cancelledOr(ctx, func() { s.skipWarn(ctx, gp, fmt.Sprintf("stdlib: staleness check unavailable (%v) - skipping", err)) })
 	}
-	if !unknown {
+	if unknown {
+		gp.stdlibUnresolved = "no Go release past the publication-age margin yet"
+	} else {
 		gp.StdlibRebuildGoVersions = versions
 	}
 
