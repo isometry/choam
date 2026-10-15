@@ -558,6 +558,44 @@ func TestPipeline_StdlibOnlyBumpsEpochAndWrites(t *testing.T) {
 	require.Len(t, result.StdlibBumps, 1)
 }
 
+// TestPipeline_ExcludedStillGetsStdlibRebuild: an excluded package skips
+// analysis, the apk stage and the fallback source checkout (linkStd), yet a
+// stdlib finding still bumps the epoch and writes the file.
+func TestPipeline_ExcludedStillGetsStdlibRebuild(t *testing.T) {
+	opts := Options{StdlibCheck: true, Validate: true, ApkAdvisoryCheck: true}
+	pipeline, gp, filePath := buildStdlibPipeline(t, stdlibPipelineYAML, opts)
+	gp.ExcludedReason = "GOPATH-mode build"
+
+	var apk processor.Stage
+	for _, stage := range pipeline.Stages {
+		switch s := stage.(type) {
+		case *StdlibStage:
+			s.linkStd = func(context.Context, *Processor) (map[string]struct{}, error) {
+				t.Error("linkStd must not run for an excluded package")
+				return nil, errors.New("unexpected")
+			}
+		case *ApkAdvisoryStage:
+			apk = s
+		}
+	}
+	require.NotNil(t, apk)
+
+	require.NoError(t, pipeline.Execute(t.Context(), gp))
+
+	assert.Nil(t, gp.VulnerabilityAnalysis, "the checker is skipped")
+	shouldRun, err := apk.ShouldRun(t.Context(), gp)
+	require.NoError(t, err)
+	assert.False(t, shouldRun, "apk alignment is skipped")
+	assert.Empty(t, gp.Notes, "no source-checkout failure note")
+
+	require.Len(t, gp.StdlibBumps, 1)
+	assert.True(t, gp.IsEpochChanged())
+	assert.Equal(t, int64(6), gp.GetNewEpoch())
+	written, err := os.ReadFile(filePath)
+	require.NoError(t, err)
+	assert.Contains(t, string(written), "epoch: 6")
+}
+
 // TestPipeline_StdlibDryRunRecordsIntentWithoutWriting covers the EpochStage
 // DryRun branch: the intent is recorded but neither CurrentYAML nor the file
 // on disk changes.

@@ -137,8 +137,10 @@ func (s *StdlibStage) Apply(ctx context.Context, p processor.Processor) error {
 
 	// Fallback checkout: only worth a clone when the preliminary unfiltered
 	// evaluation actually found fixable advisories to validate against the
-	// artifact's linked stdlib set.
-	if len(bumps) > 0 && in.Linked == nil && s.Options.Validate {
+	// artifact's linked stdlib set. Never for an excluded package: it has no
+	// analysis (no source coordinates), so the clone could only fail; findings
+	// stay unfiltered, as under --no-validate.
+	if len(bumps) > 0 && in.Linked == nil && s.Options.Validate && gp.ExcludedReason == "" {
 		if bumps, messages, err = s.filterByLinkedStd(ctx, gp, in, bumps, messages); err != nil {
 			return err
 		}

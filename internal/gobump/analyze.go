@@ -91,6 +91,16 @@ func NewVulnerabilityChecker(analyzer *Analyzer) *VulnerabilityChecker {
 	}
 }
 
+// ShouldRun skips analysis for a package excluded by annotation; leaving
+// VulnerabilityAnalysis nil turns off every stage gated on it.
+func (v *VulnerabilityChecker) ShouldRun(ctx context.Context, p processor.Processor) (bool, error) {
+	gp, err := asBump(p)
+	if err != nil {
+		return false, err
+	}
+	return gp.ExcludedReason == "", nil
+}
+
 func (v *VulnerabilityChecker) Check(ctx context.Context, p processor.Processor) error {
 	gp, err := asBump(p)
 	if err != nil {

@@ -64,7 +64,7 @@ func (s *ApkAdvisoryStage) ShouldRun(ctx context.Context, p processor.Processor)
 	if err != nil {
 		return false, err
 	}
-	return s.Options.ApkAdvisoryCheck && gp.Config != nil, nil
+	return s.Options.ApkAdvisoryCheck && gp.Config != nil && gp.ExcludedReason == "", nil
 }
 
 // Apply classifies the advisories and reports them. Every failure degrades

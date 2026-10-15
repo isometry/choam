@@ -43,6 +43,17 @@ func ProcessFile(ctx context.Context, filePath string, opts Options, analyzer *A
 	// this ctx replaces going forward (see internal/logging).
 	ctx = logging.Into(ctx, goBumpProcessor.GetLogger())
 
+	// Exclusion is processor state each stage's gate honours; the pipeline is
+	// not rebuilt. An empty annotation value still excludes.
+	if reason, ok := cfg.Package.Annotations[excludeAnnotation]; ok {
+		if reason == "" {
+			reason = "no reason given"
+		}
+		goBumpProcessor.ExcludedReason = reason
+		goBumpProcessor.AddMessage(fmt.Sprintf("excluded from bump by %s: %s", excludeAnnotation, reason))
+		logging.From(ctx).Debug("package excluded from bump", "reason", reason)
+	}
+
 	// Create and execute the pipeline
 	pipeline := NewPipeline(analyzer, opts)
 

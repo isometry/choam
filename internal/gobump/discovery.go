@@ -38,6 +38,10 @@ var buildStepSignals = map[string]string{
 // modroots simply get the ./... reachability fallback.
 const annotationPrefix = "choam/bump-"
 
+// excludeAnnotation opts a package out of dependency bumping; its value is
+// the reason shown in the report. Go stdlib rebuild epoch bumps still apply.
+const excludeAnnotation = "choam/bump-exclude-reason"
+
 // analysisUnit is one modroot to analyze plus the build package patterns
 // (relative to the modroot, in go/build's space-separated with.packages
 // grammar) observed across every build step sharing that modroot. Empty

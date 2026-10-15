@@ -62,6 +62,9 @@ type BumpSummary struct {
 	// PackagesSkipped counts files (or parts of files) not analyzed - see
 	// Result.SkipReasons.
 	PackagesSkipped int `json:"packages_skipped" yaml:"packages_skipped"`
+	// PackagesExcluded counts files that opted out of bumping via the
+	// choam/bump-exclude-reason annotation (see Result.ExcludedReason).
+	PackagesExcluded int `json:"packages_excluded" yaml:"packages_excluded"`
 
 	// PackagesStdlibStale counts files with at least one distinct fixable
 	// stdlib vulnerability ID (see DistinctStdlibVulnIDs); TotalStdlibVulns

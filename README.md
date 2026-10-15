@@ -142,6 +142,18 @@ When simulation proves a candidate dependency set, `bump` also computes the Go l
 
 On by default (`--no-stdlib` to disable). A shipped binary's standard library is always the build toolchain's (the `go-package` input's) stdlib - the module's own `go.mod` directive does not determine it. `bump` therefore assumes a package was built with the latest upstream Go release as of the melange file's last git commit (constrained by any `go-package` pins), then compares OSV `stdlib` advisories at that assumed release against the newest allowed release; when the same run raises a `go-package` pin, the rebuild side uses the raised pin. When a rebuild would fix advisories affecting stdlib packages actually linked into the build artifacts, `package.epoch` is bumped by 1 to force a rebuild - even with zero dependency changes. Advisories a pinned rebuild cannot fix but a newer Go minor would produce an informational raise-the-pin suggestion instead of a bump. Artifact-linked-import filtering only applies when simulation runs; under `--no-validate` findings are unfiltered. The check is skipped automatically for files that are untracked, outside a git repository, or have uncommitted changes (doubling as an idempotency guard so repeated runs don't stack bumps); shallow clones are still checked but produce a warning about possible false negatives.
 
+#### Excluding a package
+
+A package that must never get dependency bumps (known-broken, or a legacy GOPATH-mode build with no `go.mod`) opts out with a package annotation whose value is the reason shown in the report:
+
+```yaml
+package:
+  annotations:
+    choam/bump-exclude-reason: "GOPATH-mode build, no go.mod"
+```
+
+An excluded package skips dependency analysis, simulation, deps writes, `go/bump` migration, `go-package` pin raises and apk-advisory epoch alignment; only Go stdlib rebuild epoch bumps still apply. It reports `EXCLUDED` (or `STDLIB-REBUILD` when a stdlib rebuild is applied), counts in the summary's `excluded` total (`packages_excluded` in JSON/YAML) and carries `excluded_reason` in structured output. An empty value still excludes (reason `no reason given`), and exclusion wins over any `choam/bump-<language>` opt-in on the same spec. `check` and `update` do not honour it (use `update.enabled: false`).
+
 Both checks are best-effort and fail open: any failure degrades to a skip-with-message rather than aborting the run. They rely on network access to `proxy.golang.org` (the Go release index and the go-version fallback), in addition to the `api.osv.dev` vulnerability scanning CHOAM already uses.
 
 #### Example Output
