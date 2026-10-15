@@ -136,6 +136,12 @@ func TestApkAdvisoryStage_ShouldRun(t *testing.T) {
 	require.NoError(t, err)
 	assert.True(t, ok)
 
+	gp.ExcludedReason = "GOPATH-mode build"
+	ok, err = newApkTestStage(&fakeApkSource{}, nil).ShouldRun(t.Context(), gp)
+	require.NoError(t, err)
+	assert.False(t, ok, "off for an excluded package")
+	gp.ExcludedReason = ""
+
 	gp.Config = nil
 	ok, err = newApkTestStage(&fakeApkSource{}, nil).ShouldRun(t.Context(), gp)
 	require.NoError(t, err)

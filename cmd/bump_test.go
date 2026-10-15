@@ -116,6 +116,17 @@ func TestBumpRowStatus(t *testing.T) {
 			want:   "ERROR",
 		},
 		{
+			name:   "excluded by annotation",
+			result: &gobump.Result{ExcludedReason: "GOPATH-mode build"},
+			want:   "EXCLUDED",
+		},
+		{
+			name:        "excluded but stdlib rebuild still applies",
+			result:      &gobump.Result{ExcludedReason: "GOPATH-mode build", EpochChanged: true},
+			stdlibVulns: 1,
+			want:        "STDLIB-REBUILD",
+		},
+		{
 			name:   "no vulnerabilities, no stdlib bump",
 			result: &gobump.Result{},
 			want:   "NO VULNS",
@@ -280,7 +291,7 @@ func TestOutputBumpTable_FooterWithStdlibStale(t *testing.T) {
 
 	assert.Regexp(t, `pkg-a\s.*│ 2\s+│ 0\s+│ NO VULNS`, stdout)
 	assert.Regexp(t, `pkg-c\s.*│ -\s+│ 0\s+│ NO VULNS`, stdout)
-	assert.Contains(t, stdout, "\nSummary: 3 files, 0 changed, 0 errors, 0 skipped, 0 need action\n")
+	assert.Contains(t, stdout, "\nSummary: 3 files, 0 changed, 0 errors, 0 skipped, 0 excluded, 0 need action\n")
 }
 
 // TestOutputBumpTable_FooterWithoutStdlibStale: a clean run prints the table
@@ -307,7 +318,7 @@ func TestOutputBumpTable_FooterWithoutStdlibStale(t *testing.T) {
 
 	assert.NotContains(t, stdout, "Action needed")
 	assert.NotContains(t, stdout, "Info")
-	assert.Contains(t, stdout, "\nSummary: 2 files, 0 changed, 0 errors, 0 skipped, 0 need action\n")
+	assert.Contains(t, stdout, "\nSummary: 2 files, 0 changed, 0 errors, 0 skipped, 0 excluded, 0 need action\n")
 }
 
 // TestOutputBumpStructured_StdlibSummary exercises the real
@@ -372,10 +383,11 @@ func TestSummarizeBumpResults(t *testing.T) {
 		{FilePath: "d.yaml", PackageName: "d", SkipReasons: []string{"unsupported repository"},
 			ActionsNeeded: []gobump.NeededAction{{Kind: gobump.ActionReview, Subject: "not analyzed", Detail: "unsupported repository"}}},
 		{FilePath: "e.yaml", VulnerabilitiesFound: 1, VulnerabilitiesFixed: 1, ModulesBumped: 1, EpochChanged: true, OldEpoch: 1, NewEpoch: 2},
+		{FilePath: "f.yaml", PackageName: "f", ExcludedReason: "GOPATH-mode build"},
 	}
 	s := summarizeBumpResults(results)
 	assert.Equal(t, output.BumpSummary{
-		TotalPackages:        5,
+		TotalPackages:        6,
 		PackagesWithVulns:    3,
 		PackagesFixed:        2,
 		PackagesPartial:      2,
@@ -386,12 +398,13 @@ func TestSummarizeBumpResults(t *testing.T) {
 		TotalModulesBumped:   4,
 		Errors:               1,
 		PackagesSkipped:      1,
+		PackagesExcluded:     1,
 		PackagesChanged:      1,
 		PackagesActionNeeded: 2,
 	}, s)
 
 	table := captureStdout(t, func() { require.NoError(t, outputBumpTable(results)) })
-	assert.Contains(t, table, "\nSummary: 5 files, 1 changed, 1 errors, 1 skipped, 2 need action\n")
+	assert.Contains(t, table, "\nSummary: 6 files, 1 changed, 1 errors, 1 skipped, 1 excluded, 2 need action\n")
 	assert.Contains(t, table, "\n  ERROR   fetch failed - c\n", "errors are shown at default verbosity")
 	assert.Contains(t, table, "\n  REVIEW  not analyzed: unsupported repository - d\n", "skip reasons are shown at default verbosity")
 	assert.Regexp(t, `│ 1->2\s+│ UNVALIDATED`, table, "merged EPOCH cell")

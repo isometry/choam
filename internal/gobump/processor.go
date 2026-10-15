@@ -51,6 +51,11 @@ type Processor struct {
 	// result is SKIPPED, never clean.
 	SkipReasons []string `json:"skip_reasons,omitempty"`
 
+	// ExcludedReason is why the package opted out of bumping via the
+	// choam/bump-exclude-reason annotation ("" = not excluded). Only stdlib
+	// rebuild epoch bumps still apply; see ProcessFile.
+	ExcludedReason string `json:"excluded_reason,omitempty"`
+
 	// Notes are degradations of an otherwise complete analysis that the
 	// user must see at default verbosity (e.g. artifact linkage unavailable,
 	// so reachability classification was skipped); see AddNote.
@@ -452,6 +457,7 @@ func (p *Processor) ToResult() *Result {
 		CriticalFixed:              criticalFixed,
 		HighFixed:                  highFixed,
 		SkipReasons:                p.SkipReasons,
+		ExcludedReason:             p.ExcludedReason,
 		Notes:                      p.Notes,
 		StdlibBumps:                p.StdlibBumps,
 		StdlibChecked:              p.StdlibChecked,

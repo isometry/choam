@@ -73,3 +73,34 @@ func TestProcessFile_ReadFailureIsAttributed(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, buf.String(), "file="+missing)
 }
+
+// TestProcessFile_ExcludedByAnnotation: the choam/bump-exclude-reason
+// annotation skips analysis entirely, even for a bumpable spec, and an empty
+// value still excludes.
+func TestProcessFile_ExcludedByAnnotation(t *testing.T) {
+	for name, tc := range map[string]struct{ value, want string }{
+		"reason":       {`"GOPATH-mode build, no go.mod"`, "GOPATH-mode build, no go.mod"},
+		"empty reason": {`""`, "no reason given"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			spec := strings.Replace(notBumpableFixtureYAML, "  epoch: 0\n",
+				"  epoch: 0\n  annotations:\n    choam/bump-exclude-reason: "+tc.value+"\n    choam/bump-go: .\n", 1)
+			filePath := filepath.Join(t.TempDir(), "excluded.yaml")
+			require.NoError(t, os.WriteFile(filePath, []byte(spec), 0o644))
+
+			result, err := ProcessFile(t.Context(), filePath, Options{}, nil)
+			require.NoError(t, err)
+
+			assert.Equal(t, tc.want, result.ExcludedReason)
+			assert.Empty(t, result.SkipReasons, "exclusion is not a skip")
+			assert.Empty(t, result.ActionsNeeded, "exclusion is not an action")
+			assert.False(t, result.EpochChanged)
+			assert.False(t, result.FileWasWritten)
+			assert.Contains(t, result.Messages, "excluded from bump by choam/bump-exclude-reason: "+tc.want)
+			assert.NotContains(t, strings.Join(result.Messages, "\n"), "Not a bumpable project", "analysis must not run")
+			onDisk, err := os.ReadFile(filePath)
+			require.NoError(t, err)
+			assert.Equal(t, spec, string(onDisk))
+		})
+	}
+}

@@ -144,6 +144,9 @@ type Result struct {
 	// SkipReasons say why (part of) the package was not analyzed (status
 	// SKIPPED; see Processor.SkipReasons).
 	SkipReasons []string `json:"skip_reasons,omitempty" yaml:"skip_reasons,omitempty"`
+	// ExcludedReason is the choam/bump-exclude-reason annotation value (status
+	// EXCLUDED; see Processor.ExcludedReason).
+	ExcludedReason string `json:"excluded_reason,omitempty" yaml:"excluded_reason,omitempty"`
 	// Notes are degradations shown at default verbosity (see
 	// Processor.Notes); they do not change the row's status.
 	Notes []string `json:"notes,omitempty" yaml:"notes,omitempty"`

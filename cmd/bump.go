@@ -186,6 +186,9 @@ func summarizeBumpResults(results []*gobump.Result) output.BumpSummary {
 		if len(r.SkipReasons) > 0 {
 			summary.PackagesSkipped++
 		}
+		if r.ExcludedReason != "" {
+			summary.PackagesExcluded++
+		}
 		if n := len(r.FirstPartyVulnIDs); n > 0 {
 			summary.PackagesPatchNeeded++
 			summary.TotalFirstPartyVulns += n
@@ -248,8 +251,8 @@ func outputBumpTable(results []*gobump.Result) error {
 	}
 
 	s := summarizeBumpResults(results)
-	fmt.Printf("\nSummary: %d %s, %d changed, %d errors, %d skipped, %d %s\n",
-		s.TotalPackages, pluralWord(s.TotalPackages, "file", "files"), s.PackagesChanged, s.Errors, s.PackagesSkipped,
+	fmt.Printf("\nSummary: %d %s, %d changed, %d errors, %d skipped, %d excluded, %d %s\n",
+		s.TotalPackages, pluralWord(s.TotalPackages, "file", "files"), s.PackagesChanged, s.Errors, s.PackagesSkipped, s.PackagesExcluded,
 		s.PackagesActionNeeded, pluralWord(s.PackagesActionNeeded, "needs action", "need action"))
 	if dryRun {
 		fmt.Println("(Dry run - no files were actually modified)")
@@ -650,6 +653,8 @@ func renderInfo(results []*gobump.Result) {
 // definition the summary counts:
 //
 //	ERROR          the file failed (partial counts shown)
+//	EXCLUDED       opted out via choam/bump-exclude-reason and no stdlib
+//	               rebuild (one still reports STDLIB-REBUILD)
 //	SKIPPED        not analyzed (see SkipReasons) and nothing found
 //	PATCH-NEEDED   a first-party apk advisory (own module affected) needs a
 //	               source patch; wins over every success status below
@@ -671,6 +676,8 @@ func bumpRowStatus(result *gobump.Result, stdlibVulns int) string {
 	switch {
 	case result.Error != "":
 		return "ERROR"
+	case result.ExcludedReason != "" && stdlibVulns == 0:
+		return "EXCLUDED"
 	case len(result.SkipReasons) > 0 && result.VulnerabilitiesFound == 0:
 		return "SKIPPED"
 	case len(result.FirstPartyVulnIDs) > 0:
