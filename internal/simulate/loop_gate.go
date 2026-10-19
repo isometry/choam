@@ -8,7 +8,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/isometry/choam/internal/logging"
@@ -61,9 +60,9 @@ func (o *trialOutcome) why() string {
 // compileBaseline compiles the pristine checkout once per target arch,
 // after the initial tidy: packages that already fail there (missing C
 // libraries, generated code, host-only noise) are excluded from every later
-// verdict, so only failures a bump introduces count. The arches compile
-// concurrently; the primary arch's failures are baselineFailed, the others'
-// archBaselineFailed (for crossArchCompile).
+// verdict, so only failures a bump introduces count. The arches are checked
+// in order (see compileArches); the primary arch's failures are
+// baselineFailed, the others' archBaselineFailed (for crossArchCompile).
 func (l *loop) compileBaseline(ctx context.Context) error {
 	if err := l.engine.tidyBaseline(ctx); err != nil {
 		return gateErr(ctx, fmt.Errorf("baseline go mod tidy: %w", err))
@@ -100,21 +99,20 @@ func (l *loop) compileBaseline(ctx context.Context) error {
 	return nil
 }
 
-// compileArches compiles the checkout for each of arches concurrently,
-// returning the reports in arch order; the error is the first failing
-// arch's in arch order (every compile runs to completion).
+// compileArches checks the checkout for each of arches one after another,
+// returning the reports in arch order, or the first failing arch's error
+// (later arches are not checked). Sequential on purpose: the type-check
+// cache keys are arch-independent, so each arch after the first mostly hits
+// the entries the previous one left (concurrent checks would duplicate that
+// work, and each already uses every CPU).
 func (l *loop) compileArches(ctx context.Context, arches []string) ([]*CompileReport, error) {
-	reports := make([]*CompileReport, len(arches))
-	errs := make([]error, len(arches))
-	var wg sync.WaitGroup
-	for i, arch := range arches {
-		wg.Go(func() { reports[i], errs[i] = l.compiler.Compile(ctx, l.dir, l.target, arch) })
-	}
-	wg.Wait()
-	for i, err := range errs {
+	reports := make([]*CompileReport, 0, len(arches))
+	for _, arch := range arches {
+		report, err := l.compiler.Compile(ctx, l.dir, l.target, arch)
 		if err != nil {
-			return nil, fmt.Errorf("GOARCH=%s: %w", arches[i], err)
+			return nil, fmt.Errorf("GOARCH=%s: %w", arch, err)
 		}
+		reports = append(reports, report)
 	}
 	return reports, nil
 }

@@ -2314,8 +2314,7 @@ type fakeCompiler struct {
 	compileFn func(resolved map[string]string) *CompileReport
 	versions  map[string][]string
 	requires  map[string]map[string]string
-	// compiles counts primary-arch compiles; archCompiles every arch's
-	// (the loop compiles the arches concurrently, hence mu).
+	// compiles counts primary-arch compiles; archCompiles every arch's.
 	compiles     int
 	archCompiles map[string]int
 	mu           sync.Mutex
@@ -2752,6 +2751,9 @@ func TestCompileGate_FailsClosed(t *testing.T) {
 			require.ErrorIs(t, err, ErrCompileGate)
 			if tt.err != nil {
 				require.ErrorIs(t, err, ErrToolchainTooNew, "the sentinel survives the gate's wrapping")
+			}
+			if tt.failAt == 1 {
+				assert.Zero(t, tc.archCompiles["arm64"], "arches run in order: a failing first arch stops the rest")
 			}
 		})
 	}

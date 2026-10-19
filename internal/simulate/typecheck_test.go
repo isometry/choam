@@ -89,6 +89,42 @@ func TestTypecheck_PositionFreeExportIsCacheHitForImporter(t *testing.T) {
 	assert.Less(t, misses, 100, "cross-arch rechecks only packages whose files or imports' APIs differ")
 }
 
+// TestTypecheck_SecondArchReusesCache: cache keys are arch-independent, so
+// type-checking arm64 after amd64 (as the gate does, in sequence) rechecks
+// only packages whose file set differs. Standard-library packages with arch
+// files do differ, so the measure is relative: the same module with an
+// API-neutral _amd64.go/_arm64.go pair in lib misses exactly one more
+// package on arm64 - lib itself; its importers (mid, main) are hits.
+func TestTypecheck_SecondArchReusesCache(t *testing.T) {
+	files := map[string]string{
+		"go.mod":     "module example.com/m\n\ngo 1.21\n",
+		"lib/lib.go": "package lib\n\nfunc Value() int { return 1 }\n",
+		"mid/mid.go": "package mid\n\nimport \"example.com/m/lib\"\n\nfunc Twice() int { return 2 * lib.Value() }\n",
+		"main.go":    "package main\n\nimport (\n\t\"fmt\"\n\n\t\"example.com/m/mid\"\n)\n\nfunc main() { fmt.Println(mid.Twice()) }\n",
+	}
+	secondArchMisses := func(extra map[string]string) int {
+		all := maps.Clone(files)
+		maps.Copy(all, extra)
+		toolchain, dir := typecheckFixture(t, all)
+		report, err := toolchain.Compile(t.Context(), dir, BuildTarget{}, "amd64")
+		require.NoError(t, err)
+		require.Empty(t, report.Failed)
+		_, misses := cacheDelta(toolchain, func() {
+			report, err = toolchain.Compile(t.Context(), dir, BuildTarget{}, "arm64")
+		})
+		require.NoError(t, err)
+		require.Empty(t, report.Failed)
+		return misses
+	}
+
+	plain := secondArchMisses(nil)
+	withArchFiles := secondArchMisses(map[string]string{
+		"lib/arch_amd64.go": "package lib\n\nfunc arch() string { return \"amd64\" }\n",
+		"lib/arch_arm64.go": "package lib\n\nfunc arch() string { return \"arm64\" }\n",
+	})
+	assert.Equal(t, plain+1, withArchFiles, "only lib rechecks; its unchanged API keeps mid and main cached")
+}
+
 // TestTypecheck_PatchBumpUnchangedAPIIsCacheHit: a module-cache dependency
 // raised to a release that changes only a function body is rechecked; its
 // importer (and everything else) is a cache hit.
