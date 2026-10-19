@@ -166,6 +166,7 @@ func TestSimulationStage_FailsClosedOnCompileGate(t *testing.T) {
 		{"gate error", fmt.Errorf("simulating modroot .: %w: baseline: boom", simulate.ErrCompileGate), false},
 		{"budget timeout with gate on", fmt.Errorf("simulating modroot .: %w", context.DeadlineExceeded), true},
 		{"go tool infrastructure failure", fmt.Errorf("simulating modroot .: %w: dial tcp: i/o timeout", simulate.ErrInfrastructure), false},
+		{"toolchain newer than go/types", fmt.Errorf("simulating modroot .: toolchain go 1.99.0 is newer than choam's go/types (go1.26.4): %w", simulate.ErrToolchainTooNew), false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			stage := newStageWithFake(&fakeBumpSimulator{err: tt.err})
@@ -175,6 +176,7 @@ func TestSimulationStage_FailsClosedOnCompileGate(t *testing.T) {
 			err := stage.Apply(t.Context(), gp)
 			require.ErrorIs(t, err, tt.err)
 			assert.Contains(t, err.Error(), "file left unchanged")
+			assert.Contains(t, err.Error(), tt.err.Error(), "the cause (and any remedy) reaches the report")
 			assert.False(t, gp.Validated)
 			for _, msg := range gp.Messages {
 				assert.NotContains(t, msg, "NOT validated", "must not degrade to the unvalidated set")

@@ -30,10 +30,11 @@ import (
 // typecheckFields are the go list -json fields the type-check engine decodes.
 const typecheckFields = "ImportPath,Dir,GoFiles,CgoFiles,Imports,ImportMap,Standard,Module,Error"
 
-// errTypecheckIneligible marks a graph the in-process type-checker cannot
-// judge faithfully (a toolchain or go directive newer than choam's own
-// go/types): Compile fails with it rather than issue a verdict.
-var errTypecheckIneligible = errors.New("type-check engine ineligible")
+// ErrToolchainTooNew marks a graph choam's own go/types (the Go choam was
+// built with) is too old to judge: the toolchain the go list ran under, or
+// a module's go directive, is a newer minor. Compile fails with it rather
+// than issue a verdict; callers fail the file closed. Its text is the remedy.
+var ErrToolchainTooNew = errors.New("run a choam built with that Go or newer, e.g. go run github.com/isometry/choam@latest")
 
 // maxCompileErrorLines caps the error lines kept per failing package.
 const maxCompileErrorLines = 5
@@ -96,7 +97,7 @@ var unsafeEntry = &typecheckEntry{apiHash: sha256.Sum256([]byte("unsafe"))}
 // `go list -e -deps -json` under targetBuildEnv for arch (one arch per
 // call; nothing is compiled, so no C toolchain is needed - the spec's CGO
 // applies as is). An error return means the go tool or the engine could
-// not judge the graph (including errTypecheckIneligible), not that
+// not judge the graph (including ErrToolchainTooNew), not that
 // packages failed to type-check.
 func (t *GoToolchain) Compile(ctx context.Context, dir string, target BuildTarget, arch string) (*CompileReport, error) {
 	args := targetListArgs([]string{"list", "-e", "-deps", "-json=" + typecheckFields}, target.Patterns, target.Tags)
@@ -136,7 +137,7 @@ func (t *GoToolchain) typecheck(ctx context.Context, pkgs []goListPackage, arch 
 	}
 	sizes := types.SizesFor("gc", arch)
 	if sizes == nil {
-		return nil, fmt.Errorf("%w: no gc sizes for GOARCH=%s", errTypecheckIneligible, arch)
+		return nil, fmt.Errorf("type-check: go/types has no gc sizes for GOARCH=%s", arch)
 	}
 	sizesKey := fmt.Sprintf("%d/%d", sizes.Sizeof(types.Typ[types.Uintptr]), sizes.Alignof(types.Typ[types.Complex128]))
 
@@ -454,13 +455,13 @@ func packageGoVersion(pkg *goListPackage, rootVersion string) string {
 // typecheckEligible returns the bare version of the GOROOT the listing was
 // produced with (located through the runtime package's Dir - the go list
 // may run under a GOTOOLCHAIN=auto switched toolchain, so the host probe is
-// not it), or errTypecheckIneligible when that version or any module's go
-// directive is a newer minor than host (choam's own go/types), or either is
-// unknown.
+// not it), or ErrToolchainTooNew when that version or any module's go
+// directive is a newer minor than host (choam's own go/types). An unknown
+// version on either side is a plain error.
 func typecheckEligible(pkgs []goListPackage, host string) (string, error) {
 	hostMinor := goversion.Minor(host)
 	if hostMinor == "" {
-		return "", fmt.Errorf("%w: unrecognised host go version %q", errTypecheckIneligible, host)
+		return "", fmt.Errorf("type-check: choam's go/types version %q is not a Go release", host)
 	}
 	newer := func(v string) bool { return goversion.Compare(goversion.Minor(v), hostMinor) > 0 }
 	var rootVersion string
@@ -469,21 +470,25 @@ func typecheckEligible(pkgs []goListPackage, host string) (string, error) {
 		if pkg.Standard && pkg.ImportPath == "runtime" {
 			content, err := os.ReadFile(filepath.Join(filepath.Dir(filepath.Dir(pkg.Dir)), "VERSION"))
 			if err != nil {
-				return "", fmt.Errorf("%w: reading GOROOT VERSION: %w", errTypecheckIneligible, err)
+				return "", fmt.Errorf("type-check: reading the toolchain's GOROOT VERSION: %w", err)
 			}
 			first, _, _ := strings.Cut(string(content), "\n")
 			rootVersion = strings.TrimPrefix(strings.TrimSpace(first), "go")
 			continue
 		}
 		if v := packageGoVersion(pkg, ""); v != "" && newer(v) {
-			return "", fmt.Errorf("%w: %s requires go %s, newer than go/types %s", errTypecheckIneligible, pkg.ImportPath, v, host)
+			module := pkg.Module.Path
+			if r := pkg.Module.Replace; r != nil && r.GoVersion != "" {
+				module = r.Path
+			}
+			return "", fmt.Errorf("module %s's go directive (go %s) is newer than choam's go/types (go%s): %w", module, v, host, ErrToolchainTooNew)
 		}
 	}
 	if !goversion.IsValid(rootVersion) {
-		return "", fmt.Errorf("%w: unrecognised GOROOT version %q", errTypecheckIneligible, rootVersion)
+		return "", fmt.Errorf("type-check: toolchain version %q (GOROOT VERSION) is not a Go release", rootVersion)
 	}
 	if newer(rootVersion) {
-		return "", fmt.Errorf("%w: toolchain go %s newer than go/types %s", errTypecheckIneligible, rootVersion, host)
+		return "", fmt.Errorf("toolchain go %s is newer than choam's go/types (go%s): %w", rootVersion, host, ErrToolchainTooNew)
 	}
 	return rootVersion, nil
 }

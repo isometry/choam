@@ -2735,23 +2735,35 @@ func TestCompileGate_RepairsVictimThatIsAlsoImplicated(t *testing.T) {
 func TestCompileGate_FailsClosed(t *testing.T) {
 	seeds := []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}}
 	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
+	tooNew := fmt.Errorf("toolchain go 1.99.0 is newer than choam's go/types (go1.26.4): %w", ErrToolchainTooNew)
 	for _, tt := range []struct {
 		name   string
-		failAt int // compile call that fails (1 = baseline)
-	}{{"baseline unavailable", 1}, {"trial tool failure", 2}} {
+		failAt int   // compile call that fails (1 = baseline)
+		err    error // nil: a generic tool failure
+	}{
+		{"baseline unavailable", 1, nil},
+		{"trial tool failure", 2, nil},
+		{"baseline toolchain too new", 1, tooNew},
+		{"trial toolchain too new", 2, tooNew},
+	} {
 		t.Run(tt.name, func(t *testing.T) {
-			tc := &failingCompiler{fakeCompiler: &fakeCompiler{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}, failAt: tt.failAt}
+			tc := &failingCompiler{fakeCompiler: &fakeCompiler{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}, failAt: tt.failAt, err: tt.err}
 			_, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{Modroot: ".", Seeds: seeds}, Options{})
 			require.ErrorIs(t, err, ErrCompileGate)
+			if tt.err != nil {
+				require.ErrorIs(t, err, ErrToolchainTooNew, "the sentinel survives the gate's wrapping")
+			}
 		})
 	}
 
 }
 
-// failingCompiler fails the failAt-th Compile call as a tool failure.
+// failingCompiler fails the failAt-th Compile call with err (a generic tool
+// failure when nil).
 type failingCompiler struct {
 	*fakeCompiler
 	failAt int
+	err    error
 }
 
 func (f *failingCompiler) Compile(ctx context.Context, dir string, target BuildTarget, arch string) (*CompileReport, error) {
@@ -2761,6 +2773,9 @@ func (f *failingCompiler) Compile(ctx context.Context, dir string, target BuildT
 		f.compiles++
 	}
 	f.mu.Unlock()
+	if fail && f.err != nil {
+		return nil, f.err
+	}
 	if fail {
 		return nil, errors.New("go list: exit status 2")
 	}

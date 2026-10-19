@@ -72,7 +72,7 @@ var errHygieneBudget = errors.New("simulation budget nearly exhausted")
 // reason. Skipped (HygieneSkipped) without the compile gate or on a
 // non-converged result. Returns the final resolved graph, leaving the
 // checkout holding the final set; only a cancellation, an infrastructure or
-// a scanner failure is an error.
+// a scanner failure, or ErrToolchainTooNew is an error.
 func (l *loop) hygienePass(ctx context.Context, ref *goModState, resolved map[string]string, result *ModrootResult) (map[string]string, error) {
 	scanResult, err := l.sc.ScanPackages(ctx, l.scanTargets(resolved, l.requirements, l.replaces))
 	if err != nil {
@@ -331,6 +331,9 @@ func (l *loop) hygieneTrial(ctx context.Context, purpose string, set []*candStat
 		}
 		if ierr := l.recordInfra(err); ierr != nil {
 			return nil, ierr
+		}
+		if errors.Is(err, ErrToolchainTooNew) {
+			return nil, err // no verdict possible: fail the file, not just this bump
 		}
 		return notFree("compile check failed: " + firstLine(err.Error()))
 	}

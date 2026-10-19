@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -208,24 +209,37 @@ func TestTypecheckEligible(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "1.27.2", version)
 
+	const remedy = "run a choam built with that Go or newer, e.g. go run github.com/isometry/choam@latest"
 	for name, tc := range map[string]struct {
-		pkgs []goListPackage
-		host string
+		pkgs   []goListPackage
+		host   string
+		tooNew string // the full message when ErrToolchainTooNew, else ""
 	}{
-		"toolchain newer":       {[]goListPackage{runtimePkg("go1.28.0")}, "1.27.2"},
-		"go directive newer":    {[]goListPackage{runtimePkg("go1.27.2"), modulePkg("1.28")}, "1.27.2"},
-		"devel toolchain":       {[]goListPackage{runtimePkg("devel go1.28-abcdef")}, "1.27.2"},
-		"devel host":            {[]goListPackage{runtimePkg("go1.27.2")}, "devel go1.28-abcdef"},
-		"no runtime in listing": {[]goListPackage{modulePkg("1.21")}, "1.27.2"},
+		"toolchain newer":       {[]goListPackage{runtimePkg("go1.28.0")}, "1.27.2", "toolchain go 1.28.0 is newer than choam's go/types (go1.27.2): " + remedy},
+		"go directive newer":    {[]goListPackage{runtimePkg("go1.27.2"), modulePkg("1.28")}, "1.27.2", "module example.com/x's go directive (go 1.28) is newer than choam's go/types (go1.27.2): " + remedy},
+		"devel toolchain":       {[]goListPackage{runtimePkg("devel go1.28-abcdef")}, "1.27.2", ""},
+		"devel host":            {[]goListPackage{runtimePkg("go1.27.2")}, "devel go1.28-abcdef", ""},
+		"no runtime in listing": {[]goListPackage{modulePkg("1.21")}, "1.27.2", ""},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := typecheckEligible(tc.pkgs, tc.host)
-			assert.ErrorIs(t, err, errTypecheckIneligible)
+			require.Error(t, err)
+			if tc.tooNew != "" {
+				assert.ErrorIs(t, err, ErrToolchainTooNew)
+				assert.EqualError(t, err, tc.tooNew)
+			} else {
+				assert.NotErrorIs(t, err, ErrToolchainTooNew, "an unknown version is a plain error: %v", err)
+			}
 		})
 	}
 
 	_, err = (&GoToolchain{}).typecheck(t.Context(), []goListPackage{runtimePkg("go1.999.0")}, "amd64")
-	assert.ErrorIs(t, err, errTypecheckIneligible, "an ineligible graph is an error, not a verdict")
+	assert.ErrorIs(t, err, ErrToolchainTooNew, "an ineligible graph is an error, not a verdict")
+
+	_, err = (&GoToolchain{}).typecheck(t.Context(), []goListPackage{runtimePkg(runtime.Version())}, "nosucharch")
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrToolchainTooNew)
+	assert.Contains(t, err.Error(), "no gc sizes for GOARCH=nosucharch")
 }
 
 // TestTypecheck_LockstepBreak: on the otel-like lockstep break the engine

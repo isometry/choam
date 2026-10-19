@@ -419,10 +419,13 @@ func (s *SimulationStage) buildGoVersion(ctx context.Context, minor string) stri
 // failClosed reports whether a simulation error must fail the file instead
 // of degrading to the unvalidated candidate set: a compile-gate failure, an
 // infrastructure failure of the go tool (network, proxy, per-command
-// timeout - no verdict could be reached), or a timeout while the gate is
-// enabled (the set was never proven to compile).
+// timeout - no verdict could be reached), a toolchain newer than choam's
+// go/types (the gate cannot judge the graph; the error carries the remedy),
+// or a timeout while the gate is enabled (the set was never proven to
+// compile).
 func (s *SimulationStage) failClosed(err error) bool {
 	return errors.Is(err, simulate.ErrCompileGate) || errors.Is(err, simulate.ErrInfrastructure) ||
+		errors.Is(err, simulate.ErrToolchainTooNew) ||
 		(s.Options.Compile && errors.Is(err, context.DeadlineExceeded))
 }
 

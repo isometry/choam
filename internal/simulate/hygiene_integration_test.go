@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -263,6 +265,30 @@ func TestReplay_HygieneFree(t *testing.T) {
 			})
 		})
 	}
+}
+
+// tooNewOnHygiene is the real toolchain, except that Compile reports
+// ErrToolchainTooNew once the checkout requires the hygiene fix version (as
+// a trial that switches toolchain would).
+type tooNewOnHygiene struct{ *GoToolchain }
+
+func (c tooNewOnHygiene) Compile(ctx context.Context, dir string, target BuildTarget, arch string) (*CompileReport, error) {
+	if gomod, err := os.ReadFile(filepath.Join(dir, "go.mod")); err == nil && strings.Contains(string(gomod), modXText+" v0.21.0") {
+		return nil, fmt.Errorf("toolchain go 1.99.0 is newer than choam's go/types (go1.26.4): %w", ErrToolchainTooNew)
+	}
+	return c.GoToolchain.Compile(ctx, dir, target, arch)
+}
+
+// TestReplay_HygieneToolchainTooNewFailsFile: a hygiene trial the type-check
+// cannot judge fails the simulation (the file), not just that bump - it is
+// not shed as "not free".
+func TestReplay_HygieneToolchainTooNewFailsFile(t *testing.T) {
+	c := hygieneFreeCase()
+	f := c.fixture(t)
+	_, err := RunLoop(t.Context(), tooNewOnHygiene{f.tc}, c.sc(), f.dir, c.req, Options{})
+	require.ErrorIs(t, err, ErrToolchainTooNew)
+	assert.NotErrorIs(t, err, ErrCompileGate, "raised by the hygiene trial, not the gate")
+	assert.Contains(t, err.Error(), "go run github.com/isometry/choam@latest")
 }
 
 func countTrials(trace *traceCapture, prefix string) int {
