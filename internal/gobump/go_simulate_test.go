@@ -154,23 +154,23 @@ func TestSimulationStage_DegradesOnSimulatorError(t *testing.T) {
 	}
 }
 
-// TestSimulationStage_FailsClosedOnCompileGate: a compile-gate failure, a go
+// TestSimulationStage_FailsClosedOnTypecheckGate: a type-check gate failure, a go
 // tool infrastructure failure (or a timeout with the gate enabled) must fail
 // the file, never fall through to the raw pre-simulation candidates.
-func TestSimulationStage_FailsClosedOnCompileGate(t *testing.T) {
+func TestSimulationStage_FailsClosedOnTypecheckGate(t *testing.T) {
 	for _, tt := range []struct {
-		name    string
-		err     error
-		compile bool
+		name      string
+		err       error
+		typecheck bool
 	}{
-		{"gate error", fmt.Errorf("simulating modroot .: %w: baseline: boom", simulate.ErrCompileGate), false},
+		{"gate error", fmt.Errorf("simulating modroot .: %w: baseline: boom", simulate.ErrTypecheckGate), false},
 		{"budget timeout with gate on", fmt.Errorf("simulating modroot .: %w", context.DeadlineExceeded), true},
 		{"go tool infrastructure failure", fmt.Errorf("simulating modroot .: %w: dial tcp: i/o timeout", simulate.ErrInfrastructure), false},
 		{"toolchain newer than go/types", fmt.Errorf("simulating modroot .: toolchain go 1.99.0 is newer than choam's go/types (go1.26.4): %w", simulate.ErrToolchainTooNew), false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			stage := newStageWithFake(&fakeBumpSimulator{err: tt.err})
-			stage.Options.Compile = tt.compile
+			stage.Options.Compile = tt.typecheck
 			gp := newSimulationProcessor()
 
 			err := stage.Apply(t.Context(), gp)
@@ -200,16 +200,16 @@ func TestSimulationStage_DegradesWhenToolchainMissing(t *testing.T) {
 	assert.False(t, gp.Validated)
 }
 
-// TestCompileCgoNote: the cgo limitation is reported only when the gate is
+// TestTypecheckCgoNote: the cgo limitation is reported only when the gate is
 // on and the spec enables cgo explicitly.
-func TestCompileCgoNote(t *testing.T) {
+func TestTypecheckCgoNote(t *testing.T) {
 	m := ModrootAnalysis{Modroot: "cmd/x", BuildEnv: simulate.BuildEnv{CGO: "1"}}
 	assert.Equal(t, "modroot cmd/x: type-check gate checks cgo files without a C toolchain - errors in expressions using C types are not caught",
-		compileCgoNote(m, true))
-	assert.Empty(t, compileCgoNote(m, false), "gate off")
+		typecheckCgoNote(m, true))
+	assert.Empty(t, typecheckCgoNote(m, false), "gate off")
 	for _, cgo := range []string{"0", ""} {
 		m.BuildEnv.CGO = cgo
-		assert.Empty(t, compileCgoNote(m, true), "CGO=%q", cgo)
+		assert.Empty(t, typecheckCgoNote(m, true), "CGO=%q", cgo)
 	}
 }
 
@@ -1024,7 +1024,7 @@ func TestSimulationStage_DegradedUnreachableCrossModrootReachable(t *testing.T) 
 }
 
 // TestSeedCandidates_ThreadsSeverity: the analysis scan's per-bump severity
-// reaches simulate.Candidate (the compile gate relaxes least-severe-first).
+// reaches simulate.Candidate (the type-check gate relaxes least-severe-first).
 func TestSeedCandidates_ThreadsSeverity(t *testing.T) {
 	seeds := seedCandidates(ModrootAnalysis{
 		DesiredDeps: []string{"example.com/a@v1.1.0", "example.com/b@v1.2.0"},
@@ -1102,7 +1102,7 @@ func TestImportsByAdvisory(t *testing.T) {
 
 // TestSimulationStage_ReportsBlindSpots: unavailable linkage is a
 // default-verbosity note (Result.Notes); tolerated embed gaps and the
-// compile gate's baseline blind spot are -v messages.
+// type-check gate's baseline blind spot are -v messages.
 func TestSimulationStage_ReportsBlindSpots(t *testing.T) {
 	cause := "GOARCH=amd64: go list -deps: package example.com/gen: build constraints exclude all Go files"
 	run := func(result *simulate.ModrootResult) *Processor {
@@ -1132,6 +1132,6 @@ func TestSimulationStage_ReportsBlindSpots(t *testing.T) {
 	assert.Empty(t, gaps.Notes)
 	assert.Contains(t, gaps.GetMessages(), "modroot .: tolerated unmatched go:embed pattern(s) in example.com/app/cmd/flux (manifests/*.yaml, static/*), "+
 		"example.com/app/web (dist) (generated at build time): linkage computed from imports")
-	assert.Contains(t, gaps.GetMessages(), "modroot .: compile gate cannot check 2 package(s) that fail to build at baseline "+
+	assert.Contains(t, gaps.GetMessages(), "modroot .: type-check gate cannot check 2 package(s) that already fail to type-check at baseline "+
 		"(first: example.com/app/cmd/flux: pattern manifests/*.yaml: no matching files found)")
 }

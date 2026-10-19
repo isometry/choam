@@ -109,11 +109,11 @@ func forEachEngine(t *testing.T, fn func(t *testing.T, eng Engine)) {
 	}
 }
 
-// compileFailuresWith applies deps to a fresh copy of the pristine module the
+// checkFailuresWith applies deps to a fresh copy of the pristine module the
 // way the build's bump step does (gobump: tidy, go get each, tidy; omnibump:
-// its filter and DoUpdate) and returns the compile failures ("" when the
-// result compiles).
-func (f replayFixture) compileFailuresWith(t tb, eng Engine, deps []string) string {
+// its filter and DoUpdate) and returns the type-check failures ("" when the
+// result type-checks).
+func (f replayFixture) checkFailuresWith(t tb, eng Engine, deps []string) string {
 	t.Helper()
 	ctx := t.Context()
 	dir, err := os.MkdirTemp("", "choam-replay-verify-")
@@ -135,12 +135,12 @@ func (f replayFixture) compileFailuresWith(t tb, eng Engine, deps []string) stri
 		}
 		require.NoError(t, f.tc.ModTidy(ctx, dir))
 	}
-	report, err := f.tc.Compile(ctx, dir, BuildTarget{Tags: replayTags}, "amd64")
+	report, err := f.tc.Typecheck(ctx, dir, BuildTarget{Tags: replayTags}, "amd64")
 	require.NoError(t, err)
 	if len(report.Failed) == 0 {
 		return ""
 	}
-	return firstCompileError(report.Failed)
+	return firstCheckError(report.Failed)
 }
 
 // traceRecord is one captured simulate trace record (see logTrial).
@@ -372,8 +372,8 @@ func logResult(t tb, result *ModrootResult) {
 // TestReplay_OpentofuOtelFamily (a): the whole opentofu otel picture. The
 // correct end state moves the log train together (sdk/log and every log
 // exporter, including the advisory-free stdoutlog, at v0.21.0), takes the
-// trace side and grpc to their top fixes, leaves no "breaks compile"
-// residual, and the written deps compile from scratch.
+// trace side and grpc to their top fixes, leaves no "breaks type-check"
+// residual, and the written deps type-check from scratch.
 func TestReplay_OpentofuOtelFamily(t *testing.T) {
 	forEachEngine(t, func(t *testing.T, eng Engine) {
 		c := opentofuCase()
@@ -393,16 +393,16 @@ func TestReplay_OpentofuOtelFamily(t *testing.T) {
 				assert.Equal(t, version, result.Resolved[module], "resolved %s", module)
 			}
 			for _, r := range result.Residuals {
-				assert.NotContains(t, r.Reason, "breaks compile", "no family member may be left as a compile residual: %s", r.Module)
+				assert.NotContains(t, r.Reason, "breaks type-check", "no family member may be left as a type-check residual: %s", r.Module)
 			}
 			assert.Empty(t, result.Residuals)
-			assert.Empty(t, f.compileFailuresWith(t, eng, result.FinalDeps), "the written deps must compile")
+			assert.Empty(t, f.checkFailuresWith(t, eng, result.FinalDeps), "the written deps must type-check")
 		})
 	})
 }
 
 // TestReplay_RungFallback (b): otel/sdk has fixes at v1.43.0 (HIGH) and
-// v1.45.0 (LOW), and v1.45.0 does not compile. The candidate must relax one
+// v1.45.0 (LOW), and v1.45.0 does not type-check. The candidate must relax one
 // rung to v1.43.0 - never stay at the v1.42.0 baseline - leaving only the
 // v1.45.0-only advisory residual.
 func TestReplay_RungFallback(t *testing.T) {
@@ -415,16 +415,16 @@ func TestReplay_RungFallback(t *testing.T) {
 			require.NoError(t, err)
 			logResult(t, result)
 
-			assert.Equal(t, "v1.43.0", result.Resolved[modSDK], "one rung down from the uncompilable v1.45.0")
+			assert.Equal(t, "v1.43.0", result.Resolved[modSDK], "one rung down from the ill-typed v1.45.0")
 			assert.Equal(t, []string{modSDK + "@v1.43.0"}, result.FinalDeps)
 			assert.Equal(t, []string{advSDKLow}, residualIDs(result.Residuals, modSDK),
 				"only the advisory fixed solely in v1.45.0 remains")
-			assert.Empty(t, f.compileFailuresWith(t, eng, result.FinalDeps))
+			assert.Empty(t, f.checkFailuresWith(t, eng, result.FinalDeps))
 		})
 	})
 }
 
-// TestReplay_NoCrossContamination (c): A (fix compiles, but a lagging
+// TestReplay_NoCrossContamination (c): A (fix type-checks, but a lagging
 // sibling S requires A, so the gate blames it) and B (fix raises an API
 // whose break the sibling L cannot follow) are independent. S's coherence
 // raise only supports B (S v0.2.0 is the first release built against the
@@ -450,10 +450,10 @@ func TestReplay_NoCrossContamination(t *testing.T) {
 					assert.True(t, containsPinFor(pins, modB), "trial %d carries B's repair %s@v0.2.0 without B: %v", i, modS, pins)
 				}
 			}
-			assert.Contains(t, result.FinalDeps, modA+"@v1.1.0", "the independent, compiling fix must be admitted")
+			assert.Contains(t, result.FinalDeps, modA+"@v1.1.0", "the independent fix that type-checks must be admitted")
 			assert.Equal(t, "v1.1.0", result.Resolved[modA])
 			assert.Equal(t, []string{"GO-TEST-B"}, residualIDs(result.Residuals, modB), "B cannot be fixed without breaking L")
-			assert.Empty(t, f.compileFailuresWith(t, eng, result.FinalDeps))
+			assert.Empty(t, f.checkFailuresWith(t, eng, result.FinalDeps))
 		})
 	})
 }
@@ -483,7 +483,7 @@ func TestReplay_RedundantPinsRemoved(t *testing.T) {
 // (whose go.mod requires it), so under either engine the final tidied go.mod
 // is identical without the b entry: it is removed as redundant, naming a,
 // and its advisory stays fixed. Applying the remaining entry alone still
-// compiles.
+// type-checks.
 //
 // With `tidy: false` nothing tidies: omnibump sets a's version in place, so
 // the b entry is the only thing raising b in go.mod and must stay; gobump's
@@ -513,7 +513,7 @@ func impliedPinReplay(t *testing.T, noTidy bool) {
 		assert.True(t, result.Dropped[0].Redundant)
 		assert.Contains(t, result.Dropped[0].Reason, "implied by example.com/a@v1.1.0")
 		if !noTidy {
-			assert.Empty(t, f.compileFailuresWith(t, eng, result.FinalDeps))
+			assert.Empty(t, f.checkFailuresWith(t, eng, result.FinalDeps))
 		}
 	})
 }
@@ -576,7 +576,7 @@ func rungFallbackCase() replayCase {
 		modules: map[string]map[string]string{
 			modSDK + "@v1.42.0": stubModule(modSDK, "sdk.go", sdkSrc(`"1.42.0"`), nil),
 			modSDK + "@v1.43.0": stubModule(modSDK, "sdk.go", sdkSrc(`"1.43.0"`), nil),
-			modSDK + "@v1.45.0": stubModule(modSDK, "sdk.go", sdkSrc(`145`), nil), // type error: does not compile
+			modSDK + "@v1.45.0": stubModule(modSDK, "sdk.go", sdkSrc(`145`), nil), // type error: does not type-check
 		},
 		main: map[string]string{
 			"go.mod":  "module example.com/app\n\ngo 1.21\n\nrequire " + modSDK + " v1.42.0\n",

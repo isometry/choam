@@ -62,13 +62,13 @@ func TestTypecheck_PositionFreeExportIsCacheHitForImporter(t *testing.T) {
 	})
 	ctx := t.Context()
 
-	report, err := toolchain.Compile(ctx, dir, BuildTarget{}, "amd64")
+	report, err := toolchain.Typecheck(ctx, dir, BuildTarget{}, "amd64")
 	require.NoError(t, err)
 	assert.Empty(t, report.Failed)
 	assert.Equal(t, "", report.Modules["example.com/m/lib"])
 
 	hits, misses := cacheDelta(toolchain, func() {
-		_, err = toolchain.Compile(ctx, dir, BuildTarget{}, "amd64")
+		_, err = toolchain.Typecheck(ctx, dir, BuildTarget{}, "amd64")
 	})
 	require.NoError(t, err)
 	assert.Zero(t, misses, "an unchanged graph is all hits")
@@ -76,14 +76,14 @@ func TestTypecheck_PositionFreeExportIsCacheHitForImporter(t *testing.T) {
 
 	writeFixtureFile(t, filepath.Join(dir, "lib", "lib.go"), "\n\n"+lib)
 	_, misses = cacheDelta(toolchain, func() {
-		report, err = toolchain.Compile(ctx, dir, BuildTarget{}, "amd64")
+		report, err = toolchain.Typecheck(ctx, dir, BuildTarget{}, "amd64")
 	})
 	require.NoError(t, err)
 	assert.Empty(t, report.Failed)
 	assert.Equal(t, 1, misses, "only the shifted package is rechecked: its export hash is position-free")
 
 	_, misses = cacheDelta(toolchain, func() {
-		_, err = toolchain.Compile(ctx, dir, BuildTarget{}, "arm64")
+		_, err = toolchain.Typecheck(ctx, dir, BuildTarget{}, "arm64")
 	})
 	require.NoError(t, err)
 	assert.Less(t, misses, 100, "cross-arch rechecks only packages whose files or imports' APIs differ")
@@ -106,11 +106,11 @@ func TestTypecheck_SecondArchReusesCache(t *testing.T) {
 		all := maps.Clone(files)
 		maps.Copy(all, extra)
 		toolchain, dir := typecheckFixture(t, all)
-		report, err := toolchain.Compile(t.Context(), dir, BuildTarget{}, "amd64")
+		report, err := toolchain.Typecheck(t.Context(), dir, BuildTarget{}, "amd64")
 		require.NoError(t, err)
 		require.Empty(t, report.Failed)
 		_, misses := cacheDelta(toolchain, func() {
-			report, err = toolchain.Compile(t.Context(), dir, BuildTarget{}, "arm64")
+			report, err = toolchain.Typecheck(t.Context(), dir, BuildTarget{}, "arm64")
 		})
 		require.NoError(t, err)
 		require.Empty(t, report.Failed)
@@ -153,14 +153,14 @@ func TestTypecheck_PatchBumpUnchangedAPIIsCacheHit(t *testing.T) {
 	require.NoError(t, err)
 	ctx := t.Context()
 
-	report, err := toolchain.Compile(ctx, dir, BuildTarget{}, "amd64")
+	report, err := toolchain.Typecheck(ctx, dir, BuildTarget{}, "amd64")
 	require.NoError(t, err)
 	assert.Empty(t, report.Failed)
 	assert.Equal(t, "example.com/dep", report.Modules["example.com/dep"])
 
 	require.NoError(t, toolchain.Get(ctx, dir, "example.com/dep@v1.0.1"))
 	_, misses := cacheDelta(toolchain, func() {
-		report, err = toolchain.Compile(ctx, dir, BuildTarget{}, "amd64")
+		report, err = toolchain.Typecheck(ctx, dir, BuildTarget{}, "amd64")
 	})
 	require.NoError(t, err)
 	assert.Empty(t, report.Failed)
@@ -180,7 +180,7 @@ func TestTypecheck_DependentOfBrokenPackageNotReported(t *testing.T) {
 	})
 	ctx := t.Context()
 
-	report, err := toolchain.Compile(ctx, dir, BuildTarget{}, "amd64")
+	report, err := toolchain.Typecheck(ctx, dir, BuildTarget{}, "amd64")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"example.com/m/a", "example.com/m/c"}, slices.Sorted(maps.Keys(report.Failed)))
 	assert.Contains(t, report.Failed["example.com/m/a"][0], "a.go:3:23: undefined: missing")
@@ -192,7 +192,7 @@ func TestTypecheck_DependentOfBrokenPackageNotReported(t *testing.T) {
 
 // TestTypecheck_FilePatternUsesToolchainLanguage: a file pattern (main.go)
 // makes go list synthesize command-line-arguments with no Module; cmd/go
-// compiles it at the toolchain's language version, not go1.16, so generics
+// type-checks it at the toolchain's language version, not go1.16, so generics
 // in it are fine (aws-load-balancer-controller's `packages: main.go`). The
 // same file in a go 1.16 module, listed as a package, is held to go1.16.
 func TestTypecheck_FilePatternUsesToolchainLanguage(t *testing.T) {
@@ -201,12 +201,12 @@ func TestTypecheck_FilePatternUsesToolchainLanguage(t *testing.T) {
 		"main.go": "package main\n\nfunc id[T any](v T) T { return v }\n\nfunc main() { _ = id(1) }\n",
 	})
 
-	report, err := toolchain.Compile(t.Context(), dir, BuildTarget{Patterns: []string{"main.go"}}, "amd64")
+	report, err := toolchain.Typecheck(t.Context(), dir, BuildTarget{Patterns: []string{"main.go"}}, "amd64")
 	require.NoError(t, err)
 	assert.Empty(t, report.Failed, "command-line-arguments: toolchain language, generics allowed")
 	assert.NotContains(t, report.Modules, "command-line-arguments", "no module")
 
-	report, err = toolchain.Compile(t.Context(), dir, BuildTarget{}, "amd64")
+	report, err = toolchain.Typecheck(t.Context(), dir, BuildTarget{}, "amd64")
 	require.NoError(t, err)
 	require.Contains(t, report.Failed, "example.com/m")
 	assert.Contains(t, strings.Join(report.Failed["example.com/m"], "\n"), "go1.18", "module package: its go directive's language")
@@ -221,7 +221,7 @@ func TestTypecheck_ImportCUnderCgo(t *testing.T) {
 		"main.go": "package main\n\nimport _ \"os/user\"\n\nfunc main() { hello() }\n",
 	})
 
-	report, err := toolchain.Compile(t.Context(), dir, BuildTarget{Env: BuildEnv{CGO: "1"}}, "amd64")
+	report, err := toolchain.Typecheck(t.Context(), dir, BuildTarget{Env: BuildEnv{CGO: "1"}}, "amd64")
 	require.NoError(t, err)
 	assert.Empty(t, report.Failed)
 }
@@ -287,14 +287,14 @@ func TestTypecheck_LockstepBreak(t *testing.T) {
 	ctx := t.Context()
 	target := BuildTarget{Tags: []string{"netgo", "osusergo"}}
 
-	report, err := toolchain.Compile(ctx, dir, target, "amd64")
+	report, err := toolchain.Typecheck(ctx, dir, target, "amd64")
 	require.NoError(t, err)
 	assert.Empty(t, report.Failed, "pristine fixture type-checks")
 
 	require.NoError(t, toolchain.Get(ctx, dir, "example.com/api@v0.21.0"))
 	require.NoError(t, toolchain.ModTidy(ctx, dir))
 
-	report, err = toolchain.Compile(ctx, dir, target, "amd64")
+	report, err = toolchain.Typecheck(ctx, dir, target, "amd64")
 	require.NoError(t, err)
 	require.Equal(t, []string{"example.com/exporter"}, slices.Sorted(maps.Keys(report.Failed)))
 	lines := report.Failed["example.com/exporter"]
@@ -325,7 +325,7 @@ func TestTypecheck_CgoLimitation_CTypedErrorNotCaught(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			files["go.mod"] = "module example.com/m\n\ngo 1.21\n"
 			toolchain, dir := typecheckFixture(t, files)
-			report, err := toolchain.Compile(t.Context(), dir, BuildTarget{Env: BuildEnv{CGO: "1"}}, "amd64")
+			report, err := toolchain.Typecheck(t.Context(), dir, BuildTarget{Env: BuildEnv{CGO: "1"}}, "amd64")
 			require.NoError(t, err)
 			assert.Empty(t, report.Failed)
 		})
@@ -355,7 +355,7 @@ func TestTypecheck_CgoPackageLockstepBreak(t *testing.T) {
 	ctx, target := t.Context(), BuildTarget{Env: BuildEnv{CGO: "1"}}
 
 	require.NoError(t, toolchain.Get(ctx, dir, "example.com/dep@v1.1.0"))
-	report, err := toolchain.Compile(ctx, dir, target, "amd64")
+	report, err := toolchain.Typecheck(ctx, dir, target, "amd64")
 	require.NoError(t, err)
 	assert.Equal(t, []string{"example.com/app"}, slices.Sorted(maps.Keys(report.Failed)))
 	assert.Contains(t, strings.Join(report.Failed["example.com/app"], "\n"), "undefined: dep.Value")

@@ -118,14 +118,14 @@ func TestCompareResiduals_TotalOrder(t *testing.T) {
 
 // TestRunLoop_SecondPassMatches_GateRejectedPin is the jenkins-operator
 // non-idempotency: an existing pin (k, no advisory) moves the graph so o's
-// vulnerable package is unlinked and o's fix is shed; the compile gate then
+// vulnerable package is unlinked and o's fix is shed; the type-check gate then
 // rejects k and o's code is linked again. The next run no longer carries the
 // k pin, so it must already have been resolved the same way: both passes
 // write o's fix and leave nothing residual.
 func TestRunLoop_SecondPassMatches_GateRejectedPin(t *testing.T) {
 	jws := scan.VulnerableImport{Path: "example.com/o/jws"}
-	newTC := func() *fakeCompiler {
-		return &fakeCompiler{
+	newTC := func() *fakeChecker {
+		return &fakeChecker{
 			fakeToolchain: &fakeToolchain{
 				base: map[string]string{"example.com/k": "v1.0.0", "example.com/o": "v1.0.0"},
 				linkedPkgsFn: func(applied map[string]string) []string {
@@ -135,7 +135,7 @@ func TestRunLoop_SecondPassMatches_GateRejectedPin(t *testing.T) {
 					return []string{"example.com/k", jws.Path}
 				},
 			},
-			compileFn: brokenAbove("example.com/k", "v1.1.0"),
+			checkFn: brokenAbove("example.com/k", "v1.1.0"),
 		}
 	}
 	sc := &fakeScanner{advisories: []fakeAdvisory{

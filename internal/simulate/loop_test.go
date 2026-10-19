@@ -2305,50 +2305,50 @@ func TestRunLoop_DegradedReachability_SelfReplaceKeyFailsOpen(t *testing.T) {
 		"a module present as a replace KEY must fail open, not be classified unrequired")
 }
 
-// fakeCompiler adds the optional Compiler seam to fakeToolchain, enabling
-// the compile gate: compileFn derives the report from the module graph the
+// fakeChecker adds the optional Checker seam to fakeToolchain, enabling
+// the type-check gate: checkFn derives the report from the module graph the
 // current apply produced; versions/requires model `go list -m -versions`
 // and per-version go.mod require blocks ("module@version" keys).
-type fakeCompiler struct {
+type fakeChecker struct {
 	*fakeToolchain
-	compileFn func(resolved map[string]string) *CompileReport
-	versions  map[string][]string
-	requires  map[string]map[string]string
-	// compiles counts primary-arch compiles; archCompiles every arch's.
-	compiles     int
-	archCompiles map[string]int
-	mu           sync.Mutex
+	checkFn  func(resolved map[string]string) *CheckReport
+	versions map[string][]string
+	requires map[string]map[string]string
+	// checks counts primary-arch type-checks; archChecks every arch's.
+	checks     int
+	archChecks map[string]int
+	mu         sync.Mutex
 }
 
-func (f *fakeCompiler) Compile(ctx context.Context, dir string, target BuildTarget, arch string) (*CompileReport, error) {
+func (f *fakeChecker) Typecheck(ctx context.Context, dir string, target BuildTarget, arch string) (*CheckReport, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if arch == TargetArches(target.Arches)[0] {
-		f.compiles++
+		f.checks++
 	}
-	if f.archCompiles == nil {
-		f.archCompiles = make(map[string]int)
+	if f.archChecks == nil {
+		f.archChecks = make(map[string]int)
 	}
-	f.archCompiles[arch]++
+	f.archChecks[arch]++
 	lastCall := f.lastCall
 	resolved, err := f.ListModules(ctx, dir)
 	f.lastCall = lastCall
 	if err != nil {
 		return nil, err
 	}
-	if f.compileFn == nil {
-		return &CompileReport{}, nil
+	if f.checkFn == nil {
+		return &CheckReport{}, nil
 	}
-	return f.compileFn(resolved), nil
+	return f.checkFn(resolved), nil
 }
 
-func (f *fakeCompiler) ModuleVersions(_ context.Context, _, module string) ([]string, error) {
+func (f *fakeChecker) ModuleVersions(_ context.Context, _, module string) ([]string, error) {
 	return f.versions[module], nil
 }
 
 // RequiredBy derives `go mod graph` requirers from requires: every
 // resolved module@version with a requires entry.
-func (f *fakeCompiler) RequiredBy(ctx context.Context, dir string) (map[string]map[string]string, error) {
+func (f *fakeChecker) RequiredBy(ctx context.Context, dir string) (map[string]map[string]string, error) {
 	lastCall := f.lastCall
 	resolved, err := f.ListModules(ctx, dir)
 	f.lastCall = lastCall
@@ -2367,7 +2367,7 @@ func (f *fakeCompiler) RequiredBy(ctx context.Context, dir string) (map[string]m
 	return requiredBy, nil
 }
 
-func (f *fakeCompiler) ModuleRequires(_ context.Context, _, module, version string) (map[string]string, error) {
+func (f *fakeChecker) ModuleRequires(_ context.Context, _, module, version string) (map[string]string, error) {
 	requires, ok := f.requires[module+"@"+version]
 	if !ok {
 		return nil, errors.New("unknown module version")
@@ -2375,22 +2375,22 @@ func (f *fakeCompiler) ModuleRequires(_ context.Context, _, module, version stri
 	return requires, nil
 }
 
-// otelLikeCompiler models the opentofu break: example.com/exporter (an
-// otlploghttp stand-in) compiles only against an example.com/api (otel/log)
+// otelLikeChecker models the opentofu break: example.com/exporter (an
+// otlploghttp stand-in) type-checks only against an example.com/api (otel/log)
 // at or below what its own go.mod requires - raising api to v0.21.0 removes
 // API exporter < v0.21.0 uses, while MVS happily resolves the graph.
-func otelLikeCompiler(tc *fakeToolchain, exporterVersions []string) *fakeCompiler {
+func otelLikeChecker(tc *fakeToolchain, exporterVersions []string) *fakeChecker {
 	requires := map[string]map[string]string{"example.com/api@v0.21.0": {}}
 	for _, v := range []string{"v0.18.0", "v0.19.0", "v0.20.0", "v0.21.0", "v0.22.0"} {
 		requires["example.com/exporter@"+v] = map[string]string{"example.com/api": v}
 	}
 	requires["example.com/exporter@v0.18.0"] = map[string]string{"example.com/api": "v0.19.0"}
-	return &fakeCompiler{
+	return &fakeChecker{
 		fakeToolchain: tc,
 		versions:      map[string][]string{"example.com/exporter": exporterVersions},
 		requires:      requires,
-		compileFn: func(resolved map[string]string) *CompileReport {
-			report := &CompileReport{
+		checkFn: func(resolved map[string]string) *CheckReport {
+			report := &CheckReport{
 				Failed: map[string][]string{},
 				Modules: map[string]string{
 					"example.com/test":          "",
@@ -2410,8 +2410,8 @@ func otelLikeCompiler(tc *fakeToolchain, exporterVersions []string) *fakeCompile
 	}
 }
 
-func TestCompileGate_FullSetPasses(t *testing.T) {
-	tc := &fakeCompiler{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}
+func TestTypecheckGate_FullSetPasses(t *testing.T) {
+	tc := &fakeChecker{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}
 	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
 
 	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
@@ -2423,11 +2423,11 @@ func TestCompileGate_FullSetPasses(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"example.com/x@v1.1.0"}, result.FinalDeps)
 	assert.Empty(t, result.Residuals)
-	assert.Equal(t, 2, tc.compiles, "one baseline compile plus one full-set compile")
+	assert.Equal(t, 2, tc.checks, "one baseline type-check plus one full-set type-check")
 }
 
-func TestCompileGate_NoCompileSkipsGate(t *testing.T) {
-	tc := &fakeCompiler{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}
+func TestTypecheckGate_NoCompileSkipsGate(t *testing.T) {
+	tc := &fakeChecker{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}
 	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
 
 	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
@@ -2437,16 +2437,16 @@ func TestCompileGate_NoCompileSkipsGate(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, []string{"example.com/x@v1.1.0"}, result.FinalDeps)
-	assert.Zero(t, tc.compiles)
+	assert.Zero(t, tc.checks)
 }
 
-func TestCompileGate_BaselineFailuresExcluded(t *testing.T) {
+func TestTypecheckGate_BaselineFailuresExcluded(t *testing.T) {
 	// A package already broken in the pristine checkout (host noise, e.g.
 	// a missing C library) must not count against the bump.
-	tc := &fakeCompiler{
+	tc := &fakeChecker{
 		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}},
-		compileFn: func(map[string]string) *CompileReport {
-			return &CompileReport{
+		checkFn: func(map[string]string) *CheckReport {
+			return &CheckReport{
 				Failed:  map[string][]string{"example.com/test/cgo": {"cgo.go:3:8: could not import C"}},
 				Modules: map[string]string{"example.com/test/cgo": "", "example.com/x": "example.com/x"},
 				Imports: map[string][]string{"example.com/test/cgo": {"example.com/x"}},
@@ -2465,14 +2465,14 @@ func TestCompileGate_BaselineFailuresExcluded(t *testing.T) {
 	assert.Equal(t, []string{"example.com/x@v1.1.0"}, result.FinalDeps)
 	assert.Empty(t, result.Residuals)
 	assert.Empty(t, result.Dropped)
-	assert.Equal(t, 2, tc.compiles, "baseline failure excluded: the full set passes first time")
+	assert.Equal(t, 2, tc.checks, "baseline failure excluded: the full set passes first time")
 }
 
-func TestCompileGate_CoherenceRemedy(t *testing.T) {
+func TestTypecheckGate_CoherenceRemedy(t *testing.T) {
 	// The opentofu reference failure: the api fix tidies cleanly but breaks
 	// the lagging exporter; the gate raises exporter to the MINIMAL version
 	// whose go.mod requires the raised api (v0.21.0, not v0.22.0).
-	tc := otelLikeCompiler(&fakeToolchain{base: map[string]string{
+	tc := otelLikeChecker(&fakeToolchain{base: map[string]string{
 		"example.com/api":      "v0.19.0",
 		"example.com/exporter": "v0.19.0",
 	}}, []string{"v0.19.0", "v0.20.0", "v0.21.0", "v0.22.0"})
@@ -2491,13 +2491,13 @@ func TestCompileGate_CoherenceRemedy(t *testing.T) {
 	assert.Equal(t, []string{"example.com/api"}, result.CVEBackedModules, "a coherence raise is not a security fix")
 	assert.Empty(t, result.Residuals)
 	assert.Equal(t, "v0.21.0", result.Resolved["example.com/exporter"])
-	assert.Equal(t, 3, tc.compiles, "baseline, failing full set, coherent set")
+	assert.Equal(t, 3, tc.checks, "baseline, failing full set, coherent set")
 }
 
-func TestCompileGate_ExistingEntryIsAFloor(t *testing.T) {
+func TestTypecheckGate_ExistingEntryIsAFloor(t *testing.T) {
 	// An existing deps entry (exporter@v0.19.0, itself a fix) must be
 	// raisable by coherence, in place - never frozen, never duplicated.
-	tc := otelLikeCompiler(&fakeToolchain{base: map[string]string{
+	tc := otelLikeChecker(&fakeToolchain{base: map[string]string{
 		"example.com/api":      "v0.19.0",
 		"example.com/exporter": "v0.18.0",
 	}}, []string{"v0.18.0", "v0.19.0", "v0.20.0", "v0.21.0"})
@@ -2521,17 +2521,17 @@ func TestCompileGate_ExistingEntryIsAFloor(t *testing.T) {
 	assert.Empty(t, result.Residuals)
 }
 
-func TestCompileGate_RelaxSeverityOrderAndResidualReason(t *testing.T) {
-	// a and b each compile alone but not together, and no repair can help
+func TestTypecheckGate_RelaxSeverityOrderAndResidualReason(t *testing.T) {
+	// a and b each type-check alone but not together, and no repair can help
 	// (the conflict is in main-module code). Both are implicated; the LOW
 	// fix is relaxed (dropped: it has one rung) even though the CRITICAL
-	// one was seeded later; the loser is reported as a "breaks compile"
+	// one was seeded later; the loser is reported as a "breaks type-check"
 	// residual.
-	tc := &fakeCompiler{
+	tc := &fakeChecker{
 		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"}},
 		requires:      map[string]map[string]string{},
-		compileFn: func(resolved map[string]string) *CompileReport {
-			report := &CompileReport{
+		checkFn: func(resolved map[string]string) *CheckReport {
+			report := &CheckReport{
 				Failed:  map[string][]string{},
 				Modules: map[string]string{"example.com/test": "", "example.com/a": "example.com/a", "example.com/b": "example.com/b"},
 				Imports: map[string][]string{"example.com/test": {"example.com/a", "example.com/b"}},
@@ -2564,26 +2564,26 @@ func TestCompileGate_RelaxSeverityOrderAndResidualReason(t *testing.T) {
 	assert.Equal(t, "v1.0.0", residual.ResolvedVersion)
 	assert.Equal(t, "v1.1.0", residual.FixedVersion)
 	assert.Equal(t, []string{"GO-A"}, residual.VulnIDs)
-	assert.Equal(t, "breaks compile: example.com/test: main.go:7:2: a.X and b.X conflict", residual.Reason)
+	assert.Equal(t, "breaks type-check: example.com/test: main.go:7:2: a.X and b.X conflict", residual.Reason)
 	assert.Contains(t, result.Dropped, DroppedCandidate{
 		Module: "example.com/a", Version: "v1.1.0",
-		Reason: "breaks compile: example.com/test: main.go:7:2: a.X and b.X conflict",
+		Reason: "breaks type-check: example.com/test: main.go:7:2: a.X and b.X conflict",
 	})
 }
 
-// TestCompileGate_RelinkedAfterGateRevivesFix is the jenkins-operator
+// TestTypecheckGate_RelinkedAfterGateRevivesFix is the jenkins-operator
 // oauth2 shape: o's vulnerable package (o/jws) is linked in the pristine
 // graph and only drops out of the import graph once k is raised (k@v1.1.0 no
 // longer imports it), so the full bump set sheds o's fix as unlinked. The
-// compile gate then rejects k and the final graph links o/jws again. The
+// type-check gate then rejects k and the final graph links o/jws again. The
 // final rescan - the authoritative reachability judgement, made on the graph
 // that ships - finds GO-O applicable, so o's fix is revived and gated in
 // another round rather than left residual: the outcome must not depend on
 // which higher pins (k) the input carried, or a second run (without them)
 // would write something different.
-func TestCompileGate_RelinkedAfterGateRevivesFix(t *testing.T) {
+func TestTypecheckGate_RelinkedAfterGateRevivesFix(t *testing.T) {
 	jws := scan.VulnerableImport{Path: "example.com/o/jws"}
-	tc := &fakeCompiler{
+	tc := &fakeChecker{
 		fakeToolchain: &fakeToolchain{
 			base: map[string]string{"example.com/k": "v1.0.0", "example.com/o": "v1.0.0"},
 			linkedPkgsFn: func(applied map[string]string) []string {
@@ -2593,7 +2593,7 @@ func TestCompileGate_RelinkedAfterGateRevivesFix(t *testing.T) {
 				return []string{"example.com/k", jws.Path}
 			},
 		},
-		compileFn: brokenAbove("example.com/k", "v1.1.0"),
+		checkFn: brokenAbove("example.com/k", "v1.1.0"),
 	}
 	sc := &fakeScanner{advisories: []fakeAdvisory{
 		{module: "example.com/k", id: "GO-K", fixed: "v1.1.0"},
@@ -2619,11 +2619,11 @@ func TestCompileGate_RelinkedAfterGateRevivesFix(t *testing.T) {
 	}
 }
 
-// brokenAbove is a compileFn whose module's own package fails to compile
+// brokenAbove is a checkFn whose module's own package fails to type-check
 // at or above version.
-func brokenAbove(module, version string) func(map[string]string) *CompileReport {
-	return func(resolved map[string]string) *CompileReport {
-		report := &CompileReport{Failed: map[string][]string{}, Modules: map[string]string{module: module}}
+func brokenAbove(module, version string) func(map[string]string) *CheckReport {
+	return func(resolved map[string]string) *CheckReport {
+		report := &CheckReport{Failed: map[string][]string{}, Modules: map[string]string{module: module}}
 		if semver.Compare(resolved[module], version) >= 0 {
 			report.Failed[module] = []string{"/modcache/" + module + "@" + resolved[module] + "/x.go:1:2: broken"}
 		}
@@ -2631,13 +2631,13 @@ func brokenAbove(module, version string) func(map[string]string) *CompileReport 
 	}
 }
 
-func TestCompileGate_StepsDownFixRungs(t *testing.T) {
-	// x has three fix rungs; v1.3.0 and v1.2.0 do not compile. The gate
+func TestTypecheckGate_StepsDownFixRungs(t *testing.T) {
+	// x has three fix rungs; v1.3.0 and v1.2.0 do not type-check. The gate
 	// steps down one rung at a time to v1.1.0 (never to baseline), and only
 	// the advisories fixed solely above it remain, citing the rejection.
-	tc := &fakeCompiler{
+	tc := &fakeChecker{
 		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}},
-		compileFn:     brokenAbove("example.com/x", "v1.2.0"),
+		checkFn:       brokenAbove("example.com/x", "v1.2.0"),
 	}
 	sc := &fakeScanner{advisories: []fakeAdvisory{
 		{module: "example.com/x", id: "GO-HIGH", fixed: "v1.1.0", severity: "HIGH"},
@@ -2659,9 +2659,9 @@ func TestCompileGate_StepsDownFixRungs(t *testing.T) {
 	assert.Equal(t, "v1.1.0", result.Resolved["example.com/x"])
 	require.Len(t, result.Residuals, 1)
 	assert.ElementsMatch(t, []string{"GO-LOW", "GO-MED"}, result.Residuals[0].VulnIDs)
-	assert.Equal(t, "breaks compile: example.com/x: x.go:1:2: broken", result.Residuals[0].Reason)
+	assert.Equal(t, "breaks type-check: example.com/x: x.go:1:2: broken", result.Residuals[0].Reason)
 	assert.Empty(t, result.Dropped, "relaxed, not dropped")
-	assert.Equal(t, 4, tc.compiles, "baseline plus one trial per rung")
+	assert.Equal(t, 4, tc.checks, "baseline plus one trial per rung")
 }
 
 // mustScan returns the fake's findings for module@version.
@@ -2673,12 +2673,12 @@ func (f *fakeScanner) mustScan(t *testing.T, module, version string) []scan.Vuln
 	return result.Vulnerabilities
 }
 
-func TestCompileGate_RelaxesImplicatedBeforeLessSevere(t *testing.T) {
+func TestTypecheckGate_RelaxesImplicatedBeforeLessSevere(t *testing.T) {
 	// b's own package breaks at its fix; a (LOW, otherwise first to go) is
 	// not implicated and must survive. b has one rung, so it is dropped.
-	tc := &fakeCompiler{
+	tc := &fakeChecker{
 		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"}},
-		compileFn:     brokenAbove("example.com/b", "v1.1.0"),
+		checkFn:       brokenAbove("example.com/b", "v1.1.0"),
 	}
 	sc := &fakeScanner{advisories: []fakeAdvisory{
 		{module: "example.com/a", id: "GO-A", fixed: "v1.1.0", severity: "LOW"},
@@ -2701,12 +2701,12 @@ func TestCompileGate_RelaxesImplicatedBeforeLessSevere(t *testing.T) {
 	assert.Equal(t, []string{"GO-B"}, result.Residuals[0].VulnIDs)
 }
 
-func TestCompileGate_RepairsVictimThatIsAlsoImplicated(t *testing.T) {
+func TestTypecheckGate_RepairsVictimThatIsAlsoImplicated(t *testing.T) {
 	// The otlploghttp shape: the exporter is a CVE candidate whose own fix
 	// version requires api above baseline (so it is implicated in the api
 	// raise) AND the module that breaks. It must be repaired in place to the
 	// coherent version, not skipped or relaxed.
-	tc := otelLikeCompiler(&fakeToolchain{base: map[string]string{
+	tc := otelLikeChecker(&fakeToolchain{base: map[string]string{
 		"example.com/api":      "v0.18.0",
 		"example.com/exporter": "v0.18.0",
 	}}, []string{"v0.18.0", "v0.19.0", "v0.20.0", "v0.21.0", "v0.22.0"})
@@ -2728,16 +2728,16 @@ func TestCompileGate_RepairsVictimThatIsAlsoImplicated(t *testing.T) {
 	assert.Equal(t, []string{"example.com/exporter@v0.21.0", "example.com/api@v0.21.0"}, result.FinalDeps)
 	assert.Empty(t, result.Residuals)
 	assert.Empty(t, result.Dropped)
-	assert.Equal(t, 3, tc.compiles, "baseline, failing set, repaired set")
+	assert.Equal(t, 3, tc.checks, "baseline, failing set, repaired set")
 }
 
-func TestCompileGate_FailsClosed(t *testing.T) {
+func TestTypecheckGate_FailsClosed(t *testing.T) {
 	seeds := []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}}
 	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
 	tooNew := fmt.Errorf("toolchain go 1.99.0 is newer than choam's go/types (go1.26.4): %w", ErrToolchainTooNew)
 	for _, tt := range []struct {
 		name   string
-		failAt int   // compile call that fails (1 = baseline)
+		failAt int   // type-check call that fails (1 = baseline)
 		err    error // nil: a generic tool failure
 	}{
 		{"baseline unavailable", 1, nil},
@@ -2746,33 +2746,33 @@ func TestCompileGate_FailsClosed(t *testing.T) {
 		{"trial toolchain too new", 2, tooNew},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			tc := &failingCompiler{fakeCompiler: &fakeCompiler{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}, failAt: tt.failAt, err: tt.err}
+			tc := &failingChecker{fakeChecker: &fakeChecker{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}, failAt: tt.failAt, err: tt.err}
 			_, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{Modroot: ".", Seeds: seeds}, Options{})
-			require.ErrorIs(t, err, ErrCompileGate)
+			require.ErrorIs(t, err, ErrTypecheckGate)
 			if tt.err != nil {
 				require.ErrorIs(t, err, ErrToolchainTooNew, "the sentinel survives the gate's wrapping")
 			}
 			if tt.failAt == 1 {
-				assert.Zero(t, tc.archCompiles["arm64"], "arches run in order: a failing first arch stops the rest")
+				assert.Zero(t, tc.archChecks["arm64"], "arches run in order: a failing first arch stops the rest")
 			}
 		})
 	}
 
 }
 
-// failingCompiler fails the failAt-th Compile call with err (a generic tool
+// failingChecker fails the failAt-th Typecheck call with err (a generic tool
 // failure when nil).
-type failingCompiler struct {
-	*fakeCompiler
+type failingChecker struct {
+	*fakeChecker
 	failAt int
 	err    error
 }
 
-func (f *failingCompiler) Compile(ctx context.Context, dir string, target BuildTarget, arch string) (*CompileReport, error) {
+func (f *failingChecker) Typecheck(ctx context.Context, dir string, target BuildTarget, arch string) (*CheckReport, error) {
 	f.mu.Lock()
-	fail := arch == TargetArches(target.Arches)[0] && f.compiles+1 == f.failAt
+	fail := arch == TargetArches(target.Arches)[0] && f.checks+1 == f.failAt
 	if fail {
-		f.compiles++
+		f.checks++
 	}
 	f.mu.Unlock()
 	if fail && f.err != nil {
@@ -2781,16 +2781,16 @@ func (f *failingCompiler) Compile(ctx context.Context, dir string, target BuildT
 	if fail {
 		return nil, errors.New("go list: exit status 2")
 	}
-	return f.fakeCompiler.Compile(ctx, dir, target, arch)
+	return f.fakeChecker.Typecheck(ctx, dir, target, arch)
 }
 
-func TestCompileGate_CancellationPropagates(t *testing.T) {
+func TestTypecheckGate_CancellationPropagates(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
-	tc := &fakeCompiler{
+	tc := &fakeChecker{
 		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}},
-		compileFn: func(map[string]string) *CompileReport {
+		checkFn: func(map[string]string) *CheckReport {
 			cancel()
-			return &CompileReport{}
+			return &CheckReport{}
 		},
 	}
 	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
@@ -2805,7 +2805,7 @@ func TestCompileGate_CancellationPropagates(t *testing.T) {
 
 // TestLogTrial_RecordShape pins the trial/repair trace records: pins with
 // roles, a capped resolved diff against baseline, failing owners and the
-// first compile errors, repair decisions - and nothing at all (no
+// first type-check errors, repair decisions - and nothing at all (no
 // formatting) when Debug is disabled.
 func TestLogTrial_RecordShape(t *testing.T) {
 	baseline := map[string]string{"example.com/gone": "v1.0.0"}
@@ -2824,7 +2824,7 @@ func TestLogTrial_RecordShape(t *testing.T) {
 		{Candidate: Candidate{Module: "example.com/new", Version: "v2.0.0", Replace: true, ReplaceOld: "example.com/old"}},
 	}
 	st := &trialOutcome{
-		report:   &CompileReport{Modules: map[string]string{"example.com/x/p": "example.com/x", "example.com/app": ""}},
+		report:   &CheckReport{Modules: map[string]string{"example.com/x/p": "example.com/x", "example.com/app": ""}},
 		resolved: resolved,
 		failures: map[string][]string{
 			"example.com/x/p": {"/cache/example.com/x@v1/p.go:1:2: undefined: Foo"},
@@ -2834,7 +2834,7 @@ func TestLogTrial_RecordShape(t *testing.T) {
 
 	trace := &traceCapture{}
 	ctx := logging.Into(t.Context(), slog.New(trace))
-	l.logTrial(ctx, trialLog{purpose: "gate: relaxed", subject: "example.com/cve", pins: pins, resolved: resolved, compiled: st})
+	l.logTrial(ctx, trialLog{purpose: "gate: relaxed", subject: "example.com/cve", pins: pins, resolved: resolved, checked: st})
 	l.logTrial(ctx, trialLog{purpose: "refine: minimal set", pins: pins[:1], reject: "go: boom\nmore"})
 	l.logTrial(ctx, trialLog{purpose: "refine: minimal set", pins: pins[:1], resolved: resolved, raises: []raise{{module: "example.com/r", version: "v1.2.0"}}, residuals: 2})
 	l.logRepair(ctx, repairLog{module: "example.com/s", from: "v0.1.0", to: "v0.2.0", source: "version walk",
@@ -2853,7 +2853,7 @@ func TestLogTrial_RecordShape(t *testing.T) {
 	require.Len(t, diff, maxTrialLogDiff+1)
 	assert.Equal(t, "example.com/ma v1.0.0->v1.1.0", diff[0])
 	assert.Equal(t, "+6 more", diff[maxTrialLogDiff], "30 raised modules plus one removed, capped")
-	assert.Equal(t, "breaks compile", gate["outcome"])
+	assert.Equal(t, "breaks type-check", gate["outcome"])
 	assert.Equal(t, int64(2), gate["failing"])
 	assert.Equal(t, []string{"(main)", "example.com/x"}, gate["failing_owners"])
 	assert.Equal(t, []string{"example.com/app: main.go:3:4: broken", "example.com/x/p: p.go:1:2: undefined: Foo"}, gate["errors"])
@@ -2872,14 +2872,14 @@ func TestLogTrial_RecordShape(t *testing.T) {
 
 	var buf bytes.Buffer
 	quiet := logging.Into(t.Context(), slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelInfo})))
-	l.logTrial(quiet, trialLog{purpose: "gate: relaxed", pins: pins, resolved: resolved, compiled: st})
+	l.logTrial(quiet, trialLog{purpose: "gate: relaxed", pins: pins, resolved: resolved, checked: st})
 	l.logRepair(quiet, repairLog{module: "example.com/s", skip: "x"})
 	assert.Empty(t, buf.String(), "trace records are Debug-only")
 }
 
 // impliesFixture: a@v2.0.0's closure raises b to v2.0.0 (and, when mutual,
 // b@v2.0.0's raises a); both carry an advisory fixed at v2.0.0.
-func impliesFixture(mutual bool) (*fakeCompiler, *fakeScanner) {
+func impliesFixture(mutual bool) (*fakeChecker, *fakeScanner) {
 	effects := map[string]map[string]string{"example.com/a@v2.0.0": {"example.com/b": "v2.0.0"}}
 	requires := map[string]map[string]string{
 		"example.com/a@v2.0.0": {"example.com/b": "v2.0.0"},
@@ -2889,7 +2889,7 @@ func impliesFixture(mutual bool) (*fakeCompiler, *fakeScanner) {
 		effects["example.com/b@v2.0.0"] = map[string]string{"example.com/a": "v2.0.0"}
 		requires["example.com/b@v2.0.0"] = map[string]string{"example.com/a": "v2.0.0"}
 	}
-	tc := &fakeCompiler{
+	tc := &fakeChecker{
 		fakeToolchain: &fakeToolchain{
 			base:       map[string]string{"example.com/a": "v1.0.0", "example.com/b": "v1.0.0"},
 			getEffects: effects,

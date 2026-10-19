@@ -112,7 +112,7 @@ func (l *loop) adoptTrial(ctx context.Context, tr *trialResult, result *ModrootR
 // confirmMinimalSet checks whether the CVE-backed candidates alone reach a
 // clean state: pins no advisory backs (existing YAML hints, raises) are
 // shed when nothing needs them - this may change the graph, unlike the
-// effect-based redundancy check (see minimise); the compile gate re-adds any
+// effect-based redundancy check (see minimise); the type-check gate re-adds any
 // a build turns out to need. Adopts the smaller set when the
 // confirmation apply succeeds and its rescan demands no further raises and
 // no new residual advisories; otherwise keeps the converged full set.
@@ -374,7 +374,7 @@ func (l *loop) leaveOneOut(ctx context.Context, ref *goModState, set, order []*c
 	return ref, l.settleMinimise(ctx, set)
 }
 
-// baselineVersion is module's version in the pristine graph: the compile
+// baselineVersion is module's version in the pristine graph: the type-check
 // gate's tidied baseline when known, else the caller's go.mod view.
 func (l *loop) baselineVersion(module string) string {
 	if v, ok := l.baselineResolved[module]; ok {

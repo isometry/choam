@@ -314,8 +314,8 @@ func (t *GoToolchain) DepGoVersions(ctx context.Context, dir string) (map[string
 //   - Replace directives resolve to the replacement path, matching
 //     ListModules' identity space (scan findings name the replacement).
 //   - The build environment and tags are targetBuildEnv's and the target's,
-//     shared with the type-check engine (Compile), so the linked set and the
-//     compile gate judge the same files.
+//     shared with the type-check engine (Typecheck), so the linked set and the
+//     type-check gate judge the same files.
 func (t *GoToolchain) Linked(ctx context.Context, dir string, target BuildTarget) (Linkage, error) {
 	pkgs, embeds, err := t.listDeps(ctx, dir, target)
 	if err != nil {
@@ -476,7 +476,7 @@ func unmatchedEmbed(errText string) (pattern string, ok bool) {
 var defaultArches = []string{"amd64", "arm64"}
 
 // TargetArches normalizes a target-arch list: deduplicated, amd64 then arm64
-// first and any others after in lexical order (so the compile gate's primary
+// first and any others after in lexical order (so the type-check gate's primary
 // arch never depends on input order); empty means defaultArches.
 func TargetArches(arches []string) []string {
 	if len(arches) == 0 {
@@ -494,7 +494,7 @@ func TargetArches(arches []string) []string {
 }
 
 // targetBuildEnv is the build environment every artifact-graph query
-// (Linked, LinkedStd and the type-check engine's Compile) evaluates arch
+// (Linked, LinkedStd and the type-check engine's Typecheck) evaluates arch
 // under - the single source of GOOS/GOARCH/CGO_ENABLED/GOEXPERIMENT:
 //   - GOOS=linux: melange builds linux packages.
 //   - CGO_ENABLED is the spec's (env.CGO) when it sets one, else 1: melange's
@@ -526,7 +526,7 @@ func targetListArgs(args, patterns, tags []string) []string {
 }
 
 // goListPackage is the subset of `go list -json` package output listDeps and
-// the type-check engine (Compile) need.
+// the type-check engine (Typecheck) need.
 type goListPackage struct {
 	ImportPath string
 	Standard   bool
@@ -537,7 +537,7 @@ type goListPackage struct {
 	Incomplete    bool
 	DepsErrors    []*goListError
 	EmbedPatterns []string
-	// Decoded by the type-check engine only (see Compile).
+	// Decoded by the type-check engine only (see Typecheck).
 	Dir       string
 	GoFiles   []string
 	CgoFiles  []string

@@ -563,7 +563,7 @@ func TestProcessor_ToResult_SeverityFixed(t *testing.T) {
 		scan.Vulnerability{ID: "GO-L1", Module: "e", Severity: "LOW", FixedVersion: "v1"},
 	)
 	proc.Validated = true
-	proc.AddResiduals([]simulate.Residual{{Module: "b", VulnIDs: []string{"GO-C2"}, Reason: "breaks compile"}})
+	proc.AddResiduals([]simulate.Residual{{Module: "b", VulnIDs: []string{"GO-C2"}, Reason: "breaks type-check"}})
 	proc.AddUnreachableVulnIDs([]string{"GO-H2"})
 
 	result := proc.ToResult()

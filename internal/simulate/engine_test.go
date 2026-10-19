@@ -268,7 +268,7 @@ func TestRunLoop_AmbiguousImportBothEngines(t *testing.T) {
 		// The m/sub entry is implied by the remedied monolith: the final
 		// go.mod is identical without it.
 		assert.Equal(t, []string{"example.com/m@v1.1.0"}, result.FinalDeps)
-		assert.Empty(t, f.compileFailuresWith(t, eng, result.FinalDeps))
+		assert.Empty(t, f.checkFailuresWith(t, eng, result.FinalDeps))
 	})
 }
 
@@ -329,7 +329,7 @@ func TestRunLoop_AmbiguityRemedyWrittenFirst(t *testing.T) {
 		if i := slices.Index(result.FinalDeps, "example.com/m/sub@v1.1.0"); i >= 0 {
 			assert.Positive(t, i, "the split-module entry follows its remedy")
 		}
-		assert.Empty(t, f.compileFailuresWith(t, eng, append(result.FinalReplaces, result.FinalDeps...)),
+		assert.Empty(t, f.checkFailuresWith(t, eng, append(result.FinalReplaces, result.FinalDeps...)),
 			"the written list, applied in order, reproduces the simulated graph")
 	})
 }

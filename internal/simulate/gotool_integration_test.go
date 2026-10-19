@@ -243,10 +243,10 @@ func TestGoToolchain_LinkedUsesTargetBuildEnv(t *testing.T) {
 	assert.Equal(t, map[string]struct{}{"example.com/targetfixture": {}}, linkage.Modules, "stdlib-only fixture: only the main module")
 	assert.Equal(t, map[string]struct{}{"example.com/targetfixture": {}}, linkage.Packages)
 
-	// Compile shares the environment; CGO off keeps it host-independent (a
+	// Typecheck shares the environment; CGO off keeps it host-independent (a
 	// real cgo compile needs a linux C toolchain).
 	for _, arch := range []string{"amd64", "arm64"} {
-		report, err := toolchain.Compile(ctx, dir, BuildTarget{Tags: []string{"choamtag"}, Env: BuildEnv{CGO: "0"}}, arch)
+		report, err := toolchain.Typecheck(ctx, dir, BuildTarget{Tags: []string{"choamtag"}, Env: BuildEnv{CGO: "0"}}, arch)
 		require.NoError(t, err, arch)
 		assert.Empty(t, report.Failed, arch)
 	}
@@ -285,7 +285,7 @@ func TestGoToolchain_LinkedUsesTargetBuildEnv(t *testing.T) {
 
 // writeFileProxy builds a file:// GOPROXY serving the given module versions
 // (module@version -> file name -> content; go.mod is required), so a real go
-// toolchain can resolve and compile against them with no network access.
+// toolchain can resolve and type-check against them with no network access.
 func writeFileProxy(t *testing.T, modules map[string]map[string]string) string {
 	t.Helper()
 	proxy := t.TempDir()
@@ -322,10 +322,10 @@ func writeFileProxy(t *testing.T, modules map[string]map[string]string) string {
 
 // otelLikeFixture reproduces the opentofu otel-log break with real modules:
 // example.com/api v0.21.0 drops the KeyValue type example.com/exporter
-// v0.19.0/v0.20.0 compile against; exporter v0.21.0 is the first release
+// v0.19.0/v0.20.0 type-check against; exporter v0.21.0 is the first release
 // whose go.mod requires (and code uses) the new api. The main module links
 // exporter; raising api alone resolves and tidies cleanly but no longer
-// compiles.
+// type-checks.
 func otelLikeFixture(t *testing.T) (toolchain *GoToolchain, dir string) {
 	t.Helper()
 	if testing.Short() {
@@ -402,27 +402,27 @@ func newFixtureModule(t *testing.T, files map[string]string) string {
 	return dir
 }
 
-// TestGoToolchain_CompileReportsLockstepBreak: the compile primitive must
+// TestGoToolchain_TypecheckReportsLockstepBreak: the type-check primitive must
 // see what resolution cannot - per-package errors located in the mod-cache
 // copy of the lagging module - while a clean graph reports nothing.
-func TestGoToolchain_CompileReportsLockstepBreak(t *testing.T) {
+func TestGoToolchain_TypecheckReportsLockstepBreak(t *testing.T) {
 	toolchain, dir := otelLikeFixture(t)
 	ctx := t.Context()
 
-	report, err := toolchain.Compile(ctx, dir, BuildTarget{Tags: []string{"netgo", "osusergo"}}, "amd64")
+	report, err := toolchain.Typecheck(ctx, dir, BuildTarget{Tags: []string{"netgo", "osusergo"}}, "amd64")
 	require.NoError(t, err)
-	assert.Empty(t, report.Failed, "pristine fixture compiles")
+	assert.Empty(t, report.Failed, "pristine fixture type-checks")
 	assert.Equal(t, "", report.Modules["example.com/app"], "main-module package maps to the empty module")
 	assert.Equal(t, "example.com/exporter", report.Modules["example.com/exporter"])
 
 	require.NoError(t, toolchain.Get(ctx, dir, "example.com/api@v0.21.0"))
 	require.NoError(t, toolchain.ModTidy(ctx, dir), "MVS has no upper bounds: the raise tidies cleanly")
 
-	report, err = toolchain.Compile(ctx, dir, BuildTarget{}, "amd64")
+	report, err = toolchain.Typecheck(ctx, dir, BuildTarget{}, "amd64")
 	require.NoError(t, err)
 	require.Contains(t, report.Failed, "example.com/exporter")
 	assert.Contains(t, strings.Join(report.Failed["example.com/exporter"], "\n"), "undefined: api.KeyValue")
-	assert.NotContains(t, report.Failed, "example.com/app", "dependents of a broken package are not compiled")
+	assert.NotContains(t, report.Failed, "example.com/app", "dependents of a broken package are not type-checked")
 	assert.Contains(t, report.Imports["example.com/exporter"], "example.com/api")
 
 	versions, err := toolchain.ModuleVersions(ctx, dir, "example.com/exporter")
@@ -433,11 +433,11 @@ func TestGoToolchain_CompileReportsLockstepBreak(t *testing.T) {
 	assert.Equal(t, map[string]string{"example.com/api": "v0.21.0"}, requires)
 }
 
-// TestRunLoop_CompileGateRepairsLockstepBreak drives the whole loop with the
+// TestRunLoop_TypecheckGateRepairsLockstepBreak drives the whole loop with the
 // real toolchain: the api fix alone would ship a build that does not
-// compile; the gate must add the minimal coherent exporter (v0.21.0 - not
+// type-check; the gate must add the minimal coherent exporter (v0.21.0 - not
 // v0.20.0, whose go.mod still requires the old api).
-func TestRunLoop_CompileGateRepairsLockstepBreak(t *testing.T) {
+func TestRunLoop_TypecheckGateRepairsLockstepBreak(t *testing.T) {
 	toolchain, dir := otelLikeFixture(t)
 	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/api", id: "GO-API", fixed: "v0.21.0"}}}
 

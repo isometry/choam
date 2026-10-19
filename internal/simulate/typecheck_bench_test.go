@@ -73,10 +73,10 @@ func TestTypecheckBench(t *testing.T) {
 	tw := tabwriter.NewWriter(&table, 0, 0, 2, ' ', 0)
 	_, _ = fmt.Fprintln(tw, "step\tarch\ttypecheck\thits\tmisses\tfailed")
 	measure := func(step, arch string) {
-		var report *CompileReport
+		var report *CheckReport
 		start := time.Now()
 		hits, misses := cacheDelta(toolchain, func() {
-			report, err = toolchain.Compile(ctx, dir, target, arch)
+			report, err = toolchain.Typecheck(ctx, dir, target, arch)
 		})
 		require.NoError(t, err)
 		_, _ = fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%d\t%d\n", step, arch, time.Since(start).Round(time.Millisecond), hits, misses, len(report.Failed))

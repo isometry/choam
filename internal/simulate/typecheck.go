@@ -32,12 +32,12 @@ const typecheckFields = "ImportPath,Dir,GoFiles,CgoFiles,Imports,ImportMap,Stand
 
 // ErrToolchainTooNew marks a graph choam's own go/types (the Go choam was
 // built with) is too old to judge: the toolchain the go list ran under, or
-// a module's go directive, is a newer minor. Compile fails with it rather
+// a module's go directive, is a newer minor. Typecheck fails with it rather
 // than issue a verdict; callers fail the file closed. Its text is the remedy.
 var ErrToolchainTooNew = errors.New("run a choam built with that Go or newer, e.g. go run github.com/isometry/choam@latest")
 
-// maxCompileErrorLines caps the error lines kept per failing package.
-const maxCompileErrorLines = 5
+// maxCheckErrorLines caps the error lines kept per failing package.
+const maxCheckErrorLines = 5
 
 // typecheckCache memoizes per-package type-check outcomes for the lifetime
 // of a GoToolchain (one spec), keyed by typecheckKey: a package is rechecked
@@ -92,14 +92,14 @@ func (c *typecheckCache) stats() (hits, misses int) {
 // (the importer returns types.Unsafe).
 var unsafeEntry = &typecheckEntry{apiHash: sha256.Sum256([]byte("unsafe"))}
 
-// Compile type-checks every non-test package in the transitive import graph
+// Typecheck type-checks every non-test package in the transitive import graph
 // of the target's patterns in process (see typecheck), fed by one
 // `go list -e -deps -json` under targetBuildEnv for arch (one arch per
 // call; nothing is compiled, so no C toolchain is needed - the spec's CGO
 // applies as is). An error return means the go tool or the engine could
 // not judge the graph (including ErrToolchainTooNew), not that
 // packages failed to type-check.
-func (t *GoToolchain) Compile(ctx context.Context, dir string, target BuildTarget, arch string) (*CompileReport, error) {
+func (t *GoToolchain) Typecheck(ctx context.Context, dir string, target BuildTarget, arch string) (*CheckReport, error) {
 	args := targetListArgs([]string{"list", "-e", "-deps", "-json=" + typecheckFields}, target.Patterns, target.Tags)
 	output, err := t.runEnv(ctx, dir, targetBuildEnv(arch, target.Env), args...)
 	if err != nil {
@@ -121,7 +121,7 @@ func (t *GoToolchain) Compile(ctx context.Context, dir string, target BuildTarge
 }
 
 // typecheck type-checks pkgs (a `go list -deps` listing, dependency order)
-// in process with go/types for GOARCH=arch, as a CompileReport: a package
+// in process with go/types for GOARCH=arch, as a CheckReport: a package
 // with a go list error or type errors is Failed; a package whose dependency
 // failed or was skipped is skipped and not reported, so failures surface on
 // the deepest broken package - the module that needs blaming. A
@@ -130,7 +130,7 @@ func (t *GoToolchain) Compile(ctx context.Context, dir string, target BuildTarge
 // Packages are checked concurrently (bounded by GOMAXPROCS) as soon as their
 // imports are done; each check reads its imports' export data into a fresh
 // map, so no live *types.Package is ever shared between checks.
-func (t *GoToolchain) typecheck(ctx context.Context, pkgs []goListPackage, arch string) (*CompileReport, error) {
+func (t *GoToolchain) typecheck(ctx context.Context, pkgs []goListPackage, arch string) (*CheckReport, error) {
 	rootVersion, err := typecheckEligible(pkgs, strings.TrimPrefix(runtime.Version(), "go"))
 	if err != nil {
 		return nil, err
@@ -178,7 +178,7 @@ func (t *GoToolchain) typecheck(ctx context.Context, pkgs []goListPackage, arch 
 		return nil, err
 	}
 
-	report := &CompileReport{
+	report := &CheckReport{
 		Failed:  make(map[string][]string),
 		Modules: make(map[string]string),
 		Imports: make(map[string][]string),
@@ -221,7 +221,7 @@ func (t *GoToolchain) checkPackage(ctx context.Context, pkg *goListPackage, inde
 		if pkg.Standard {
 			return nil, fmt.Errorf("type-check: standard package %s: %s", pkg.ImportPath, firstLine(pkg.Error.Err))
 		}
-		return &typecheckEntry{errLines: compileErrorLines(pkg.Error.Err)}, nil
+		return &typecheckEntry{errLines: checkErrorLines(pkg.Error.Err)}, nil
 	}
 	if pkg.ImportPath == "unsafe" {
 		return unsafeEntry, nil
@@ -331,7 +331,7 @@ func checkSources(pkg *goListPackage, names []string, sources map[string][]byte,
 		files = append(files, file)
 	}
 	if len(parseErrs) > 0 {
-		return &typecheckEntry{errLines: compileErrorLines(strings.Join(parseErrs, "\n"))}, nil
+		return &typecheckEntry{errLines: checkErrorLines(strings.Join(parseErrs, "\n"))}, nil
 	}
 
 	imports := make(map[string]*types.Package) // fresh per check: never share live packages
@@ -387,7 +387,7 @@ func checkSources(pkg *goListPackage, names []string, sources map[string][]byte,
 			last, lastMsg = pos, e.Msg
 			lines = append(lines, e.Error())
 		}
-		return &typecheckEntry{errLines: compileErrorLines(strings.Join(lines, "\n"))}, nil
+		return &typecheckEntry{errLines: checkErrorLines(strings.Join(lines, "\n"))}, nil
 	}
 
 	// A nil FileSet writes no positions: the bytes (and hash) are the API.
@@ -398,10 +398,10 @@ func checkSources(pkg *goListPackage, names []string, sources map[string][]byte,
 	return &typecheckEntry{export: buf.Bytes(), apiHash: sha256.Sum256(buf.Bytes())}, nil
 }
 
-// compileErrorLines extracts the first maxCompileErrorLines diagnostic lines
+// checkErrorLines extracts the first maxCheckErrorLines diagnostic lines
 // from a go list package error or joined type errors, dropping any "# pkg"
 // header.
-func compileErrorLines(errText string) []string {
+func checkErrorLines(errText string) []string {
 	var lines []string
 	for line := range strings.SplitSeq(errText, "\n") {
 		line = strings.TrimSpace(line)
@@ -409,7 +409,7 @@ func compileErrorLines(errText string) []string {
 			continue
 		}
 		lines = append(lines, line)
-		if len(lines) == maxCompileErrorLines {
+		if len(lines) == maxCheckErrorLines {
 			break
 		}
 	}

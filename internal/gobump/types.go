@@ -196,7 +196,7 @@ type ModrootAnalysis struct {
 
 	// BuildTags are this modroot's go/build steps' build tags (each step's
 	// toolchaintags - default netgo,osusergo - plus its tags), unioned, for
-	// the simulation's compile gate. Empty when no go/build step covers it.
+	// the simulation's type-check gate. Empty when no go/build step covers it.
 	BuildTags []string `json:"build_tags,omitempty" yaml:"build_tags,omitempty"`
 
 	// BuildArches are the GOARCHes the package is built for (from
@@ -318,10 +318,10 @@ type Options struct {
 	// SimulationTimeout bounds each package's bump simulation (default 10m).
 	SimulationTimeout time.Duration `json:"simulation_timeout" yaml:"simulation_timeout"`
 
-	// Compile enables the simulation's compile gate (default true at the
+	// Compile enables the simulation's type-check gate (default true at the
 	// CLI; --no-compile disables it): the validated deps set must also
-	// compile the go/build packages without new failures (see
-	// simulate.Compiler). Moot when Validate is false.
+	// type-check the go/build packages without new failures (see
+	// simulate.Checker). Moot when Validate is false.
 	Compile bool `json:"compile" yaml:"compile"`
 
 	// StdlibCheck enables the Go stdlib staleness check (see StdlibStage):

@@ -24,11 +24,11 @@ type bumpSimulator interface {
 	Simulate(ctx context.Context, repoURL, tag, expectedCommit string, reqs []simulate.ModrootRequest) (map[string]*simulate.ModrootResult, error)
 }
 
-// compileCgoNote reports the gate's cgo limitation for modroot m when the
+// typecheckCgoNote reports the gate's cgo limitation for modroot m when the
 // spec sets CGO_ENABLED=1: cgo files are type-checked against a fake "C"
 // package (no C toolchain runs). "" when the gate is off or cgo is not set.
-func compileCgoNote(m ModrootAnalysis, compile bool) string {
-	if !compile || m.BuildEnv.CGO != "1" {
+func typecheckCgoNote(m ModrootAnalysis, enabled bool) string {
+	if !enabled || m.BuildEnv.CGO != "1" {
 		return ""
 	}
 	return fmt.Sprintf("modroot %s: type-check gate checks cgo files without a C toolchain - errors in expressions using C types are not caught", m.Modroot)
@@ -122,7 +122,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 		results, err := sim.Simulate(ctx, analysis.RepoURL, analysis.Tag, analysis.ExpectedCommit, reqs)
 		if err != nil {
 			if ctx.Err() == nil && s.failClosed(err) {
-				// The simulation could not prove the candidate set (compile
+				// The simulation could not prove the candidate set (type-check
 				// gate, or a go tool infrastructure failure): writing it (or
 				// the raw pre-simulation set) could break the build, so fail
 				// the file and leave its deps untouched.
@@ -140,7 +140,7 @@ func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) erro
 }
 
 // buildRequests turns one language's modroot analyses into simulation
-// requests, emitting the per-modroot compile-gate cgo notes and (once) the
+// requests, emitting the per-modroot type-check gate cgo notes and (once) the
 // omnibump engine note as it goes.
 func (s *SimulationStage) buildRequests(ctx context.Context, gp *Processor, lang *LanguageAnalysis) []simulate.ModrootRequest {
 	goEco := ecogolang.New()
@@ -150,7 +150,7 @@ func (s *SimulationStage) buildRequests(ctx context.Context, gp *Processor, lang
 		if m.BumpEngine == simulate.EngineOmnibump {
 			omnibumpRoots++
 		}
-		if note := compileCgoNote(m, s.Options.Compile); note != "" {
+		if note := typecheckCgoNote(m, s.Options.Compile); note != "" {
 			gp.AddMessage(note)
 		}
 		reqs = append(reqs, simulate.ModrootRequest{
@@ -251,8 +251,8 @@ func adoptResult(gp *Processor, m *ModrootAnalysis, result *simulate.ModrootResu
 // reportBlindSpots surfaces what the simulation could not see in one
 // modroot: unavailable artifact linkage as a default-verbosity note (every
 // reachability verdict was skipped - fail open), and at -v the tolerated
-// unmatched //go:embed patterns and the packages the compile gate cannot
-// check because they already fail to build at baseline.
+// unmatched //go:embed patterns and the packages the type-check gate cannot
+// check because they already fail to type-check at baseline.
 func reportBlindSpots(gp *Processor, modroot string, result *simulate.ModrootResult) {
 	if result.LinkageError != "" {
 		prefix := ""
@@ -277,7 +277,7 @@ func reportBlindSpots(gp *Processor, modroot string, result *simulate.ModrootRes
 			modroot, strings.Join(byPackage, ", ")))
 	}
 	if result.GateUnchecked > 0 {
-		gp.AddMessage(fmt.Sprintf("modroot %s: compile gate cannot check %d package(s) that fail to build at baseline (first: %s)",
+		gp.AddMessage(fmt.Sprintf("modroot %s: type-check gate cannot check %d package(s) that already fail to type-check at baseline (first: %s)",
 			modroot, result.GateUnchecked, result.GateUncheckedFirst))
 	}
 }
@@ -417,14 +417,14 @@ func (s *SimulationStage) buildGoVersion(ctx context.Context, minor string) stri
 }
 
 // failClosed reports whether a simulation error must fail the file instead
-// of degrading to the unvalidated candidate set: a compile-gate failure, an
+// of degrading to the unvalidated candidate set: a type-check gate failure, an
 // infrastructure failure of the go tool (network, proxy, per-command
 // timeout - no verdict could be reached), a toolchain newer than choam's
 // go/types (the gate cannot judge the graph; the error carries the remedy),
 // or a timeout while the gate is enabled (the set was never proven to
-// compile).
+// type-check).
 func (s *SimulationStage) failClosed(err error) bool {
-	return errors.Is(err, simulate.ErrCompileGate) || errors.Is(err, simulate.ErrInfrastructure) ||
+	return errors.Is(err, simulate.ErrTypecheckGate) || errors.Is(err, simulate.ErrInfrastructure) ||
 		errors.Is(err, simulate.ErrToolchainTooNew) ||
 		(s.Options.Compile && errors.Is(err, context.DeadlineExceeded))
 }
@@ -491,7 +491,7 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 			candidate.Severity = info.Severity
 			// The fix ladder keeps every advisory's own fix version and the
 			// existing YAML pin, which FilterBumps merged into one (the
-			// highest) version: the compile gate relaxes down these rungs.
+			// highest) version: the type-check gate relaxes down these rungs.
 			// A single rung is implied by the candidate itself.
 			also := []string{version}
 			for _, existing := range existingVersions[module] {

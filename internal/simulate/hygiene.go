@@ -63,13 +63,13 @@ var errHygieneBudget = errors.New("simulation budget nearly exhausted")
 // go/toolchain lines are unchanged; for go < 1.17 nor does the build list),
 // the dependency graph needs no newer Go than the validated set (so neither
 // RequiredGoVersion nor a go-package pin can move), nothing new fails to
-// compile, and the rescan asks for no raise and finds no advisory the final
+// type-check, and the rescan asks for no raise and finds no advisory the final
 // set did not have. One batch trial of every target first; if it is not
 // free, each target alone in a fixed order (most severe first, then by
 // module) on top of those already accepted, a carried-in pin before the
 // minimal fix. Accepted bumps are written but never defended, relaxed or
 // counted as security fixes; rejected ones are recorded as dropped with the
-// reason. Skipped (HygieneSkipped) without the compile gate or on a
+// reason. Skipped (HygieneSkipped) without the type-check gate or on a
 // non-converged result. Returns the final resolved graph, leaving the
 // checkout holding the final set; only a cancellation, an infrastructure or
 // a scanner failure, or ErrToolchainTooNew is an error.
@@ -147,13 +147,13 @@ func (l *loop) hygienePass(ctx context.Context, ref *goModState, resolved map[st
 }
 
 // hygieneSkipReason is why the hygiene pass cannot evaluate any target ("" when
-// it can): it needs a converged result and the compile gate.
+// it can): it needs a converged result and the type-check gate.
 func (l *loop) hygieneSkipReason(result *ModrootResult) string {
 	switch {
 	case !result.Converged:
 		return "the simulation did not converge"
-	case l.compiler == nil:
-		return "compile gate disabled"
+	case l.checker == nil:
+		return "type-check gate disabled"
 	}
 	return ""
 }
@@ -324,7 +324,7 @@ func (l *loop) hygieneTrial(ctx context.Context, purpose string, set []*candStat
 	case goversion.Compare(depGo, maxGo) > 0:
 		return notFree(fmt.Sprintf("raises dependency Go %s->%s", maxGo, depGo))
 	}
-	report, err := l.compiler.Compile(ctx, l.dir, l.target, l.target.Arches[0])
+	report, err := l.checker.Typecheck(ctx, l.dir, l.target, l.target.Arches[0])
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr
@@ -335,7 +335,7 @@ func (l *loop) hygieneTrial(ctx context.Context, purpose string, set []*candStat
 		if errors.Is(err, ErrToolchainTooNew) {
 			return nil, err // no verdict possible: fail the file, not just this bump
 		}
-		return notFree("compile check failed: " + firstLine(err.Error()))
+		return notFree("type-check failed: " + firstLine(err.Error()))
 	}
 	failures := make(map[string][]string)
 	for pkg, lines := range report.Failed {
@@ -344,7 +344,7 @@ func (l *loop) hygieneTrial(ctx context.Context, purpose string, set []*candStat
 		}
 	}
 	if len(failures) > 0 {
-		return notFree("breaks compile: " + firstCompileError(failures))
+		return notFree("breaks type-check: " + firstCheckError(failures))
 	}
 	resolved, err := l.tc.ListModules(ctx, l.dir)
 	if err != nil {

@@ -10,13 +10,13 @@ import (
 
 // Build-target replay fixtures (offline file:// GOPROXY, real go toolchain,
 // fake scanner): reachability is the union over the package's target arches
-// and honours the spec's CGO_ENABLED; the final set is compiled on every
+// and honours the spec's CGO_ENABLED; the final set is type-checked on every
 // target arch.
 
 const (
 	modArmDep = "example.com/armdep" // imported only from main's _arm64.go file
 	modCgoDep = "example.com/cgodep" // imported only from main's cgo-constrained file
-	modDep    = "example.com/dep"    // v1.1.0 does not compile for arm64
+	modDep    = "example.com/dep"    // v1.1.0 does not type-check for arm64
 
 	advArm = "GO-TEST-ARM"
 	advCgo = "GO-TEST-CGO"
@@ -105,14 +105,14 @@ func TestReplay_BuildTargetLinkage(t *testing.T) {
 	}
 }
 
-// crossArchCase: dep v1.1.0 fixes an advisory and compiles for amd64, but
-// one of its _arm64.go files does not compile.
+// crossArchCase: dep v1.1.0 fixes an advisory and type-checks for amd64, but
+// one of its _arm64.go files does not type-check.
 func crossArchCase() replayCase {
 	src := "package dep\n\nfunc Name() string { return \"dep\" }\n"
 	broken := stubModule(modDep, "dep.go", src, nil)
 	broken["dep_arm64.go"] = "package dep\n\nvar _ int = \"not an int\"\n"
 	return replayCase{
-		name: "cross-arch-compile",
+		name: "cross-arch-typecheck",
 		modules: map[string]map[string]string{
 			modDep + "@v1.0.0": stubModule(modDep, "dep.go", src, nil),
 			modDep + "@v1.1.0": broken,
@@ -133,16 +133,16 @@ func crossArchCase() replayCase {
 	}
 }
 
-// TestReplay_CrossArchCompile: the gate runs on the primary arch, then the
-// final set is compiled once on each other target arch - a break there
-// fails the simulation closed (ErrCompileGate); an x86_64-only package is
-// not compiled for arm64 at all.
-func TestReplay_CrossArchCompile(t *testing.T) {
+// TestReplay_CrossArchTypecheck: the gate runs on the primary arch, then the
+// final set is type-checked once on each other target arch - a break there
+// fails the simulation closed (ErrTypecheckGate); an x86_64-only package is
+// not type-checked for arm64 at all.
+func TestReplay_CrossArchTypecheck(t *testing.T) {
 	c := crossArchCase()
 	f := c.fixture(t)
 
 	_, err := c.run(t, f.fresh(t), EngineOmnibump, false)
-	require.ErrorIs(t, err, ErrCompileGate)
+	require.ErrorIs(t, err, ErrTypecheckGate)
 	assert.ErrorContains(t, err, "GOARCH=arm64")
 
 	amd64 := c

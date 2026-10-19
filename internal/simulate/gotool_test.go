@@ -81,7 +81,7 @@ func TestGoToolchain_RejectsFlagLikeArguments(t *testing.T) {
 }
 
 // TestTargetBuildEnv pins the single source of the build environment Linked,
-// LinkedStd and Compile run under: GOOS=linux, the arch, GOEXPERIMENT always
+// LinkedStd and Typecheck run under: GOOS=linux, the arch, GOEXPERIMENT always
 // set, and CGO_ENABLED from the spec - 1 when unset or not understood.
 func TestTargetBuildEnv(t *testing.T) {
 	for _, tt := range []struct {
@@ -105,7 +105,7 @@ func TestTargetBuildEnv(t *testing.T) {
 	assert.Equal(t, []string{"list", "./..."}, targetListArgs([]string{"list"}, nil, nil))
 }
 
-// TestTargetArches: normalization is order-independent (the compile gate's
+// TestTargetArches: normalization is order-independent (the type-check gate's
 // primary arch never depends on input order), deduplicated, and empty means
 // both Wolfi arches.
 func TestTargetArches(t *testing.T) {

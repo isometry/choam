@@ -83,13 +83,13 @@ func assertFixed(t *testing.T, _ string, body func(t tb)) {
 // Known defects pinned by the replay tests, named by the plan stage that
 // fixes them (see the soft-wondering-kettle plan).
 const (
-	defectFamilyCoUpdate = "stage4: compile gate cannot move the otel/log v0.21 train together " +
+	defectFamilyCoUpdate = "stage4: type-check gate cannot move the otel/log v0.21 train together " +
 		"(lagging otlploghttp skipped as blamed, trials polluted by unrelated coherence raises); " +
-		"family candidates rejected as 'breaks compile'"
-	defectRungFallback = "stage4: a CVE candidate whose top fix breaks compile is rejected outright " +
+		"family candidates rejected as 'breaks type-check'"
+	defectRungFallback = "stage4: a CVE candidate whose top fix breaks type-check is rejected outright " +
 		"instead of relaxing one fix rung (sdk v1.45.0 -> v1.43.0); it stays at baseline"
 	defectTrialPollution = "stage4: gate admission trials carry coherence raises for unrelated " +
-		"blamed candidates, so an independent compiling fix is rejected"
+		"blamed candidates, so an independent fix that type-checks is rejected"
 )
 
 func TestKnownDefectHelper(t *testing.T) {
