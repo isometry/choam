@@ -170,7 +170,7 @@ func TestSimulationStage_FailsClosedOnTypecheckGate(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			stage := newStageWithFake(&fakeBumpSimulator{err: tt.err})
-			stage.Options.Compile = tt.typecheck
+			stage.Options.Typecheck = tt.typecheck
 			gp := newSimulationProcessor()
 
 			err := stage.Apply(t.Context(), gp)

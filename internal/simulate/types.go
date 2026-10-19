@@ -60,7 +60,7 @@ type Toolchain interface {
 
 // Checker is the optional type-check gate seam: a Toolchain that also
 // implements it enables the post-convergence type-check gate (see
-// loop.typecheckGate), unless Options.NoCompile is set. *GoToolchain
+// loop.typecheckGate), unless Options.NoTypecheck is set. *GoToolchain
 // implements it.
 type Checker interface {
 	// Typecheck type-checks the transitive non-test import graph of the
@@ -446,8 +446,8 @@ type Options struct {
 	CommandTimeout time.Duration
 	// Budget bounds the whole per-package simulation (default 10m).
 	Budget time.Duration
-	// NoCompile disables the type-check gate (see Checker).
-	NoCompile bool
+	// NoTypecheck disables the type-check gate (see Checker).
+	NoTypecheck bool
 }
 
 // WithDefaults fills unset options.

@@ -469,7 +469,7 @@ func TestReplay_HygieneBatchThenSingles(t *testing.T) {
 func TestReplay_HygieneSkippedWithoutTypecheckGate(t *testing.T) {
 	c := hygieneFreeCase()
 	f := c.fixture(t)
-	result, err := RunLoop(t.Context(), f.tc, c.sc(), f.dir, c.req, Options{NoCompile: true})
+	result, err := RunLoop(t.Context(), f.tc, c.sc(), f.dir, c.req, Options{NoTypecheck: true})
 	require.NoError(t, err)
 	assert.Empty(t, result.FinalDeps)
 	assert.Empty(t, result.HygieneModules)

@@ -87,20 +87,20 @@ func TestBuildBumpProcessorOptions_ApkAdvisoryCheck(t *testing.T) {
 	assert.False(t, buildBumpProcessorOptions().ApkAdvisoryCheck, "--no-apk-advisories disables it")
 }
 
-// TestBuildBumpProcessorOptions_Compile verifies --no-compile (and
-// --no-validate, which skips simulation entirely) disable the compile gate.
-func TestBuildBumpProcessorOptions_Compile(t *testing.T) {
-	origCompile, origValidate := noCompile, noValidate
-	t.Cleanup(func() { noCompile, noValidate = origCompile, origValidate })
+// TestBuildBumpProcessorOptions_Typecheck verifies --no-typecheck (and
+// --no-validate, which skips simulation entirely) disable the type-check gate.
+func TestBuildBumpProcessorOptions_Typecheck(t *testing.T) {
+	origTypecheck, origValidate := noTypecheck, noValidate
+	t.Cleanup(func() { noTypecheck, noValidate = origTypecheck, origValidate })
 
-	noCompile, noValidate = false, false
-	assert.True(t, buildBumpProcessorOptions().Compile, "compile gate defaults on")
+	noTypecheck, noValidate = false, false
+	assert.True(t, buildBumpProcessorOptions().Typecheck, "type-check gate defaults on")
 
-	noCompile = true
-	assert.False(t, buildBumpProcessorOptions().Compile, "--no-compile disables the gate")
+	noTypecheck = true
+	assert.False(t, buildBumpProcessorOptions().Typecheck, "--no-typecheck disables the gate")
 
-	noCompile, noValidate = false, true
-	assert.False(t, buildBumpProcessorOptions().Compile, "--no-validate implies no compile gate")
+	noTypecheck, noValidate = false, true
+	assert.False(t, buildBumpProcessorOptions().Typecheck, "--no-validate implies no type-check gate")
 }
 
 func TestBumpRowStatus(t *testing.T) {

@@ -2426,14 +2426,14 @@ func TestTypecheckGate_FullSetPasses(t *testing.T) {
 	assert.Equal(t, 2, tc.checks, "one baseline type-check plus one full-set type-check")
 }
 
-func TestTypecheckGate_NoCompileSkipsGate(t *testing.T) {
+func TestTypecheckGate_NoTypecheckSkipsGate(t *testing.T) {
 	tc := &fakeChecker{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}}}
 	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
 
 	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
 		Modroot: ".",
 		Seeds:   []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
-	}, Options{NoCompile: true})
+	}, Options{NoTypecheck: true})
 
 	require.NoError(t, err)
 	assert.Equal(t, []string{"example.com/x@v1.1.0"}, result.FinalDeps)
@@ -2942,7 +2942,7 @@ func TestMinimise_BelowBaselineRemoved(t *testing.T) {
 // second run on the output removes nothing and adds nothing.
 func TestMinimise_ImpliedPinRemoved(t *testing.T) {
 	tc, sc := impliesFixture(false)
-	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest("example.com/a", "example.com/b"), Options{NoCompile: true})
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest("example.com/a", "example.com/b"), Options{NoTypecheck: true})
 
 	require.NoError(t, err)
 	assert.Equal(t, []string{"example.com/a@v2.0.0"}, result.FinalDeps)
@@ -2954,7 +2954,7 @@ func TestMinimise_ImpliedPinRemoved(t *testing.T) {
 	assert.Contains(t, result.Dropped[0].Reason, "implied by example.com/a@v2.0.0")
 
 	tc, sc = impliesFixture(false)
-	again, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest("example.com/a"), Options{NoCompile: true})
+	again, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest("example.com/a"), Options{NoTypecheck: true})
 	require.NoError(t, err)
 	assert.Equal(t, result.FinalDeps, again.FinalDeps, "idempotent")
 	assert.Empty(t, again.Dropped)
@@ -2965,7 +2965,7 @@ func TestMinimise_ImpliedPinRemoved(t *testing.T) {
 func TestMinimise_MutuallyImplyingKeepsOne(t *testing.T) {
 	for _, seeds := range [][]string{{"example.com/a", "example.com/b"}, {"example.com/b", "example.com/a"}} {
 		tc, sc := impliesFixture(true)
-		result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest(seeds...), Options{NoCompile: true})
+		result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest(seeds...), Options{NoTypecheck: true})
 		require.NoError(t, err)
 		assert.Equal(t, []string{"example.com/b@v2.0.0"}, result.FinalDeps, "seeds %v", seeds)
 		assert.Empty(t, result.Residuals)
@@ -2977,7 +2977,7 @@ func TestMinimise_MutuallyImplyingKeepsOne(t *testing.T) {
 func TestMinimise_EffectiveEntriesKept(t *testing.T) {
 	tc, sc := impliesFixture(false)
 	tc.getEffects = nil
-	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest("example.com/a", "example.com/b"), Options{NoCompile: true})
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), impliesRequest("example.com/a", "example.com/b"), Options{NoTypecheck: true})
 
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"example.com/a@v2.0.0", "example.com/b@v2.0.0"}, result.FinalDeps)
@@ -3034,7 +3034,7 @@ func TestMinimise_BudgetExhaustionKeepsSet(t *testing.T) {
 		}
 		return nil
 	}
-	result, err := RunLoop(ctx, tc, sc, newTestModuleDir(t), impliesRequest("example.com/a", "example.com/b"), Options{NoCompile: true})
+	result, err := RunLoop(ctx, tc, sc, newTestModuleDir(t), impliesRequest("example.com/a", "example.com/b"), Options{NoTypecheck: true})
 
 	require.NoError(t, err)
 	assert.ElementsMatch(t, []string{"example.com/a@v2.0.0", "example.com/b@v2.0.0"}, result.FinalDeps)

@@ -67,8 +67,8 @@ func NewSimulationStage(analyzer *Analyzer, opts Options) *SimulationStage {
 
 func defaultSimulator(ctx context.Context, opts Options, analyzer *Analyzer) (bumpSimulator, error) {
 	simOpts := simulate.Options{
-		Budget:    opts.SimulationTimeout,
-		NoCompile: !opts.Compile,
+		Budget:      opts.SimulationTimeout,
+		NoTypecheck: !opts.Typecheck,
 	}.WithDefaults()
 	toolchain, err := simulate.NewToolchain(ctx, simOpts.CommandTimeout)
 	if err != nil {
@@ -150,7 +150,7 @@ func (s *SimulationStage) buildRequests(ctx context.Context, gp *Processor, lang
 		if m.BumpEngine == simulate.EngineOmnibump {
 			omnibumpRoots++
 		}
-		if note := typecheckCgoNote(m, s.Options.Compile); note != "" {
+		if note := typecheckCgoNote(m, s.Options.Typecheck); note != "" {
 			gp.AddMessage(note)
 		}
 		reqs = append(reqs, simulate.ModrootRequest{
@@ -426,7 +426,7 @@ func (s *SimulationStage) buildGoVersion(ctx context.Context, minor string) stri
 func (s *SimulationStage) failClosed(err error) bool {
 	return errors.Is(err, simulate.ErrTypecheckGate) || errors.Is(err, simulate.ErrInfrastructure) ||
 		errors.Is(err, simulate.ErrToolchainTooNew) ||
-		(s.Options.Compile && errors.Is(err, context.DeadlineExceeded))
+		(s.Options.Typecheck && errors.Is(err, context.DeadlineExceeded))
 }
 
 // degrade falls back to the unvalidated pre-simulation candidate set,

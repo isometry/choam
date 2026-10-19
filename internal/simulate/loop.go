@@ -118,7 +118,7 @@ type loop struct {
 	degradedNoted   bool
 
 	// Type-check gate (see typecheckGate): checker is nil when the gate is off
-	// (toolchain without Checker support, or Options.NoCompile).
+	// (toolchain without Checker support, or Options.NoTypecheck).
 	// baselineFailed are the packages already failing to type-check in the
 	// pristine checkout on the primary arch (excluded from every verdict),
 	// archBaselineFailed the same for each other target arch (see
@@ -263,7 +263,7 @@ func newLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	if len(l.target.Patterns) == 0 {
 		l.target.Patterns = []string{"./..."}
 	}
-	if checker, ok := tc.(Checker); ok && !opts.NoCompile {
+	if checker, ok := tc.(Checker); ok && !opts.NoTypecheck {
 		l.checker = checker
 	}
 	if err := l.savePristine(ctx); err != nil {

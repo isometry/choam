@@ -42,7 +42,7 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `cmd/root.go:55` - `collectMelangeFiles()` YAML discovery
 - `cmd/check.go:15` - `NewCheckCmd()` update detection command
 - `cmd/update.go:16` - `NewUpdateCmd()` apply updates command
-- `cmd/bump.go:19` - `NewBumpCmd()` vulnerability-bump command (`gobump` alias; flags: `--dry-run`, `--format`, `--backup-suffix`, `--no-validate`, `--simulation-timeout`, `--no-stdlib`, `--no-apk-advisories`, `--fail-on-residual`)
+- `cmd/bump.go:19` - `NewBumpCmd()` vulnerability-bump command (`gobump` alias; flags: `--dry-run`, `--format`, `--backup-suffix`, `--no-validate`, `--no-typecheck`, `--simulation-timeout`, `--no-stdlib`, `--no-apk-advisories`, `--fail-on-residual`)
 - `cmd/bump.go:51` - `runBump()` vulnerability scan/apply logic; exits non-zero (`ErrBumpFailed`) when any file errors; `summarizeBumpResults()` feeds both table and JSON/YAML (results keyed by file path)
 
 ### Core Processing Architecture
@@ -59,13 +59,14 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `internal/gobump/pipeline.go` - `NewPipeline()` assembly, `Applier`, epoch hooks/comment
 - `internal/gobump/analyze.go` - language-agnostic analysis (`VulnerabilityChecker`, per-modroot fetch/scan, security-fix/hygiene recording, coordinate helpers)
 - `internal/gobump/reconcile.go` - language-agnostic reconcile of desired deps into bump/go-bump steps (plan/apply edits, coalesce modroots)
-- `internal/gobump/go_simulate.go` + `internal/simulate/` (Go-only) - bump simulation (proves candidate sets resolve and cover advisories with a real go toolchain)
-- `internal/simulate/hygiene.go` - scanner-hygiene ("bump when free") pass: a linked module whose advisories' vulnerable packages are not linked is raised anyway only when free (final go.mod changes by that module alone, no newer dependency Go, compiles, rescan clean); reported as `hygiene_bumps`/HYGIENE column, never as a security fix
+- `internal/gobump/go_simulate.go` + `internal/simulate/` (Go-only) - bump simulation (proves candidate sets resolve, cover advisories and type-check with a real go toolchain)
+- `internal/simulate/hygiene.go` - scanner-hygiene ("bump when free") pass: a linked module whose advisories' vulnerable packages are not linked is raised anyway only when free (final go.mod changes by that module alone, no newer dependency Go, type-checks, rescan clean); reported as `hygiene_bumps`/HYGIENE column, never as a security fix
 - `internal/gobump/discovery.go` + `internal/gobump/go_discovery.go` (Go-only parts: `go/install`, build tags, GOARCHes) - analysis units from `go/build`, `go/install` (unversioned only; `go/install pkg@version` ignores the checkout's go.mod, so it is reported, not bumped), `cargo/build`, bump steps and annotations; derives the build target the simulation evaluates: GOARCHes from `package.target-architecture` (empty/`all` = amd64+arm64) and the spec's build environment (`CGO_ENABLED` step > package > melange default 1; GOEXPERIMENT from go/build's `experiments` input; GOFLAGS `-tags` only for build-step-less roots) - whatever is not mirrored is reported as a `build:` message
-- `internal/simulate/gotool.go` `targetBuildEnv()` - the single source of GOOS/GOARCH/CGO_ENABLED/GOEXPERIMENT for `Linked`, `LinkedStd` and `Compile`: reachability is the union over the target arches (concurrent `go list -deps`, which needs no C toolchain, so it always uses the spec's CGO); `Compile` (gate and hygiene trials) runs on the first arch with host-capability CGO fallback, and the final set is compiled once more on each other arch (a new failure there fails closed)
-- `internal/simulate/gotool.go` `listDeps()`/`parseDeps()` - `Linked`/`LinkedStd` walk with `go list -e -deps -json` and inspect every package's `Error`/`DepsErrors`: an unmatched `//go:embed` pattern (`no matching files found` / `contains no embeddable files`, files generated at build time) is tolerated and reported (`Linkage.Embeds`, -v message); any other load error fails reachability OPEN with the first offending package as the cause - surfaced at default verbosity as a `Note <pkg>: artifact linkage unavailable (...)` line and the `notes` JSON/YAML key (`Result.Notes`). Nothing is generated in the checkout (no placeholder files, no spec scripts); the compile gate's baseline-failing packages (its blind spot) are a -v message
+- `internal/simulate/gotool.go` `targetBuildEnv()` - the single build environment (GOOS=linux, GOARCH, the spec's CGO_ENABLED, GOEXPERIMENT) for `Linked`, `LinkedStd` and `Typecheck`; neither needs a C toolchain, so there is no CGO fallback: reachability is the union over the target arches (concurrent `go list -deps`); `Typecheck` (gate and hygiene trials) runs on the first arch, and the final set is type-checked once more on each other arch (a new failure there fails closed)
+- `internal/simulate/gotool.go` `listDeps()`/`parseDeps()` - `Linked`/`LinkedStd` walk with `go list -e -deps -json` and inspect every package's `Error`/`DepsErrors`: an unmatched `//go:embed` pattern (`no matching files found` / `contains no embeddable files`, files generated at build time) is tolerated and reported (`Linkage.Embeds`, -v message); any other load error fails reachability OPEN with the first offending package as the cause - surfaced at default verbosity as a `Note <pkg>: artifact linkage unavailable (...)` line and the `notes` JSON/YAML key (`Result.Notes`). Nothing is generated in the checkout (no placeholder files, no spec scripts); the type-check gate's baseline-failing packages (its blind spot) are a -v message
 - `internal/simulate/engine.go` - apply engines: `uses: bump` steps (and new steps) simulate with the linked omnibump's `golang.DoUpdate` behind its CLI's raw-go.mod filter; `uses: go/bump` steps keep the gobump model (both honour `tidy: false`)
-- `internal/simulate/loop.go` - `RunLoop()` and its phases; topic files `loop_apply.go` (apply/tidy/get failure handling), `loop_reach.go` (reachability), `loop_scan.go` (scan findings, residuals), `loop_minimise.go`, `loop_gate.go` (compile gate, repair fixpoint), `loop_trace.go` (trial/repair logging)
+- `internal/simulate/loop.go` - `RunLoop()` and its phases; topic files `loop_apply.go` (apply/tidy/get failure handling), `loop_reach.go` (reachability), `loop_scan.go` (scan findings, residuals), `loop_minimise.go`, `loop_gate.go` (type-check gate: baseline, trials, repair fixpoint, cross-arch check), `loop_trace.go` (trial/repair logging)
+- `internal/simulate/typecheck.go` - in-process go/types engine behind `Typecheck`: file selection from `go list -e -deps`, per-package cache keyed by the dependencies' API hashes (a bump rechecks only what actually changed; keys are arch-independent, so later arches mostly hit)
 - `internal/simulate/loop_minimise.go` `minimise()` - effect-based redundancy removal on the final set: an entry is dropped when it matches/regresses upstream or the engine's final go.mod is identical without it (written deps carry only entries that do work; no co-update declaration)
 - `internal/gobump/go_migrate.go` - automatic `uses: go/bump` -> `uses: bump` migration planning and editing (drops `go-version`, adds `go-package` pins; skipped for `work: true`/unvalidated steps)
 - `internal/gobump/go_pin.go` + `internal/gobump/go_pin_stage.go` - `go-package` toolchain pin parsing and raising on `go/build`/`go/install` steps
@@ -122,6 +123,7 @@ brew install isometry/tap/choam
 
 # Go install
 go install github.com/isometry/choam@latest
+go run github.com/isometry/choam@latest bump ./packages/   # one-off run, built with the newest Go
 
 # From source (development)
 make deps && make build
@@ -185,6 +187,7 @@ make fmt && make lint && make test
 # Fix dependency vulnerabilities via bump pipeline steps
 ./choam bump ./packages/                  # Scan and fix (simulation needs a go toolchain)
 ./choam bump --no-validate ./packages/    # Skip simulation (no toolchain required)
+./choam bump --no-typecheck ./packages/   # Simulate but skip the type-check gate
 ./choam bump --no-stdlib ./packages/      # Skip the Go stdlib staleness/epoch-bump check
 ./choam bump --no-apk-advisories ./packages/  # Skip the Chainguard/Wolfi apk advisory epoch alignment
 
@@ -264,6 +267,20 @@ make fmt && make lint && make test
   advisories in unlinked packages of a linked module are info (UNLINKED) and
   at most a scanner-hygiene bump (`internal/simulate/hygiene.go`), never a
   security fix: no go-package pin raise, no module added, shed when not free
+
+**Type-check gate (`internal/simulate/typecheck.go`, `loop_gate.go`; `--no-typecheck` to disable):**
+- Checks the go/build packages in process with go/types; nothing is compiled
+- cgo files are checked with `FakeImportC`: errors in expressions using C
+  types are not caught, and `cgoArtefact` drops the follow-on "invalid
+  type/operand" errors (pinned by `TestTypecheck_CgoLimitation_CTypedErrorNotCaught`)
+- An unmatched `//go:embed` is not a baseline failure (embeds are not
+  resolved), so `GateUnchecked` counts can shrink
+- Fails closed with `ErrToolchainTooNew` when choam's go/types is older than
+  the toolchain or any module's go directive; remedy: run a choam built with
+  a newer Go, e.g. `go run github.com/isometry/choam@latest` (works because
+  go.mod has no replace/exclude directives - guarded by `TestGoModRunnable`
+  in `main_test.go`)
+- The cache is in memory, lives for one spec and is never evicted
 
 **Logging (`internal/logging`):**
 - `ctx context.Context` is the first parameter on every function that logs,

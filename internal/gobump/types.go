@@ -318,11 +318,11 @@ type Options struct {
 	// SimulationTimeout bounds each package's bump simulation (default 10m).
 	SimulationTimeout time.Duration `json:"simulation_timeout" yaml:"simulation_timeout"`
 
-	// Compile enables the simulation's type-check gate (default true at the
-	// CLI; --no-compile disables it): the validated deps set must also
-	// type-check the go/build packages without new failures (see
+	// Typecheck enables the simulation's type-check gate (default true at the
+	// CLI; --no-typecheck disables it): the go/build packages must also
+	// type-check against the validated deps set without new failures (see
 	// simulate.Checker). Moot when Validate is false.
-	Compile bool `json:"compile" yaml:"compile"`
+	Typecheck bool `json:"typecheck" yaml:"typecheck"`
 
 	// StdlibCheck enables the Go stdlib staleness check (see StdlibStage):
 	// estimate the toolchain the package was last built with and bump the

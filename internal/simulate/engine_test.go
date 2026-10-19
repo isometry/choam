@@ -167,7 +167,7 @@ func TestRunLoop_OmnibumpPrunedEntryDropped(t *testing.T) {
 		Baseline: map[string]string{"example.com/a": "v1.0.0"},
 		Packages: []string{"./does-not-exist"},
 		Engine:   EngineOmnibump,
-	}, Options{NoCompile: true})
+	}, Options{NoTypecheck: true})
 	require.NoError(t, err)
 	logResult(t, result)
 	assert.Equal(t, []string{"example.com/a@v1.2.0"}, result.FinalDeps)
@@ -209,7 +209,7 @@ func TestRunLoop_OmnibumpDowngradeVerification(t *testing.T) {
 			Seeds:    []Candidate{{Module: "example.com/a", Version: "v1.2.0", FromCVE: true, VulnIDs: []string{"GO-A"}}},
 			Baseline: map[string]string{"example.com/a": "v1.0.0"},
 			Engine:   EngineOmnibump,
-		}, Options{NoCompile: true})
+		}, Options{NoTypecheck: true})
 	require.NoError(t, err)
 	logResult(t, result)
 	assert.Empty(t, result.FinalDeps)
@@ -251,7 +251,7 @@ func TestRunLoop_AmbiguousImportBothEngines(t *testing.T) {
 			Baseline: map[string]string{"example.com/m": "v1.0.0"},
 			Packages: []string{"./does-not-exist"},
 			Engine:   eng,
-		}, Options{NoCompile: true})
+		}, Options{NoTypecheck: true})
 		require.NoError(t, err)
 		logResult(t, result)
 		assert.Empty(t, result.FinalReplaces)
@@ -311,7 +311,7 @@ func TestRunLoop_AmbiguityRemedyWrittenFirst(t *testing.T) {
 			Baseline: map[string]string{"example.com/m": "v1.0.0", "example.com/x": "v1.0.0"},
 			Packages: []string{"./does-not-exist"},
 			Engine:   eng,
-		}, Options{NoCompile: true})
+		}, Options{NoTypecheck: true})
 		require.NoError(t, err)
 		logResult(t, result)
 		if eng == EngineOmnibump {
@@ -380,13 +380,13 @@ func TestRunLoop_ProbeTidy(t *testing.T) {
 		NoTidy:   true,
 	}
 	tc, dir := doUpdateFixture(t)
-	result, err := RunLoop(t.Context(), tc, sc, dir, req, Options{NoCompile: true})
+	result, err := RunLoop(t.Context(), tc, sc, dir, req, Options{NoTypecheck: true})
 	require.NoError(t, err)
 	assert.False(t, result.BaselineTidies, "no probe requested")
 
 	tc, dir = doUpdateFixture(t) // the loop leaves its checkout bumped
 	req.ProbeTidy = true
-	result, err = RunLoop(t.Context(), tc, sc, dir, req, Options{NoCompile: true})
+	result, err = RunLoop(t.Context(), tc, sc, dir, req, Options{NoTypecheck: true})
 	require.NoError(t, err)
 	assert.True(t, result.BaselineTidies)
 	assert.Equal(t, []string{"example.com/a@v1.2.0"}, result.FinalDeps)
