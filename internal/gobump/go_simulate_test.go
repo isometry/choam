@@ -198,6 +198,19 @@ func TestSimulationStage_DegradesWhenToolchainMissing(t *testing.T) {
 	assert.False(t, gp.Validated)
 }
 
+// TestCompileCgoNote: the cgo limitation is reported only when the gate is
+// on and the spec enables cgo explicitly.
+func TestCompileCgoNote(t *testing.T) {
+	m := ModrootAnalysis{Modroot: "cmd/x", BuildEnv: simulate.BuildEnv{CGO: "1"}}
+	assert.Equal(t, "modroot cmd/x: type-check gate checks cgo files without a C toolchain - errors in expressions using C types are not caught",
+		compileCgoNote(m, true))
+	assert.Empty(t, compileCgoNote(m, false), "gate off")
+	for _, cgo := range []string{"0", ""} {
+		m.BuildEnv.CGO = cgo
+		assert.Empty(t, compileCgoNote(m, true), "CGO=%q", cgo)
+	}
+}
+
 func TestSimulationStage_ShouldRunGates(t *testing.T) {
 	fake := &fakeBumpSimulator{}
 

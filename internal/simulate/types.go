@@ -63,10 +63,11 @@ type Toolchain interface {
 // loop.compileGate), unless Options.NoCompile is set. *GoToolchain
 // implements it.
 type Compiler interface {
-	// Compile compiles (without linking) the transitive non-test import
-	// graph of the target for GOOS=linux and GOARCH=arch, reporting
-	// per-package failures. An error return means the go tool itself could
-	// not run, not that packages failed to compile.
+	// Compile type-checks the transitive non-test import graph of the
+	// target for GOOS=linux and GOARCH=arch, reporting per-package
+	// failures. An error return means the graph could not be judged (the go
+	// tool failed, or the type-checker is older than the toolchain), not
+	// that packages failed to type-check.
 	Compile(ctx context.Context, dir string, target BuildTarget, arch string) (*CompileReport, error)
 	// ModuleVersions lists module's released versions, ascending.
 	ModuleVersions(ctx context.Context, dir, module string) ([]string, error)
@@ -115,8 +116,8 @@ type UnmatchedEmbed struct {
 
 // CompileReport is the outcome of one Compiler.Compile.
 type CompileReport struct {
-	// Failed maps each package that failed to compile to its first error
-	// lines ("# pkg" header stripped).
+	// Failed maps each package that failed to type-check to its first error
+	// lines.
 	Failed map[string][]string
 	// Modules maps every non-standard package in the graph to its module
 	// path (replacement applied); "" for main-module packages.
@@ -124,9 +125,6 @@ type CompileReport struct {
 	// Imports holds the direct imports of each failed package, for repair
 	// and relaxation attribution.
 	Imports map[string][]string
-	// FileModules maps module-cache file paths named in error lines
-	// (<GOMODCACHE>/<mod>@<ver>/...) back to "module@version".
-	FileModules map[string]string
 }
 
 // ReplaceTarget is the right-hand side of a go.mod replace directive.

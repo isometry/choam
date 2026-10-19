@@ -24,25 +24,14 @@ type bumpSimulator interface {
 	Simulate(ctx context.Context, repoURL, tag, expectedCommit string, reqs []simulate.ModrootRequest) (map[string]*simulate.ModrootResult, error)
 }
 
-// compileCgoNote reports the compile gate's cgo limitation for modroot m:
-// the spec sets CGO_ENABLED=1, but the host cannot compile linux cgo for
-// some target arch, so the gate type-checks it with CGO_ENABLED=0
-// (reachability still uses 1: see simulate.BuildEnv). "" when not limited.
+// compileCgoNote reports the gate's cgo limitation for modroot m when the
+// spec sets CGO_ENABLED=1: cgo files are type-checked against a fake "C"
+// package (no C toolchain runs). "" when the gate is off or cgo is not set.
 func compileCgoNote(m ModrootAnalysis, compile bool) string {
 	if !compile || m.BuildEnv.CGO != "1" {
 		return ""
 	}
-	var limited []string
-	for _, arch := range simulate.TargetArches(m.BuildArches) {
-		if simulate.CompileCgoLimited(arch, m.BuildEnv) {
-			limited = append(limited, arch)
-		}
-	}
-	if len(limited) == 0 {
-		return ""
-	}
-	return fmt.Sprintf("modroot %s: compile gate ran with CGO_ENABLED=0 for GOARCH=%s (the spec sets CGO_ENABLED=1, but this host cannot compile linux cgo) - cgo files count as linked but are not compile-checked",
-		m.Modroot, strings.Join(limited, ","))
+	return fmt.Sprintf("modroot %s: type-check gate checks cgo files without a C toolchain - errors in expressions using C types are not caught", m.Modroot)
 }
 
 // SimulationStage validates the Go bump candidate sets computed by the

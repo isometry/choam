@@ -2,12 +2,10 @@ package simulate
 
 import (
 	"context"
-	"maps"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -426,8 +424,6 @@ func TestGoToolchain_CompileReportsLockstepBreak(t *testing.T) {
 	assert.Contains(t, strings.Join(report.Failed["example.com/exporter"], "\n"), "undefined: api.KeyValue")
 	assert.NotContains(t, report.Failed, "example.com/app", "dependents of a broken package are not compiled")
 	assert.Contains(t, report.Imports["example.com/exporter"], "example.com/api")
-	assert.Contains(t, slices.Collect(maps.Values(report.FileModules)), "example.com/exporter@v0.19.0",
-		"mod-cache error paths map back to module@version")
 
 	versions, err := toolchain.ModuleVersions(ctx, dir, "example.com/exporter")
 	require.NoError(t, err)
