@@ -8,7 +8,6 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/scan"
@@ -57,12 +56,11 @@ func (o *trialOutcome) why() string {
 	return "breaks type-check: " + firstCheckError(o.failures)
 }
 
-// typecheckBaseline type-checks the pristine checkout once per target arch,
+// typecheckBaseline type-checks the pristine checkout on every target arch,
 // after the initial tidy: packages that already fail there (a go list or
 // type error, e.g. from generated or build-time-only files) are excluded
-// from every later verdict, so only failures a bump introduces count. The arches are checked
-// in order (see typecheckArches); the primary arch's failures are
-// baselineFailed, the others' archBaselineFailed (for crossArchTypecheck).
+// from every later verdict on that arch, so only failures a bump
+// introduces count.
 func (l *loop) typecheckBaseline(ctx context.Context) error {
 	if err := l.engine.tidyBaseline(ctx); err != nil {
 		return gateErr(ctx, fmt.Errorf("baseline go mod tidy: %w", err))
@@ -76,34 +74,31 @@ func (l *loop) typecheckBaseline(ctx context.Context) error {
 		return gateErr(ctx, fmt.Errorf("baseline: %w", err))
 	}
 	l.baselineResolved = resolved
-	l.archBaselineFailed = make(map[string]map[string]struct{}, len(reports)-1)
+	l.baselineFailed = make(map[string]map[string]struct{}, len(reports))
 	for i, report := range reports {
 		failed := make(map[string]struct{}, len(report.Failed))
 		for pkg := range report.Failed {
 			failed[pkg] = struct{}{}
 		}
 		arch := l.target.Arches[i]
-		if i == 0 {
-			l.baselineFailed = failed
-			if len(failed) > 0 {
-				l.baselineFirst = firstCheckError(report.Failed)
-			}
-		} else {
-			l.archBaselineFailed[arch] = failed
-		}
+		l.baselineFailed[arch] = failed
 		if len(report.Failed) > 0 {
 			logging.From(ctx).Debug("type-check gate baseline: packages already failing are excluded",
 				"modroot", l.req.Modroot, "arch", arch, "count", len(report.Failed), "first", firstCheckError(report.Failed))
 		}
+	}
+	if merged := mergeArchReports(l.target.Arches, reports, nil); len(merged.Failed) > 0 {
+		l.gateUnchecked, l.baselineFirst = len(merged.Failed), firstCheckError(merged.Failed)
 	}
 	return nil
 }
 
 // typecheckArches checks the checkout for each of arches one after another,
 // returning the reports in arch order, or the first failing arch's error
-// (later arches are not checked). Sequential on purpose: the type-check
-// cache keys are arch-independent, so each arch after the first mostly hits
-// the entries the previous one left (concurrent checks would duplicate that
+// (later arches are not checked; a report with failed packages is a
+// verdict, not an error). Sequential on purpose: the type-check cache keys
+// are arch-independent, so each arch after the first mostly hits the
+// entries the previous one left (concurrent checks would duplicate that
 // work, and each already uses every CPU).
 func (l *loop) typecheckArches(ctx context.Context, arches []string) ([]*CheckReport, error) {
 	reports := make([]*CheckReport, 0, len(arches))
@@ -117,41 +112,54 @@ func (l *loop) typecheckArches(ctx context.Context, arches []string) ([]*CheckRe
 	return reports, nil
 }
 
-// crossArchTypecheck type-checks the final set once on each target arch besides
-// the primary one (the gate's and the hygiene trials' arch, which bounds
-// their cost): a failure that arch's baseline did not have fails the
-// simulation closed (ErrTypecheckGate) - the set was never proven to build
-// there. The checkout is re-applied to the final set first (a trial may
-// have left another state). Nothing to do without the type-check gate, with a
-// single arch, or with no entry to write.
-func (l *loop) crossArchTypecheck(ctx context.Context) error {
-	final := l.inApplyOrder(l.activeCandidates())
-	if l.checker == nil || len(l.target.Arches) < 2 || len(final) == 0 {
-		return nil
-	}
-	start := time.Now()
-	if fail := l.engine.apply(ctx, final); fail != nil {
-		return gateErr(ctx, fmt.Errorf("re-applying the final set for the cross-arch type-check: %w", fail.err))
-	}
-	arches := l.target.Arches[1:]
-	reports, err := l.typecheckArches(ctx, arches)
+// typecheckAll type-checks the checkout on every target arch (see
+// typecheckArches) and merges the reports into one verdict whose Failed
+// holds only failures that arch's baseline did not have (see
+// mergeArchReports).
+func (l *loop) typecheckAll(ctx context.Context) (*CheckReport, error) {
+	reports, err := l.typecheckArches(ctx, l.target.Arches)
 	if err != nil {
-		return gateErr(ctx, err)
+		return nil, err
 	}
+	return mergeArchReports(l.target.Arches, reports, l.baselineFailed), nil
+}
+
+// mergeArchReports merges per-arch reports (in arches order) into one:
+// Failed holds every package failing on some arch and absent from that
+// arch's baseline (nil: nothing excluded), with the lines and Imports of the
+// first arch failing it - the first line prefixed "GOARCH=<arches>: "
+// (every arch failing it) when arches[0] is not among them, so an
+// arch-specific break says so; Modules is the union.
+func mergeArchReports(arches []string, reports []*CheckReport, baseline map[string]map[string]struct{}) *CheckReport {
+	merged := &CheckReport{Failed: make(map[string][]string), Modules: make(map[string]string), Imports: make(map[string][]string)}
+	failedOn := make(map[string][]string)
 	for i, report := range reports {
-		failures := make(map[string][]string)
-		for pkg, lines := range report.Failed {
-			if _, known := l.archBaselineFailed[arches[i]][pkg]; !known {
-				failures[pkg] = lines
+		for pkg, module := range report.Modules {
+			if _, ok := merged.Modules[pkg]; !ok {
+				merged.Modules[pkg] = module
 			}
 		}
-		if len(failures) > 0 {
-			return gateErr(ctx, fmt.Errorf("the final bump set breaks the GOARCH=%s build: %s", arches[i], firstCheckError(failures)))
+		for pkg, lines := range report.Failed {
+			if _, known := baseline[arches[i]][pkg]; known {
+				continue
+			}
+			failedOn[pkg] = append(failedOn[pkg], arches[i])
+			if _, ok := merged.Failed[pkg]; !ok {
+				merged.Failed[pkg] = lines
+				if imports, ok := report.Imports[pkg]; ok {
+					merged.Imports[pkg] = imports
+				}
+			}
 		}
 	}
-	logging.From(ctx).Info("cross-arch type-check passed", "modroot", l.req.Modroot, "arches", strings.Join(arches, ","),
-		"duration", time.Since(start).Round(time.Millisecond))
-	return nil
+	for pkg, on := range failedOn {
+		if on[0] != arches[0] && len(merged.Failed[pkg]) > 0 {
+			lines := slices.Clone(merged.Failed[pkg])
+			lines[0] = "GOARCH=" + strings.Join(on, ",") + ": " + lines[0]
+			merged.Failed[pkg] = lines
+		}
+	}
+	return merged
 }
 
 // gateRun is the type-check gate's search state: each candidate's fix ladder
@@ -338,16 +346,11 @@ func (l *loop) trial(ctx context.Context, purpose, subject string, pins []*candS
 	if err != nil {
 		return nil, gateErr(ctx, err)
 	}
-	report, err := l.checker.Typecheck(ctx, l.dir, l.target, l.target.Arches[0])
+	report, err := l.typecheckAll(ctx)
 	if err != nil {
 		return nil, gateErr(ctx, err)
 	}
-	out := &trialOutcome{report: report, resolved: resolved, failures: make(map[string][]string)}
-	for pkg, lines := range report.Failed {
-		if _, known := l.baselineFailed[pkg]; !known {
-			out.failures[pkg] = lines
-		}
-	}
+	out := &trialOutcome{report: report, resolved: resolved, failures: report.Failed}
 	l.logTrial(ctx, trialLog{purpose: purpose, subject: subject, pins: pins, resolved: resolved, checked: out})
 	return out, nil
 }

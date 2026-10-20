@@ -323,8 +323,9 @@ type ModrootResult struct {
 	UnmatchedEmbeds []UnmatchedEmbed `json:"-" yaml:"-"`
 
 	// GateUnchecked counts the packages the type-check gate excluded because
-	// they already fail to type-check in the pristine checkout (primary arch) -
-	// its blind spot; GateUncheckedFirst is the first one's "pkg: error".
+	// they already fail to type-check in the pristine checkout (on any target
+	// arch, counted once) - its blind spot; GateUncheckedFirst is the first
+	// one's "pkg: error" (in arch order, see mergeArchReports).
 	GateUnchecked      int    `json:"-" yaml:"-"`
 	GateUncheckedFirst string `json:"-" yaml:"-"`
 
@@ -405,8 +406,8 @@ type ModrootRequest struct {
 	// the build will compile.
 	Tags []string
 	// Arches are the GOARCHes the package is built for (see BuildTarget):
-	// reachability is their union; the type-check gate runs on the first and
-	// the final set is type-checked once more on each of the others.
+	// reachability is their union, and every type-check gate trial checks all
+	// of them (later arches mostly hit the type-check cache).
 	Arches []string
 	// Env is the build environment the spec sets (see BuildEnv).
 	Env BuildEnv

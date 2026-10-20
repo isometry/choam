@@ -476,8 +476,9 @@ func unmatchedEmbed(errText string) (pattern string, ok bool) {
 var defaultArches = []string{"amd64", "arm64"}
 
 // TargetArches normalizes a target-arch list: deduplicated, amd64 then arm64
-// first and any others after in lexical order (so the type-check gate's primary
-// arch never depends on input order); empty means defaultArches.
+// first and any others after in lexical order (so the type-check gate's arch
+// order, and so which arch's errors it reports, never depends on input
+// order); empty means defaultArches.
 func TargetArches(arches []string) []string {
 	if len(arches) == 0 {
 		return slices.Clone(defaultArches)

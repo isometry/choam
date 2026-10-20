@@ -201,18 +201,22 @@ func (l *loop) logRepair(ctx context.Context, rl repairLog) {
 }
 
 // firstCheckError renders the first (by package path) type-check failure as
-// "pkg: file.go:line:col: message", trimming the file's directory.
+// "pkg: file.go:line:col: message", trimming the file's directory (and
+// leading a merged arch-specific failure's "GOARCH=...: " prefix).
 func firstCheckError(failures map[string][]string) string {
 	pkgs := sortedKeys(failures)
 	if len(pkgs) == 0 || len(failures[pkgs[0]]) == 0 {
 		return "unknown type-check error"
 	}
-	line := failures[pkgs[0]][0]
+	line, arch := failures[pkgs[0]][0], ""
+	if p, rest, ok := strings.Cut(line, ": "); ok && strings.HasPrefix(p, "GOARCH=") {
+		arch, line = p+": ", rest // see mergeArchReports
+	}
 	if idx := strings.Index(line, ".go:"); idx >= 0 {
 		file := line[:idx+len(".go")]
 		line = filepath.Base(file) + line[idx+len(".go"):]
 	}
-	return pkgs[0] + ": " + line
+	return arch + pkgs[0] + ": " + line
 }
 
 func firstLine(text string) string {

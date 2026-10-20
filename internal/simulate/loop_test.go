@@ -2307,14 +2307,17 @@ func TestRunLoop_DegradedReachability_SelfReplaceKeyFailsOpen(t *testing.T) {
 
 // fakeChecker adds the optional Checker seam to fakeToolchain, enabling
 // the type-check gate: checkFn derives the report from the module graph the
-// current apply produced; versions/requires model `go list -m -versions`
-// and per-version go.mod require blocks ("module@version" keys).
+// current apply produced (archFn, when set, also gets the arch and takes
+// precedence); versions/requires model `go list -m -versions` and
+// per-version go.mod require blocks ("module@version" keys).
 type fakeChecker struct {
 	*fakeToolchain
 	checkFn  func(resolved map[string]string) *CheckReport
+	archFn   func(arch string, resolved map[string]string) *CheckReport
 	versions map[string][]string
 	requires map[string]map[string]string
-	// checks counts primary-arch type-checks; archChecks every arch's.
+	// checks counts first-target-arch type-checks (one per trial);
+	// archChecks every arch's.
 	checks     int
 	archChecks map[string]int
 	mu         sync.Mutex
@@ -2336,10 +2339,25 @@ func (f *fakeChecker) Typecheck(ctx context.Context, dir string, target BuildTar
 	if err != nil {
 		return nil, err
 	}
-	if f.checkFn == nil {
-		return &CheckReport{}, nil
+	switch {
+	case f.archFn != nil:
+		return f.archFn(arch, resolved), nil
+	case f.checkFn != nil:
+		return f.checkFn(resolved), nil
 	}
-	return f.checkFn(resolved), nil
+	return &CheckReport{}, nil
+}
+
+// onArch restricts a checkFn's failures to one arch (other arches see the
+// same graph with nothing failing).
+func onArch(only string, fn func(map[string]string) *CheckReport) func(string, map[string]string) *CheckReport {
+	return func(arch string, resolved map[string]string) *CheckReport {
+		report := fn(resolved)
+		if arch != only {
+			report.Failed = nil
+		}
+		return report
+	}
 }
 
 func (f *fakeChecker) ModuleVersions(_ context.Context, _, module string) ([]string, error) {
@@ -2662,6 +2680,147 @@ func TestTypecheckGate_StepsDownFixRungs(t *testing.T) {
 	assert.Equal(t, "breaks type-check: example.com/x: x.go:1:2: broken", result.Residuals[0].Reason)
 	assert.Empty(t, result.Dropped, "relaxed, not dropped")
 	assert.Equal(t, 4, tc.checks, "baseline plus one trial per rung")
+}
+
+// stepsDownSeed is TestTypecheckGate_StepsDownFixRungs' x: fix rungs
+// v1.1.0 (HIGH), v1.2.0 (MEDIUM), v1.3.0 (LOW), seeded at the top.
+func stepsDownSeed(t *testing.T) (*fakeScanner, ModrootRequest) {
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/x", id: "GO-HIGH", fixed: "v1.1.0", severity: "HIGH"},
+		{module: "example.com/x", id: "GO-MED", fixed: "v1.2.0", severity: "MEDIUM"},
+		{module: "example.com/x", id: "GO-LOW", fixed: "v1.3.0", severity: "LOW"},
+	}}
+	return sc, ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{{
+			Module: "example.com/x", Version: "v1.3.0", FromCVE: true, VulnIDs: []string{"GO-HIGH", "GO-LOW", "GO-MED"}, Severity: "HIGH",
+			Rungs: FixRungs(sc.mustScan(t, "example.com/x", "v1.0.0"), "example.com/x", nil),
+		}},
+		Baseline: map[string]string{"example.com/x": "v1.0.0"},
+	}
+}
+
+func TestTypecheckGate_ArchSpecificBreakStepsDown(t *testing.T) {
+	// As StepsDownFixRungs, but v1.2.0+ breaks only the arm64 build: every
+	// trial checks both arches, so the gate relaxes x exactly as for an
+	// amd64 break, and the residual names the arch.
+	tc := &fakeChecker{
+		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}},
+		archFn:        onArch("arm64", brokenAbove("example.com/x", "v1.2.0")),
+	}
+	sc, req := stepsDownSeed(t)
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), req, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/x@v1.1.0"}, result.FinalDeps)
+	require.Len(t, result.Residuals, 1)
+	assert.ElementsMatch(t, []string{"GO-LOW", "GO-MED"}, result.Residuals[0].VulnIDs)
+	assert.Equal(t, "breaks type-check: GOARCH=arm64: example.com/x: x.go:1:2: broken", result.Residuals[0].Reason)
+	assert.Equal(t, map[string]int{"amd64": 4, "arm64": 4}, tc.archChecks, "baseline plus one trial per rung, each on both arches")
+}
+
+func TestTypecheckGate_SingleArchIgnoresOtherArchBreak(t *testing.T) {
+	// The same arm64-only break with an x86_64-only target: arm64 is never
+	// checked, and the top rung passes.
+	tc := &fakeChecker{
+		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}},
+		archFn:        onArch("arm64", brokenAbove("example.com/x", "v1.2.0")),
+	}
+	sc, req := stepsDownSeed(t)
+	req.Arches = []string{"amd64"}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), req, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/x@v1.3.0"}, result.FinalDeps)
+	assert.Empty(t, result.Residuals)
+	assert.Equal(t, map[string]int{"amd64": 2}, tc.archChecks, "baseline plus the full set, amd64 only")
+}
+
+func TestTypecheckGate_ArchSpecificBreakRepaired(t *testing.T) {
+	// CoherenceRemedy with the lockstep break visible only on arm64: the
+	// gate derives the same co-update repair from the arm64 failure.
+	tc := otelLikeChecker(&fakeToolchain{base: map[string]string{
+		"example.com/api":      "v0.19.0",
+		"example.com/exporter": "v0.19.0",
+	}}, []string{"v0.19.0", "v0.20.0", "v0.21.0", "v0.22.0"})
+	tc.archFn, tc.checkFn = onArch("arm64", tc.checkFn), nil
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/api", id: "GO-1", fixed: "v0.21.0"}}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot:  ".",
+		Seeds:    []Candidate{{Module: "example.com/api", Version: "v0.21.0", FromCVE: true, VulnIDs: []string{"GO-1"}, Severity: "HIGH"}},
+		Baseline: map[string]string{"example.com/api": "v0.19.0", "example.com/exporter": "v0.19.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/api@v0.21.0", "example.com/exporter@v0.21.0"}, result.FinalDeps)
+	assert.Empty(t, result.Residuals)
+	assert.Equal(t, map[string]int{"amd64": 3, "arm64": 3}, tc.archChecks, "baseline, failing full set, coherent set")
+}
+
+func TestTypecheckGate_BaselineIsPerArch(t *testing.T) {
+	// q already fails on arm64 only and p on amd64 only (pristine): q is
+	// excluded on arm64 (counted once as unchecked, its arch named), but p's
+	// amd64 baseline does not mask a new arm64 failure of p once x is
+	// bumped - x has one rung, so it is dropped.
+	tc := &fakeChecker{
+		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/x": "v1.0.0"}},
+		archFn: func(arch string, resolved map[string]string) *CheckReport {
+			report := &CheckReport{
+				Failed:  map[string][]string{},
+				Modules: map[string]string{"example.com/test/p": "", "example.com/test/q": "", "example.com/x": "example.com/x"},
+				Imports: map[string][]string{"example.com/test/p": {"example.com/x"}},
+			}
+			switch arch {
+			case "arm64":
+				report.Failed["example.com/test/q"] = []string{"q.go:1:2: generated"}
+				if resolved["example.com/x"] == "v1.1.0" {
+					report.Failed["example.com/test/p"] = []string{"p.go:1:2: undefined: x.Old"}
+				}
+			case "amd64":
+				report.Failed["example.com/test/p"] = []string{"p_amd64.go:1:2: generated"}
+			}
+			return report
+		},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/x", id: "GO-1", fixed: "v1.1.0"}}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot:  ".",
+		Seeds:    []Candidate{{Module: "example.com/x", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
+		Baseline: map[string]string{"example.com/x": "v1.0.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Empty(t, result.FinalDeps)
+	require.Len(t, result.Dropped, 1)
+	assert.Equal(t, "breaks type-check: GOARCH=arm64: example.com/test/p: p.go:1:2: undefined: x.Old", result.Dropped[0].Reason)
+	assert.Equal(t, 2, result.GateUnchecked, "p (amd64) and q (arm64), each counted once")
+	assert.Equal(t, "example.com/test/p: p_amd64.go:1:2: generated", result.GateUncheckedFirst)
+}
+
+func TestMergeArchReports(t *testing.T) {
+	arches := []string{"amd64", "arm64", "riscv64"}
+	reports := []*CheckReport{
+		{Failed: map[string][]string{"both": {"amd64 line"}}, Modules: map[string]string{"both": "m", "a": "ma"}},
+		{
+			Failed:  map[string][]string{"both": {"arm64 line"}, "late": {"late arm64", "second"}, "known": {"x"}},
+			Modules: map[string]string{"both": "other", "late": "ml"},
+			Imports: map[string][]string{"late": {"a"}},
+		},
+		{Failed: map[string][]string{"late": {"late riscv64"}}},
+	}
+	merged := mergeArchReports(arches, reports, map[string]map[string]struct{}{"arm64": {"known": {}}})
+	assert.Equal(t, map[string][]string{
+		"both": {"amd64 line"},
+		"late": {"GOARCH=arm64,riscv64: late arm64", "second"},
+	}, merged.Failed, "first arch's lines; arch named unless the first target arch fails it; baseline per arch")
+	assert.Equal(t, map[string]string{"both": "m", "a": "ma", "late": "ml"}, merged.Modules)
+	assert.Equal(t, map[string][]string{"late": {"a"}}, merged.Imports)
+	assert.Equal(t, []string{"late arm64", "second"}, reports[1].Failed["late"], "inputs are not mutated")
+	assert.Equal(t, "GOARCH=arm64,riscv64: late: late arm64", firstCheckError(map[string][]string{"late": merged.Failed["late"]}))
 }
 
 // mustScan returns the fake's findings for module@version.

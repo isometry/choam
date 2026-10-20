@@ -10,7 +10,7 @@ import (
 
 // Build-target replay fixtures (offline file:// GOPROXY, real go toolchain,
 // fake scanner): reachability is the union over the package's target arches
-// and honours the spec's CGO_ENABLED; the final set is type-checked on every
+// and honours the spec's CGO_ENABLED; every type-check gate trial covers every
 // target arch.
 
 const (
@@ -105,14 +105,14 @@ func TestReplay_BuildTargetLinkage(t *testing.T) {
 	}
 }
 
-// crossArchCase: dep v1.1.0 fixes an advisory and type-checks for amd64, but
+// archBreakCase: dep v1.1.0 fixes an advisory and type-checks for amd64, but
 // one of its _arm64.go files does not type-check.
-func crossArchCase() replayCase {
+func archBreakCase() replayCase {
 	src := "package dep\n\nfunc Name() string { return \"dep\" }\n"
 	broken := stubModule(modDep, "dep.go", src, nil)
 	broken["dep_arm64.go"] = "package dep\n\nvar _ int = \"not an int\"\n"
 	return replayCase{
-		name: "cross-arch-typecheck",
+		name: "arch-specific-break",
 		modules: map[string]map[string]string{
 			modDep + "@v1.0.0": stubModule(modDep, "dep.go", src, nil),
 			modDep + "@v1.1.0": broken,
@@ -133,21 +133,26 @@ func crossArchCase() replayCase {
 	}
 }
 
-// TestReplay_CrossArchTypecheck: the gate runs on the primary arch, then the
-// final set is type-checked once on each other target arch - a break there
-// fails the simulation closed (ErrTypecheckGate); an x86_64-only package is
-// not type-checked for arm64 at all.
-func TestReplay_CrossArchTypecheck(t *testing.T) {
-	c := crossArchCase()
+// TestReplay_ArchSpecificBreakHandledByGate: every gate trial type-checks
+// all target arches, so an arm64-only break is a gate verdict like any
+// other: dep has no lower fix rung, so its bump is rejected and the
+// advisory left a residual whose reason names the arch - not a failed
+// simulation. An x86_64-only package is not type-checked for arm64 at all.
+func TestReplay_ArchSpecificBreakHandledByGate(t *testing.T) {
+	c := archBreakCase()
 	f := c.fixture(t)
 
-	_, err := c.run(t, f.fresh(t), EngineOmnibump, false)
-	require.ErrorIs(t, err, ErrTypecheckGate)
-	assert.ErrorContains(t, err, "GOARCH=arm64")
+	result, err := c.run(t, f.fresh(t), EngineOmnibump, false)
+	require.NoError(t, err)
+	logResult(t, result)
+	assert.Empty(t, result.FinalDeps)
+	require.Len(t, result.Residuals, 1)
+	assert.Equal(t, modDep, result.Residuals[0].Module)
+	assert.Contains(t, result.Residuals[0].Reason, "breaks type-check: GOARCH=arm64: "+modDep+": dep_arm64.go:")
 
 	amd64 := c
 	amd64.req.Arches = []string{"amd64"}
-	result, err := amd64.run(t, f.fresh(t), EngineOmnibump, false)
+	result, err = amd64.run(t, f.fresh(t), EngineOmnibump, false)
 	require.NoError(t, err)
 	assert.Equal(t, []string{modDep + "@v1.1.0"}, result.FinalDeps)
 }

@@ -106,7 +106,7 @@ func TestTargetBuildEnv(t *testing.T) {
 }
 
 // TestTargetArches: normalization is order-independent (the type-check gate's
-// primary arch never depends on input order), deduplicated, and empty means
+// arch order never depends on input order), deduplicated, and empty means
 // both Wolfi arches.
 func TestTargetArches(t *testing.T) {
 	assert.Equal(t, []string{"amd64", "arm64"}, TargetArches(nil))

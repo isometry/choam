@@ -324,7 +324,7 @@ func (l *loop) hygieneTrial(ctx context.Context, purpose string, set []*candStat
 	case goversion.Compare(depGo, maxGo) > 0:
 		return notFree(fmt.Sprintf("raises dependency Go %s->%s", maxGo, depGo))
 	}
-	report, err := l.checker.Typecheck(ctx, l.dir, l.target, l.target.Arches[0])
+	report, err := l.typecheckAll(ctx)
 	if err != nil {
 		if cerr := ctx.Err(); cerr != nil {
 			return nil, cerr
@@ -337,14 +337,8 @@ func (l *loop) hygieneTrial(ctx context.Context, purpose string, set []*candStat
 		}
 		return notFree("type-check failed: " + firstLine(err.Error()))
 	}
-	failures := make(map[string][]string)
-	for pkg, lines := range report.Failed {
-		if _, known := l.baselineFailed[pkg]; !known {
-			failures[pkg] = lines
-		}
-	}
-	if len(failures) > 0 {
-		return notFree("breaks type-check: " + firstCheckError(failures))
+	if len(report.Failed) > 0 {
+		return notFree("breaks type-check: " + firstCheckError(report.Failed))
 	}
 	resolved, err := l.tc.ListModules(ctx, l.dir)
 	if err != nil {

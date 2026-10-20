@@ -119,16 +119,17 @@ type loop struct {
 
 	// Type-check gate (see typecheckGate): checker is nil when the gate is off
 	// (toolchain without Checker support, or Options.NoTypecheck).
-	// baselineFailed are the packages already failing to type-check in the
-	// pristine checkout on the primary arch (excluded from every verdict),
-	// archBaselineFailed the same for each other target arch (see
-	// crossArchTypecheck); baselineResolved is the pristine tidied module graph.
-	checker            Checker
-	baselineFailed     map[string]struct{}
-	archBaselineFailed map[string]map[string]struct{}
-	baselineResolved   map[string]string
-	// baselineFirst is the first baselineFailed package's first error line
-	// ("pkg: line"; see ModrootResult.GateUncheckedFirst).
+	// baselineFailed maps each target arch to the packages already failing
+	// to type-check there in the pristine checkout (excluded from every
+	// verdict on that arch); baselineResolved is the pristine tidied module
+	// graph.
+	checker          Checker
+	baselineFailed   map[string]map[string]struct{}
+	baselineResolved map[string]string
+	// gateUnchecked counts the distinct baselineFailed packages across
+	// arches; baselineFirst is the first one's first error line ("pkg:
+	// line"; see ModrootResult.GateUnchecked).
+	gateUnchecked int
 	baselineFirst string
 	// gateRejected maps a module to why the gate rejected its higher rung,
 	// across gate rounds; revived marks candidates shed as unlinked that a
@@ -220,10 +221,6 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	result.StdPackages = l.linkedStdPackages(ctx)
 
 	if resolved, err = l.refine(ctx, resolved, result); err != nil {
-		return nil, err
-	}
-
-	if err := l.crossArchTypecheck(ctx); err != nil {
 		return nil, err
 	}
 
@@ -432,7 +429,7 @@ func (l *loop) buildResult(ctx context.Context, resolved map[string]string, resu
 		result.LinkageError = l.linkedErr.Error()
 	}
 	result.UnmatchedEmbeds = l.embeds
-	result.GateUnchecked, result.GateUncheckedFirst = len(l.baselineFailed), l.baselineFirst
+	result.GateUnchecked, result.GateUncheckedFirst = l.gateUnchecked, l.baselineFirst
 	result.Requires = l.requirements
 	result.UnrequiredModules = l.unrequiredModules(resolved)
 	result.FinalDeps, result.FinalReplaces, result.CVEBackedModules = l.finalOutputs(resolved)
