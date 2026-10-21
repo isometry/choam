@@ -505,3 +505,43 @@ func TestApkAdvisoryStage_Failures(t *testing.T) {
 		notesContain(t, gp, "apk: advisory source unavailable")
 	})
 }
+
+func TestApkProofWanted(t *testing.T) {
+	const queried = "3.6.0-r1"
+	goProcessor := func() *Processor {
+		gp := newApkTestProcessor()
+		gp.VulnerabilityAnalysis.ByLanguage[0].Language = "go"
+		return gp
+	}
+	src := func(recs ...*osvschema.Vulnerability) *fakeApkSource {
+		return &fakeApkSource{byVersion: map[string][]*osvschema.Vulnerability{queried: recs}}
+	}
+
+	tests := []struct {
+		name    string
+		gp      *Processor
+		src     *fakeApkSource
+		want    bool
+		wantErr bool
+	}{
+		{"fixed epoch, upstream matches a scanned advisory", goProcessor(), src(apkRecord("CGA-1", []string{"GO-A"}, "3.6.0-r2")), true, false},
+		{"upstream matches via an alias", goProcessor(), src(apkRecord("CGA-1", []string{"GHSA-a"}, "3.6.0-r2")), true, false},
+		{"upstream matches nothing scanned", goProcessor(), src(apkRecord("CGA-1", []string{"GO-OTHER"}, "3.6.0-r2")), false, false},
+		{"no epoch can clear it", goProcessor(), src(apkRecord("CGA-1", []string{"GO-A"}, "3.6.0-r1")), false, false},
+		{"no apk advisories", goProcessor(), src(), false, false},
+		{"scan found nothing", func() *Processor {
+			gp := goProcessor()
+			gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0].ScanResult.Vulnerabilities = nil
+			return gp
+		}(), src(apkRecord("CGA-1", []string{"GO-A"}, "3.6.0-r2")), false, false},
+		{"not a go analysis (the simulation is Go-only)", newApkTestProcessor(), src(apkRecord("CGA-1", []string{"GO-A"}, "3.6.0-r2")), false, false},
+		{"osv failure", goProcessor(), &fakeApkSource{err: errors.New("osv down")}, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := apkProofWanted(t.Context(), tt.src, tt.gp)
+			assert.Equal(t, tt.want, got)
+			assert.Equal(t, tt.wantErr, err != nil)
+		})
+	}
+}

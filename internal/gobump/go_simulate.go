@@ -77,7 +77,11 @@ func defaultSimulator(ctx context.Context, opts Options, analyzer *Analyzer) (bu
 	return simulate.NewSimulator(nil, toolchain, analyzer.vulnerabilityScanner, opts.TempDir, simOpts), nil
 }
 
-func (s *SimulationStage) ShouldRun(_ context.Context, p processor.Processor) (bool, error) {
+// ShouldRun: a go bump action is pending, or - for a rerun whose spec already
+// carries the fixing deps (no action) - an apk advisory needs the proof only
+// the simulation gives (see apkProofWanted). An OSV failure there is left to
+// ApkAdvisoryStage to report.
+func (s *SimulationStage) ShouldRun(ctx context.Context, p processor.Processor) (bool, error) {
 	gp, err := asBump(p)
 	if err != nil {
 		return false, err
@@ -94,7 +98,14 @@ func (s *SimulationStage) ShouldRun(_ context.Context, p processor.Processor) (b
 			return true, nil
 		}
 	}
-	return false, nil
+	if !s.Options.ApkAdvisoryCheck || gp.ExcludedReason != "" || s.Analyzer == nil || s.Analyzer.vulnerabilityScanner == nil {
+		return false, nil
+	}
+	wanted, err := apkProofWanted(ctx, s.Analyzer.vulnerabilityScanner, gp)
+	if err != nil {
+		return false, ctx.Err()
+	}
+	return wanted, nil
 }
 
 func (s *SimulationStage) Apply(ctx context.Context, p processor.Processor) error {

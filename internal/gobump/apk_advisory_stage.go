@@ -120,11 +120,7 @@ func dependencyAnalysisComplete(gp *Processor) bool {
 // and those without an upstream ID to correlate are dropped.
 func (s *ApkAdvisoryStage) classify(ctx context.Context, gp *Processor) ([]ApkAdvisory, error) {
 	name, version, epoch := gp.GetPackageName(), gp.GetCurrentVersion(), gp.GetCurrentEpoch()
-	pkgs := make([]scan.Package, 0, len(apkEcosystems))
-	for _, ecosystem := range apkEcosystems {
-		pkgs = append(pkgs, scan.Package{Name: name, Ecosystem: ecosystem, Version: fmt.Sprintf("%s-r%d", version, epoch)})
-	}
-	records, err := s.advisories.Advisories(ctx, pkgs)
+	records, err := s.advisories.Advisories(ctx, apkPackages(gp))
 	if err != nil || len(records) == 0 {
 		return nil, err
 	}
@@ -183,6 +179,59 @@ func (s *ApkAdvisoryStage) classify(ctx context.Context, gp *Processor) ([]ApkAd
 	}
 	gp.ApkAlignment = &ApkAlignment{Version: fmt.Sprintf("%s-r%d", version, epoch), Ignored: notAddressable + uncorrelated, Uncorrelated: uncorrelated}
 	return advs, nil
+}
+
+// apkPackages are the package's own APK coordinates at its pristine
+// "<version>-r<epoch>", one per ecosystem Chainguard publishes under.
+func apkPackages(gp *Processor) []scan.Package {
+	version := fmt.Sprintf("%s-r%d", gp.GetCurrentVersion(), gp.GetCurrentEpoch())
+	pkgs := make([]scan.Package, 0, len(apkEcosystems))
+	for _, ecosystem := range apkEcosystems {
+		pkgs = append(pkgs, scan.Package{Name: gp.GetPackageName(), Ecosystem: ecosystem, Version: version})
+	}
+	return pkgs
+}
+
+// apkProofWanted reports whether the Go bump simulation is worth running
+// although no bump action is pending: an epoch-addressable apk advisory
+// shares an upstream ID with an advisory the pristine Go dependency scan
+// found. Only the simulation can prove such a dependency advisory fixed (by
+// the deps already in the spec, from an earlier run), and without that proof
+// the apk advisory reads as open and holds the epoch down (see
+// apkDependencyEvidence). The query is the one ApkAdvisoryStage makes anyway,
+// served from the scanner's per-run cache the second time. Once the epoch
+// reaches the advisory's fix, OSV stops returning it, so this turns itself off.
+func apkProofWanted(ctx context.Context, src apkAdvisorySource, gp *Processor) (bool, error) {
+	var goIDs []string
+	for _, lang := range gp.VulnerabilityAnalysis.ByLanguage {
+		if lang.Language != "go" {
+			continue
+		}
+		for _, modroot := range lang.ByModroot {
+			if modroot.ScanResult == nil {
+				continue
+			}
+			for _, vuln := range modroot.ScanResult.Vulnerabilities {
+				goIDs = append(goIDs, vuln.ID)
+				goIDs = append(goIDs, vuln.Aliases...)
+			}
+		}
+	}
+	if len(goIDs) == 0 {
+		return false, nil
+	}
+	records, err := src.Advisories(ctx, apkPackages(gp))
+	if err != nil {
+		return false, err
+	}
+	found := aliasExpand(goIDs, nil)
+	name, version, epoch := gp.GetPackageName(), gp.GetCurrentVersion(), gp.GetCurrentEpoch()
+	for _, rec := range records {
+		if _, ok := apkFixedEpoch(rec, name, version, epoch); ok && anyIn(rec.GetUpstream(), found) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // rebuildUnresolved says why no rebuild Go toolchain is known for the
@@ -255,10 +304,7 @@ func (s *ApkAdvisoryStage) components(ctx context.Context, upstream []string, fe
 // carry the rescan's aliases on simulate.Residual if that ever misclassifies.
 func apkDependencyEvidence(gp *Processor) apkEvidence {
 	aliasesOf := analysisAliases(gp)
-	hygiene := make(map[string]struct{})
-	if gp.ActualChangesApplied {
-		hygiene = fixVulnIDs(gp.HygieneBumps)
-	}
+	hygiene := shippedHygieneIDs(gp)
 	fixed := gp.fixedVulnIDs()
 	maps.Copy(fixed, hygiene)
 	var open []string
@@ -280,6 +326,27 @@ func apkDependencyEvidence(gp *Processor) apkEvidence {
 		scanned: analysisScanned(gp),
 		mains:   analysisMainModules(gp),
 	}
+}
+
+// shippedHygieneIDs are the advisories cleared by scanner-hygiene entries in
+// the deps this run leaves in the spec: the simulation's HygieneModules
+// (re-proposed on every run) that are already declared - written by an
+// earlier run, so no HygieneBump records them - or that this run wrote
+// (ActualChangesApplied).
+func shippedHygieneIDs(gp *Processor) map[string]struct{} {
+	ids := make(map[string]struct{})
+	for _, lang := range gp.VulnerabilityAnalysis.ByLanguage {
+		for _, modroot := range lang.ByModroot {
+			for _, h := range modroot.HygieneModules {
+				if gp.ActualChangesApplied || slices.Contains(modroot.ExistingDeps, h.Module+"@"+h.Version) {
+					for _, id := range h.VulnIDs {
+						ids[id] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+	return ids
 }
 
 // analysisScanned is the set of "ecosystem|name" packages the analysis scan
