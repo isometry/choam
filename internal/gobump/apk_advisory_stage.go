@@ -24,6 +24,12 @@ type apkAdvisorySource interface {
 	Advisory(ctx context.Context, id string) (*osvschema.Vulnerability, error)
 }
 
+// advisoryPrefetcher is implemented by the real scanner: it warms the record
+// cache concurrently. Test fakes need not implement it.
+type advisoryPrefetcher interface {
+	PrefetchAdvisories(ctx context.Context, ids []string)
+}
+
 // ApkAdvisoryStage aligns package.epoch with the Chainguard/Wolfi advisories
 // published for the package's own APK name: scanners match those by name and
 // "-r<epoch>", so an advisory whose upstream issue this build provably fixes
@@ -123,6 +129,18 @@ func (s *ApkAdvisoryStage) classify(ctx context.Context, gp *Processor) ([]ApkAd
 	records, err := s.advisories.Advisories(ctx, apkPackages(gp))
 	if err != nil || len(records) == 0 {
 		return nil, err
+	}
+
+	// The loop below fetches each addressable advisory's upstream records one
+	// by one: warm them concurrently first.
+	if p, ok := s.advisories.(advisoryPrefetcher); ok {
+		var ids []string
+		for _, rec := range records {
+			if _, ok := apkFixedEpoch(rec, name, version, epoch); ok {
+				ids = append(ids, upstreamRecordIDs(rec.GetUpstream())...)
+			}
+		}
+		p.PrefetchAdvisories(ctx, ids)
 	}
 
 	ev := apkDependencyEvidence(gp)
@@ -254,10 +272,7 @@ func (s *ApkAdvisoryStage) rebuildUnresolved(gp *Processor) string {
 func (s *ApkAdvisoryStage) components(ctx context.Context, upstream []string, fetched map[string]*osvschema.Vulnerability, ev apkEvidence) ([]apkComponent, error) {
 	var comps []apkComponent
 	for _, prefix := range []string{"GO-", "GHSA-"} {
-		for _, id := range upstream {
-			if !strings.HasPrefix(id, prefix) {
-				continue
-			}
+		for _, id := range upstreamIDs(upstream, prefix) {
 			rec, ok := fetched[id]
 			if !ok {
 				var err error
@@ -291,6 +306,21 @@ func (s *ApkAdvisoryStage) components(ctx context.Context, upstream []string, fe
 		}
 	}
 	return comps, nil
+}
+
+// upstreamIDs are the upstream IDs carrying prefix (GO- / GHSA-).
+func upstreamIDs(upstream []string, prefix string) []string {
+	return slices.DeleteFunc(slices.Clone(upstream), func(id string) bool { return !strings.HasPrefix(id, prefix) })
+}
+
+// upstreamRecordIDs are the upstream records components fetches first: the GO-
+// ones, else (when there are none) the GHSA- ones. A GO- record without
+// package data sends components on to the GHSA- ones; those stay serial.
+func upstreamRecordIDs(upstream []string) []string {
+	if ids := upstreamIDs(upstream, "GO-"); len(ids) > 0 {
+		return ids
+	}
+	return upstreamIDs(upstream, "GHSA-")
 }
 
 // apkDependencyEvidence gathers the dependency-side evidence. OPEN is what

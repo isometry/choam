@@ -259,6 +259,7 @@ make fmt && make lint && make test
 **Vulnerability Scanning:**
 - Security is highest priority
 - OSV database integration via `internal/scan/vulnerability.go`
+- Advisory records are fetched into the shared per-run `VulnerabilityCache` concurrently (`PrefetchAdvisories`, at most `osvFetchConcurrency` = 8 in flight, one request per ID via singleflight); it is only a warm-up - the ordered hydration pass still decides results and errors, so scans fail closed exactly as before
 - Minimal fix strategy to reduce update impact
 - Reported advisory IDs are CVE-first (`scan.PreferredID`; `Vulnerability.Aliases` retained); the epoch is aligned to proven Chainguard/Wolfi apk advisories (`--no-apk-advisories` to disable) and never raised past an advisory not proven fixed (a rerun with no bump actions still runs the simulation when such an advisory shares an upstream ID with a pristine Go dependency advisory - `apkProofWanted` - since only the simulation proves the spec's existing deps fix it; hygiene pins already in the spec count as fixing their advisories, not only ones this run writes - `shippedHygieneIDs`); an advisory whose upstream records affect only modules outside the analysed dependency graph is `not-applicable` (cannot ship, so it never blocks and the epoch may align with it)
 - Epoch management tied to actual fixes (security fixes, scanner-hygiene bumps or stdlib rebuilds) and to any other edit this run writes to the build inputs (`Processor.buildInputsChanged`: parsed original vs current YAML minus `package.epoch`; comment-only rewrites do not count)

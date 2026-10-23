@@ -545,3 +545,36 @@ func TestApkProofWanted(t *testing.T) {
 		})
 	}
 }
+
+// prefetchApkSource is a fakeApkSource that also records the IDs the stage
+// asks to have warmed, like the real scanner.
+type prefetchApkSource struct {
+	*fakeApkSource
+	prefetched []string
+}
+
+func (p *prefetchApkSource) PrefetchAdvisories(_ context.Context, ids []string) {
+	p.prefetched = append(p.prefetched, ids...)
+}
+
+// Only what components will fetch is warmed: the GO- upstream records (GHSA-
+// ones only when there is no GO- one) of the epoch-addressable advisories.
+func TestApkAdvisoryStage_PrefetchesUpstreamRecords(t *testing.T) {
+	src := &prefetchApkSource{fakeApkSource: &fakeApkSource{
+		byVersion: map[string][]*osvschema.Vulnerability{"3.6.0-r1": {
+			apkRecord("CGA-a", []string{"CVE-A", "GO-A"}, "3.6.0-r2"),
+			apkRecord("CGA-g7", []string{"CVE-G7", "GHSA-g7"}, "3.6.0-r3"),
+			apkRecord("CGA-b", []string{"CVE-B", "GO-B", "GHSA-b"}, "3.6.0-r4"),
+			apkRecord("CGA-old", []string{"GO-X"}, "3.6.0-r1"),         // no epoch can clear it
+			apkRecord("CGA-bare", nil, "3.6.0-r5"),                     // no upstream to correlate
+			apkRecord("CGA-ghsa-only", []string{"GHSA-x"}, "3.6.0-r6"), // GHSA- only
+		}},
+		records: apkTestRecords,
+	}}
+	stage := newApkTestStage(src.fakeApkSource, &fakeStdlibScanner{vulnsByVersion: map[string][]scan.Vulnerability{}})
+	stage.advisories = src
+
+	require.NoError(t, stage.Apply(t.Context(), newApkTestProcessor()))
+
+	assert.Equal(t, []string{"GO-A", "GHSA-g7", "GO-B", "GHSA-x"}, src.prefetched)
+}
