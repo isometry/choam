@@ -130,9 +130,27 @@ func TestApkDependencyEvidence(t *testing.T) {
 	gp.ActualChangesApplied = true
 	gp.VulnerabilityAnalysis = analysis()
 	gp.AddUnreachableVulnIDs([]string{"CVE-H", "CVE-U"})
+	gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0].HygieneModules = []simulate.HygieneModule{{Module: "m", Version: "v1.0.1", VulnIDs: []string{"CVE-H"}}}
 	gp.AddHygieneBump(SecurityFix{Module: "m", Vulnerability: "CVE-H"})
 	gp.AddResiduals([]simulate.Residual{{Module: "r", VulnIDs: []string{"CVE-R"}, Reason: "blocked"}})
 	assert.Equal(t, idSet("CVE-U", "CVE-R", "GO-R"), apkDependencyEvidence(gp).open)
+
+	// A hygiene pin an earlier run wrote: the simulation re-proposes it but
+	// this run writes nothing, so no HygieneBump records it - it still
+	// ships, so its advisory is fixed for scanners.
+	gp = NewProcessor("/t.yaml", "pkg", "3.6.0", 1)
+	gp.Validated = true
+	gp.VulnerabilityAnalysis = analysis()
+	modroot := &gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0]
+	modroot.ExistingDeps = []string{"m@v1.0.1"}
+	modroot.HygieneModules = []simulate.HygieneModule{{Module: "m", Version: "v1.0.1", VulnIDs: []string{"CVE-H"}}}
+	gp.AddUnreachableVulnIDs([]string{"CVE-H", "CVE-U"})
+	assert.Equal(t, idSet("CVE-U"), apkDependencyEvidence(gp).open)
+
+	// ... but a proposal that was not written (not already in the spec, no
+	// change applied) ships nothing: still open.
+	modroot.ExistingDeps = nil
+	assert.Contains(t, apkDependencyEvidence(gp).open, "CVE-H")
 
 	// --no-validate: a pristine advisory no SecurityFix of this run names
 	// (e.g. fixed by an earlier run) stays open - the safe direction.

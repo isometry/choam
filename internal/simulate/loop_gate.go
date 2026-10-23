@@ -8,42 +8,40 @@ import (
 	"slices"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/isometry/choam/internal/logging"
 	"github.com/isometry/choam/internal/scan"
 	"golang.org/x/mod/semver"
 )
 
-// Compile-gate bounds: repair rounds per pin set (each repairs every newly
+// Type-check gate bounds: repair rounds per pin set (each repairs every newly
 // failing module at most once more) and versions inspected per module walk.
 const (
 	maxRepairRounds  = 3
 	maxCoherenceWalk = 40
 )
 
-// ErrCompileGate marks a simulation the compile gate could not finish
+// ErrTypecheckGate marks a simulation the type-check gate could not finish
 // (baseline unavailable, tool failure, budget exhausted, or a build that
 // fails with every bump relaxed). Callers must fail closed: the candidate
-// set was never proven to compile, so it must not be written.
-var ErrCompileGate = errors.New("compile gate failed")
+// set was never proven to type-check, so it must not be written.
+var ErrTypecheckGate = errors.New("type-check gate failed")
 
-// gateErr wraps a compile-gate failure in ErrCompileGate, except that a
+// gateErr wraps a type-check gate failure in ErrTypecheckGate, except that a
 // cancellation propagates as itself (it is not a gate verdict).
 func gateErr(ctx context.Context, err error) error {
 	if cerr := ctx.Err(); errors.Is(cerr, context.Canceled) {
 		return cerr
 	}
-	return fmt.Errorf("%w: %w", ErrCompileGate, err)
+	return fmt.Errorf("%w: %w", ErrTypecheckGate, err)
 }
 
-// trialOutcome is the outcome of one compile trial: a non-empty reject means
+// trialOutcome is the outcome of one type-check trial: a non-empty reject means
 // the pins did not resolve/tidy; otherwise failures are the packages failing
 // now but not at baseline.
 type trialOutcome struct {
 	reject   string
-	report   *CompileReport
+	report   *CheckReport
 	resolved map[string]string
 	failures map[string][]string
 }
@@ -55,16 +53,15 @@ func (o *trialOutcome) why() string {
 	if o.reject != "" {
 		return "breaks module graph: " + o.reject
 	}
-	return "breaks compile: " + firstCompileError(o.failures)
+	return "breaks type-check: " + firstCheckError(o.failures)
 }
 
-// compileBaseline compiles the pristine checkout once per target arch,
-// after the initial tidy: packages that already fail there (missing C
-// libraries, generated code, host-only noise) are excluded from every later
-// verdict, so only failures a bump introduces count. The arches compile
-// concurrently; the primary arch's failures are baselineFailed, the others'
-// archBaselineFailed (for crossArchCompile).
-func (l *loop) compileBaseline(ctx context.Context) error {
+// typecheckBaseline type-checks the pristine checkout on every target arch,
+// after the initial tidy: packages that already fail there (a go list or
+// type error, e.g. from generated or build-time-only files) are excluded
+// from every later verdict on that arch, so only failures a bump
+// introduces count.
+func (l *loop) typecheckBaseline(ctx context.Context) error {
 	if err := l.engine.tidyBaseline(ctx); err != nil {
 		return gateErr(ctx, fmt.Errorf("baseline go mod tidy: %w", err))
 	}
@@ -72,91 +69,100 @@ func (l *loop) compileBaseline(ctx context.Context) error {
 	if err != nil {
 		return gateErr(ctx, err)
 	}
-	reports, err := l.compileArches(ctx, l.target.Arches)
+	reports, err := l.typecheckArches(ctx, l.target.Arches)
 	if err != nil {
 		return gateErr(ctx, fmt.Errorf("baseline: %w", err))
 	}
 	l.baselineResolved = resolved
-	l.archBaselineFailed = make(map[string]map[string]struct{}, len(reports)-1)
+	l.baselineFailed = make(map[string]map[string]struct{}, len(reports))
 	for i, report := range reports {
 		failed := make(map[string]struct{}, len(report.Failed))
 		for pkg := range report.Failed {
 			failed[pkg] = struct{}{}
 		}
 		arch := l.target.Arches[i]
-		if i == 0 {
-			l.baselineFailed = failed
-			if len(failed) > 0 {
-				l.baselineFirst = firstCompileError(report.Failed)
-			}
-		} else {
-			l.archBaselineFailed[arch] = failed
-		}
+		l.baselineFailed[arch] = failed
 		if len(report.Failed) > 0 {
-			logging.From(ctx).Debug("compile gate baseline: packages already failing are excluded",
-				"modroot", l.req.Modroot, "arch", arch, "count", len(report.Failed), "first", firstCompileError(report.Failed))
+			logging.From(ctx).Debug("type-check gate baseline: packages already failing are excluded",
+				"modroot", l.req.Modroot, "arch", arch, "count", len(report.Failed), "first", firstCheckError(report.Failed))
 		}
+	}
+	if merged := mergeArchReports(l.target.Arches, reports, nil); len(merged.Failed) > 0 {
+		l.gateUnchecked, l.baselineFirst = len(merged.Failed), firstCheckError(merged.Failed)
 	}
 	return nil
 }
 
-// compileArches compiles the checkout for each of arches concurrently,
-// returning the reports in arch order; the error is the first failing
-// arch's in arch order (every compile runs to completion).
-func (l *loop) compileArches(ctx context.Context, arches []string) ([]*CompileReport, error) {
-	reports := make([]*CompileReport, len(arches))
-	errs := make([]error, len(arches))
-	var wg sync.WaitGroup
-	for i, arch := range arches {
-		wg.Go(func() { reports[i], errs[i] = l.compiler.Compile(ctx, l.dir, l.target, arch) })
-	}
-	wg.Wait()
-	for i, err := range errs {
+// typecheckArches checks the checkout for each of arches one after another,
+// returning the reports in arch order, or the first failing arch's error
+// (later arches are not checked; a report with failed packages is a
+// verdict, not an error). Sequential on purpose: the type-check cache keys
+// are arch-independent, so each arch after the first mostly hits the
+// entries the previous one left (concurrent checks would duplicate that
+// work, and each already uses every CPU).
+func (l *loop) typecheckArches(ctx context.Context, arches []string) ([]*CheckReport, error) {
+	reports := make([]*CheckReport, 0, len(arches))
+	for _, arch := range arches {
+		report, err := l.checker.Typecheck(ctx, l.dir, l.target, arch)
 		if err != nil {
-			return nil, fmt.Errorf("GOARCH=%s: %w", arches[i], err)
+			return nil, fmt.Errorf("GOARCH=%s: %w", arch, err)
 		}
+		reports = append(reports, report)
 	}
 	return reports, nil
 }
 
-// crossArchCompile compiles the final set once on each target arch besides
-// the primary one (the gate's and the hygiene trials' arch, which bounds
-// their cost): a failure that arch's baseline did not have fails the
-// simulation closed (ErrCompileGate) - the set was never proven to build
-// there. The checkout is re-applied to the final set first (a trial may
-// have left another state). Nothing to do without the compile gate, with a
-// single arch, or with no entry to write.
-func (l *loop) crossArchCompile(ctx context.Context) error {
-	final := l.inApplyOrder(l.activeCandidates())
-	if l.compiler == nil || len(l.target.Arches) < 2 || len(final) == 0 {
-		return nil
-	}
-	start := time.Now()
-	if fail := l.engine.apply(ctx, final); fail != nil {
-		return gateErr(ctx, fmt.Errorf("re-applying the final set for the cross-arch compile: %w", fail.err))
-	}
-	arches := l.target.Arches[1:]
-	reports, err := l.compileArches(ctx, arches)
+// typecheckAll type-checks the checkout on every target arch (see
+// typecheckArches) and merges the reports into one verdict whose Failed
+// holds only failures that arch's baseline did not have (see
+// mergeArchReports).
+func (l *loop) typecheckAll(ctx context.Context) (*CheckReport, error) {
+	reports, err := l.typecheckArches(ctx, l.target.Arches)
 	if err != nil {
-		return gateErr(ctx, err)
+		return nil, err
 	}
-	for i, report := range reports {
-		failures := make(map[string][]string)
-		for pkg, lines := range report.Failed {
-			if _, known := l.archBaselineFailed[arches[i]][pkg]; !known {
-				failures[pkg] = lines
-			}
-		}
-		if len(failures) > 0 {
-			return gateErr(ctx, fmt.Errorf("the final bump set breaks the GOARCH=%s build: %s", arches[i], firstCompileError(failures)))
-		}
-	}
-	logging.From(ctx).Info("cross-arch compile passed", "modroot", l.req.Modroot, "arches", strings.Join(arches, ","),
-		"duration", time.Since(start).Round(time.Millisecond))
-	return nil
+	return mergeArchReports(l.target.Arches, reports, l.baselineFailed), nil
 }
 
-// gateRun is the compile gate's search state: each candidate's fix ladder
+// mergeArchReports merges per-arch reports (in arches order) into one:
+// Failed holds every package failing on some arch and absent from that
+// arch's baseline (nil: nothing excluded), with the lines and Imports of the
+// first arch failing it - the first line prefixed "GOARCH=<arches>: "
+// (every arch failing it) when arches[0] is not among them, so an
+// arch-specific break says so; Modules is the union.
+func mergeArchReports(arches []string, reports []*CheckReport, baseline map[string]map[string]struct{}) *CheckReport {
+	merged := &CheckReport{Failed: make(map[string][]string), Modules: make(map[string]string), Imports: make(map[string][]string)}
+	failedOn := make(map[string][]string)
+	for i, report := range reports {
+		for pkg, module := range report.Modules {
+			if _, ok := merged.Modules[pkg]; !ok {
+				merged.Modules[pkg] = module
+			}
+		}
+		for pkg, lines := range report.Failed {
+			if _, known := baseline[arches[i]][pkg]; known {
+				continue
+			}
+			failedOn[pkg] = append(failedOn[pkg], arches[i])
+			if _, ok := merged.Failed[pkg]; !ok {
+				merged.Failed[pkg] = lines
+				if imports, ok := report.Imports[pkg]; ok {
+					merged.Imports[pkg] = imports
+				}
+			}
+		}
+	}
+	for pkg, on := range failedOn {
+		if on[0] != arches[0] && len(merged.Failed[pkg]) > 0 {
+			lines := slices.Clone(merged.Failed[pkg])
+			lines[0] = "GOARCH=" + strings.Join(on, ",") + ": " + lines[0]
+			merged.Failed[pkg] = lines
+		}
+	}
+	return merged
+}
+
+// gateRun is the type-check gate's search state: each candidate's fix ladder
 // (see ladder) and the index of its active rung. Candidates themselves are
 // never mutated until the accepted set is adopted.
 type gateRun struct {
@@ -166,7 +172,7 @@ type gateRun struct {
 
 func (g *gateRun) rung(c *candState) Rung { return g.ladders[c][g.at[c]] }
 
-// compileGate proves the final candidate set compiles, as a repair fixpoint
+// typecheckGate proves the final candidate set type-checks, as a repair fixpoint
 // with relaxation: trial every candidate at its active rung; on failure,
 // add co-update repairs derived from that trial's failures and re-trial
 // (see repairFixpoint); if it still fails, step the implicated candidate
@@ -175,9 +181,9 @@ func (g *gateRun) rung(c *candState) Rung { return g.ladders[c][g.at[c]] }
 // strictly lowers the pin set, so this terminates. The accepted set (pins
 // plus the repairs of the passing trial) is adopted and rescanned; any
 // advisory left unfixed by a relaxation becomes a residual carrying the
-// rejected rung's failure. Errors are ErrCompileGate (or a cancellation):
+// rejected rung's failure. Errors are ErrTypecheckGate (or a cancellation):
 // the caller must not trust the candidate set.
-func (l *loop) compileGate(ctx context.Context, resolved map[string]string, result *ModrootResult) (map[string]string, bool, error) {
+func (l *loop) typecheckGate(ctx context.Context, resolved map[string]string, result *ModrootResult) (map[string]string, bool, error) {
 	active := l.inApplyOrder(l.activeCandidates())
 	if len(active) == 0 {
 		return resolved, false, nil
@@ -200,13 +206,13 @@ func (l *loop) compileGate(ctx context.Context, resolved map[string]string, resu
 		}
 		if out.passed() {
 			if len(rejected) == 0 && len(repairs) == 0 && len(l.revived) == 0 {
-				logging.From(ctx).Debug("compile gate passed", "modroot", l.req.Modroot, "candidates", len(live))
+				logging.From(ctx).Debug("type-check gate passed", "modroot", l.req.Modroot, "candidates", len(live))
 				return resolved, false, nil
 			}
 			return l.gateAdopt(ctx, g, live, repairs, rejected, result)
 		}
 		if purpose == "gate: converged set" {
-			logging.From(ctx).Info("compile gate: converged bump set breaks the build",
+			logging.From(ctx).Info("type-check gate: converged bump set breaks the build",
 				"modroot", l.req.Modroot, "first", firstLine(out.why()))
 		}
 
@@ -219,12 +225,12 @@ func (l *loop) compileGate(ctx context.Context, resolved map[string]string, resu
 		from := g.rung(victim).Version
 		if g.at[victim]+1 < len(g.ladders[victim]) {
 			g.at[victim]++
-			logging.From(ctx).Info("compile gate: relaxed bump one fix rung", "modroot", l.req.Modroot,
+			logging.From(ctx).Info("type-check gate: relaxed bump one fix rung", "modroot", l.req.Modroot,
 				"module", victim.Module, "from", from, "to", g.rung(victim).Version, "reason", reason)
 		} else {
 			victim.Version = from
 			l.drop(victim, reason)
-			logging.From(ctx).Warn("compile gate rejected bump", "modroot", l.req.Modroot,
+			logging.From(ctx).Warn("type-check gate rejected bump", "modroot", l.req.Modroot,
 				"module", victim.Module, "version", from, "reason", reason)
 		}
 		purpose, subject = "gate: relaxed", victim.Module
@@ -253,7 +259,7 @@ func (l *loop) ladder(c *candState) []Rung {
 }
 
 // repairFixpoint trials live at their active rungs and, while the trial
-// fails to compile, adds the co-update repairs that trial's failures call
+// fails to type-check, adds the co-update repairs that trial's failures call
 // for (see repairsFor) and re-trials, bounded by maxRepairRounds. Repairs
 // are inputs of this pin set only: they are derived from its own failing
 // trials and never carried over to another. Returns the last outcome that
@@ -314,7 +320,7 @@ func (l *loop) trialPins(g *gateRun, live []*candState, repairs map[string]strin
 }
 
 // trial applies exactly pins from the pristine snapshot (see applyExact),
-// lists the resolved graph and compiles it. It is stateless: the outcome is
+// lists the resolved graph and type-checks it. It is stateless: the outcome is
 // returned, nothing on the loop or the candidates changes. A resolve/tidy
 // failure is a verdict (outcome.reject); an error means the gate cannot
 // continue. purpose/subject only label the trial's debug record.
@@ -340,17 +346,12 @@ func (l *loop) trial(ctx context.Context, purpose, subject string, pins []*candS
 	if err != nil {
 		return nil, gateErr(ctx, err)
 	}
-	report, err := l.compiler.Compile(ctx, l.dir, l.target, l.target.Arches[0])
+	report, err := l.typecheckAll(ctx)
 	if err != nil {
 		return nil, gateErr(ctx, err)
 	}
-	out := &trialOutcome{report: report, resolved: resolved, failures: make(map[string][]string)}
-	for pkg, lines := range report.Failed {
-		if _, known := l.baselineFailed[pkg]; !known {
-			out.failures[pkg] = lines
-		}
-	}
-	l.logTrial(ctx, trialLog{purpose: purpose, subject: subject, pins: pins, resolved: resolved, compiled: out})
+	out := &trialOutcome{report: report, resolved: resolved, failures: report.Failed}
+	l.logTrial(ctx, trialLog{purpose: purpose, subject: subject, pins: pins, resolved: resolved, checked: out})
 	return out, nil
 }
 
@@ -536,7 +537,7 @@ func (l *loop) outgrownDeps(ctx context.Context, out *trialOutcome, pkg string) 
 	if owner == "" || ownerVersion == "" {
 		return owner, nil
 	}
-	requires, err := l.compiler.ModuleRequires(ctx, l.dir, owner, ownerVersion)
+	requires, err := l.checker.ModuleRequires(ctx, l.dir, owner, ownerVersion)
 	if err != nil {
 		_ = l.recordInfra(err) // recorded: fails the run (see RunLoop)
 		return owner, nil
@@ -562,7 +563,7 @@ func (l *loop) outgrownDeps(ctx context.Context, out *trialOutcome, pkg string) 
 // above its baseline version (best-effort: lookup failures attribute
 // nothing).
 func (l *loop) candidateRaises(ctx context.Context, module, version, dep string) bool {
-	requires, err := l.compiler.ModuleRequires(ctx, l.dir, module, version)
+	requires, err := l.checker.ModuleRequires(ctx, l.dir, module, version)
 	if err != nil {
 		_ = l.recordInfra(err) // recorded: fails the run (see RunLoop)
 		return false
@@ -578,7 +579,7 @@ func (l *loop) candidateRaises(ctx context.Context, module, version, dep string)
 // the raise. "" when there is nothing to repair or no such version exists;
 // an error only for cancellation.
 func (l *loop) minCoherentVersion(ctx context.Context, module, from string, raised map[string]string) (string, error) {
-	current, err := l.compiler.ModuleRequires(ctx, l.dir, module, from)
+	current, err := l.checker.ModuleRequires(ctx, l.dir, module, from)
 	if err != nil {
 		if ierr := l.recordInfra(err); ierr != nil {
 			return "", ierr
@@ -594,7 +595,7 @@ func (l *loop) minCoherentVersion(ctx context.Context, module, from string, rais
 	if len(relevant) == 0 {
 		return "", nil
 	}
-	versions, err := l.compiler.ModuleVersions(ctx, l.dir, module)
+	versions, err := l.checker.ModuleVersions(ctx, l.dir, module)
 	if err != nil {
 		if ierr := l.recordInfra(err); ierr != nil {
 			return "", ierr
@@ -616,7 +617,7 @@ func (l *loop) minCoherentVersion(ctx context.Context, module, from string, rais
 		if inspected > maxCoherenceWalk {
 			break
 		}
-		requires, err := l.compiler.ModuleRequires(ctx, l.dir, module, version)
+		requires, err := l.checker.ModuleRequires(ctx, l.dir, module, version)
 		if err != nil {
 			if cerr := ctx.Err(); cerr != nil {
 				return "", cerr
@@ -660,7 +661,7 @@ func (l *loop) gateAdopt(ctx context.Context, g *gateRun, live []*candState, rep
 	return l.gateFinish(ctx, l.inApplyOrder(l.activeCandidates()), rejected, result)
 }
 
-// gateFinish adopts the compile gate's accepted set: re-applies it,
+// gateFinish adopts the type-check gate's accepted set: re-applies it,
 // rescans, and refreshes the loop's accepted state. The rescan is the
 // authoritative reachability judgement - it is made on the graph that ships
 // - so a fix shed as unlinked under the (since rejected) full set whose
@@ -669,14 +670,14 @@ func (l *loop) gateAdopt(ctx context.Context, g *gateRun, live []*candState, rep
 // on which higher pins the input happened to carry. An advisory the rescan
 // still finds for a module whose higher rung was rejected is a residual
 // carrying that rejection; any other fix the rescan wants is surfaced as a
-// residual rather than raised (it was never compile-validated).
+// residual rather than raised (it was never validated by the type-check gate).
 func (l *loop) gateFinish(ctx context.Context, keep []*candState, rejected map[string]string, result *ModrootResult) (map[string]string, bool, error) {
 	tr, err := l.trialApply(ctx, "gate: adopt accepted set", keep)
 	if err != nil {
 		return nil, false, gateErr(ctx, fmt.Errorf("re-applying the accepted set: %w", err))
 	}
 	if !l.sustained(tr, keep) {
-		logging.From(ctx).Warn("compile gate: accepted set not fully sustained by the tidied go.mod",
+		logging.From(ctx).Warn("type-check gate: accepted set not fully sustained by the tidied go.mod",
 			"modroot", l.req.Modroot)
 	}
 	l.adoptTrial(ctx, tr, result)
@@ -688,9 +689,9 @@ func (l *loop) gateFinish(ctx context.Context, keep []*candState, rejected map[s
 		switch c := l.byModule[r.module]; {
 		case wasRejected:
 		case c != nil && c.isDropped() && c.shedUnlinked:
-			reason = "vulnerable code linked again after compile-gate adjustments (fix was shed as unlinked under the full bump set); fix not validated"
+			reason = "vulnerable code linked again after type-check gate adjustments (fix was shed as unlinked under the full bump set); fix not validated"
 		default:
-			reason = "advisory surfaced after compile-gate adjustments; fix not validated"
+			reason = "advisory surfaced after type-check gate adjustments; fix not validated"
 		}
 		l.persistentResiduals = append(l.persistentResiduals, Residual{
 			Module:          r.module,
@@ -722,7 +723,7 @@ func (l *loop) reviveRelinked(ctx context.Context, raises []raise) bool {
 		c.residualized, c.shedUnlinked, c.dropReason, c.hygieneSeed = false, false, "", ""
 		l.revived[r.module] = true
 		revivedAny = true
-		logging.From(ctx).Info("compile gate: vulnerable code linked again - fix revived for another gate round",
+		logging.From(ctx).Info("type-check gate: vulnerable code linked again - fix revived for another gate round",
 			"modroot", l.req.Modroot, "module", c.Module, "version", c.Version)
 	}
 	return revivedAny

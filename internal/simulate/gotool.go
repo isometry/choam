@@ -12,7 +12,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -31,19 +30,14 @@ import (
 // directory doesn't mask resolution, and GOWORK=off so a stray go.work can't
 // leak into the analysis.
 type GoToolchain struct {
-	goBin      string
-	goVersion  string // bare version ("1.26.4"), for gobump-parity `go mod tidy -go=`
-	goModCache string // GOMODCACHE, for mapping compile-error paths back to module@version
-	goCache    string // GOCACHE, for recognising a build-cache entry lost mid-compile
-	timeout    time.Duration
-
-	// compileTimeout bounds a Compile invocation, which type-checks the
-	// whole import graph and can take far longer than a resolution command
-	// on a cold build cache (the simulation budget still bounds it).
-	compileTimeout time.Duration
+	goBin     string
+	goVersion string // bare version ("1.26.4"), for gobump-parity `go mod tidy -go=`
+	timeout   time.Duration
 
 	modRequiresMu sync.Mutex
 	modRequires   map[string]map[string]string // "module@version" -> its go.mod requires
+
+	typecheckCache typecheckCache // see typecheck
 }
 
 // NewToolchain locates the go binary; the error return lets callers degrade
@@ -57,10 +51,9 @@ func NewToolchain(ctx context.Context, commandTimeout time.Duration) (*GoToolcha
 		commandTimeout = 2 * time.Minute
 	}
 	t := &GoToolchain{
-		goBin:          goBin,
-		timeout:        commandTimeout,
-		compileTimeout: max(commandTimeout, 10*time.Minute),
-		modRequires:    make(map[string]map[string]string),
+		goBin:       goBin,
+		timeout:     commandTimeout,
+		modRequires: make(map[string]map[string]string),
 	}
 
 	// melange's gobump tidies with `-go=<its local go version>`, switching
@@ -69,16 +62,8 @@ func NewToolchain(ctx context.Context, commandTimeout time.Duration) (*GoToolcha
 	// documented residual risk).
 	probeCtx, cancel := context.WithTimeout(ctx, commandTimeout)
 	defer cancel()
-	env, err := exec.CommandContext(probeCtx, goBin, "env", "GOVERSION", "GOMODCACHE", "GOCACHE").Output()
-	if err == nil {
-		lines := strings.Split(strings.TrimSpace(string(env)), "\n")
-		t.goVersion = strings.TrimPrefix(strings.TrimSpace(lines[0]), "go")
-		if len(lines) > 1 {
-			t.goModCache = strings.TrimSpace(lines[1])
-		}
-		if len(lines) > 2 {
-			t.goCache = strings.TrimSpace(lines[2])
-		}
+	if env, err := exec.CommandContext(probeCtx, goBin, "env", "GOVERSION").Output(); err == nil {
+		t.goVersion = strings.TrimPrefix(strings.TrimSpace(string(env)), "go")
 	}
 	return t, nil
 }
@@ -329,8 +314,8 @@ func (t *GoToolchain) DepGoVersions(ctx context.Context, dir string) (map[string
 //   - Replace directives resolve to the replacement path, matching
 //     ListModules' identity space (scan findings name the replacement).
 //   - The build environment and tags are targetBuildEnv's and the target's,
-//     shared with Compile, so the linked set and the compile gate judge the
-//     same files (CGO aside: see targetBuildEnv).
+//     shared with the type-check engine (Typecheck), so the linked set and the
+//     type-check gate judge the same files.
 func (t *GoToolchain) Linked(ctx context.Context, dir string, target BuildTarget) (Linkage, error) {
 	pkgs, embeds, err := t.listDeps(ctx, dir, target)
 	if err != nil {
@@ -401,7 +386,7 @@ func (t *GoToolchain) listDeps(ctx context.Context, dir string, target BuildTarg
 	var wg sync.WaitGroup
 	for i, arch := range arches {
 		wg.Go(func() {
-			output, err := t.runEnv(ctx, dir, targetBuildEnv(arch, target.Env, false), args...)
+			output, err := t.runEnv(ctx, dir, targetBuildEnv(arch, target.Env), args...)
 			if err == nil {
 				pkgs[i], embeds[i], err = parseDeps(output)
 			}
@@ -491,8 +476,9 @@ func unmatchedEmbed(errText string) (pattern string, ok bool) {
 var defaultArches = []string{"amd64", "arm64"}
 
 // TargetArches normalizes a target-arch list: deduplicated, amd64 then arm64
-// first and any others after in lexical order (so the compile gate's primary
-// arch never depends on input order); empty means defaultArches.
+// first and any others after in lexical order (so the type-check gate's arch
+// order, and so which arch's errors it reports, never depends on input
+// order); empty means defaultArches.
 func TargetArches(arches []string) []string {
 	if len(arches) == 0 {
 		return slices.Clone(defaultArches)
@@ -508,37 +494,21 @@ func TargetArches(arches []string) []string {
 	return slices.Compact(out)
 }
 
-// hostCanCgo reports whether the host can compile cgo for linux/arch
-// natively; no linux cross C toolchain is assumed (cross-cgo would fail
-// runtime/cgo and mask every package above it).
-func hostCanCgo(arch string) bool {
-	return runtime.GOOS == "linux" && runtime.GOARCH == arch
-}
-
-// CompileCgoLimited reports whether the compile gate must type-check arch
-// with CGO disabled although the build enables it (see targetBuildEnv).
-func CompileCgoLimited(arch string, env BuildEnv) bool {
-	return env.CGO != "0" && !hostCanCgo(arch)
-}
-
 // targetBuildEnv is the build environment every artifact-graph query
-// (Linked, LinkedStd and, with compile set, Compile) evaluates arch under -
-// the single source of GOOS/GOARCH/CGO_ENABLED/GOEXPERIMENT:
+// (Linked, LinkedStd and the type-check engine's Typecheck) evaluates arch
+// under - the single source of GOOS/GOARCH/CGO_ENABLED/GOEXPERIMENT:
 //   - GOOS=linux: melange builds linux packages.
 //   - CGO_ENABLED is the spec's (env.CGO) when it sets one, else 1: melange's
 //     go/build and go/install pull in build-base, so a native build has a C
-//     toolchain and the go command enables cgo. Reachability always uses
-//     that value - `go list -deps` only evaluates build constraints (cgo
-//     files, import "C") and never invokes the C compiler, so it needs no C
-//     toolchain even for a cross target. Compile does run cgo, so it falls
-//     back to CGO_ENABLED=0 when the host cannot build cgo for linux/arch
-//     (see hostCanCgo, CompileCgoLimited): the gate then judges the !cgo
-//     files - a documented limitation, reported by the caller.
+//     toolchain and the go command enables cgo. `go list -deps` only
+//     evaluates build constraints (cgo files, import "C") and never invokes
+//     the C compiler, and the type-check fakes package "C", so no C
+//     toolchain is needed even for a cross target.
 //   - GOEXPERIMENT is always set (empty clears the user's own), as the
 //     go/build and go/install pipelines do.
-func targetBuildEnv(arch string, env BuildEnv, compile bool) []string {
+func targetBuildEnv(arch string, env BuildEnv) []string {
 	cgo := "1"
-	if env.CGO == "0" || (compile && !hostCanCgo(arch)) {
+	if env.CGO == "0" {
 		cgo = "0"
 	}
 	return []string{"GOOS=linux", "GOARCH=" + arch, "CGO_ENABLED=" + cgo, "GOEXPERIMENT=" + env.GOExperiment}
@@ -556,159 +526,28 @@ func targetListArgs(args, patterns, tags []string) []string {
 	return append(args, patterns...)
 }
 
-// maxCompileErrorLines caps the error lines kept per failing package.
-const maxCompileErrorLines = 5
-
-// goListPackage is the subset of `go list -json` package output Compile and
-// listDeps need.
+// goListPackage is the subset of `go list -json` package output listDeps and
+// the type-check engine (Typecheck) need.
 type goListPackage struct {
 	ImportPath string
 	Standard   bool
 	Module     *goListModule
 	Imports    []string
 	Error      *goListError
-	// Decoded by listDeps only (Compile does not request them).
+	// Decoded by listDeps only (the type-check does not request them).
 	Incomplete    bool
 	DepsErrors    []*goListError
 	EmbedPatterns []string
+	// Decoded by the type-check engine only (see Typecheck).
+	Dir       string
+	GoFiles   []string
+	CgoFiles  []string
+	ImportMap map[string]string
 }
 
 // goListError is go list's PackageError (message only).
 type goListError struct {
 	Err string
-}
-
-// Compile type-checks and compiles (without linking) every non-test package
-// in the transitive import graph of the target's patterns, via
-// `go list -e -export -deps -json`: -export forces a real compile of each
-// package to export data, and -e records each package's own compile error
-// on its .Error instead of aborting the walk - structured, per-package, no
-// vet noise, no link step. A package whose dependency failed is not compiled
-// at all (only DepsErrors), so failures surface on the deepest broken
-// package - exactly the module that needs blaming. The build target is
-// targetBuildEnv's for arch (one arch per call). The build cache is the
-// user's GOCACHE, shared and incremental across compiles and runs. An error
-// return means the go tool itself failed (not that packages failed to
-// compile).
-func (t *GoToolchain) Compile(ctx context.Context, dir string, target BuildTarget, arch string) (*CompileReport, error) {
-	args := targetListArgs([]string{"list", "-e", "-export", "-deps", "-json=ImportPath,Standard,Module,Imports,Error"}, target.Patterns, target.Tags)
-	output, err := t.runEnvTimeout(ctx, dir, targetBuildEnv(arch, target.Env, true), t.compileTimeout, args...)
-	if err != nil {
-		return nil, err
-	}
-
-	report := &CompileReport{
-		Failed:      make(map[string][]string),
-		Modules:     make(map[string]string),
-		Imports:     make(map[string][]string),
-		FileModules: make(map[string]string),
-	}
-	decoder := json.NewDecoder(bytes.NewReader(output))
-	for {
-		var pkg goListPackage
-		if err := decoder.Decode(&pkg); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, fmt.Errorf("parsing go list -export -json output: %w", err)
-		}
-		if pkg.Standard {
-			continue
-		}
-		if pkg.Module != nil {
-			modulePath := pkg.Module.Path
-			if pkg.Module.Replace != nil && pkg.Module.Replace.Version != "" {
-				modulePath = pkg.Module.Replace.Path
-			}
-			if pkg.Module.Main {
-				modulePath = ""
-			}
-			report.Modules[pkg.ImportPath] = modulePath
-		}
-		if pkg.Error == nil {
-			continue
-		}
-		if t.lostCacheEntry(pkg.Error.Err) {
-			// Not a verdict on the graph: another process removed build-cache
-			// entries under this compile (e.g. a concurrent `go clean -cache`).
-			return nil, fmt.Errorf("%w: build cache entry vanished during compile of %s: %s",
-				ErrInfrastructure, pkg.ImportPath, compileErrorLines(pkg.Error.Err)[0])
-		}
-		lines := compileErrorLines(pkg.Error.Err)
-		report.Failed[pkg.ImportPath] = lines
-		report.Imports[pkg.ImportPath] = pkg.Imports
-		for _, line := range lines {
-			if file, coord, ok := t.modCacheFile(dir, line); ok {
-				report.FileModules[file] = coord
-			}
-		}
-	}
-	return report, nil
-}
-
-// lostCacheEntry reports whether a package error is the compiler failing to
-// open an export file in the build cache (GOCACHE) - an entry deleted while
-// the go command relied on it.
-func (t *GoToolchain) lostCacheEntry(errText string) bool {
-	return t.goCache != "" && strings.Contains(errText, "(open "+t.goCache+string(filepath.Separator)) &&
-		strings.Contains(errText, "no such file or directory")
-}
-
-// compileErrorLines extracts the first maxCompileErrorLines diagnostic lines
-// from a go list package error, dropping the "# pkg" header.
-func compileErrorLines(errText string) []string {
-	var lines []string
-	for line := range strings.SplitSeq(errText, "\n") {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "# ") {
-			continue
-		}
-		lines = append(lines, line)
-		if len(lines) == maxCompileErrorLines {
-			break
-		}
-	}
-	if len(lines) == 0 {
-		lines = []string{strings.TrimSpace(errText)}
-	}
-	return lines
-}
-
-// modCacheFile maps a "file:line:col: msg" diagnostic whose file lives in the
-// module cache (<GOMODCACHE>/<escaped module>@<version>/...) back to its
-// absolute path and module@version.
-func (t *GoToolchain) modCacheFile(dir, line string) (file, coord string, ok bool) {
-	if t.goModCache == "" {
-		return "", "", false
-	}
-	idx := strings.Index(line, ".go:")
-	if idx < 0 {
-		return "", "", false
-	}
-	file = line[:idx+len(".go")]
-	if !filepath.IsAbs(file) {
-		file = filepath.Join(dir, file)
-	}
-	file = filepath.Clean(file)
-	rel, err := filepath.Rel(filepath.Clean(t.goModCache), file)
-	if err != nil || strings.HasPrefix(rel, "..") {
-		return "", "", false
-	}
-	rel = filepath.ToSlash(rel)
-	at := strings.Index(rel, "@")
-	if at < 0 {
-		return "", "", false
-	}
-	version, _, _ := strings.Cut(rel[at+1:], "/")
-	modulePath, err := module.UnescapePath(rel[:at])
-	if err != nil {
-		return "", "", false
-	}
-	version, err = module.UnescapeVersion(version)
-	if err != nil {
-		return "", "", false
-	}
-	return file, modulePath + "@" + version, true
 }
 
 // ModuleVersions lists the released versions of module (`go list -m

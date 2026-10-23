@@ -19,25 +19,25 @@ const (
 	repairLogMsg = "simulate: repair decision"
 
 	maxTrialLogDiff   = 25 // changed modules listed per trial record
-	maxTrialLogErrors = 3  // compile error lines listed per trial record
+	maxTrialLogErrors = 3  // type-check error lines listed per trial record
 )
 
 // trialLog describes one trial for logTrial: the pins it applied (in apply
 // order), and whichever outcome applies - a resolve/tidy rejection, a
-// compile report (gate trials), or a rescan (refinement trials).
+// type-check report (gate trials), or a rescan (refinement trials).
 type trialLog struct {
 	purpose   string
 	subject   string // module the trial is about, when it has one (the relaxed bump)
 	pins      []*candState
 	reject    string
 	resolved  map[string]string
-	compiled  *trialOutcome
+	checked   *trialOutcome
 	raises    []raise
 	residuals int
 }
 
 // pinRole names the provenance a pin carries in the loop, for tracing:
-// remedy (ambiguous-import repair), coherence (compile-gate co-update
+// remedy (ambiguous-import repair), coherence (type-check gate co-update
 // repair), cve (advisory-backed), hygiene (scanner hygiene, see hygienePass),
 // seed (caller-provided, no advisory), raise.
 func pinRole(c *candState) string {
@@ -92,14 +92,14 @@ func (l *loop) logTrial(ctx context.Context, tl trialLog) {
 	if tl.resolved != nil {
 		attrs = append(attrs, "resolved_diff", l.resolvedDiff(tl.resolved))
 	}
-	if st := tl.compiled; st != nil {
-		outcome := "compiles"
+	if st := tl.checked; st != nil {
+		outcome := "type-checks"
 		if len(st.failures) > 0 {
-			outcome = "breaks compile"
+			outcome = "breaks type-check"
 		}
 		attrs = append(attrs, "outcome", outcome, "failing", len(st.failures))
 		if len(st.failures) > 0 {
-			attrs = append(attrs, "failing_owners", failingOwners(st), "errors", firstCompileErrors(st.failures, maxTrialLogErrors))
+			attrs = append(attrs, "failing_owners", failingOwners(st), "errors", firstCheckErrors(st.failures, maxTrialLogErrors))
 		}
 	} else {
 		raises := make([]string, 0, len(tl.raises))
@@ -113,7 +113,7 @@ func (l *loop) logTrial(ctx context.Context, tl trialLog) {
 
 // resolvedDiff lists the modules whose resolved version differs from the
 // pristine baseline graph ("module old->new"; "-" for absent), capped at
-// maxTrialLogDiff with a trailing "+N more". The baseline is the compile
+// maxTrialLogDiff with a trailing "+N more". The baseline is the type-check
 // gate's pristine tidied graph when known, else the caller's go.mod view.
 func (l *loop) resolvedDiff(resolved map[string]string) []string {
 	baseline := l.baselineResolved
@@ -158,20 +158,20 @@ func failingOwners(st *trialOutcome) []string {
 	return sortedKeys(owners)
 }
 
-// firstCompileErrors renders up to n compile failures, one line each, in
-// package order (see firstCompileError for the line shape).
-func firstCompileErrors(failures map[string][]string, n int) []string {
+// firstCheckErrors renders up to n type-check failures, one line each, in
+// package order (see firstCheckError for the line shape).
+func firstCheckErrors(failures map[string][]string, n int) []string {
 	var lines []string
 	for _, pkg := range sortedKeys(failures) {
 		if len(lines) == n {
 			break
 		}
-		lines = append(lines, firstCompileError(map[string][]string{pkg: failures[pkg]}))
+		lines = append(lines, firstCheckError(map[string][]string{pkg: failures[pkg]}))
 	}
 	return lines
 }
 
-// repairLog describes one compile-gate repair decision for logRepair: the
+// repairLog describes one type-check gate repair decision for logRepair: the
 // failing module, its version, the raised dependencies that outgrew it,
 // and either the chosen raise (to/source) or the skip reason.
 type repairLog struct {
@@ -200,19 +200,23 @@ func (l *loop) logRepair(ctx context.Context, rl repairLog) {
 	logger.Debug(repairLogMsg, attrs...)
 }
 
-// firstCompileError renders the first (by package path) compile failure as
-// "pkg: file.go:line:col: message", trimming the file's directory.
-func firstCompileError(failures map[string][]string) string {
+// firstCheckError renders the first (by package path) type-check failure as
+// "pkg: file.go:line:col: message", trimming the file's directory (and
+// leading a merged arch-specific failure's "GOARCH=...: " prefix).
+func firstCheckError(failures map[string][]string) string {
 	pkgs := sortedKeys(failures)
 	if len(pkgs) == 0 || len(failures[pkgs[0]]) == 0 {
-		return "unknown compile error"
+		return "unknown type-check error"
 	}
-	line := failures[pkgs[0]][0]
+	line, arch := failures[pkgs[0]][0], ""
+	if p, rest, ok := strings.Cut(line, ": "); ok && strings.HasPrefix(p, "GOARCH=") {
+		arch, line = p+": ", rest // see mergeArchReports
+	}
 	if idx := strings.Index(line, ".go:"); idx >= 0 {
 		file := line[:idx+len(".go")]
 		line = filepath.Base(file) + line[idx+len(".go"):]
 	}
-	return pkgs[0] + ": " + line
+	return arch + pkgs[0] + ": " + line
 }
 
 func firstLine(text string) string {

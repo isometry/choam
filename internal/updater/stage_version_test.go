@@ -79,7 +79,7 @@ func TestGetLatestValidGitHubVersion_TagFilters(t *testing.T) {
 			monitor: melange.GitHubMonitor{
 				Identifier:  "fluxcd/flux2",
 				StripPrefix: "v",
-				TagFilter:   "v2.8.",
+				TagFilter:   "v2.8.", //nolint:staticcheck // exercises the deprecated tag-filter compat path
 			},
 			wantVersion: "2.8.9",
 			wantSource:  "github-releases",
@@ -99,7 +99,7 @@ func TestGetLatestValidGitHubVersion_TagFilters(t *testing.T) {
 			monitor: melange.GitHubMonitor{
 				Identifier:      "fluxcd/flux2",
 				StripPrefix:     "v",
-				TagFilter:       "v2.8.",
+				TagFilter:       "v2.8.", //nolint:staticcheck // exercises the deprecated tag-filter compat path
 				TagFilterPrefix: "v2.9.",
 			},
 			wantVersion: "2.9.0",
@@ -129,7 +129,7 @@ func TestGetLatestValidGitHubVersion_TagFilters(t *testing.T) {
 			monitor: melange.GitHubMonitor{
 				Identifier:  "fluxcd/flux2",
 				StripPrefix: "v",
-				TagFilter:   "v2.8.",
+				TagFilter:   "v2.8.", //nolint:staticcheck // exercises the deprecated tag-filter compat path
 				UseTags:     true,
 			},
 			wantVersion: "2.8.9",

@@ -58,16 +58,17 @@ type Toolchain interface {
 	LinkedStd(ctx context.Context, dir string, target BuildTarget) (map[string]struct{}, error)
 }
 
-// Compiler is the optional compile-gate seam: a Toolchain that also
-// implements it enables the post-convergence compile gate (see
-// loop.compileGate), unless Options.NoCompile is set. *GoToolchain
+// Checker is the optional type-check gate seam: a Toolchain that also
+// implements it enables the post-convergence type-check gate (see
+// loop.typecheckGate), unless Options.NoTypecheck is set. *GoToolchain
 // implements it.
-type Compiler interface {
-	// Compile compiles (without linking) the transitive non-test import
-	// graph of the target for GOOS=linux and GOARCH=arch, reporting
-	// per-package failures. An error return means the go tool itself could
-	// not run, not that packages failed to compile.
-	Compile(ctx context.Context, dir string, target BuildTarget, arch string) (*CompileReport, error)
+type Checker interface {
+	// Typecheck type-checks the transitive non-test import graph of the
+	// target for GOOS=linux and GOARCH=arch, reporting per-package
+	// failures. An error return means the graph could not be judged (the go
+	// tool failed, or the type-checker is older than the toolchain), not
+	// that packages failed to type-check.
+	Typecheck(ctx context.Context, dir string, target BuildTarget, arch string) (*CheckReport, error)
 	// ModuleVersions lists module's released versions, ascending.
 	ModuleVersions(ctx context.Context, dir, module string) ([]string, error)
 	// ModuleRequires returns the require entries of module@version's own
@@ -113,10 +114,10 @@ type UnmatchedEmbed struct {
 	Pattern string
 }
 
-// CompileReport is the outcome of one Compiler.Compile.
-type CompileReport struct {
-	// Failed maps each package that failed to compile to its first error
-	// lines ("# pkg" header stripped).
+// CheckReport is the outcome of one Checker.Typecheck.
+type CheckReport struct {
+	// Failed maps each package that failed to type-check to its first error
+	// lines.
 	Failed map[string][]string
 	// Modules maps every non-standard package in the graph to its module
 	// path (replacement applied); "" for main-module packages.
@@ -124,9 +125,6 @@ type CompileReport struct {
 	// Imports holds the direct imports of each failed package, for repair
 	// and relaxation attribution.
 	Imports map[string][]string
-	// FileModules maps module-cache file paths named in error lines
-	// (<GOMODCACHE>/<mod>@<ver>/...) back to "module@version".
-	FileModules map[string]string
 }
 
 // ReplaceTarget is the right-hand side of a go.mod replace directive.
@@ -157,7 +155,7 @@ type Candidate struct {
 
 	// Rungs is the candidate's fix ladder, highest first: one rung per
 	// distinct advisory fix version (plus an existing YAML version), each
-	// with the advisories it first fixes. The compile gate relaxes a
+	// with the advisories it first fixes. The type-check gate relaxes a
 	// candidate whose version breaks the build one rung down. Empty means
 	// the single rung {Version, VulnIDs, Severity}.
 	Rungs []Rung
@@ -258,7 +256,7 @@ type DroppedCandidate struct {
 // HygieneModule is a scanner-hygiene bump: a module linked into the
 // artifact whose advisories' vulnerable packages are not, raised anyway
 // because the bump is free - it changes nothing in the final go.mod but
-// this module's own version, needs no newer Go, compiles and introduces no
+// this module's own version, needs no newer Go, type-checks and introduces no
 // advisory. Module-level scanners (grype) flag the module version; this is
 // not a security fix and is never counted as one.
 type HygieneModule struct {
@@ -324,9 +322,10 @@ type ModrootResult struct {
 	// Linkage.Embeds).
 	UnmatchedEmbeds []UnmatchedEmbed `json:"-" yaml:"-"`
 
-	// GateUnchecked counts the packages the compile gate excluded because
-	// they already fail to compile in the pristine checkout (primary arch) -
-	// its blind spot; GateUncheckedFirst is the first one's "pkg: error".
+	// GateUnchecked counts the packages the type-check gate excluded because
+	// they already fail to type-check in the pristine checkout (on any target
+	// arch, counted once) - its blind spot; GateUncheckedFirst is the first
+	// one's "pkg: error" (in arch order, see mergeArchReports).
 	GateUnchecked      int    `json:"-" yaml:"-"`
 	GateUncheckedFirst string `json:"-" yaml:"-"`
 
@@ -369,7 +368,7 @@ type ModrootResult struct {
 	HygieneModules []HygieneModule `json:"hygiene_modules,omitempty" yaml:"hygiene_modules,omitempty"`
 
 	// HygieneSkipped says why scanner-hygiene bumps were not evaluated
-	// although candidates existed (compile gate off, package reachability
+	// although candidates existed (type-check gate off, package reachability
 	// unknown, or no convergence); empty otherwise.
 	HygieneSkipped string `json:"hygiene_skipped,omitempty" yaml:"hygiene_skipped,omitempty"`
 
@@ -403,12 +402,12 @@ type ModrootRequest struct {
 	// (over-approximate, never narrower than the artifact).
 	Packages []string
 	// Tags are the go/build steps' build tags (toolchaintags plus tags),
-	// applied by reachability and the compile gate so they judge the files
+	// applied by reachability and the type-check gate so they judge the files
 	// the build will compile.
 	Tags []string
 	// Arches are the GOARCHes the package is built for (see BuildTarget):
-	// reachability is their union; the compile gate runs on the first and
-	// the final set is compiled once more on each of the others.
+	// reachability is their union, and every type-check gate trial checks all
+	// of them (later arches mostly hit the type-check cache).
 	Arches []string
 	// Env is the build environment the spec sets (see BuildEnv).
 	Env BuildEnv
@@ -448,8 +447,8 @@ type Options struct {
 	CommandTimeout time.Duration
 	// Budget bounds the whole per-package simulation (default 10m).
 	Budget time.Duration
-	// NoCompile disables the compile gate (see Compiler).
-	NoCompile bool
+	// NoTypecheck disables the type-check gate (see Checker).
+	NoTypecheck bool
 }
 
 // WithDefaults fills unset options.

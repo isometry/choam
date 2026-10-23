@@ -40,7 +40,7 @@ Path can be a single file or a directory containing .yaml files.`,
 	cmd.Flags().StringVar(&backupSuffix, "backup-suffix", "", "Suffix for backup files (empty = no backup)")
 	cmd.Flags().BoolVar(&noValidate, "no-validate", false, "Skip bump simulation (writes deps lists without proving they resolve or cover all advisories, and skips artifact-reachability filtering; go.sum narrowing still applies); requires a go toolchain otherwise")
 	cmd.Flags().DurationVar(&simulationTimeout, "simulation-timeout", 10*time.Minute, "Per-package budget for bump simulation")
-	cmd.Flags().BoolVar(&noCompile, "no-compile", false, "Skip the simulation's compile gate (validated deps are then only proven to resolve, not to compile the go/build packages); implied by --no-validate")
+	cmd.Flags().BoolVar(&noTypecheck, "no-typecheck", false, "Skip the simulation's type-check gate (bumps are still simulated and proven to resolve and cover advisories, but the go/build packages are not type-checked against them); implied by --no-validate")
 	cmd.Flags().BoolVar(&failOnResidual, "fail-on-residual", false, "Exit non-zero when any advisory remains residual or a first-party apk advisory needs a patch (files that error always exit non-zero)")
 	cmd.Flags().BoolVar(&noStdlib, "no-stdlib", false, "Skip the Go stdlib staleness check (no epoch bump for toolchain-fixed vulnerabilities). The check is also skipped automatically for files with uncommitted changes.")
 	cmd.Flags().BoolVar(&noApkAdvisories, "no-apk-advisories", false, "Skip the Chainguard/Wolfi apk advisory check (no epoch alignment with published apk advisories, no first-party patch alerts)")
@@ -143,7 +143,7 @@ func buildBumpProcessorOptions() gobump.Options {
 		},
 		Validate:          !noValidate,
 		SimulationTimeout: simulationTimeout,
-		Compile:           !noValidate && !noCompile,
+		Typecheck:         !noValidate && !noTypecheck,
 		StdlibCheck:       !noStdlib,
 		ApkAdvisoryCheck:  !noApkAdvisories,
 	}

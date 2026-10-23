@@ -81,38 +81,32 @@ func TestGoToolchain_RejectsFlagLikeArguments(t *testing.T) {
 }
 
 // TestTargetBuildEnv pins the single source of the build environment Linked,
-// LinkedStd and Compile run under: GOOS=linux, the arch, GOEXPERIMENT always
-// set, and CGO_ENABLED from the spec - 1 when unset or not understood - with
-// Compile alone falling back to 0 where the host cannot build linux cgo.
+// LinkedStd and Typecheck run under: GOOS=linux, the arch, GOEXPERIMENT always
+// set, and CGO_ENABLED from the spec - 1 when unset or not understood.
 func TestTargetBuildEnv(t *testing.T) {
-	native := runtime.GOOS == "linux"
 	for _, tt := range []struct {
-		arch    string
-		env     BuildEnv
-		compile bool
-		cgo     string
+		arch string
+		env  BuildEnv
+		cgo  string
 	}{
-		{"amd64", BuildEnv{}, false, "1"},
-		{"arm64", BuildEnv{}, false, "1"},
-		{"arm64", BuildEnv{CGO: "1"}, false, "1"},
-		{"amd64", BuildEnv{CGO: "0"}, false, "0"},
-		{"amd64", BuildEnv{CGO: "0"}, true, "0"},
-		{"riscv64", BuildEnv{}, true, map[bool]string{true: "1", false: "0"}[native && runtime.GOARCH == "riscv64"]},
-		{runtime.GOARCH, BuildEnv{CGO: "1"}, true, map[bool]string{true: "1", false: "0"}[native]},
+		{"amd64", BuildEnv{}, "1"},
+		{"arm64", BuildEnv{}, "1"},
+		{"arm64", BuildEnv{CGO: "1"}, "1"},
+		{"amd64", BuildEnv{CGO: "0"}, "0"},
+		{"riscv64", BuildEnv{CGO: "bogus"}, "1"},
 	} {
-		env := targetBuildEnv(tt.arch, tt.env, tt.compile)
+		env := targetBuildEnv(tt.arch, tt.env)
 		assert.Equal(t, []string{"GOOS=linux", "GOARCH=" + tt.arch, "CGO_ENABLED=" + tt.cgo, "GOEXPERIMENT=" + tt.env.GOExperiment}, env, "%+v", tt)
-		assert.Equal(t, tt.compile && tt.cgo == "0" && tt.env.CGO != "0", CompileCgoLimited(tt.arch, tt.env) && tt.compile, "%+v", tt)
 	}
 	assert.Equal(t, []string{"GOOS=linux", "GOARCH=arm64", "CGO_ENABLED=1", "GOEXPERIMENT=boringcrypto"},
-		targetBuildEnv("arm64", BuildEnv{GOExperiment: "boringcrypto"}, false))
+		targetBuildEnv("arm64", BuildEnv{GOExperiment: "boringcrypto"}))
 
 	assert.Equal(t, []string{"list", "-deps", "-tags", "a,b", "./cmd/x"}, targetListArgs([]string{"list", "-deps"}, []string{"./cmd/x"}, []string{"a", "b"}))
 	assert.Equal(t, []string{"list", "./..."}, targetListArgs([]string{"list"}, nil, nil))
 }
 
-// TestTargetArches: normalization is order-independent (the compile gate's
-// primary arch never depends on input order), deduplicated, and empty means
+// TestTargetArches: normalization is order-independent (the type-check gate's
+// arch order never depends on input order), deduplicated, and empty means
 // both Wolfi arches.
 func TestTargetArches(t *testing.T) {
 	assert.Equal(t, []string{"amd64", "arm64"}, TargetArches(nil))
@@ -131,18 +125,6 @@ func TestTargetArches(t *testing.T) {
 	in := []string{"arm64", "amd64"}
 	TargetArches(in)
 	assert.Equal(t, []string{"arm64", "amd64"}, in, "the input is not modified")
-}
-
-// TestLostCacheEntry: a compile error that is the build cache losing an
-// export file under the compile is recognised (Compile then reports an
-// infrastructure failure, not a verdict); ordinary errors are not.
-func TestLostCacheEntry(t *testing.T) {
-	tc := &GoToolchain{goCache: filepath.Join("/cache", "go-build")}
-	lost := "# example.com/p\np.go:12:2: could not import time (open " + filepath.Join("/cache", "go-build", "50", "50a2-d") + ": no such file or directory)"
-	assert.True(t, tc.lostCacheEntry(lost))
-	assert.False(t, tc.lostCacheEntry("p.go:3:2: undefined: api.KeyValue"))
-	assert.False(t, tc.lostCacheEntry("p.go:3:2: open /elsewhere/x: no such file or directory"))
-	assert.False(t, (&GoToolchain{}).lostCacheEntry(lost), "unknown GOCACHE: never assumed")
 }
 
 // depsJSON renders go list -json package objects as one stream.

@@ -35,7 +35,7 @@ type candState struct {
 	// current at the time, which a later adjustment can replace.
 	shedUnlinked bool
 
-	// repair marks a coherence-only pin the compile gate added to keep a
+	// repair marks a coherence-only pin the type-check gate added to keep a
 	// module compatible with a raised dependency (see repairsFor).
 	repair bool
 
@@ -95,7 +95,7 @@ type loop struct {
 
 	// Artifact reachability: target is what the build compiles (go/build
 	// package patterns, default ./..., tags, arches - normalized, the first
-	// is the compile gate's - and environment) whose non-test import graph
+	// is the type-check gate's - and environment) whose non-test import graph
 	// decides what actually ships; linked/linkedPackages are the module and
 	// package sets from the last Toolchain.Linked query, nil when unknown
 	// (query failed) - reachability then fails OPEN and no filtering happens.
@@ -117,18 +117,19 @@ type loop struct {
 	linkedStdWarned bool
 	degradedNoted   bool
 
-	// Compile gate (see compileGate): compiler is nil when the gate is off
-	// (toolchain without Compiler support, or Options.NoCompile).
-	// baselineFailed are the packages already failing to compile in the
-	// pristine checkout on the primary arch (excluded from every verdict),
-	// archBaselineFailed the same for each other target arch (see
-	// crossArchCompile); baselineResolved is the pristine tidied module graph.
-	compiler           Compiler
-	baselineFailed     map[string]struct{}
-	archBaselineFailed map[string]map[string]struct{}
-	baselineResolved   map[string]string
-	// baselineFirst is the first baselineFailed package's first error line
-	// ("pkg: line"; see ModrootResult.GateUncheckedFirst).
+	// Type-check gate (see typecheckGate): checker is nil when the gate is off
+	// (toolchain without Checker support, or Options.NoTypecheck).
+	// baselineFailed maps each target arch to the packages already failing
+	// to type-check there in the pristine checkout (excluded from every
+	// verdict on that arch); baselineResolved is the pristine tidied module
+	// graph.
+	checker          Checker
+	baselineFailed   map[string]map[string]struct{}
+	baselineResolved map[string]string
+	// gateUnchecked counts the distinct baselineFailed packages across
+	// arches; baselineFirst is the first one's first error line ("pkg:
+	// line"; see ModrootResult.GateUnchecked).
+	gateUnchecked int
 	baselineFirst string
 	// gateRejected maps a module to why the gate rejected its higher rung,
 	// across gate rounds; revived marks candidates shed as unlinked that a
@@ -171,8 +172,8 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	l.refreshLinked(ctx)
 	l.dropUnreachable()
 
-	if l.compiler != nil {
-		if err := l.compileBaseline(ctx); err != nil {
+	if l.checker != nil {
+		if err := l.typecheckBaseline(ctx); err != nil {
 			return nil, err
 		}
 	}
@@ -187,7 +188,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	// Dependency-graph capabilities (max go directive, linked stdlib set) are
 	// computed HERE: right after the fixpoint loop exits (converged or
 	// iteration-cap exhausted) and BEFORE the refinement phases
-	// (confirmMinimalSet, the compile gate, minimise) run. At this exact point the
+	// (confirmMinimalSet, the type-check gate, minimise) run. At this exact point the
 	// checkout on disk is guaranteed to be the state that produced
 	// `resolved` - the loop body's last apply() is always immediately
 	// followed by ListModules/Requirements/Replaces/refreshLinked with no
@@ -223,10 +224,6 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 		return nil, err
 	}
 
-	if err := l.crossArchCompile(ctx); err != nil {
-		return nil, err
-	}
-
 	if l.infraErr != nil {
 		// A best-effort lookup hit an infrastructure failure: some verdict
 		// above may rest on it, so nothing here is trusted.
@@ -238,7 +235,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 }
 
 // newLoop builds the loop for the module at dir: the build target, the
-// compile gate (when the toolchain supports it), the pristine go.mod/go.sum
+// type-check gate (when the toolchain supports it), the pristine go.mod/go.sum
 // snapshot, the step's engine and the upstream replace directives. It also
 // reports whether the pristine module already tidies (see
 // ModrootResult.BaselineTidies; probed only for `tidy: false`).
@@ -263,8 +260,8 @@ func newLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	if len(l.target.Patterns) == 0 {
 		l.target.Patterns = []string{"./..."}
 	}
-	if compiler, ok := tc.(Compiler); ok && !opts.NoCompile {
-		l.compiler = compiler
+	if checker, ok := tc.(Checker); ok && !opts.NoTypecheck {
+		l.checker = checker
 	}
 	if err := l.savePristine(ctx); err != nil {
 		return nil, false, err
@@ -367,7 +364,7 @@ func (l *loop) resync(ctx context.Context) (map[string]string, error) {
 
 // refine runs the post-fixpoint phases on the converged set, in order:
 // shed pins no advisory needs (confirmMinimalSet; on non-convergence the
-// last raises become residuals instead), the compile gate, the redundancy
+// last raises become residuals instead), the type-check gate, the redundancy
 // check (minimise) and scanner-hygiene bumps. Returns the final resolved
 // graph.
 func (l *loop) refine(ctx context.Context, resolved map[string]string, result *ModrootResult) (map[string]string, error) {
@@ -392,13 +389,13 @@ func (l *loop) refine(ctx context.Context, resolved map[string]string, result *M
 		}
 	}
 
-	// The compile gate runs last, against the final candidate set: the
+	// The type-check gate runs last, against the final candidate set: the
 	// fixpoint only proves the graph resolves and tidies - MVS has no upper
 	// bounds, so a raised dependency can still remove API a lagging sibling
-	// compiles against (see compileGate).
-	if l.compiler != nil {
+	// type-checks against (see typecheckGate).
+	if l.checker != nil {
 		for {
-			gated, again, err := l.compileGate(ctx, resolved, result)
+			gated, again, err := l.typecheckGate(ctx, resolved, result)
 			if err != nil {
 				return nil, err
 			}
@@ -432,7 +429,7 @@ func (l *loop) buildResult(ctx context.Context, resolved map[string]string, resu
 		result.LinkageError = l.linkedErr.Error()
 	}
 	result.UnmatchedEmbeds = l.embeds
-	result.GateUnchecked, result.GateUncheckedFirst = len(l.baselineFailed), l.baselineFirst
+	result.GateUnchecked, result.GateUncheckedFirst = l.gateUnchecked, l.baselineFirst
 	result.Requires = l.requirements
 	result.UnrequiredModules = l.unrequiredModules(resolved)
 	result.FinalDeps, result.FinalReplaces, result.CVEBackedModules = l.finalOutputs(resolved)

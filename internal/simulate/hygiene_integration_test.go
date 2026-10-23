@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -236,7 +238,7 @@ func hygieneDrop(result *ModrootResult, module string) (DroppedCandidate, bool) 
 // TestReplay_HygieneFree: kubeconform's shape - the x/text advisories'
 // packages are not linked, the module is, and the fix changes nothing else:
 // the bump is proposed as scanner hygiene (written, but not CVE-backed),
-// and its applied deps compile.
+// and its applied deps type-check.
 func TestReplay_HygieneFree(t *testing.T) {
 	for _, noTidy := range []bool{false, true} {
 		t.Run(fmt.Sprintf("notidy=%v", noTidy), func(t *testing.T) {
@@ -258,11 +260,35 @@ func TestReplay_HygieneFree(t *testing.T) {
 				assert.Empty(t, result.Residuals)
 				assert.Equal(t, 1, countTrials(trace, "hygiene: "), "one trial for one target")
 				if !noTidy {
-					assert.Empty(t, f.compileFailuresWith(t, eng, result.FinalDeps))
+					assert.Empty(t, f.checkFailuresWith(t, eng, result.FinalDeps))
 				}
 			})
 		})
 	}
+}
+
+// tooNewOnHygiene is the real toolchain, except that Typecheck reports
+// ErrToolchainTooNew once the checkout requires the hygiene fix version (as
+// a trial that switches toolchain would).
+type tooNewOnHygiene struct{ *GoToolchain }
+
+func (c tooNewOnHygiene) Typecheck(ctx context.Context, dir string, target BuildTarget, arch string) (*CheckReport, error) {
+	if gomod, err := os.ReadFile(filepath.Join(dir, "go.mod")); err == nil && strings.Contains(string(gomod), modXText+" v0.21.0") {
+		return nil, fmt.Errorf("toolchain go 1.99.0 is newer than choam's go/types (go1.26.4): %w", ErrToolchainTooNew)
+	}
+	return c.GoToolchain.Typecheck(ctx, dir, target, arch)
+}
+
+// TestReplay_HygieneToolchainTooNewFailsFile: a hygiene trial the type-check
+// cannot judge fails the simulation (the file), not just that bump - it is
+// not shed as "not free".
+func TestReplay_HygieneToolchainTooNewFailsFile(t *testing.T) {
+	c := hygieneFreeCase()
+	f := c.fixture(t)
+	_, err := RunLoop(t.Context(), tooNewOnHygiene{f.tc}, c.sc(), f.dir, c.req, Options{})
+	require.ErrorIs(t, err, ErrToolchainTooNew)
+	assert.NotErrorIs(t, err, ErrTypecheckGate, "raised by the hygiene trial, not the gate")
+	assert.Contains(t, err.Error(), "go run github.com/isometry/choam@latest")
 }
 
 func countTrials(trace *traceCapture, prefix string) int {
@@ -438,14 +464,14 @@ func TestReplay_HygieneBatchThenSingles(t *testing.T) {
 	})
 }
 
-// TestReplay_HygieneSkippedWithoutCompileGate: without the compile gate no
+// TestReplay_HygieneSkippedWithoutTypecheckGate: without the type-check gate no
 // bump can be proven free, so none is proposed and the skip is reported.
-func TestReplay_HygieneSkippedWithoutCompileGate(t *testing.T) {
+func TestReplay_HygieneSkippedWithoutTypecheckGate(t *testing.T) {
 	c := hygieneFreeCase()
 	f := c.fixture(t)
-	result, err := RunLoop(t.Context(), f.tc, c.sc(), f.dir, c.req, Options{NoCompile: true})
+	result, err := RunLoop(t.Context(), f.tc, c.sc(), f.dir, c.req, Options{NoTypecheck: true})
 	require.NoError(t, err)
 	assert.Empty(t, result.FinalDeps)
 	assert.Empty(t, result.HygieneModules)
-	assert.Equal(t, "compile gate disabled ("+modXText+"@v0.21.0)", result.HygieneSkipped)
+	assert.Equal(t, "type-check gate disabled ("+modXText+"@v0.21.0)", result.HygieneSkipped)
 }

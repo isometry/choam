@@ -100,7 +100,7 @@ type engine interface {
 	// order); nil means it applied cleanly.
 	apply(ctx context.Context, keep []*candState) *applyFailure
 	// tidyBaseline restores the pristine snapshot and runs only the
-	// engine's own tidying (the compile gate's baseline state).
+	// engine's own tidying (the type-check gate's baseline state).
 	tidyBaseline(ctx context.Context) error
 	// upstreamSkip reports why c matches or regresses the upstream go.mod
 	// (the build's bump step would skip it, or it would only re-pin what

@@ -4,7 +4,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strings"
 	"testing"
 
 	"github.com/isometry/choam/internal/scan"
@@ -101,8 +100,9 @@ func TestGoToolchain_LinkedToleratesUnmatchedEmbed(t *testing.T) {
 
 // TestReplay_UnmatchedEmbed: with the embed gap tolerated, reachability is
 // known: the advisory in the embedding package's import is a linked fix,
-// the test-only one is unlinked; the gap and the compile gate's blind spot
-// (the embedding package cannot compile at baseline) are reported.
+// the test-only one is unlinked; the gap is reported. The type-check does
+// not resolve //go:embed, so the embedding package is checked like any
+// other: no baseline failure, no gate blind spot.
 func TestReplay_UnmatchedEmbed(t *testing.T) {
 	forEachEngine(t, func(t *testing.T, eng Engine) {
 		c := linkageCase("embed", "")
@@ -121,9 +121,8 @@ func TestReplay_UnmatchedEmbed(t *testing.T) {
 		assert.Contains(t, result.Dropped[i].Reason, "module not linked")
 		assert.Empty(t, result.Residuals)
 
-		assert.Equal(t, 1, result.GateUnchecked, "the embedding package already fails to build")
-		assert.True(t, strings.HasPrefix(result.GateUncheckedFirst, "example.com/app: "), result.GateUncheckedFirst)
-		assert.Contains(t, result.GateUncheckedFirst, "pattern gen/*.txt: no matching files found")
+		assert.Zero(t, result.GateUnchecked, "the embed gap is not a type-check failure")
+		assert.Empty(t, result.GateUncheckedFirst)
 	})
 }
 
