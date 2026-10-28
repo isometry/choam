@@ -705,8 +705,9 @@ func (l *loop) gateFinish(ctx context.Context, keep []*candState, rejected map[s
 }
 
 // reviveRelinked brings back every candidate dropUnreachable shed (and not
-// yet revived) that a gated rescan wants raised again, withdrawing its drop
-// record. Reports whether anything was revived.
+// yet revived) or dropImpliedSiblings dropped as implied by a pin the gate
+// may since have relaxed, that a gated rescan wants raised again, withdrawing
+// its drop record. Reports whether anything was revived.
 func (l *loop) reviveRelinked(ctx context.Context, raises []raise) bool {
 	if l.revived == nil {
 		l.revived = make(map[string]bool)
@@ -714,14 +715,15 @@ func (l *loop) reviveRelinked(ctx context.Context, raises []raise) bool {
 	revivedAny := false
 	for _, r := range raises {
 		c := l.byModule[r.module]
-		if c == nil || !c.isDropped() || !c.shedUnlinked || l.revived[r.module] {
+		if c == nil || !c.isDropped() || (!c.shedUnlinked && !c.impliedBy) || l.revived[r.module] {
 			continue
 		}
 		l.dropped = slices.DeleteFunc(l.dropped, func(d DroppedCandidate) bool {
 			return d.Module == c.Module && d.Reason == c.dropReason
 		})
-		c.residualized, c.shedUnlinked, c.dropReason, c.hygieneSeed = false, false, "", ""
+		c.residualized, c.shedUnlinked, c.impliedBy, c.dropReason, c.hygieneSeed = false, false, false, "", ""
 		l.revived[r.module] = true
+		l.markReraised(r.module)
 		revivedAny = true
 		logging.From(ctx).Info("type-check gate: vulnerable code linked again - fix revived for another gate round",
 			"modroot", l.req.Modroot, "module", c.Module, "version", c.Version)

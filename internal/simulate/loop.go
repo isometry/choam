@@ -34,6 +34,11 @@ type candState struct {
 	// shedUnlinked marks a drop by dropUnreachable: judged against the graph
 	// current at the time, which a later adjustment can replace.
 	shedUnlinked bool
+	// impliedBy marks a drop by dropImpliedSiblings: provisional, assuming
+	// the implying candidate survives. Not residualized, so the rescan
+	// re-raises the module as a defended candidate if its advisory persists
+	// (see processScan).
+	impliedBy bool
 
 	// repair marks a coherence-only pin the type-check gate added to keep a
 	// module compatible with a raised dependency (see repairsFor).
@@ -137,6 +142,10 @@ type loop struct {
 	// (each at most once, so the rounds are bounded).
 	gateRejected map[string]string
 	revived      map[string]bool
+	// noImply holds modules re-raised after an implied drop (see
+	// dropImpliedSiblings): never implied-dropped again, so a shortfall the
+	// drop did not explain falls through to stepDown instead of cycling.
+	noImply map[string]bool
 }
 
 // raise is a rescan finding that requires moving a module further forward;

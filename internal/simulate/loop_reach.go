@@ -257,6 +257,9 @@ func (l *loop) seedVulnPackagesLinked(vulnIDs []string) bool {
 func (l *loop) dropUnsustained(ctx context.Context) bool {
 	changed := false
 	for _, c := range l.activeCandidates() {
+		if c.isDropped() { // implied by an earlier candidate this pass
+			continue
+		}
 		if c.Replace {
 			if l.checkReplaceCandidate(c) {
 				changed = true
@@ -277,7 +280,7 @@ func (l *loop) dropUnsustained(ctx context.Context) bool {
 		case semver.Compare(requiredVersion, c.Version) < 0:
 			if !c.FromCVE {
 				l.drop(c, fmt.Sprintf("go mod tidy reverts the pin to %s", requiredVersion))
-			} else {
+			} else if !l.dropImpliedSiblings(ctx, c) {
 				// Same policy as an unfetchable fix: fall back to the next
 				// lower fix rung rather than abandon every advisory. A
 				// higher rung is often just an existing YAML pin; dropping
@@ -289,6 +292,56 @@ func (l *loop) dropUnsustained(ctx context.Context) bool {
 		}
 	}
 	return changed
+}
+
+// dropImpliedSiblings handles a CVE candidate the tidied go.mod holds below
+// its version: another candidate listed after it (a low floor such as
+// x/sys@2022) is applied with a downgrading `go get` that drags c back down
+// along with the modules c's own go.mod pulls up. When c@version's go.mod
+// already requires such a sibling at or above the sibling's version, the
+// sibling is implied by c and is dropped (provisionally, as minimise would
+// later) instead of stepping c down. Reports whether any sibling was dropped; false (also when
+// the .mod cannot be read) leaves the caller to step c down.
+func (l *loop) dropImpliedSiblings(ctx context.Context, c *candState) bool {
+	lister, ok := l.tc.(interface {
+		ModuleRequires(ctx context.Context, dir, module, version string) (map[string]string, error)
+	})
+	if !ok {
+		return false
+	}
+	requires, err := lister.ModuleRequires(ctx, l.dir, c.Module, c.Version)
+	if err != nil {
+		_ = l.recordInfra(err) // recorded: fails the run (see RunLoop)
+		return false
+	}
+	dropped := false
+	for _, s := range l.activeCandidates() {
+		if s == c || s.Replace || l.noImply[s.Module] {
+			continue
+		}
+		// Strictly above: a sibling at exactly c's requirement lowers nothing.
+		if need, ok := requires[s.Module]; ok && semver.Compare(need, s.Version) > 0 {
+			// Provisional (unlike minimise's final-set drop): if c later steps
+			// down, the rescan re-raises s (see candState.impliedBy).
+			why := fmt.Sprintf("implied by %s@%s", c.Module, c.Version)
+			l.drop(s, "redundant: "+why)
+			l.dropped[len(l.dropped)-1].Redundant = true
+			s.impliedBy = true
+			logging.From(ctx).Debug("implied entry removed", "modroot", l.req.Modroot,
+				"module", s.Module, "version", s.Version, "reason", why)
+			dropped = true
+		}
+	}
+	return dropped
+}
+
+// markReraised records that module was re-raised after an implied drop, so
+// dropImpliedSiblings never drops it that way again.
+func (l *loop) markReraised(module string) {
+	if l.noImply == nil {
+		l.noImply = make(map[string]bool)
+	}
+	l.noImply[module] = true
 }
 
 // checkReplaceCandidate verifies a (user-authored) replace candidate against
