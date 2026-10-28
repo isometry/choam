@@ -9,6 +9,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1140,6 +1141,158 @@ func TestRunLoop_RevertedCVEPinIsResidual(t *testing.T) {
 	assert.Equal(t, "golang.org/x/crypto", result.Residuals[0].Module)
 	assert.Equal(t, "fix not sustained: go mod tidy reverts the pin to v0.51.0", result.Residuals[0].Reason)
 	assert.Empty(t, tc.editLog, "no replace directive is ever created")
+}
+
+func TestRunLoop_ImpliedFloorDroppedInsteadOfSteppingDown(t *testing.T) {
+	// The x/net case: a low x/sys floor listed after x/net is applied with a
+	// downgrading `go get` that drags x/net below its pin. x/net@v0.62.0's own
+	// go.mod requires a newer x/sys, so the floor is implied: it is dropped
+	// and x/net keeps its version instead of stepping down.
+	const net, sys = "golang.org/x/net", "golang.org/x/sys"
+	tc := &fakeLister{
+		fakeToolchain: &fakeToolchain{
+			base: map[string]string{net: "v0.40.0", sys: "v0.30.0"},
+			getEffects: map[string]map[string]string{
+				sys + "@v0.45.0": {net: "v0.45.0"}, // the downgrade
+			},
+		},
+		requires: map[string]map[string]string{net + "@v0.62.0": {sys: "v0.49.0"}},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: net, id: "GO-NET-1", fixed: "v0.62.0"},
+		// x/sys's advisory is deliberately left out: the fake cannot model
+		// omnibump's real `go get` drag. A consistent fake graph (x/net's
+		// requirement on x/sys applied) trips the gobump engine's skip guard, and
+		// an inconsistent one makes the rescan re-raise x/sys and cycle. x/sys's
+		// advisory coverage is exercised by
+		// TestRunLoop_ImpliedFloorNotLostWhenImplierSteppedDown instead.
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: net, Version: "v0.62.0", FromCVE: true, VulnIDs: []string{"GO-NET-1"}, Rungs: []Rung{
+				{Version: "v0.62.0", VulnIDs: []string{"GO-NET-1"}}, {Version: "v0.60.0"},
+			}},
+			{Module: sys, Version: "v0.45.0", FromCVE: true, VulnIDs: []string{"GO-SYS-1"}},
+		},
+		Baseline: map[string]string{net: "v0.40.0", sys: "v0.30.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Equal(t, []string{net + "@v0.62.0"}, result.FinalDeps)
+	assert.Empty(t, result.Residuals)
+	var reasons []string
+	for _, d := range result.Dropped {
+		reasons = append(reasons, d.Module+": "+d.Reason)
+	}
+	assert.Contains(t, reasons, sys+": redundant: implied by "+net+"@v0.62.0")
+}
+
+// A gate round that relaxes the implier can re-surface an implied-dropped
+// sibling's advisory; reviveRelinked must bring it back (once), withdrawing
+// its drop record. A unit test of the revive step itself: the gobump-model
+// fake cannot drag a sibling below its pin (the skip guard blocks it), so no
+// end-to-end gate scenario can produce this state.
+func TestReviveRelinked_ImpliedSibling(t *testing.T) {
+	const sys = "golang.org/x/sys"
+	l := &loop{req: ModrootRequest{Modroot: "."}, byModule: map[string]*candState{}}
+	c := &candState{Candidate: Candidate{Module: sys, Version: "v0.45.0", FromCVE: true}}
+	l.byModule[sys] = c
+	l.cands = []*candState{c}
+	l.drop(c, "redundant: implied by golang.org/x/net@v0.62.0")
+	c.residualized, c.impliedBy = false, true
+
+	assert.True(t, l.reviveRelinked(t.Context(), []raise{{module: sys, version: "v0.45.0"}}))
+	assert.False(t, c.isDropped())
+	assert.False(t, c.impliedBy)
+	assert.Empty(t, l.dropped, "the provisional drop record is withdrawn")
+	assert.True(t, l.noImply[sys], "never implied-dropped again")
+	assert.False(t, l.reviveRelinked(t.Context(), []raise{{module: sys, version: "v0.45.0"}}), "revived at most once")
+}
+
+func TestRunLoop_ImpliedDropDoesNotCycle(t *testing.T) {
+	// The inconsistent fake graph (x/net's requirement on x/sys is not applied,
+	// so the rescan still sees the x/sys floor's advisory after the implied
+	// drop): x/sys is re-raised, and must not be implied-dropped again. The
+	// loop converges, x/net's shortfall falls through to the step-down path,
+	// and neither advisory is silently lost.
+	const net, sys = "golang.org/x/net", "golang.org/x/sys"
+	tc := &fakeLister{
+		fakeToolchain: &fakeToolchain{
+			base: map[string]string{net: "v0.40.0", sys: "v0.30.0"},
+			getEffects: map[string]map[string]string{
+				sys + "@v0.45.0": {net: "v0.45.0"}, // the downgrade
+			},
+		},
+		requires: map[string]map[string]string{net + "@v0.62.0": {sys: "v0.49.0"}},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: net, id: "GO-NET-1", fixed: "v0.62.0"},
+		{module: sys, id: "GO-SYS-1", fixed: "v0.45.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: net, Version: "v0.62.0", FromCVE: true, VulnIDs: []string{"GO-NET-1"}, Rungs: []Rung{
+				{Version: "v0.62.0", VulnIDs: []string{"GO-NET-1"}}, {Version: "v0.60.0"},
+			}},
+			{Module: sys, Version: "v0.45.0", FromCVE: true, VulnIDs: []string{"GO-SYS-1"}},
+		},
+		Baseline: map[string]string{net: "v0.40.0", sys: "v0.30.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	assert.Contains(t, result.FinalDeps, sys+"@v0.45.0", "x/sys's fix is kept")
+	netHandled := slices.ContainsFunc(result.Residuals, func(r Residual) bool { return r.Module == net }) ||
+		slices.ContainsFunc(result.FinalDeps, func(d string) bool { return strings.HasPrefix(d, net+"@") })
+	assert.True(t, netHandled, "x/net is either written or an explicit residual, never lost")
+	for _, d := range result.Dropped {
+		assert.NotEqual(t, sys, d.Module, "no stale implied-drop record for x/sys")
+	}
+}
+
+func TestRunLoop_ImpliedFloorNotLostWhenImplierSteppedDown(t *testing.T) {
+	// x/net is also held below its pin for an unrelated reason (tidy caps it).
+	// The x/sys floor is dropped as implied by x/net@v0.62.0, but x/net then
+	// steps down to a version that no longer implies it: the floor's fix must
+	// be re-raised, never silently lost.
+	const net, sys = "golang.org/x/net", "golang.org/x/sys"
+	tc := &fakeLister{
+		fakeToolchain: &fakeToolchain{
+			base:   map[string]string{net: "v0.40.0", sys: "v0.30.0"},
+			capped: map[string]string{net: "v0.61.0"},
+		},
+		requires: map[string]map[string]string{net + "@v0.62.0": {sys: "v0.49.0"}},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: net, id: "GO-NET-1", fixed: "v0.62.0"},
+		{module: net, id: "GO-NET-0", fixed: "v0.60.0"},
+		{module: sys, id: "GO-SYS-1", fixed: "v0.45.0"},
+	}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: net, Version: "v0.62.0", FromCVE: true, VulnIDs: []string{"GO-NET-1", "GO-NET-0"}, Rungs: []Rung{
+				{Version: "v0.62.0", VulnIDs: []string{"GO-NET-1"}}, {Version: "v0.60.0", VulnIDs: []string{"GO-NET-0"}},
+			}},
+			{Module: sys, Version: "v0.45.0", FromCVE: true, VulnIDs: []string{"GO-SYS-1"}},
+		},
+		Baseline: map[string]string{net: "v0.40.0", sys: "v0.30.0"},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Contains(t, result.FinalDeps, sys+"@v0.45.0", "the floor's fix is re-raised, not lost")
+	for _, d := range result.Dropped {
+		assert.NotEqual(t, sys, d.Module, "the provisional drop record is withdrawn on re-raise")
+	}
+	for _, r := range result.Residuals {
+		assert.NotEqual(t, sys, r.Module)
+	}
 }
 
 func TestRunLoop_RevertedCoherencePinStillShed(t *testing.T) {

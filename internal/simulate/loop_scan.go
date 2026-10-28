@@ -43,7 +43,7 @@ func (l *loop) processScan(ctx context.Context, scanResult *scan.ScanResult, res
 	applied := make([]raise, 0, len(raises))
 	for _, r := range raises {
 		if existing, ok := l.byModule[r.module]; ok && existing.isDropped() {
-			if existing.FromCVE {
+			if existing.FromCVE && !existing.impliedBy {
 				if !existing.residualized {
 					if l.degradedUnlinked(r.module, l.requirements, l.replaces) {
 						// Mirror dropUnreachable's deliberately residual-free
@@ -72,8 +72,16 @@ func (l *loop) processScan(ctx context.Context, scanResult *scan.ScanResult, res
 				// Already proven unresolvable - the residual stands.
 				continue
 			}
-			// Dropped as a coherence hint; a CVE now demands it, so try
+			// Dropped as a coherence hint (or provisionally as implied by
+			// another pin that has since gone); a CVE now demands it, so try
 			// again as a defended candidate.
+			if existing.impliedBy {
+				l.markReraised(existing.Module)
+				// Withdraw the provisional drop record (see reviveRelinked).
+				l.dropped = slices.DeleteFunc(l.dropped, func(d DroppedCandidate) bool {
+					return d.Module == existing.Module && d.Reason == existing.dropReason
+				})
+			}
 			delete(l.byModule, r.module)
 		}
 		if existing, ok := l.byModule[r.module]; ok && (semver.Compare(r.version, existing.Version) <= 0 ||
