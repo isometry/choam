@@ -197,7 +197,7 @@ func RunLoop(ctx context.Context, tc Toolchain, sc Scanner, dir string, req Modr
 	// Dependency-graph capabilities (max go directive, linked stdlib set) are
 	// computed HERE: right after the fixpoint loop exits (converged or
 	// iteration-cap exhausted) and BEFORE the refinement phases
-	// (confirmMinimalSet, the type-check gate, minimise) run. At this exact point the
+	// (the type-check gate, minimise) run. At this exact point the
 	// checkout on disk is guaranteed to be the state that produced
 	// `resolved` - the loop body's last apply() is always immediately
 	// followed by ListModules/Requirements/Replaces/refreshLinked with no
@@ -371,11 +371,10 @@ func (l *loop) resync(ctx context.Context) (map[string]string, error) {
 	}
 }
 
-// refine runs the post-fixpoint phases on the converged set, in order:
-// shed pins no advisory needs (confirmMinimalSet; on non-convergence the
-// last raises become residuals instead), the type-check gate, the redundancy
-// check (minimise) and scanner-hygiene bumps. Returns the final resolved
-// graph.
+// refine runs the post-fixpoint phases on the converged set, in order: on
+// non-convergence the last raises become residuals, then the type-check gate,
+// the redundancy check (minimise) and scanner-hygiene bumps. Returns the final
+// resolved graph.
 func (l *loop) refine(ctx context.Context, resolved map[string]string, result *ModrootResult) (map[string]string, error) {
 	var err error
 	if !result.Converged {
@@ -389,12 +388,6 @@ func (l *loop) refine(ctx context.Context, resolved map[string]string, result *M
 				VulnIDs:         c.VulnIDs,
 				Reason:          "iteration cap reached before fix could be validated",
 			})
-		}
-	} else {
-		// Post-convergence refinement (one trial): shed pins no advisory
-		// needs.
-		if resolved, err = l.confirmMinimalSet(ctx, resolved, result); err != nil {
-			return nil, err
 		}
 	}
 
