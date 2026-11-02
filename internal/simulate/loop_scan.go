@@ -310,13 +310,6 @@ func majorChange(modulePath, fixedVersion, resolvedVersion string) bool {
 	return !ok || strings.TrimLeft(pathMajor, "/.") != fixedMajor
 }
 
-// introducesNewVulns reports whether candidate residuals reference advisories
-// absent from the accepted residual set - i.e. the minimal candidate set
-// regressed some module into a vulnerability the full set had avoided.
-func introducesNewVulns(candidate, accepted []Residual) bool {
-	return len(newVulnIDs(candidate, accepted)) > 0
-}
-
 // newVulnIDs lists, sorted, the candidate residuals' advisories absent from
 // the accepted residual set.
 func newVulnIDs(candidate, accepted []Residual) []string {

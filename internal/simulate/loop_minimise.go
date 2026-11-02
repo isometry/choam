@@ -30,11 +30,9 @@ type trialResult struct {
 // the step's engine (see applyExact), refreshes reachability for the trial
 // graph, rescans it, and classifies the findings. Single-shot: any failure rejects the trial (non-nil error) with
 // no repair ladder. Reachability must be recomputed for the trial graph and
-// its rescan filtered identically to the main loop's - otherwise
-// introducesNewVulns would compare linked-filtered accepted residuals
-// against an unfiltered candidate scan, see "new" unlinked advisories, and
-// spuriously reject the trial. Callers snapshot l.linked/l.linkedPackages
-// beforehand and restore them when rejecting.
+// its rescan filtered identically to the main loop's - otherwise an
+// unfiltered trial scan would see "new" unlinked advisories. Callers snapshot
+// l.linked/l.linkedPackages beforehand and restore them when rejecting.
 func (l *loop) trialApply(ctx context.Context, purpose string, keep []*candState) (*trialResult, error) {
 	if err := l.applyExact(ctx, keep); err != nil {
 		if ierr := l.recordInfra(err); ierr != nil {
@@ -107,53 +105,6 @@ func (l *loop) adoptTrial(ctx context.Context, tr *trialResult, result *ModrootR
 	if std := l.linkedStdPackages(ctx); std != nil {
 		result.StdPackages = std
 	}
-}
-
-// confirmMinimalSet checks whether the CVE-backed candidates alone reach a
-// clean state: pins no advisory backs (existing YAML hints, raises) are
-// shed when nothing needs them - this may change the graph, unlike the
-// effect-based redundancy check (see minimise); the type-check gate re-adds any
-// a build turns out to need. Adopts the smaller set when the
-// confirmation apply succeeds and its rescan demands no further raises and
-// no new residual advisories; otherwise keeps the converged full set.
-// result's MaxDepGoVersion/StdPackages - set by the caller from the
-// converged full set - are refreshed in place on adoption (see adoptTrial).
-// Only an infrastructure failure or a cancellation is returned as an error.
-func (l *loop) confirmMinimalSet(ctx context.Context, resolved map[string]string, result *ModrootResult) (map[string]string, error) {
-	// Essential candidates: CVE-backed fixes, remedies (they keep the graph
-	// resolvable at all), and user-authored replaces (load-bearing fork
-	// redirects - never dropped as redundant).
-	active := l.activeCandidates()
-	essential := make([]*candState, 0, len(active))
-	isEssential := func(c *candState) bool { return c.FromCVE || c.remedy || c.Replace }
-	for _, c := range active {
-		if isEssential(c) {
-			essential = append(essential, c)
-		}
-	}
-	if len(essential) == len(active) {
-		return resolved, nil
-	}
-
-	convergedLinked, convergedPackages := l.linked, l.linkedPackages
-	tr, err := l.trialApply(ctx, "refine: minimal set", essential)
-	if err != nil && (errors.Is(err, ErrInfrastructure) || ctx.Err() != nil) {
-		return nil, err
-	}
-	if err != nil || len(tr.raises) > 0 ||
-		introducesNewVulns(tr.residuals, l.scanResiduals) || !l.sustained(tr, essential) {
-		l.linked, l.linkedPackages = convergedLinked, convergedPackages
-		return resolved, nil
-	}
-
-	for _, c := range active {
-		if isEssential(c) {
-			continue
-		}
-		l.drop(c, "not needed: no advisory depends on it and the advisory-backed set resolves cleanly without it")
-	}
-	l.adoptTrial(ctx, tr, result)
-	return tr.resolved, nil
 }
 
 // goModState is the effect of a pin set: the go.mod the step's engine leaves

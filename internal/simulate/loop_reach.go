@@ -144,8 +144,9 @@ func (l *loop) unrequiredModules(resolved map[string]string) map[string]struct{}
 	return unrequired
 }
 
-// dropUnreachable sheds every active candidate - seeds included, which is
-// what prunes already-declared YAML deps - whose module is not linked into
+// dropUnreachable sheds every active candidate - CVE-backed and replace seeds
+// included, which is what prunes already-declared YAML deps; advisory-less deps
+// seeds are exempt (minimise and the gate decide those) - whose module is not linked into
 // any build artifact, or (for CVE-backed candidates with known advisory
 // import metadata) whose advisories' vulnerable packages are all outside
 // the artifact's import graph even though the module is linked (e.g.
@@ -164,7 +165,9 @@ func (l *loop) dropUnreachable() bool {
 	for _, c := range l.activeCandidates() {
 		var reason string
 		switch {
-		case !l.isLinked(c.Module):
+		// An advisory-less spec pin is not a security fix, so linkage does not
+		// decide its fate: minimise (redundancy) and the gate do.
+		case !l.isLinked(c.Module) && (c.FromCVE || c.Replace || !c.seed):
 			reason = fmt.Sprintf("module not linked into build artifacts (packages: %s)", strings.Join(l.target.Patterns, " "))
 		case c.FromCVE && !l.seedVulnPackagesLinked(c.VulnIDs):
 			reason = "vulnerable package(s) not linked into build artifacts"

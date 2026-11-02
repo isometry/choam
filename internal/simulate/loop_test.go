@@ -80,7 +80,7 @@ type fakeToolchain struct {
 	// no loop failure). depGoVersionsFn, when set, takes priority over both
 	// and computes the answer from the current attempt's applied set - lets
 	// a test assert the value differs between the full converged graph and
-	// confirmMinimalSet's minimal graph.
+	// the type-check gate's adopted graph.
 	depGoVersions    map[string]string
 	depGoVersionsErr error
 	depGoVersionsFn  func(applied map[string]string) (map[string]string, error)
@@ -708,9 +708,11 @@ func TestRunLoop_BaselineNoopsDropped(t *testing.T) {
 	assert.True(t, result.Dropped[0].Redundant)
 }
 
-func TestRunLoop_ConfirmationDropsRedundantPins(t *testing.T) {
-	// A coherence-only pin that MVS satisfies anyway is dropped by the
-	// confirmation pass; the CVE-backed entry survives.
+func TestRunLoop_AdvisoryLessSeedAboveUpstreamKept(t *testing.T) {
+	// An existing spec pin with no advisory (e.g. a behavioural pin like
+	// kube-openapi for json/v2) is not redundant while it sits above
+	// upstream: it must survive even though the CVE-backed set resolves
+	// cleanly without it.
 	tc := &fakeToolchain{base: map[string]string{
 		"example.com/pin":  "v1.0.0",
 		"example.com/vuln": "v1.9.0",
@@ -733,16 +735,34 @@ func TestRunLoop_ConfirmationDropsRedundantPins(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.True(t, result.Converged)
-	assert.Equal(t, []string{"example.com/vuln@v2.0.0"}, result.FinalDeps)
-	require.Len(t, result.Dropped, 1)
-	assert.Equal(t, "example.com/pin", result.Dropped[0].Module)
-	assert.Contains(t, result.Dropped[0].Reason, "not needed")
+	assert.ElementsMatch(t, []string{"example.com/pin@v1.5.0", "example.com/vuln@v2.0.0"}, result.FinalDeps)
+	assert.Empty(t, result.Dropped)
+}
+
+func TestRunLoop_AdvisoryLessSeedOnUnlinkedModuleKept(t *testing.T) {
+	// Linkage decides the fate of a CVE-backed fix, not of an advisory-less
+	// spec pin: an unlinked pin stays (only redundancy or the gate remove it).
+	tc := &fakeToolchain{
+		base:   map[string]string{"example.com/linked": "v1.0.0", "example.com/pin": "v1.0.0"},
+		linked: []string{"example.com/linked"},
+	}
+
+	result, err := RunLoop(t.Context(), tc, &fakeScanner{}, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds:   []Candidate{{Module: "example.com/pin", Version: "v1.5.0"}},
+		Baseline: map[string]string{
+			"example.com/linked": "v1.0.0",
+			"example.com/pin":    "v1.0.0",
+		},
+	}, Options{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/pin@v1.5.0"}, result.FinalDeps)
+	assert.Empty(t, result.Dropped)
 }
 
 func TestRunLoop_ConfirmationKeepsProtectivePins(t *testing.T) {
-	// Dropping the pin would regress example.com/pin below its own fix
-	// version - the confirmation pass must detect the raise and keep the
-	// full set.
+	// The pin sits at its own fix version, so it is kept.
 	tc := &fakeToolchain{base: map[string]string{
 		"example.com/pin":  "v1.0.0",
 		"example.com/vuln": "v1.9.0",
@@ -771,113 +791,41 @@ func TestRunLoop_ConfirmationKeepsProtectivePins(t *testing.T) {
 	assert.Empty(t, result.Residuals)
 }
 
-// depsGoVersionsByPin and stdByPin key a stateful DepGoVersions/LinkedStd
-// answer off whether "example.com/pin" is still part of the current apply
-// attempt: present models the full converged set (main-loop apply, both
-// candidates active), absent models confirmMinimalSet's essential-only
-// reapply once the redundant pin has been provisionally dropped. The
-// minimal-state answer deliberately is NOT a subset of the full-state
-// answer (it both loses "net/http" and gains "crypto/subtle") to prove
-// StdPackages genuinely needs a recompute, not just a shrink, on adoption.
-func depGoVersionsByPin(applied map[string]string) (map[string]string, error) {
-	if _, pinned := applied["example.com/pin"]; pinned {
-		return map[string]string{"example.com/pin": "1.26", "example.com/vuln": "1.24"}, nil
-	}
-	return map[string]string{"example.com/vuln": "1.24"}, nil
-}
-
-func stdByPin(applied map[string]string) ([]string, error) {
-	if _, pinned := applied["example.com/pin"]; pinned {
-		return []string{"fmt", "net/http"}, nil
-	}
-	return []string{"fmt", "crypto/subtle"}, nil
-}
-
-// TestRunLoop_ConfirmMinimalSetRecomputesCapabilitiesOnAdoption: when the
-// confirmation pass adopts the minimal (redundant-pin-dropped) graph, the
-// MaxDepGoVersion/StdPackages fields set from the converged full set must be
-// refreshed against the adopted graph - not left describing the superset.
-// This pins the fix for the gap where StdPackages, computed only once
-// pre-minimization, could silently miss stdlib packages the adopted
-// (differently-versioned) minimal graph actually links.
-func TestRunLoop_ConfirmMinimalSetRecomputesCapabilitiesOnAdoption(t *testing.T) {
-	tc := &fakeToolchain{
-		base: map[string]string{
-			"example.com/pin":  "v1.0.0",
-			"example.com/vuln": "v1.9.0",
-		},
-		depGoVersionsFn: depGoVersionsByPin,
-		linkedStdFn:     stdByPin,
-	}
-	sc := &fakeScanner{advisories: []fakeAdvisory{
-		{module: "example.com/vuln", id: "GO-VULN-1", fixed: "v2.0.0"},
+// TestTypecheckGate_AdoptRecomputesCapabilities: when the gate adopts its
+// repaired set (exporter pinned), MaxDepGoVersion/StdPackages computed from
+// the converged set must be refreshed against the adopted graph - not left
+// describing the converged one. The adopted answer is deliberately NOT a subset of the
+// converged one (it loses "fmt" and gains "net/http").
+func TestTypecheckGate_AdoptRecomputesCapabilities(t *testing.T) {
+	base := &fakeToolchain{base: map[string]string{
+		"example.com/api":      "v0.19.0",
+		"example.com/exporter": "v0.19.0",
 	}}
+	base.depGoVersionsFn = func(applied map[string]string) (map[string]string, error) {
+		if _, pinned := applied["example.com/exporter"]; pinned {
+			return map[string]string{"example.com/exporter": "1.26"}, nil
+		}
+		return map[string]string{"example.com/api": "1.24"}, nil
+	}
+	base.linkedStdFn = func(applied map[string]string) ([]string, error) {
+		if _, pinned := applied["example.com/exporter"]; pinned {
+			return []string{"net/http"}, nil
+		}
+		return []string{"fmt"}, nil
+	}
+	tc := otelLikeChecker(base, []string{"v0.19.0", "v0.20.0", "v0.21.0", "v0.22.0"})
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/api", id: "GO-1", fixed: "v0.21.0"}}}
 
 	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
-		Modroot: ".",
-		Seeds: []Candidate{
-			{Module: "example.com/pin", Version: "v1.5.0"},
-			{Module: "example.com/vuln", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-VULN-1"}},
-		},
-		Baseline: map[string]string{
-			"example.com/pin":  "v1.0.0",
-			"example.com/vuln": "v1.9.0",
-		},
+		Modroot:  ".",
+		Seeds:    []Candidate{{Module: "example.com/api", Version: "v0.21.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
+		Baseline: map[string]string{"example.com/api": "v0.19.0", "example.com/exporter": "v0.19.0"},
 	}, Options{})
 
 	require.NoError(t, err)
-	assert.True(t, result.Converged)
-	require.Len(t, result.Dropped, 1, "pin must be dropped as redundant for this to exercise adoption")
-	assert.Equal(t, "example.com/pin", result.Dropped[0].Module)
-
-	// Minimal-state answers, not the full-set superset the loop would have
-	// reported without the adoption-time recompute.
-	assert.Equal(t, "1.24", result.MaxDepGoVersion)
-	assert.Equal(t, map[string]struct{}{"fmt": {}, "crypto/subtle": {}}, result.StdPackages)
-}
-
-// TestRunLoop_ConfirmMinimalSetKeepsCapabilitiesOnRejection: mirrors
-// TestRunLoop_ConfirmationKeepsProtectivePins, but with the same
-// applied-set-keyed fake capability answers as the adoption test above.
-// Because dropping the pin here regresses it below its own fix version,
-// confirmMinimalSet must reject the minimal set - and the capability
-// fields must stay at the full-set values computed post-convergence,
-// never having been touched by the (never-reached) adoption-time
-// recompute.
-func TestRunLoop_ConfirmMinimalSetKeepsCapabilitiesOnRejection(t *testing.T) {
-	tc := &fakeToolchain{
-		base: map[string]string{
-			"example.com/pin":  "v1.0.0",
-			"example.com/vuln": "v1.9.0",
-		},
-		depGoVersionsFn: depGoVersionsByPin,
-		linkedStdFn:     stdByPin,
-	}
-	sc := &fakeScanner{advisories: []fakeAdvisory{
-		{module: "example.com/vuln", id: "GO-VULN-1", fixed: "v2.0.0"},
-		{module: "example.com/pin", id: "GO-PIN-1", fixed: "v1.5.0"},
-	}}
-
-	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
-		Modroot: ".",
-		Seeds: []Candidate{
-			{Module: "example.com/pin", Version: "v1.5.0"},
-			{Module: "example.com/vuln", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-VULN-1"}},
-		},
-		Baseline: map[string]string{
-			"example.com/pin":  "v1.0.0",
-			"example.com/vuln": "v1.9.0",
-		},
-	}, Options{})
-
-	require.NoError(t, err)
-	assert.True(t, result.Converged)
-	assert.Empty(t, result.Dropped, "the minimal set must be rejected, keeping both candidates")
-
-	// Full-set (superset) answers - the minimal-state recompute never runs
-	// because adoption is rejected.
+	assert.Equal(t, []string{"example.com/api@v0.21.0", "example.com/exporter@v0.21.0"}, result.FinalDeps)
 	assert.Equal(t, "1.26", result.MaxDepGoVersion)
-	assert.Equal(t, map[string]struct{}{"fmt": {}, "net/http": {}}, result.StdPackages)
+	assert.Equal(t, map[string]struct{}{"net/http": {}}, result.StdPackages)
 }
 
 const genprotoAmbiguityErr = `go mod tidy: exit status 1: 	google.golang.org/grpc/status imports
@@ -1518,44 +1466,6 @@ func TestRunLoop_LocalPathReplacePinIsResidual(t *testing.T) {
 	assert.Equal(t, []string{"GO-VEND-1"}, result.RemainingVulnIDs)
 }
 
-func TestRunLoop_ConfirmMinimalSetKeepsReplaces(t *testing.T) {
-	// The confirmation pass must re-apply (user-authored) replace directives
-	// while dropping redundant coherence pins.
-	tc := &fakeToolchain{
-		base: map[string]string{
-			"golang.org/x/crypto": "v0.51.0",
-			"example.com/pin":     "v1.0.0",
-		},
-		capped: map[string]string{"golang.org/x/crypto": "v0.51.0"},
-	}
-	sc := &fakeScanner{}
-
-	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
-		Modroot: ".",
-		Seeds: []Candidate{
-			{Module: "golang.org/x/crypto", Version: "v0.52.0", FromCVE: true, VulnIDs: []string{"GO-CRYPTO-1"}, Replace: true},
-			{Module: "example.com/pin", Version: "v1.5.0"}, // coherence-only, satisfied without it
-		},
-		Baseline: map[string]string{
-			"golang.org/x/crypto": "v0.51.0",
-			"example.com/pin":     "v1.0.0",
-		},
-	}, Options{})
-
-	require.NoError(t, err)
-	assert.True(t, result.Converged)
-	assert.Equal(t, []string{"golang.org/x/crypto=golang.org/x/crypto@v0.52.0"}, result.FinalReplaces)
-	var pinDropped bool
-	for _, dropped := range result.Dropped {
-		if dropped.Module == "example.com/pin" {
-			pinDropped = true
-			assert.Contains(t, dropped.Reason, "not needed")
-		}
-	}
-	assert.True(t, pinDropped, "coherence pin must be dropped as redundant")
-	assert.Empty(t, result.Residuals)
-}
-
 // TestRunLoop_UnreachableSeedDroppedNoResidual: a CVE-backed seed whose
 // module is not linked into any build artifact must be shed - with the
 // distinct not-linked drop reason and, unlike every other CVE-backed drop,
@@ -2100,32 +2010,35 @@ func TestRunLoop_NilBaselineSkipsClassification(t *testing.T) {
 // go.mod's go directive qualifies (>= 1.17, the default fixture), so the
 // degraded module-level signal takes over: graphonly is pruned by tidy
 // (never required) and must be reported as UNLINKED (via UnrequiredModules
-// and an empty Residuals set), never as a residual. The redundant coherence
-// seed on linkedmod forces confirmMinimalSet to run a trial - proving the
-// MANDATORY trialApply/scanTargets filtering (Step 2): without it, the
-// unfiltered trial rescan would see graphonly's advisory as newly introduced
-// (a major-version residual) and reject the trial.
+// and an empty Residuals set), never as a residual. The api fix breaks the
+// lagging exporter, so the type-check gate adopts a repaired set via
+// trialApply/scanTargets - proving the MANDATORY filtering (Step 2): without
+// it, the unfiltered trial rescan would see graphonly's advisory as newly
+// introduced and surface a residual.
 func TestRunLoop_DegradedReachability_UnrequiredModuleNotResidual(t *testing.T) {
-	tc := &fakeToolchain{
+	tc := otelLikeChecker(&fakeToolchain{
 		base: map[string]string{
-			"example.com/linkedmod": "v1.0.0",
+			"example.com/api":       "v0.19.0",
+			"example.com/exporter":  "v0.19.0",
 			"example.com/graphonly": "v1.0.0",
 		},
 		pruned:    map[string]bool{"example.com/graphonly": true},
 		linkedErr: errors.New("go list -deps: build constraints exclude all Go files"),
-	}
+	}, []string{"v0.19.0", "v0.20.0", "v0.21.0", "v0.22.0"})
 	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/api", id: "GO-1", fixed: "v0.21.0"},
 		{module: "example.com/graphonly", id: "GO-GRAPH-1", fixed: "v2.0.0"},
 	}}
 
 	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
 		Modroot: ".",
 		Seeds: []Candidate{
+			{Module: "example.com/api", Version: "v0.21.0", FromCVE: true, VulnIDs: []string{"GO-1"}},
 			{Module: "example.com/graphonly", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-GRAPH-1"}},
-			{Module: "example.com/linkedmod", Version: "v1.1.0"}, // coherence-only
 		},
 		Baseline: map[string]string{
-			"example.com/linkedmod": "v1.0.0",
+			"example.com/api":       "v0.19.0",
+			"example.com/exporter":  "v0.19.0",
 			"example.com/graphonly": "v1.0.0",
 		},
 	}, Options{})
@@ -2133,7 +2046,8 @@ func TestRunLoop_DegradedReachability_UnrequiredModuleNotResidual(t *testing.T) 
 	require.NoError(t, err)
 	assert.True(t, result.Converged)
 	assert.Nil(t, result.Linked, "precise reachability unavailable")
-	assert.Empty(t, result.FinalDeps, "graphonly must not survive: pruned and unlinkable")
+	assert.Equal(t, []string{"example.com/api@v0.21.0", "example.com/exporter@v0.21.0"}, result.FinalDeps,
+		"graphonly must not survive: pruned and unlinkable; the gate repaired exporter")
 	assert.Empty(t, result.Residuals, "an unrequired-and-unlinkable module is neither fixed nor residual")
 
 	var graphonlyDropped bool
@@ -2314,20 +2228,19 @@ func TestRunLoop_CtxLoggerAttributesRecords(t *testing.T) {
 
 // TestRunLoop_DegradedReachability_LinkedStdWarnOnce: the linked-stdlib
 // lookup can fire twice per RunLoop call (once post-fixpoint, once more from
-// adoptTrial when a refinement phase adopts a trial) - the warning must log
-// only once. Mirrors TestRunLoop_ConfirmMinimalSetRecomputesCapabilitiesOnAdoption's
-// fixture (a redundant coherence pin forces confirmMinimalSet to adopt a
-// trial) with a failing LinkedStd instead of a fake capability function.
+// adoptTrial when the type-check gate adopts its repaired set) - the warning
+// must log only once. A failing LinkedStd stands in for a fake capability
+// function.
 func TestRunLoop_DegradedReachability_LinkedStdWarnOnce(t *testing.T) {
-	tc := &fakeToolchain{
+	tc := otelLikeChecker(&fakeToolchain{
 		base: map[string]string{
-			"example.com/pin":  "v1.0.0",
-			"example.com/vuln": "v1.9.0",
+			"example.com/api":      "v0.19.0",
+			"example.com/exporter": "v0.19.0",
 		},
 		linkedStdErr: errors.New("go list -deps: boom"),
-	}
+	}, []string{"v0.19.0", "v0.20.0", "v0.21.0", "v0.22.0"})
 	sc := &fakeScanner{advisories: []fakeAdvisory{
-		{module: "example.com/vuln", id: "GO-VULN-1", fixed: "v2.0.0"},
+		{module: "example.com/api", id: "GO-1", fixed: "v0.21.0"},
 	}}
 
 	handler := &countingHandler{}
@@ -2336,20 +2249,14 @@ func TestRunLoop_DegradedReachability_LinkedStdWarnOnce(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
-		Modroot: ".",
-		Seeds: []Candidate{
-			{Module: "example.com/pin", Version: "v1.5.0"},
-			{Module: "example.com/vuln", Version: "v2.0.0", FromCVE: true, VulnIDs: []string{"GO-VULN-1"}},
-		},
-		Baseline: map[string]string{
-			"example.com/pin":  "v1.0.0",
-			"example.com/vuln": "v1.9.0",
-		},
+		Modroot:  ".",
+		Seeds:    []Candidate{{Module: "example.com/api", Version: "v0.21.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
+		Baseline: map[string]string{"example.com/api": "v0.19.0", "example.com/exporter": "v0.19.0"},
 	}, Options{})
 
 	require.NoError(t, err)
 	assert.True(t, result.Converged)
-	require.Len(t, result.Dropped, 1, "pin must be dropped as redundant for adoptTrial to fire")
+	assert.Contains(t, result.FinalDeps, "example.com/exporter@v0.21.0", "the gate must adopt a repaired set for adoptTrial to fire")
 	assert.Equal(t, 1, handler.count("linked stdlib package lookup unavailable"),
 		"the warning must be logged exactly once despite two lookup attempts")
 }
@@ -2358,69 +2265,52 @@ func TestRunLoop_DegradedReachability_LinkedStdWarnOnce(t *testing.T) {
 // trialApply/scanTargets wiring is load-bearing (Step 2's "MANDATORY" call
 // site) - proven here by a fixture where the trial's requirements genuinely
 // differ from the main loop's, unlike every other degraded fixture (which
-// uses the fake's STATIC `pruned` set, identical in the main loop and every
-// trial). `pruneUnless` ties graphonly's presence in Requirements() to
-// whether pin's `go get` ran THIS attempt:
+// uses the fake's STATIC `pruned` set). `pruneUnless` ties graphonly's
+// presence in Requirements() to whether exporter's `go get` ran THIS attempt:
 //
-//   - Main loop: pin is applied (coherence seed, redundant), and its
-//     getEffects simultaneously raise graphonly to the fixed version -
-//     graphonly is required (pin's closure pulls it in) but not vulnerable
-//     there, so it scans clean and never becomes a residual.
-//   - confirmMinimalSet's trial drops pin (not essential: no CVE, no
-//     remedy, not a replace seed). Without pin's get, graphonly reverts to
-//     its base (vulnerable) version AND drops out of tr.requirements -
-//     degradedUnlinked correctly excludes it from the trial's rescan, the
-//     trial sees no new advisories, and pin is confirmed redundant.
+//   - Main loop: only the api fix is applied, so graphonly is pruned
+//     (unrequired) and excluded from the rescan.
+//   - The type-check gate's repair pins exporter; the adopt trial therefore
+//     requires graphonly, still at its vulnerable base version. The trial's
+//     own requirements must make the rescan scan it and surface the advisory
+//     as a residual.
 //
 // Mutating trialApply's scanTargets call to pass l.requirements/l.replaces
-// (the main loop's STALE, pin-applied requirements) instead of
-// tr.requirements/tr.replaces makes degradedUnlinked wrongly see graphonly
-// as required in the trial too - it gets scanned at its reverted vulnerable
-// version, "fix requires major version import path change" surfaces as a
-// brand-new residual (absent from the main loop's clean scan), and the
-// trial is wrongly rejected: pin survives. Verified by hand-applying that
-// exact mutation (see task-r1-report.md, Fix round 1) - it flips this
-// test's assertions and passes with the wiring restored.
+// (the main loop's STALE requirements) instead of tr.requirements/
+// tr.replaces would see graphonly as unrequired in the trial too and hide the
+// advisory.
 func TestRunLoop_DegradedReachability_TrialUsesTrialRequirements(t *testing.T) {
-	tc := &fakeToolchain{
+	tc := otelLikeChecker(&fakeToolchain{
 		base: map[string]string{
-			"example.com/pin":       "v1.0.0",
+			"example.com/api":       "v0.19.0",
+			"example.com/exporter":  "v0.19.0",
 			"example.com/graphonly": "v1.0.0",
 		},
-		pruneUnless: map[string]string{"example.com/graphonly": "example.com/pin"},
-		getEffects: map[string]map[string]string{
-			"example.com/pin@v1.1.0": {"example.com/graphonly": "v2.0.0"},
-		},
-		linkedErr: errors.New("go list -deps: build constraints exclude all Go files"),
-	}
+		pruneUnless: map[string]string{"example.com/graphonly": "example.com/exporter"},
+		linkedErr:   errors.New("go list -deps: build constraints exclude all Go files"),
+	}, []string{"v0.19.0", "v0.20.0", "v0.21.0", "v0.22.0"})
 	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/api", id: "GO-1", fixed: "v0.21.0"},
 		{module: "example.com/graphonly", id: "GO-GRAPH-3", fixed: "v2.0.0"},
 	}}
 
 	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
 		Modroot: ".",
-		Seeds: []Candidate{
-			{Module: "example.com/pin", Version: "v1.1.0"}, // coherence-only, redundant
-		},
+		Seeds:   []Candidate{{Module: "example.com/api", Version: "v0.21.0", FromCVE: true, VulnIDs: []string{"GO-1"}}},
 		Baseline: map[string]string{
-			"example.com/pin":       "v1.0.0",
+			"example.com/api":       "v0.19.0",
+			"example.com/exporter":  "v0.19.0",
 			"example.com/graphonly": "v1.0.0",
 		},
 	}, Options{})
 
 	require.NoError(t, err)
-	assert.True(t, result.Converged)
 	assert.Nil(t, result.Linked, "precise reachability unavailable")
-
-	require.Len(t, result.Dropped, 1, "the trial-filtered rescan must confirm pin redundant")
-	assert.Equal(t, "example.com/pin", result.Dropped[0].Module)
-	assert.Contains(t, result.Dropped[0].Reason, "not needed")
-
-	assert.Empty(t, result.FinalDeps, "pin must not survive: confirmed redundant")
-	assert.Empty(t, result.Residuals,
-		"graphonly's advisory must never surface: clean in the main loop, correctly filtered from the trial")
-	assert.Contains(t, result.UnrequiredModules, "example.com/graphonly",
-		"the adopted (trial) graph must reclassify graphonly as unrequired")
+	assert.Contains(t, result.FinalDeps, "example.com/exporter@v0.21.0", "the gate must adopt a repaired set")
+	require.Len(t, result.Residuals, 1, "graphonly is required in the adopted graph: its advisory must surface")
+	assert.Equal(t, "example.com/graphonly", result.Residuals[0].Module)
+	assert.NotContains(t, result.UnrequiredModules, "example.com/graphonly",
+		"the adopted (trial) graph requires graphonly")
 }
 
 // TestRunLoop_DegradedReachability_SelfReplaceKeyFailsOpen: degradedUnlinked's
@@ -3147,8 +3037,8 @@ func TestLogTrial_RecordShape(t *testing.T) {
 	trace := &traceCapture{}
 	ctx := logging.Into(t.Context(), slog.New(trace))
 	l.logTrial(ctx, trialLog{purpose: "gate: relaxed", subject: "example.com/cve", pins: pins, resolved: resolved, checked: st})
-	l.logTrial(ctx, trialLog{purpose: "refine: minimal set", pins: pins[:1], reject: "go: boom\nmore"})
-	l.logTrial(ctx, trialLog{purpose: "refine: minimal set", pins: pins[:1], resolved: resolved, raises: []raise{{module: "example.com/r", version: "v1.2.0"}}, residuals: 2})
+	l.logTrial(ctx, trialLog{purpose: "gate: converged set", pins: pins[:1], reject: "go: boom\nmore"})
+	l.logTrial(ctx, trialLog{purpose: "gate: converged set", pins: pins[:1], resolved: resolved, raises: []raise{{module: "example.com/r", version: "v1.2.0"}}, residuals: 2})
 	l.logRepair(ctx, repairLog{module: "example.com/s", from: "v0.1.0", to: "v0.2.0", source: "version walk",
 		outgrown: map[string]string{"example.com/api": "v0.2.0"}})
 	l.logRepair(ctx, repairLog{module: "example.com/s", from: "v0.1.0", skip: "no coherent version"})
