@@ -1243,6 +1243,98 @@ func TestRunLoop_ImpliedFloorNotLostWhenImplierSteppedDown(t *testing.T) {
 	}
 }
 
+// impliedFloorTidyFixture: a CVE pin seeded before a low x/sys floor whose
+// `go get` downgrades the graph so that the closing tidy fails, with the
+// failure naming the pin (blame order alone would shed the pin). requires is
+// the pin's own go.mod requirements.
+func impliedFloorTidyFixture(t *testing.T, requires map[string]map[string]string) *ModrootResult {
+	t.Helper()
+	const pin, sys = "example.com/pin", "golang.org/x/sys"
+	tc := &fakeLister{
+		fakeToolchain: &fakeToolchain{base: map[string]string{pin: "v1.0.0", sys: "v0.30.0"}},
+		requires:      requires,
+	}
+	tc.tidyErr = func(applied map[string]string) error {
+		if applied[sys] == "v0.45.0" {
+			return errors.New("go: " + pin + "/client imports example.com/meta: ambiguous import: found package example.com/meta in multiple modules")
+		}
+		return nil
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: pin, id: "GO-PIN-1", fixed: "v1.5.0"}}}
+
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot: ".",
+		Seeds: []Candidate{
+			{Module: pin, Version: "v1.5.0", FromCVE: true, VulnIDs: []string{"GO-PIN-1"}},
+			{Module: sys, Version: "v0.45.0", FromCVE: true, VulnIDs: []string{"GO-SYS-1"}},
+		},
+		Baseline: map[string]string{pin: "v1.0.0", sys: "v0.30.0"},
+	}, Options{})
+	require.NoError(t, err)
+	assert.True(t, result.Converged)
+	return result
+}
+
+func TestRunLoop_TidyFailureDropsImpliedFloorFirst(t *testing.T) {
+	const pin, sys = "example.com/pin", "golang.org/x/sys"
+	result := impliedFloorTidyFixture(t, map[string]map[string]string{pin + "@v1.5.0": {sys: "v0.49.0"}})
+
+	assert.Equal(t, []string{pin + "@v1.5.0"}, result.FinalDeps, "the CVE pin survives")
+	assert.Empty(t, result.Residuals)
+	require.Len(t, result.Dropped, 1)
+	assert.Equal(t, sys, result.Dropped[0].Module)
+	assert.True(t, result.Dropped[0].Redundant)
+	assert.Equal(t, "redundant: implied by "+pin+"@v1.5.0", result.Dropped[0].Reason)
+}
+
+func TestRunLoop_TidyFailureUnimpliedFloorShedsAsBefore(t *testing.T) {
+	// The pin's go.mod does not imply the floor: the old ladder runs and
+	// sheds the named pin; the floor (still breaking tidy) follows. Both stay
+	// residual: neither module resolves at its fix in the final graph.
+	const pin, sys = "example.com/pin", "golang.org/x/sys"
+	result := impliedFloorTidyFixture(t, nil)
+
+	assert.Empty(t, result.FinalDeps)
+	for _, d := range result.Dropped {
+		assert.False(t, d.Redundant, d.Module)
+		assert.Contains(t, d.Reason, "removed to restore resolvability", d.Module)
+	}
+	var residuals []string
+	for _, r := range result.Residuals {
+		residuals = append(residuals, r.Module+"@"+r.FixedVersion)
+	}
+	assert.ElementsMatch(t, []string{pin + "@v1.5.0", sys + "@v0.45.0"}, residuals)
+	assert.Equal(t, []string{"GO-PIN-1", "GO-SYS-1"}, result.RemainingVulnIDs)
+}
+
+func TestBuildResult_DropsPersistentResidualsFixedInFinalGraph(t *testing.T) {
+	l := &loop{
+		req: ModrootRequest{Modroot: "."},
+		persistentResiduals: []Residual{
+			{Module: "example.com/above", FixedVersion: "v1.5.0", VulnIDs: []string{"GO-ABOVE-1"}},
+			{Module: "example.com/at", FixedVersion: "v1.5.0", VulnIDs: []string{"GO-AT-1"}},
+			{Module: "example.com/below", FixedVersion: "v1.5.0", VulnIDs: []string{"GO-BELOW-1"}},
+			{Module: "example.com/nofix", VulnIDs: []string{"GO-NOFIX-1"}},
+		},
+		// Scan residuals are the rescan's own verdict: never filtered here.
+		scanResiduals: []Residual{
+			{Module: "example.com/scanned", FixedVersion: "v1.0.0", ResolvedVersion: "v2.0.0", VulnIDs: []string{"GO-SCAN-1"}},
+		},
+	}
+	result := &ModrootResult{}
+	l.buildResult(t.Context(), map[string]string{
+		"example.com/above": "v1.6.0", "example.com/at": "v1.5.0",
+		"example.com/below": "v1.4.0", "example.com/nofix": "v1.9.0",
+	}, result)
+
+	var modules []string
+	for _, r := range result.Residuals {
+		modules = append(modules, r.Module)
+	}
+	assert.ElementsMatch(t, []string{"example.com/below", "example.com/nofix", "example.com/scanned"}, modules)
+	assert.Equal(t, []string{"GO-BELOW-1", "GO-NOFIX-1", "GO-SCAN-1"}, result.RemainingVulnIDs)
+}
+
 func TestRunLoop_RevertedCoherencePinStillShed(t *testing.T) {
 	// A tidy-reverted pin with no CVE backing is shed with no residual.
 	tc := &fakeToolchain{
