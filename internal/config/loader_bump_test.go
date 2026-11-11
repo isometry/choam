@@ -472,7 +472,7 @@ func TestLoader_UpdateGoBumpStep_UpsertsReplaces(t *testing.T) {
 	loader := NewLoader()
 
 	// singleGoBumpYAML's go/bump step (index 2) has no replaces field yet.
-	updated, err := loader.UpdateBumpStep([]byte(singleGoBumpYAML), 2,
+	updated, err := loader.UpdateBumpStep([]byte(singleGoBumpYAML), 2, "",
 		[]string{"golang.org/x/net@v0.55.0"},
 		[]string{"golang.org/x/crypto=golang.org/x/crypto@v0.52.0"}, "")
 	require.NoError(t, err)
@@ -488,7 +488,7 @@ func TestLoader_UpdateGoBumpStep_UpdatesAndClearsReplaces(t *testing.T) {
 	loader := NewLoader()
 
 	// Update existing replaces in place.
-	updated, err := loader.UpdateBumpStep([]byte(replacesGoBumpYAML), 1,
+	updated, err := loader.UpdateBumpStep([]byte(replacesGoBumpYAML), 1, "",
 		[]string{"golang.org/x/net@v0.55.0"},
 		[]string{"github.com/aws/aws-sdk-go=github.com/aws/aws-sdk-go@v1.55.0"}, "")
 	require.NoError(t, err)
@@ -499,7 +499,7 @@ func TestLoader_UpdateGoBumpStep_UpdatesAndClearsReplaces(t *testing.T) {
 	assert.Contains(t, string(updated), "# keep me", "comments must be preserved")
 
 	// Empty replaces removes just the field, keeping the step.
-	cleared, err := loader.UpdateBumpStep([]byte(replacesGoBumpYAML), 1,
+	cleared, err := loader.UpdateBumpStep([]byte(replacesGoBumpYAML), 1, "",
 		[]string{"golang.org/x/net@v0.55.0"}, nil, "")
 	require.NoError(t, err)
 	steps, err = loader.FindBumpSteps(cleared)
@@ -514,7 +514,7 @@ func TestLoader_UpdateGoBumpStep_ReplacesOnlyKeepsStep(t *testing.T) {
 
 	// Deps empty + replaces non-empty must keep the step (gobump accepts a
 	// replaces-only invocation) with only the deps field removed.
-	updated, err := loader.UpdateBumpStep([]byte(replacesGoBumpYAML), 1,
+	updated, err := loader.UpdateBumpStep([]byte(replacesGoBumpYAML), 1, "",
 		nil, []string{"github.com/aws/aws-sdk-go=github.com/aws/aws-sdk-go@v1.34.0"}, "")
 	require.NoError(t, err)
 
@@ -528,7 +528,7 @@ func TestLoader_UpdateGoBumpStep_ReplacesOnlyKeepsStep(t *testing.T) {
 func TestLoader_UpdateGoBumpStep_BothEmptyRemovesStep(t *testing.T) {
 	loader := NewLoader()
 
-	updated, err := loader.UpdateBumpStep([]byte(replacesGoBumpYAML), 1, nil, nil, "")
+	updated, err := loader.UpdateBumpStep([]byte(replacesGoBumpYAML), 1, "", nil, nil, "")
 	require.NoError(t, err)
 
 	steps, err := loader.FindBumpSteps(updated)
@@ -547,7 +547,7 @@ func TestLoader_UpdateGoBumpStep_GoVersionEmptyLeavesExistingUntouched(t *testin
         golang.org/x/net@v0.55.0
 `
 	// goVersion == "" must never remove or alter an already-present go-version.
-	updated, err := loader.UpdateBumpStep([]byte(withGoVersion), 0,
+	updated, err := loader.UpdateBumpStep([]byte(withGoVersion), 0, "",
 		[]string{"golang.org/x/net@v0.56.0"}, nil, "")
 	require.NoError(t, err)
 	assert.Contains(t, string(updated), `go-version: "1.24"`)
@@ -563,7 +563,7 @@ func TestLoader_UpdateGoBumpStep_AddsGoVersionToStepLackingIt(t *testing.T) {
 	loader := NewLoader()
 
 	// singleGoBumpYAML's go/bump step (index 2) has no go-version field yet.
-	updated, err := loader.UpdateBumpStep([]byte(singleGoBumpYAML), 2,
+	updated, err := loader.UpdateBumpStep([]byte(singleGoBumpYAML), 2, "",
 		[]string{"golang.org/x/net@v0.56.0"}, nil, "1.25")
 	require.NoError(t, err)
 	assert.Contains(t, string(updated), `go-version: "1.25"`, "go-version must be rendered as a quoted scalar")
@@ -593,7 +593,7 @@ func TestLoader_UpdateGoBumpStep_AddsGoVersionAfterModrootAtEOF(t *testing.T) {
         .
         cmd/a
 `
-	updated, err := loader.UpdateBumpStep([]byte(withModrootLastAtEOF), 0,
+	updated, err := loader.UpdateBumpStep([]byte(withModrootLastAtEOF), 0, "",
 		[]string{"golang.org/x/net@v0.56.0"}, nil, "1.26")
 	require.NoError(t, err)
 
@@ -626,7 +626,7 @@ func TestLoader_UpdateGoBumpStep_UpdatesExistingGoVersion(t *testing.T) {
       deps: |-
         golang.org/x/net@v0.55.0
 `
-	updated, err := loader.UpdateBumpStep([]byte(withGoVersionAndComment), 0,
+	updated, err := loader.UpdateBumpStep([]byte(withGoVersionAndComment), 0, "",
 		[]string{"golang.org/x/net@v0.56.0"}, nil, "1.25")
 	require.NoError(t, err)
 	assert.Contains(t, string(updated), `go-version: "1.25"`)
@@ -820,7 +820,7 @@ pipeline:
       packages: .
 `
 	loader := NewLoader()
-	updated, err := loader.UpdateBumpStep([]byte(midPipelineYAML), 1,
+	updated, err := loader.UpdateBumpStep([]byte(midPipelineYAML), 1, "",
 		[]string{"github.com/aws/aws-sdk-go@v1.34.0"},
 		[]string{"golang.org/x/crypto=golang.org/x/crypto@v0.52.0"}, "")
 	require.NoError(t, err)
@@ -1095,4 +1095,104 @@ pipeline:
 		assert.Contains(t, string(updated), "epoch: 5\n")
 		assert.NotContains(t, string(updated), "epoch: 5 #")
 	})
+}
+
+const packagesBumpYAML = `package:
+  name: example
+  version: 1.0.0
+  epoch: 0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      language: java
+      # pinned for CVE-2024-0001
+      packages: |
+        io.netty@netty-codec-http@4.1.90.Final
+      manifest: bom/pom.xml # the BOM, not the root pom
+`
+
+func TestLoader_FindBumpSteps_PackagesAndManifest(t *testing.T) {
+	loader := NewLoader()
+
+	steps, err := loader.FindBumpSteps([]byte(packagesBumpYAML))
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, "packages", steps[0].DepsKey)
+	assert.Equal(t, []string{"io.netty@netty-codec-http@4.1.90.Final"}, steps[0].Deps)
+	assert.Equal(t, "bom/pom.xml", steps[0].Manifest)
+
+	// deps wins over packages when both are present; neither defaults to deps.
+	both := strings.Replace(packagesBumpYAML, "      manifest:", "      deps: a@b@1\n      manifest:", 1)
+	steps, err = loader.FindBumpSteps([]byte(both))
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, "deps", steps[0].DepsKey)
+	assert.Equal(t, []string{"a@b@1"}, steps[0].Deps)
+
+	steps, err = loader.FindBumpSteps([]byte(singleGoBumpYAML))
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, "deps", steps[0].DepsKey)
+	assert.Empty(t, steps[0].Manifest)
+}
+
+func TestLoader_UpdateBumpStep_PackagesKey(t *testing.T) {
+	loader := NewLoader()
+
+	updated, err := loader.UpdateBumpStep([]byte(packagesBumpYAML), 1, "packages",
+		[]string{"io.netty@netty-codec-http@4.1.94.Final"}, nil, "")
+	require.NoError(t, err)
+	out := string(updated)
+	assert.NotContains(t, out, "deps:", "a packages step must not gain a deps key")
+	assert.Contains(t, out, "# pinned for CVE-2024-0001")
+	assert.Contains(t, out, "# the BOM, not the root pom")
+
+	steps, err := loader.FindBumpSteps(updated)
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, "packages", steps[0].DepsKey)
+	assert.Equal(t, []string{"io.netty@netty-codec-http@4.1.94.Final"}, steps[0].Deps)
+	assert.Equal(t, "bom/pom.xml", steps[0].Manifest)
+
+	// Empty deps with replaces removes just the packages field.
+	cleared, err := loader.UpdateBumpStep([]byte(packagesBumpYAML), 1, "packages", nil, []string{"a=b@1"}, "")
+	require.NoError(t, err)
+	assert.NotContains(t, string(cleared), "packages:")
+	steps, err = loader.FindBumpSteps(cleared)
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Empty(t, steps[0].Deps)
+
+	// Everything empty removes the step.
+	removed, err := loader.UpdateBumpStep([]byte(packagesBumpYAML), 1, "packages", nil, nil, "")
+	require.NoError(t, err)
+	steps, err = loader.FindBumpSteps(removed)
+	require.NoError(t, err)
+	assert.Empty(t, steps)
+}
+
+func TestLoader_UpdateBumpStep_UpsertsMissingDeps(t *testing.T) {
+	loader := NewLoader()
+
+	// A replaces-only step gaining deps must get the key, not a silent no-op.
+	replacesOnly, err := loader.UpdateBumpStep([]byte(replacesGoBumpYAML), 1, "",
+		nil, []string{"github.com/aws/aws-sdk-go=github.com/aws/aws-sdk-go@v1.34.0"}, "")
+	require.NoError(t, err)
+
+	updated, err := loader.UpdateBumpStep(replacesOnly, 1, "deps",
+		[]string{"golang.org/x/net@v0.55.0"},
+		[]string{"github.com/aws/aws-sdk-go=github.com/aws/aws-sdk-go@v1.34.0"}, "")
+	require.NoError(t, err)
+
+	steps, err := loader.FindBumpSteps(updated)
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, []string{"golang.org/x/net@v0.55.0"}, steps[0].Deps)
+	assert.Equal(t, []string{"github.com/aws/aws-sdk-go=github.com/aws/aws-sdk-go@v1.34.0"}, steps[0].Replaces)
 }

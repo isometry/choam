@@ -282,7 +282,7 @@ func (g *Applier) rewriteStep(ctx context.Context, gp *Processor, yamlContent []
 			return nil, fmt.Errorf("splitting pipeline[%d]: %w", step.Index, err)
 		}
 		clone := step.Index + 1
-		if updated, err = loader.UpdateBumpStep(updated, clone, group.Deps, group.Replaces, ""); err != nil {
+		if updated, err = loader.UpdateBumpStep(updated, clone, step.DepsKey, group.Deps, group.Replaces, ""); err != nil {
 			return nil, fmt.Errorf("updating split of pipeline[%d]: %w", step.Index, err)
 		}
 		if updated, err = loader.SetBumpModroots(updated, clone, group.Modroots); err != nil {
@@ -297,7 +297,7 @@ func (g *Applier) rewriteStep(ctx context.Context, gp *Processor, yamlContent []
 // updateStepInPlace writes group's deps/replaces (and goVersion, when
 // non-empty) into the step, and its modroot list when that changed.
 func updateStepInPlace(loader *config.Loader, yamlContent []byte, step config.BumpStep, group modrootGroup, goVersion string) ([]byte, error) {
-	updated, err := loader.UpdateBumpStep(yamlContent, step.Index, group.Deps, group.Replaces, goVersion)
+	updated, err := loader.UpdateBumpStep(yamlContent, step.Index, step.DepsKey, group.Deps, group.Replaces, goVersion)
 	if err != nil {
 		return nil, fmt.Errorf("updating %s pipeline[%d]: %w", step.Action, step.Index, err)
 	}

@@ -30,6 +30,7 @@ const maxHygieneDiff = 3
 type hygienePin struct {
 	module, version string
 	ids             []string
+	notFree         string // why an existing spec pin kept anyway is not free
 }
 
 // hygieneTarget is one module the hygiene pass may raise: the finding (see
@@ -45,6 +46,8 @@ type hygieneTarget struct {
 // and, when free, the state it leaves.
 type hygieneOutcome struct {
 	why            string
+	moves          string // why an accepted existing spec pin is not free
+	depGo          string
 	st             *goModState
 	resolved       map[string]string
 	linked         map[string]struct{}
@@ -67,7 +70,11 @@ var errHygieneBudget = errors.New("simulation budget nearly exhausted")
 // set did not have. One batch trial of every target first; if it is not
 // free, each target alone in a fixed order (most severe first, then by
 // module) on top of those already accepted, a carried-in pin before the
-// minimal fix. Accepted bumps are written but never defended, relaxed or
+// minimal fix. "Free" gates only new bumps: a module's existing spec pin
+// (Candidate.Pinned) is kept even when it moves other modules, the go/toolchain
+// lines or the dependency Go - only a pin that does not apply, breaks the
+// type-check or the rescan is not kept - and later trials are judged against
+// it. Accepted bumps are written but never defended, relaxed or
 // counted as security fixes; rejected ones are recorded as dropped with the
 // reason. Skipped (HygieneSkipped) without the type-check gate or on a
 // non-converged result. Returns the final resolved graph, leaving the
@@ -132,6 +139,7 @@ func (l *loop) hygienePass(ctx context.Context, ref *goModState, resolved map[st
 		return resolved, nil
 	}
 
+	result.MaxDepGoVersion = s.maxGo // raised only by a kept existing pin
 	l.adoptHygiene(s.accepted)
 	out := s.acceptedOut
 	l.requirements, l.replaces = out.st.requires, out.st.replaces
@@ -182,12 +190,12 @@ type hygieneSearch struct {
 
 // try runs one hygiene trial, or returns errHygieneBudget when the budget
 // is too low for another (or the trial ran out of it).
-func (s *hygieneSearch) try(ctx context.Context, purpose string, pins []hygienePin) (*hygieneOutcome, error) {
+func (s *hygieneSearch) try(ctx context.Context, purpose string, pins []hygienePin, kept bool) (*hygieneOutcome, error) {
 	if dl, has := ctx.Deadline(); has && time.Until(dl) < 2*s.cost {
 		return nil, errHygieneBudget
 	}
 	began := time.Now()
-	out, err := s.l.hygieneTrial(ctx, purpose, s.set, pins, s.ref, s.maxGo, s.baseResiduals)
+	out, err := s.l.hygieneTrial(ctx, purpose, s.set, pins, s.ref, s.maxGo, s.baseResiduals, kept)
 	s.cost = max(s.cost, time.Since(began))
 	s.trials++
 	if err != nil && errors.Is(ctx.Err(), context.DeadlineExceeded) {
@@ -205,14 +213,16 @@ func (s *hygieneSearch) run(ctx context.Context, targets []hygieneTarget) error 
 		for _, t := range targets {
 			pins = append(pins, hygienePin{module: t.module, version: t.versions[0], ids: t.vulnIDs})
 		}
-		out, err := s.try(ctx, "hygiene: batch", pins)
+		kept := !slices.ContainsFunc(pins, func(p hygienePin) bool { return !s.l.isPinned(p) })
+		out, err := s.try(ctx, "hygiene: batch", pins, kept)
 		switch {
 		case errors.Is(err, errHygieneBudget):
 			s.stopped = err.Error()
 		case err != nil:
 			return err
 		case out.why == "":
-			s.accepted, s.acceptedOut, s.lastAccepted = pins, out, true
+			s.accept(pins, out, 0)
+			s.lastAccepted = true
 		}
 	}
 	if s.accepted != nil || s.stopped != "" {
@@ -220,8 +230,9 @@ func (s *hygieneSearch) run(ctx context.Context, targets []hygieneTarget) error 
 	}
 	for _, t := range targets {
 		for _, version := range t.versions {
-			pins := append(slices.Clone(s.accepted), hygienePin{module: t.module, version: version, ids: t.vulnIDs})
-			out, err := s.try(ctx, "hygiene: "+t.module, pins)
+			pin := hygienePin{module: t.module, version: version, ids: t.vulnIDs}
+			pins := append(slices.Clone(s.accepted), pin)
+			out, err := s.try(ctx, "hygiene: "+t.module, pins, s.l.isPinned(pin))
 			if errors.Is(err, errHygieneBudget) {
 				s.stopped = err.Error()
 				return nil
@@ -231,7 +242,7 @@ func (s *hygieneSearch) run(ctx context.Context, targets []hygieneTarget) error 
 			}
 			s.lastAccepted = out.why == ""
 			if s.lastAccepted {
-				s.accepted, s.acceptedOut = pins, out
+				s.accept(pins, out, len(pins)-1)
 				delete(s.whys, t.module)
 				break
 			}
@@ -239,6 +250,40 @@ func (s *hygieneSearch) run(ctx context.Context, targets []hygieneTarget) error 
 		}
 	}
 	return nil
+}
+
+// accept adopts pins and the trial that accepted them. When that trial is
+// not free (it accepted existing spec pins, pins[from:]), those pins carry
+// why, and later trials are judged against its go.mod and dependency Go.
+func (s *hygieneSearch) accept(pins []hygienePin, out *hygieneOutcome, from int) {
+	if out.moves != "" {
+		for i := from; i < len(pins); i++ {
+			pins[i].notFree = out.moves
+		}
+		s.ref = out.st
+		if goversion.Compare(out.depGo, s.maxGo) > 0 {
+			s.maxGo = out.depGo
+		}
+	}
+	s.accepted, s.acceptedOut = pins, out
+}
+
+// isPinned reports whether p is at the version the spec already pins its
+// module at (see Candidate.Pinned).
+func (l *loop) isPinned(p hygienePin) bool {
+	pinned := l.pinned(p.module)
+	return pinned != "" && semver.Compare(pinned, p.version) == 0
+}
+
+// pinned is the version the spec already pins module at ("" for none).
+func (l *loop) pinned(module string) string {
+	var v string
+	for _, c := range l.cands {
+		if c.Module == module && semver.Compare(c.Pinned, v) > 0 {
+			v = c.Pinned
+		}
+	}
+	return v
 }
 
 // settleHygiene leaves the checkout holding the final set, as the build will
@@ -281,6 +326,13 @@ func (l *loop) hygieneTargets(found []raise, resolved map[string]string) []hygie
 		case rel == 0:
 			t.versions = []string{scan.PreferVersion(r.version, t.seed)}
 		}
+		// The spec's own pin is tried before anything below it (it is kept
+		// even when not free).
+		if p := l.pinned(r.module); semver.Compare(p, r.version) > 0 && semver.Compare(p, t.seed) != 0 &&
+			!majorChange(r.module, p, resolved[r.module]) {
+			t.versions = append(t.versions, p)
+			slices.SortFunc(t.versions, func(a, b string) int { return semver.Compare(b, a) })
+		}
 		targets = append(targets, t)
 	}
 	slices.SortFunc(targets, func(a, b hygieneTarget) int {
@@ -290,10 +342,12 @@ func (l *loop) hygieneTargets(found []raise, resolved map[string]string) []hygie
 }
 
 // hygieneTrial applies set with pins on top (see withHygiene) and judges
-// whether the result is free against ref (see hygienePass). A verdict is an
-// outcome; an error means the search cannot continue (cancellation,
+// whether the result is free against ref (see hygienePass); kept (the pins
+// under trial are existing spec pins) accepts a result that is not free only
+// because it moves other modules, the go/toolchain lines or the dependency
+// Go, recording why in the outcome. A verdict is an outcome; an error means the search cannot continue (cancellation,
 // infrastructure, toolchain or scanner failure).
-func (l *loop) hygieneTrial(ctx context.Context, purpose string, set []*candState, pins []hygienePin, ref *goModState, maxGo string, baseResiduals []Residual) (*hygieneOutcome, error) {
+func (l *loop) hygieneTrial(ctx context.Context, purpose string, set []*candState, pins []hygienePin, ref *goModState, maxGo string, baseResiduals []Residual, kept bool) (*hygieneOutcome, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -315,14 +369,20 @@ func (l *loop) hygieneTrial(ctx context.Context, purpose string, set []*candStat
 	if err != nil {
 		return nil, err
 	}
-	if why := hygieneDiff(ref, st, pins); why != "" {
-		return notFree(why)
+	why, moves := hygieneDiff(ref, st, pins)
+	if why != "" || (moves != "" && !kept) {
+		return notFree(cmp.Or(why, moves))
 	}
-	switch depGo := l.maxDepGoVersion(ctx); {
+	depGo := l.maxDepGoVersion(ctx)
+	switch {
 	case depGo == "" || maxGo == "":
 		return notFree("dependency Go version unknown")
 	case goversion.Compare(depGo, maxGo) > 0:
-		return notFree(fmt.Sprintf("raises dependency Go %s->%s", maxGo, depGo))
+		raise := fmt.Sprintf("raises dependency Go %s->%s", maxGo, depGo)
+		if !kept {
+			return notFree(raise)
+		}
+		moves = strings.Join(slices.DeleteFunc([]string{moves, raise}, func(s string) bool { return s == "" }), ", ")
 	}
 	report, err := l.typecheckAll(ctx)
 	if err != nil {
@@ -361,37 +421,39 @@ func (l *loop) hygieneTrial(ctx context.Context, purpose string, set []*candStat
 		return notFree("introduces " + strings.Join(ids, ", "))
 	}
 	l.logTrial(ctx, trialLog{purpose: purpose, pins: trialPins, resolved: resolved, residuals: len(residuals)})
-	return &hygieneOutcome{st: st, resolved: resolved, linked: l.linked, linkedPackages: l.linkedPackages, residuals: residuals}, nil
+	return &hygieneOutcome{moves: moves, depGo: depGo, st: st, resolved: resolved, linked: l.linked, linkedPackages: l.linkedPackages, residuals: residuals}, nil
 }
 
 // hygieneDiff reports how st differs from ref beyond the pins' own modules
-// moving to exactly the pins' versions ("" when it does not).
-func hygieneDiff(ref, st *goModState, pins []hygienePin) string {
-	if st.goLines != ref.goLines {
-		return fmt.Sprintf("changes the go/toolchain lines (%q -> %q)", ref.goLines, st.goLines)
-	}
+// moving to exactly the pins' versions: why when the pins do not apply as
+// asked (or replaces change), else moves when other modules or the
+// go/toolchain lines move ("" each when they do not).
+func hygieneDiff(ref, st *goModState, pins []hygienePin) (why, moves string) {
 	if !maps.Equal(st.replaces, ref.replaces) {
-		return "changes replace directives"
+		return "changes replace directives", ""
 	}
 	want := make(map[string]string, len(pins))
 	for _, p := range pins {
 		want[p.module] = p.version
 		if _, ok := ref.requires[p.module]; !ok {
-			return "adds " + p.module + " to go.mod"
+			return "adds " + p.module + " to go.mod", ""
 		}
 		if got := st.requires[p.module]; got != p.version {
-			return fmt.Sprintf("go.mod keeps %s at %s, not %s", p.module, orNone(got), p.version)
+			return fmt.Sprintf("go.mod keeps %s at %s, not %s", p.module, orNone(got), p.version), ""
 		}
 	}
+	if st.goLines != ref.goLines {
+		return "", fmt.Sprintf("changes the go/toolchain lines (%q -> %q)", ref.goLines, st.goLines)
+	}
 	if changes := mapChanges(ref.requires, st.requires, want); len(changes) > 0 {
-		return capList(changes)
+		return "", capList(changes)
 	}
 	if ref.graph != nil {
 		if changes := mapChanges(ref.graph, st.graph, want); len(changes) > 0 {
-			return "build list " + capList(changes)
+			return "", "build list " + capList(changes)
 		}
 	}
-	return ""
+	return "", ""
 }
 
 // mapChanges lists the modules whose version differs between before and
@@ -471,7 +533,7 @@ func withHygiene(set []*candState, pins []hygienePin) []*candState {
 func (l *loop) adoptHygiene(accepted []hygienePin) {
 	for _, p := range accepted {
 		if c := l.byModule[p.module]; c != nil && !c.isDropped() {
-			c.Version, c.hygieneIDs = p.version, p.ids
+			c.Version, c.hygieneIDs, c.hygieneNotFree = p.version, p.ids, p.notFree
 			continue
 		}
 		for _, c := range l.cands {
@@ -481,7 +543,8 @@ func (l *loop) adoptHygiene(accepted []hygienePin) {
 				})
 			}
 		}
-		l.addCandidate(Candidate{Module: p.module, Version: p.version}, false).hygieneIDs = p.ids
+		c := l.addCandidate(Candidate{Module: p.module, Version: p.version}, false)
+		c.hygieneIDs, c.hygieneNotFree = p.ids, p.notFree
 	}
 }
 
@@ -530,7 +593,7 @@ func (l *loop) hygieneModules() []HygieneModule {
 	var modules []HygieneModule
 	for _, c := range l.activeCandidates() {
 		if len(c.hygieneIDs) > 0 {
-			modules = append(modules, HygieneModule{Module: c.Module, Version: c.Version, VulnIDs: c.hygieneIDs})
+			modules = append(modules, HygieneModule{Module: c.Module, Version: c.Version, VulnIDs: c.hygieneIDs, NotFree: c.hygieneNotFree})
 		}
 	}
 	slices.SortFunc(modules, func(a, b HygieneModule) int { return strings.Compare(a.Module, b.Module) })

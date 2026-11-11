@@ -82,6 +82,19 @@ func TestDiscoverGoInstall(t *testing.T) {
 	})
 }
 
+func TestDiscoverPatchStepsNote(t *testing.T) {
+	build := melange.Pipeline{Uses: "go/build", With: map[string]string{"packages": "./cmd/app"}}
+	_, notes := goUnits(t, &melange.Configuration{Pipeline: []melange.Pipeline{
+		{Uses: "patch", With: map[string]string{"patches": "a.patch"}},
+		{Uses: "patch", With: map[string]string{"patches": "b.patch"}},
+		build,
+	}})
+	assert.Equal(t, []string{"2 patch step(s) are not applied in the simulation; deps are validated against the unpatched checkout"}, notes)
+
+	_, notes = goUnits(t, &melange.Configuration{Pipeline: []melange.Pipeline{build}})
+	assert.Empty(t, notes)
+}
+
 func TestDiscoverBuildEnv(t *testing.T) {
 	goBuild := func(with map[string]string, env map[string]string) melange.Pipeline {
 		return melange.Pipeline{Uses: "go/build", With: with, Environment: env}

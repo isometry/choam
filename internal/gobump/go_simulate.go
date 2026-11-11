@@ -320,6 +320,11 @@ func reportModrootResult(ctx context.Context, gp *Processor, m *ModrootAnalysis,
 	}
 	for _, h := range result.HygieneModules {
 		hygieneProposed[h.Module], hygieneProposed[ecogolang.TrimMajorSuffix(h.Module)] = true, true
+		if h.NotFree != "" {
+			gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: kept existing pin %s@%s for scanners although not free (%s; %s; vulnerable package not linked, not a security fix)",
+				m.Modroot, h.Module, h.Version, h.NotFree, strings.Join(h.VulnIDs, ", ")))
+			continue
+		}
 		gp.AddMessage(fmt.Sprintf("modroot %s: hygiene: %s@%s proposed for scanners (%s; vulnerable package not linked, not a security fix)",
 			m.Modroot, h.Module, h.Version, strings.Join(h.VulnIDs, ", ")))
 	}
@@ -497,6 +502,11 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 			continue
 		}
 		candidate := simulate.Candidate{Module: module, Version: version}
+		for _, existing := range existingVersions[module] {
+			if semver.Compare(existing, candidate.Pinned) > 0 {
+				candidate.Pinned = existing
+			}
+		}
 		if info, ok := lookupModule(bumpByModule, module); ok {
 			candidate.FromCVE = true
 			candidate.VulnIDs = info.VulnIDs

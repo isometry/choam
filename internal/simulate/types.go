@@ -166,6 +166,11 @@ type Candidate struct {
 	// left-hand side; empty means a self-replace (ReplaceOld == Module).
 	Replace    bool
 	ReplaceOld string
+
+	// Pinned is the version the spec's deps already pin Module at ("" when
+	// they pin none). The hygiene pass keeps such a pin even when it is not
+	// free: "free" gates only new hygiene bumps (see hygienePass).
+	Pinned string
 }
 
 // OldPath returns the replace directive's left-hand side, defaulting to the
@@ -263,6 +268,9 @@ type HygieneModule struct {
 	Module  string   `json:"module" yaml:"module"`
 	Version string   `json:"version" yaml:"version"`
 	VulnIDs []string `json:"vuln_ids" yaml:"vuln_ids"`
+	// NotFree is why the bump is not free, set only for a pin the spec
+	// already had, kept anyway (see Candidate.Pinned).
+	NotFree string `json:"not_free,omitempty" yaml:"not_free,omitempty"`
 }
 
 // Residual is a vulnerability the simulation could not eliminate, with the

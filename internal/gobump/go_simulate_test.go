@@ -116,7 +116,7 @@ func TestSimulationStage_RewritesDesiredDeps(t *testing.T) {
 		"baseline advisory IDs must thread into the simulation request")
 	seeds := fake.gotReqs[0].Seeds
 	require.Len(t, seeds, 2)
-	assert.Equal(t, simulate.Candidate{Module: "example.com/old", Version: "v1.2.0", FromCVE: true, VulnIDs: []string{"GO-OLD-1"}}, seeds[0])
+	assert.Equal(t, simulate.Candidate{Module: "example.com/old", Version: "v1.2.0", FromCVE: true, VulnIDs: []string{"GO-OLD-1"}, Pinned: "v1.0.0"}, seeds[0])
 	assert.Equal(t, simulate.Candidate{Module: "example.com/pin", Version: "v0.9.0"}, seeds[1])
 
 	modroot := gp.VulnerabilityAnalysis.ByLanguage[0].ByModroot[0]
@@ -1037,6 +1037,18 @@ func TestSeedCandidates_ThreadsSeverity(t *testing.T) {
 		Module: "example.com/a", Version: "v1.1.0", FromCVE: true, VulnIDs: []string{"GO-A"}, Severity: "CRITICAL",
 	}, seeds[0])
 	assert.Equal(t, simulate.Candidate{Module: "example.com/b", Version: "v1.2.0"}, seeds[1])
+}
+
+// TestSeedCandidates_ThreadsPinned: a seed carries the spec's existing pin
+// (the highest, if several), so the hygiene pass keeps it even when not free.
+func TestSeedCandidates_ThreadsPinned(t *testing.T) {
+	seeds := seedCandidates(ModrootAnalysis{
+		ExistingDeps: []string{"example.com/a@v1.3.0", "example.com/a@v1.4.0"},
+		DesiredDeps:  []string{"example.com/a@v1.4.0", "example.com/b@v1.2.0"},
+	})
+	require.Len(t, seeds, 2)
+	assert.Equal(t, "v1.4.0", seeds[0].Pinned)
+	assert.Empty(t, seeds[1].Pinned, "a new dep pins nothing")
 }
 
 // TestSimulationStage_ThreadsEngine: the modroot's bump-step engine and tidy
