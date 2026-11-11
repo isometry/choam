@@ -235,7 +235,11 @@ func scanBuildSteps(ctx context.Context, cfg *melange.Configuration) buildStepSc
 	render := newLenientRenderer(ctx, cfg)
 	arches := goTargetArches(ctx, cfg)
 
+	patches := 0
 	config.ForEachPipelineStep(cfg, func(step *melange.Pipeline) {
+		if step.Uses == "patch" {
+			patches++
+		}
 		var unit analysisUnit
 		language := "go"
 		switch step.Uses {
@@ -267,6 +271,10 @@ func scanBuildSteps(ctx context.Context, cfg *melange.Configuration) buildStepSc
 		}
 		result.units[language] = append(result.units[language], unit)
 	})
+	// ponytail: patch steps are flagged, not mirrored (the simulation clones the pristine tag); mirror them if a spec's pins come to depend on patched imports.
+	if patches > 0 {
+		result.notes[fmt.Sprintf("%d patch step(s) are not applied in the simulation; deps are validated against the unpatched checkout", patches)] = struct{}{}
+	}
 	slices.Sort(result.versionedInstalls)
 	return result
 }
