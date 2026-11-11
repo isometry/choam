@@ -54,6 +54,9 @@ type candState struct {
 	// hygieneIDs are the unlinked advisories a scanner-hygiene bump clears
 	// (see hygienePass); non-empty marks the entry as hygiene.
 	hygieneIDs []string
+	// hygieneNotFree is why a hygiene entry is not free: an existing spec
+	// pin kept anyway (see Candidate.Pinned).
+	hygieneNotFree string
 }
 
 // isDropped reports whether the candidate was dropped (see loop.drop).
