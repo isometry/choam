@@ -84,13 +84,13 @@ func TestEcosystem_FilterBumps(t *testing.T) {
 	}
 
 	t.Run("keeps bump newer than the locked version", func(t *testing.T) {
-		result, held := filter(nil, scan.SecurityBump{Name: "serde", FixedVersion: "1.0.200"})
+		result, held := filter(nil, scan.SecurityBump{Name: "serde", CurrentVersion: "1.0.150", FixedVersion: "1.0.200"})
 		assert.Equal(t, []string{"serde@1.0.200"}, result)
 		assert.Empty(t, held)
 	})
 
 	t.Run("drops bump not newer than the locked version", func(t *testing.T) {
-		result, held := filter(nil, scan.SecurityBump{Name: "serde", FixedVersion: "1.0.120"})
+		result, held := filter(nil, scan.SecurityBump{Name: "serde", CurrentVersion: "1.0.150", FixedVersion: "1.0.120"})
 		assert.Empty(t, result)
 		assert.Empty(t, held)
 	})
@@ -107,16 +107,16 @@ func TestEcosystem_FilterBumps(t *testing.T) {
 	})
 
 	t.Run("never lowers an existing higher pin", func(t *testing.T) {
-		result, held := filter([]string{"serde@1.0.210"}, scan.SecurityBump{Name: "serde", FixedVersion: "1.0.200"})
+		result, held := filter([]string{"serde@1.0.210"}, scan.SecurityBump{Name: "serde", CurrentVersion: "1.0.150", FixedVersion: "1.0.200"})
 		assert.Equal(t, []string{"serde@1.0.210"}, result)
 		assert.Empty(t, held)
 	})
 
 	t.Run("refuses semver-incompatible jumps", func(t *testing.T) {
 		for _, bump := range []scan.SecurityBump{
-			{Name: "serde", FixedVersion: "2.0.0", VulnIDs: []string{"RUSTSEC-1"}}, // major
-			{Name: "hyper", FixedVersion: "0.16.0"},                                // 0.x minor
-			{Name: "ring", FixedVersion: "0.0.4"},                                  // 0.0.x patch
+			{Name: "serde", CurrentVersion: "1.0.150", FixedVersion: "2.0.0", VulnIDs: []string{"RUSTSEC-1"}}, // major
+			{Name: "hyper", CurrentVersion: "0.14.20", FixedVersion: "0.16.0"},                                // 0.x minor
+			{Name: "ring", CurrentVersion: "0.0.3", FixedVersion: "0.0.4"},                                    // 0.0.x patch
 		} {
 			result, held := filter(nil, bump)
 			assert.Empty(t, result, bump.Name)
@@ -124,16 +124,44 @@ func TestEcosystem_FilterBumps(t *testing.T) {
 			assert.Equal(t, bump, held[0].Bump)
 			assert.Contains(t, held[0].Reason, "semver-incompatible")
 		}
-		result, held := filter(nil, scan.SecurityBump{Name: "hyper", FixedVersion: "0.14.28"})
+		result, held := filter(nil, scan.SecurityBump{Name: "hyper", CurrentVersion: "0.14.20", FixedVersion: "0.14.28"})
 		assert.Equal(t, []string{"hyper@0.14.28"}, result, "a compatible 0.x patch is applied")
 		assert.Empty(t, held)
 	})
 
-	t.Run("skips crates locked at multiple versions", func(t *testing.T) {
-		result, held := filter(nil, scan.SecurityBump{Name: "rand", FixedVersion: "0.8.6"})
+	rand := func(current, fixed string) scan.SecurityBump {
+		return scan.SecurityBump{Name: "rand", CurrentVersion: current, FixedVersion: fixed}
+	}
+
+	t.Run("one pinned entry per vulnerable locked version", func(t *testing.T) {
+		result, held := filter(nil, rand("0.7.3", "0.7.4"), rand("0.8.5", "0.8.6"))
+		assert.Equal(t, []string{"rand@0.7.3=0.7.4", "rand@0.8.5=0.8.6"}, result)
+		assert.Empty(t, held)
+
+		result, _ = filter(nil, rand("0.8.5", "0.8.6"))
+		assert.Equal(t, []string{"rand@0.8.5=0.8.6"}, result, "only the vulnerable locked version")
+	})
+
+	t.Run("drops a pinned entry upstream has overtaken", func(t *testing.T) {
+		upstream := &ecosystem.ModuleDeps{Deps: []ecosystem.Dep{
+			{Name: "rand", Version: "0.7.3"},
+			{Name: "rand", Version: "0.8.7"},
+		}}
+		result, held := eco.FilterBumps(t.Context(), []string{"rand@0.8.5=0.8.6"}, nil, upstream)
+		assert.Empty(t, result)
+		assert.Empty(t, held)
+	})
+
+	t.Run("rewrites a plain entry in pinned form", func(t *testing.T) {
+		result, _ := filter([]string{"rand@0.8.6"})
+		assert.Equal(t, []string{"rand@0.8.5=0.8.6"}, result)
+	})
+
+	t.Run("holds a semver-incompatible fix of a multi-version crate", func(t *testing.T) {
+		result, held := filter(nil, rand("0.7.3", "0.8.0"))
 		assert.Empty(t, result)
 		require.Len(t, held, 1)
-		assert.Equal(t, "crate locked at multiple versions (0.7.3, 0.8.5): one bump entry cannot target a single one", held[0].Reason)
+		assert.Equal(t, "fix 0.8.0 is a semver-incompatible upgrade from locked 0.7.3", held[0].Reason)
 	})
 }
 
@@ -153,4 +181,20 @@ func TestEcosystem_BumpCoords_Identity(t *testing.T) {
 	coords := eco.BumpCoords(t.Context(), []scan.SecurityBump{bump}, &ecosystem.ModuleDeps{})
 	require.Len(t, coords, 1)
 	assert.Equal(t, bump, coords["serde"])
+
+	t.Run("crate locked at several versions", func(t *testing.T) {
+		deps := &ecosystem.ModuleDeps{Deps: []ecosystem.Dep{
+			{Name: "rand", Version: "0.8.5"},
+			{Name: "rand", Version: "0.9.2"},
+		}}
+		bump := scan.SecurityBump{Name: "rand", CurrentVersion: "0.9.2", FixedVersion: "0.9.3"}
+		coords := eco.BumpCoords(t.Context(), []scan.SecurityBump{bump}, deps)
+		assert.Equal(t, map[string]scan.SecurityBump{"rand@0.9.2": bump}, coords)
+
+		// The coord matches the split of the entry FilterBumps renders.
+		rendered, _ := eco.FilterBumps(t.Context(), nil, []scan.SecurityBump{bump}, deps)
+		require.Equal(t, []string{"rand@0.9.2=0.9.3"}, rendered)
+		coord, _, _ := ecosystem.SplitDep(rendered[0])
+		assert.Contains(t, coords, coord)
+	})
 }

@@ -335,7 +335,7 @@ func (v *VulnerabilityChecker) analyzeModroot(ctx context.Context, eco ecosystem
 
 	// Coordinates in this modroot's rendered dep grammar (not OSV's own
 	// naming - see Ecosystem.BumpCoords), so they compare directly
-	// against splitCoordVersion output downstream.
+	// against ecosystem.SplitDep output downstream.
 	bumpCoords := eco.BumpCoords(ctx, scanResult.SecurityBumps, deps)
 	securityBumpModules := make([]string, 0, len(bumpCoords))
 	for coord := range bumpCoords {
@@ -433,18 +433,18 @@ func modrootPath(root, file string) string {
 }
 
 // newlyAddedDeps returns the entries in desired that are new or changed
-// relative to existing, by coordinate (see splitCoordVersion).
+// relative to existing, by coordinate (see ecosystem.SplitDep).
 func newlyAddedDeps(existing, desired []string) []string {
 	existingByCoord := make(map[string]string, len(existing))
 	for _, dep := range existing {
-		if coord, version, ok := splitCoordVersion(dep); ok {
+		if coord, version, ok := ecosystem.SplitDep(dep); ok {
 			existingByCoord[coord] = version
 		}
 	}
 
 	var added []string
 	for _, dep := range desired {
-		coord, version, ok := splitCoordVersion(dep)
+		coord, version, ok := ecosystem.SplitDep(dep)
 		if !ok {
 			continue
 		}
@@ -453,18 +453,6 @@ func newlyAddedDeps(existing, desired []string) []string {
 		}
 	}
 	return added
-}
-
-// splitCoordVersion splits a rendered dep entry into its coordinate and
-// trailing version, splitting on the LAST "@" so multi-@ grammars (Maven's
-// "groupId@artifactId@version") are handled the same as simpler ones (Go's
-// "module@version", Rust's "crate@version").
-func splitCoordVersion(dep string) (coord, version string, ok bool) {
-	idx := strings.LastIndex(dep, "@")
-	if idx < 0 {
-		return "", "", false
-	}
-	return dep[:idx], dep[idx+1:], true
 }
 
 // haveDepsChanged compares two dependency lists (order-independent, after
@@ -504,7 +492,7 @@ func addedAcrossRoots(byModroot []ModrootAnalysis) []string {
 		}
 
 		for _, dep := range newlyAddedDeps(m.ExistingDeps, m.DesiredDeps) {
-			coord, _, ok := splitCoordVersion(dep)
+			coord, _, ok := ecosystem.SplitDep(dep)
 			if !ok {
 				coord = dep
 			}
@@ -521,7 +509,7 @@ func addedAcrossRoots(byModroot []ModrootAnalysis) []string {
 		// security fix too - raised replaces must feed epoch accounting. The
 		// module coordinate is the directive's new path ("old=new@version").
 		for _, replace := range newlyAddedDeps(m.ExistingReplaces, m.DesiredReplaces) {
-			coord, version, ok := splitCoordVersion(replace)
+			coord, version, ok := ecosystem.SplitDep(replace)
 			if !ok {
 				continue
 			}
@@ -549,7 +537,7 @@ func addedAcrossRoots(byModroot []ModrootAnalysis) []string {
 func (g *Applier) recordSecurityFixes(gp *Processor, langAnalysis LanguageAnalysis, dependencies []string) {
 	bumps := analysisBumps(langAnalysis)
 	for _, dep := range dependencies {
-		module, version, ok := splitCoordVersion(dep)
+		module, version, ok := ecosystem.SplitDep(dep)
 		if !ok {
 			module = dep
 			version = "unknown"
@@ -573,7 +561,7 @@ func (g *Applier) recordSecurityFixes(gp *Processor, langAnalysis LanguageAnalys
 
 // analysisBumps indexes a language's analysis bumps for lookupModule:
 // rendered coordinates first (see Ecosystem.BumpCoords - this is what
-// matches splitCoordVersion output for Maven "groupId@artifactId" and
+// matches ecosystem.SplitDep output for Maven "groupId@artifactId" and
 // v2+-normalized Go module paths), then OSV names for coordinates the map
 // lacks (hand-built fixtures, or entries the simulation added after
 // analysis).

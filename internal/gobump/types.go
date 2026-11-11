@@ -249,7 +249,7 @@ type ModrootAnalysis struct {
 	ExistingGoVersion string `json:"existing_go_version,omitempty" yaml:"existing_go_version,omitempty"`
 
 	// SecurityBumpModules lists the rendered-grammar coordinates (see
-	// splitCoordVersion and Ecosystem.BumpCoords) of the dependencies OSV
+	// ecosystem.SplitDep and Ecosystem.BumpCoords) of the dependencies OSV
 	// actually flagged as vulnerable for this modroot - i.e.
 	// scanResult.SecurityBumps, not DesiredDeps. The desired set may carry
 	// additional entries with no CVE of their own (e.g. coherence pins the
