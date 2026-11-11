@@ -22,10 +22,9 @@ var (
 )
 
 // Ecosystem implements ecosystem.Ecosystem for Maven-based Java projects.
-// Gradle is not yet supported: melange has no build-pipeline signal to
-// auto-detect a first-time Gradle package (unlike go/build for Go or
-// maven/pombump for Maven), so it isn't reachable through the
-// language-detection path internal/gobump wires up.
+// Gradle is not analyzed: a Gradle project is reachable through a bump step's
+// with.language: java, but its modroot (no pom.xml, a Gradle build file) is
+// skipped - see UnsupportedBuildMarkers.
 //
 // Known limitation: omnibump's Maven analyzer resolves properties declared
 // in a <parent> POM's chain, but only within the files it's given - and
@@ -34,6 +33,13 @@ var (
 // parent POM is skipped rather than mis-scanned.
 type Ecosystem struct {
 	analyzer *maven.MavenAnalyzer
+}
+
+// UnsupportedBuildMarkers implements ecosystem.UnsupportedBuild: a modroot
+// with no pom.xml but a Gradle build file is skipped, not an error.
+func (e *Ecosystem) UnsupportedBuildMarkers() (reason string, markers []string) {
+	return "gradle project: java dependency analysis unsupported",
+		[]string{"build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"}
 }
 
 // New creates the Java (Maven) ecosystem implementation.

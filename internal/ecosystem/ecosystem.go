@@ -62,6 +62,13 @@ type Ecosystem interface {
 	BumpCoords(ctx context.Context, bumps []scan.SecurityBump, deps *ModuleDeps) map[string]scan.SecurityBump
 }
 
+// UnsupportedBuild is optionally implemented by an Ecosystem whose modroots may
+// use a build tool it cannot analyze: when a required manifest is a confirmed
+// 404 and one of the markers exists, the modroot is skipped with reason.
+type UnsupportedBuild interface {
+	UnsupportedBuildMarkers() (reason string, markers []string)
+}
+
 // ModuleDeps is a normalized dependency view for one modroot.
 // HeldBump is an advisory fix FilterBumps refused to write, and why.
 type HeldBump struct {

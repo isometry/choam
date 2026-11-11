@@ -76,6 +76,9 @@ type analysisUnit struct {
 	Arches []string
 	Env    simulate.BuildEnv
 	envs   []simulate.BuildEnv
+	// Manifest is the covering bump step's with.manifest (java: the
+	// checkout-relative pom.xml omnibump reads); "" when absent.
+	Manifest string
 }
 
 // discoverAnalysisUnits determines, for every registered language, the set
@@ -96,6 +99,9 @@ func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bump
 		for _, sets := range units.add(step.EffectiveLanguage(), step.Modroots, nil, nil) {
 			if sets.step == nil {
 				sets.step = step
+			} else if step.Manifest != sets.step.Manifest {
+				logging.From(ctx).Debug("bump steps disagree on manifest; using the first step's",
+					"pipeline", step.Index, "manifest", step.Manifest, "first_pipeline", sets.step.Index, "first_manifest", sets.step.Manifest)
 			}
 		}
 	}
@@ -175,6 +181,7 @@ func (b unitSetBuilder) build(ctx context.Context, golang goDiscovery, notes map
 			unit := analysisUnit{Modroot: root, Engine: simulate.EngineOmnibump}
 			if sets.step != nil {
 				unit.NoTidy = sets.step.NoTidy
+				unit.Manifest = sets.step.Manifest
 			}
 			if language == "go" {
 				for _, tag := range goUnitDetails(ctx, golang, &unit, sets.step, sets.built, notes) {

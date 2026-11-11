@@ -262,6 +262,12 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 		ctx := logging.With(ctx, "modroot", root)
 
 		m, err := v.analyzeModroot(ctx, eco, repoURL, ref, unit, existing, gp)
+		var unsupported *unsupportedBuildError
+		if errors.As(err, &unsupported) {
+			// Absent from ByModroot, so planEdits leaves its steps untouched.
+			gp.Skip(ctx, fmt.Sprintf("%s modroot %s: %s", language, root, unsupported.reason))
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -298,7 +304,7 @@ type modrootExisting struct {
 // bumps the ecosystem holds back are recorded as residuals on gp.
 func (v *VulnerabilityChecker) analyzeModroot(ctx context.Context, eco ecosystem.Ecosystem, repoURL, ref string, unit analysisUnit, existing modrootExisting, gp *Processor) (ModrootAnalysis, error) {
 	root := unit.Modroot
-	files, err := v.fetchManifests(ctx, eco, repoURL, ref, root)
+	files, err := v.fetchManifests(ctx, eco, repoURL, ref, root, unit.Manifest)
 	if err != nil {
 		return ModrootAnalysis{}, err
 	}
@@ -374,14 +380,29 @@ func (v *VulnerabilityChecker) analyzeModroot(ctx context.Context, eco ecosystem
 // fetchManifests fetches a modroot's required and optional manifest files
 // at ref; only a confirmed 404 on an optional manifest is tolerated (fail
 // closed).
-func (v *VulnerabilityChecker) fetchManifests(ctx context.Context, eco ecosystem.Ecosystem, repoURL, ref, root string) (map[string][]byte, error) {
+func (v *VulnerabilityChecker) fetchManifests(ctx context.Context, eco ecosystem.Ecosystem, repoURL, ref, root, manifest string) (map[string][]byte, error) {
 	required, optional := eco.ManifestFiles()
 	files := make(map[string][]byte, len(required)+len(optional))
-	for _, name := range append(slices.Clone(required), optional...) {
-		content, err := v.Analyzer.fetcher.FetchFile(ctx, repoURL, ref, modrootPath(root, name))
+	for i, name := range append(slices.Clone(required), optional...) {
+		path := modrootPath(root, name)
+		if i == 0 && manifest != "" && len(required) > 0 {
+			// The step's with.manifest replaces the first required manifest:
+			// the pipeline passes it as --manifest ${SOURCE_DIR}/<manifest>,
+			// so it is checkout-relative, not modroot-relative. Stored under
+			// the usual key so Analyze is unchanged; a 404 still fails.
+			path = strings.TrimPrefix(manifest, "./")
+		}
+		content, err := v.Analyzer.fetcher.FetchFile(ctx, repoURL, ref, path)
 		if errors.Is(err, ecosystem.ErrNotFound) && slices.Contains(optional, name) {
 			logging.From(ctx).Debug("optional manifest file absent", "manifest", name)
 			continue
+		}
+		if errors.Is(err, ecosystem.ErrNotFound) && manifest == "" && slices.Contains(required, name) {
+			if ub, ok := eco.(ecosystem.UnsupportedBuild); ok {
+				if uerr := v.probeUnsupportedBuild(ctx, ub, repoURL, ref, root); uerr != nil {
+					return nil, uerr
+				}
+			}
 		}
 		if err != nil {
 			return nil, fmt.Errorf("modroot %s: %w", root, err)
@@ -389,6 +410,36 @@ func (v *VulnerabilityChecker) fetchManifests(ctx context.Context, eco ecosystem
 		files[name] = content
 	}
 	return files, nil
+}
+
+// unsupportedBuildError marks a modroot built by a tool its ecosystem cannot
+// analyze (see ecosystem.UnsupportedBuild): skipped, not failed.
+type unsupportedBuildError struct {
+	root, marker, reason string
+}
+
+func (e *unsupportedBuildError) Error() string {
+	return fmt.Sprintf("modroot %s: %s (found %s)", e.root, e.reason, e.marker)
+}
+
+// probeUnsupportedBuild looks for ub's marker files in a modroot whose
+// required manifest is a confirmed 404: the first one found yields an
+// *unsupportedBuildError; none found yields nil (the not-found stands); any
+// other fetch failure is returned (fail closed).
+func (v *VulnerabilityChecker) probeUnsupportedBuild(ctx context.Context, ub ecosystem.UnsupportedBuild, repoURL, ref, root string) error {
+	reason, markers := ub.UnsupportedBuildMarkers()
+	for _, marker := range markers {
+		_, err := v.Analyzer.fetcher.FetchFile(ctx, repoURL, ref, modrootPath(root, marker))
+		if errors.Is(err, ecosystem.ErrNotFound) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("modroot %s: probing %s: %w", root, marker, err)
+		}
+		logging.From(ctx).Debug("unsupported build detected", "marker", marker, "reason", reason)
+		return &unsupportedBuildError{root: root, marker: marker, reason: reason}
+	}
+	return nil
 }
 
 // existingDepsForModroots returns, for each modroot, the deduplicated union
