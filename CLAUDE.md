@@ -78,6 +78,7 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `internal/goversion/` - bare Go version comparison/parsing helpers shared across the above
 - `internal/git/local.go` - `LastCommitInfo()` last-commit-time/dirty/shallow lookup used by the stdlib staleness idempotency guard (a dirty/untracked/non-git file skips only the staleness trigger, not the rebuild-toolchain resolution)
 - `internal/ecosystem/` - per-language `Ecosystem` implementations (`golang/`, `rust/`, `java/`) behind a self-registering plugin registry
+- `internal/ecosystem/rust/` - a crate locked at several Cargo.lock versions gets one deps entry per vulnerable locked version, `name@<locked>=<fix>` (omnibump keys plain `name@v` entries by name, so they would overwrite each other); a single-version crate keeps `name@fix`. The scan keys crates.io fixes by locked version, and `ecosystem.SplitDep` splits the pinned form into coord `name@<locked>`
 - `internal/ecosystem/fetcher.go` - remote manifest fetching (go.mod/Cargo.lock/pom.xml)
 - `internal/scan/vulnerability.go` - `NewVulnerabilityScanner()` OSV scanner (language-agnostic `ScanPackages`; fails closed on incomplete pages or advisory lookups)
 - `internal/scan/osv.go` - minimal api.osv.dev client (querybatch + vulns/{id})

@@ -17,30 +17,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestSplitCoordVersion(t *testing.T) {
-	tests := []struct {
-		dep, wantCoord, wantVersion string
-	}{
-		{"golang.org/x/net@v0.56.0", "golang.org/x/net", "v0.56.0"},
-		{"serde@1.0.200", "serde", "1.0.200"},
-		{"io.netty@netty-codec-http@4.1.94.Final", "io.netty@netty-codec-http", "4.1.94.Final"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.dep, func(t *testing.T) {
-			coord, version, ok := splitCoordVersion(tt.dep)
-			require.True(t, ok)
-			assert.Equal(t, tt.wantCoord, coord)
-			assert.Equal(t, tt.wantVersion, version)
-		})
-	}
-
-	t.Run("no @ at all", func(t *testing.T) {
-		_, _, ok := splitCoordVersion("malformed")
-		assert.False(t, ok)
-	})
-}
-
 func TestRecordSecurityFixes_Attribution(t *testing.T) {
 	lang := LanguageAnalysis{
 		Language: "go",

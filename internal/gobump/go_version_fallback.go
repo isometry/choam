@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/isometry/choam/internal/ecosystem"
 	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
 	"github.com/isometry/choam/internal/gorelease"
 	"github.com/isometry/choam/internal/goversion"
@@ -118,7 +119,7 @@ func fallbackCandidates(m *ModrootAnalysis) []moduleVersion {
 	}
 
 	for _, dep := range m.DesiredDeps {
-		if mod, version, ok := splitCoordVersion(dep); ok {
+		if mod, version, ok := ecosystem.SplitDep(dep); ok {
 			add(mod, version)
 		}
 	}

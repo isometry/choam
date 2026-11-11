@@ -9,6 +9,7 @@ package ecosystem
 
 import (
 	"context"
+	"strings"
 
 	"github.com/isometry/choam/internal/scan"
 )
@@ -89,4 +90,23 @@ type Dep struct {
 	GroupID    string // Java only
 	ArtifactID string // Java only
 	Indirect   bool
+}
+
+// SplitDep splits a rendered dep entry into its coordinate and trailing
+// version, splitting on the LAST "@" so multi-@ grammars (Maven's
+// "groupId@artifactId@version") are handled the same as simpler ones (Go's
+// "module@version", Rust's "crate@version"). A Rust entry pinned to one of
+// several locked versions, "crate@locked=fix", splits into ("crate@locked",
+// "fix"); no other grammar has "=" after its last "@" (a Go replace's "=" sits
+// before it).
+func SplitDep(dep string) (coord, version string, ok bool) {
+	idx := strings.LastIndex(dep, "@")
+	if idx < 0 {
+		return "", "", false
+	}
+	coord, version = dep[:idx], dep[idx+1:]
+	if from, to, pinned := strings.Cut(version, "="); pinned {
+		return coord + "@" + from, to, true
+	}
+	return coord, version, true
 }

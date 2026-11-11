@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/isometry/choam/internal/ecosystem"
 	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
 	"github.com/isometry/choam/internal/goversion"
 	"github.com/isometry/choam/internal/logging"
@@ -467,7 +468,7 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 	}
 	existingVersions := make(map[string][]string)
 	for _, dep := range m.ExistingDeps {
-		if module, version, ok := splitCoordVersion(dep); ok {
+		if module, version, ok := ecosystem.SplitDep(dep); ok {
 			existingVersions[module] = append(existingVersions[module], version)
 		}
 	}
@@ -491,7 +492,7 @@ func seedCandidates(m ModrootAnalysis) []simulate.Candidate {
 	}
 
 	for _, dep := range m.DesiredDeps {
-		module, version, ok := splitCoordVersion(dep)
+		module, version, ok := ecosystem.SplitDep(dep)
 		if !ok {
 			continue
 		}
