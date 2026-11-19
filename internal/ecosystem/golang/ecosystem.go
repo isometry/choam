@@ -192,6 +192,6 @@ func (e *Ecosystem) FilterBumps(ctx context.Context, existing []string, bumps []
 		candidate = append(candidate, fmt.Sprintf("%s@%s", bump.Name, bump.FixedVersion))
 	}
 
-	_, filtered := e.analyzer.analyzeBumps(ctx, candidate, info)
+	_, filtered := e.analyzer.analyzeBumps(ctx, candidate, existing, info)
 	return filtered, nil
 }
