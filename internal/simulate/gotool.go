@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/isometry/choam/internal/logging"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
@@ -217,39 +218,82 @@ type goListModule struct {
 	Main      bool
 	GoVersion string // the module's `go` directive, bare form (e.g. "1.24.5")
 	Replace   *goListModule
+	Error     *struct{ Err string } // set by `go list -m -e` when the module cannot be loaded
 }
 
-func (t *GoToolchain) ListModules(ctx context.Context, dir string) (map[string]string, error) {
-	output, err := t.run(ctx, dir, "list", "-m", "-json", "all")
-	if err != nil {
-		return nil, err
-	}
+// isPlaceholderVersion reports whether v is a version no module can be
+// fetched at: the `v0.0.0` (or zero pseudo-version) a go.mod uses together
+// with a local `replace`. k8s.io/kubernetes requires its staging modules this
+// way; a consumer inherits the requirement but not the replace.
+func isPlaceholderVersion(v string) bool {
+	return v == "v0.0.0" || v == "v0.0.0-00010101000000-000000000000"
+}
 
-	resolved := make(map[string]string)
+// parseModules decodes `go list -m -e -json all` output into the non-main
+// modules of the build list with replace directives applied (Path, Version
+// and GoVersion are the replacement's), skipping local-filesystem
+// replacements. A module that failed to load is skipped and its path
+// returned in unloadable when its version is a placeholder - the real build
+// never reads such a module's go.mod (no package of it is imported), and
+// `go list -m` without -e would abort the whole listing on it. Any other load
+// error is returned (an infrastructure failure stays ErrInfrastructure):
+// -e must not silently drop real scan input.
+func parseModules(output []byte) (mods []goListModule, unloadable []string, err error) {
 	decoder := json.NewDecoder(bytes.NewReader(output))
 	for {
 		var mod goListModule
 		if err := decoder.Decode(&mod); err != nil {
 			if err == io.EOF {
-				break
+				return mods, unloadable, nil
 			}
-			return nil, fmt.Errorf("parsing go list -m -json output: %w", err)
+			return nil, nil, fmt.Errorf("parsing go list -m -json output: %w", err)
 		}
 		if mod.Main {
 			continue
 		}
-		path, version := mod.Path, mod.Version
 		if mod.Replace != nil {
 			if mod.Replace.Version == "" {
 				// Local filesystem replacement - nothing meaningful to scan.
 				continue
 			}
-			path, version = mod.Replace.Path, mod.Replace.Version
+			err := mod.Error
+			mod = *mod.Replace
+			mod.Error = err
 		}
-		if version == "" {
-			continue
+		if mod.Error != nil {
+			if isPlaceholderVersion(mod.Version) {
+				unloadable = append(unloadable, mod.Path)
+				continue
+			}
+			err := fmt.Errorf("go list -m %s@%s: %s", mod.Path, mod.Version, condenseOutput([]byte(mod.Error.Err)))
+			if ierr := asInfra(err); ierr != nil {
+				return nil, nil, ierr
+			}
+			return nil, nil, err
 		}
-		resolved[path] = version
+		mods = append(mods, mod)
+	}
+}
+
+func (t *GoToolchain) ListModules(ctx context.Context, dir string) (map[string]string, error) {
+	output, err := t.run(ctx, dir, "list", "-m", "-e", "-json", "all")
+	if err != nil {
+		return nil, err
+	}
+	mods, unloadable, err := parseModules(output)
+	if err != nil {
+		return nil, err
+	}
+	if len(unloadable) > 0 {
+		logging.From(ctx).Debug("ignoring placeholder-version modules that cannot be loaded (replaced only in their own module)",
+			"count", len(unloadable), "first", unloadable[0])
+	}
+
+	resolved := make(map[string]string)
+	for _, mod := range mods {
+		if mod.Version != "" {
+			resolved[mod.Path] = mod.Version
+		}
 	}
 	return resolved, nil
 }
@@ -260,36 +304,20 @@ func (t *GoToolchain) ListModules(ctx context.Context, dir string) (map[string]s
 // skip-main/skip-local-replacement semantics exactly, substituting GoVersion
 // for Version throughout.
 func (t *GoToolchain) DepGoVersions(ctx context.Context, dir string) (map[string]string, error) {
-	output, err := t.run(ctx, dir, "list", "-m", "-json", "all")
+	output, err := t.run(ctx, dir, "list", "-m", "-e", "-json", "all")
+	if err != nil {
+		return nil, err
+	}
+	mods, _, err := parseModules(output)
 	if err != nil {
 		return nil, err
 	}
 
 	versions := make(map[string]string)
-	decoder := json.NewDecoder(bytes.NewReader(output))
-	for {
-		var mod goListModule
-		if err := decoder.Decode(&mod); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return nil, fmt.Errorf("parsing go list -m -json output: %w", err)
+	for _, mod := range mods {
+		if mod.GoVersion != "" {
+			versions[mod.Path] = mod.GoVersion
 		}
-		if mod.Main {
-			continue
-		}
-		path, goVersion := mod.Path, mod.GoVersion
-		if mod.Replace != nil {
-			if mod.Replace.Version == "" {
-				// Local filesystem replacement - mirror ListModules' skip.
-				continue
-			}
-			path, goVersion = mod.Replace.Path, mod.Replace.GoVersion
-		}
-		if goVersion == "" {
-			continue
-		}
-		versions[path] = goVersion
 	}
 	return versions, nil
 }

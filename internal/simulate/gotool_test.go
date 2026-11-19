@@ -226,6 +226,41 @@ func TestParseDeps_Malformed(t *testing.T) {
 	assert.Contains(t, err.Error(), "parsing go list -deps -json output")
 }
 
+// TestParseModules: main and local-replaced modules are skipped, replaces are
+// applied, an unloadable placeholder-version module (k8s.io/kubernetes' staging
+// requirements) is skipped and reported, and any other load error fails closed
+// (an environment failure stays ErrInfrastructure).
+func TestParseModules(t *testing.T) {
+	out := []byte(`
+{"Path":"example.com/main","Main":true}
+{"Path":"example.com/a","Version":"v1.2.3","GoVersion":"1.24"}
+{"Path":"example.com/r","Version":"v1.0.0","GoVersion":"1.20","Replace":{"Path":"example.com/r2","Version":"v1.1.0","GoVersion":"1.22"}}
+{"Path":"example.com/local","Version":"v1.0.0","Replace":{"Path":"../local"}}
+{"Path":"k8s.io/kubectl","Version":"v0.0.0","Error":{"Err":"invalid version: unknown revision v0.0.0"}}
+{"Path":"k8s.io/kubelet","Version":"v0.0.0-00010101000000-000000000000","Error":{"Err":"invalid version"}}
+`)
+	mods, unloadable, err := parseModules(out)
+	require.NoError(t, err)
+	require.Len(t, mods, 2)
+	assert.Equal(t, "example.com/a", mods[0].Path)
+	assert.Equal(t, "example.com/r2", mods[1].Path)
+	assert.Equal(t, "v1.1.0", mods[1].Version)
+	assert.Equal(t, "1.22", mods[1].GoVersion)
+	assert.Equal(t, []string{"k8s.io/kubectl", "k8s.io/kubelet"}, unloadable)
+
+	_, _, err = parseModules([]byte(`{"Path":"example.com/b","Version":"v1.0.0","Error":{"Err":"verifying module: checksum mismatch"}}`))
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrInfrastructure)
+	assert.Contains(t, err.Error(), "example.com/b@v1.0.0")
+
+	_, _, err = parseModules([]byte(`{"Path":"example.com/b","Version":"v1.0.0","Error":{"Err":"dial tcp: i/o timeout"}}`))
+	assert.ErrorIs(t, err, ErrInfrastructure)
+
+	_, _, err = parseModules([]byte(`{"Path":`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parsing go list -m -json output")
+}
+
 func TestUnmatchedEmbed(t *testing.T) {
 	for text, want := range map[string]string{
 		"pattern manifests/*.yaml: no matching files found":                         "manifests/*.yaml",
