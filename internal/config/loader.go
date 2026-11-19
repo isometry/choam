@@ -408,19 +408,22 @@ func splitWhitespaceList(value string) []string {
 	return result
 }
 
-// GetBumpDeps extracts the deps field from a bump or go/bump pipeline
-func (l *Loader) GetBumpDeps(yamlContent []byte, pipelineIndex int) ([]string, error) {
+// GetBumpDeps extracts the deps of a bump or go/bump pipeline step and the
+// with key holding them: with.deps, else its pipeline alias with.packages
+// (the two are mutually exclusive in the pipeline, so deps wins when both are
+// present). The key is "deps" when neither is present.
+func (l *Loader) GetBumpDeps(yamlContent []byte, pipelineIndex int) ([]string, string, error) {
 	withFields, err := l.GetPipelineWithField(yamlContent, pipelineIndex)
 	if err != nil {
-		return nil, fmt.Errorf("getting pipeline with fields: %w", err)
+		return nil, "", fmt.Errorf("getting pipeline with fields: %w", err)
 	}
 
-	deps, ok := withFields["deps"]
-	if !ok {
-		return []string{}, nil // No deps field
+	for _, key := range []string{"deps", "packages"} {
+		if deps, ok := withFields[key]; ok {
+			return splitWhitespaceList(deps), key, nil
+		}
 	}
-
-	return splitWhitespaceList(deps), nil
+	return []string{}, "deps", nil
 }
 
 // GetBumpReplaces extracts the replaces field ("old=new@version" entries) from
@@ -453,7 +456,9 @@ type BumpStep struct {
 	NoTidy    bool     // with.tidy is literally false (the input defaults to true)
 	Work      bool     // with.work is literally true (go/bump only: gobump's go.work mode)
 	Modroots  []string // parsed with.modroot entries; defaults to ["."] when absent
-	Deps      []string // parsed with.deps entries ("module@version")
+	Deps      []string // parsed with.deps (else with.packages) entries ("module@version")
+	DepsKey   string   // the with key Deps came from and is written back to: "deps" or "packages"
+	Manifest  string   // raw with.manifest (java: checkout-relative pom.xml path; "" when absent)
 	Replaces  []string // parsed with.replaces entries ("old=new@version")
 }
 
@@ -483,7 +488,7 @@ func (l *Loader) FindBumpSteps(yamlContent []byte) ([]BumpStep, error) {
 				return nil, fmt.Errorf("getting modroot for pipeline[%d]: %w", idx, err)
 			}
 
-			deps, err := l.GetBumpDeps(yamlContent, idx)
+			deps, depsKey, err := l.GetBumpDeps(yamlContent, idx)
 			if err != nil {
 				return nil, fmt.Errorf("getting deps for pipeline[%d]: %w", idx, err)
 			}
@@ -493,10 +498,11 @@ func (l *Loader) FindBumpSteps(yamlContent []byte) ([]BumpStep, error) {
 				return nil, fmt.Errorf("getting replaces for pipeline[%d]: %w", idx, err)
 			}
 
-			var language, goVersion string
+			var language, goVersion, manifest string
 			var noTidy, work bool
 			if withFields, err := l.GetPipelineWithField(yamlContent, idx); err == nil {
 				language = withFields["language"]
+				manifest = strings.TrimSpace(withFields["manifest"])
 				goVersion = withFields["go-version"]
 				noTidy = strings.TrimSpace(withFields["tidy"]) == "false"
 				work = strings.TrimSpace(withFields["work"]) == "true"
@@ -511,6 +517,8 @@ func (l *Loader) FindBumpSteps(yamlContent []byte) ([]BumpStep, error) {
 				Work:      work,
 				Modroots:  modroots,
 				Deps:      deps,
+				DepsKey:   depsKey,
+				Manifest:  manifest,
 				Replaces:  replaces,
 			})
 		}
@@ -538,25 +546,29 @@ func (l *Loader) GetBumpModroots(yamlContent []byte, pipelineIndex int) ([]strin
 	return splitWhitespaceList(modroot), nil
 }
 
-// UpdateBumpStep updates a bump/go-bump step's deps, replaces and
-// go-version fields in place. Both deps and replaces empty removes the whole
+// UpdateBumpStep updates a bump/go-bump step's deps (under with.<depsKey>:
+// "deps" or its alias "packages"; "" means "deps"), replaces and go-version
+// fields in place; a missing deps key is created. Both deps and replaces empty removes the whole
 // step; deps empty with replaces present keeps the step (gobump accepts a
 // replaces-only invocation) and removes just the deps field; an empty
 // replaces list removes just that field. goVersion == "" leaves any existing
 // go-version field untouched (it is never removed by this call); a non-empty
 // goVersion upserts go-version as a quoted scalar so it can never round-trip
 // as a YAML float.
-func (l *Loader) UpdateBumpStep(yamlContent []byte, pipelineIndex int, deps, replaces []string, goVersion string) ([]byte, error) {
+func (l *Loader) UpdateBumpStep(yamlContent []byte, pipelineIndex int, depsKey string, deps, replaces []string, goVersion string) ([]byte, error) {
 	if len(deps) == 0 && len(replaces) == 0 {
 		return l.RemovePipelineStep(yamlContent, pipelineIndex)
+	}
+	if depsKey == "" {
+		depsKey = "deps"
 	}
 
 	var err error
 	if len(deps) == 0 {
-		yamlContent, err = l.RemovePipelineWithField(yamlContent, pipelineIndex, "deps")
+		yamlContent, err = l.RemovePipelineWithField(yamlContent, pipelineIndex, depsKey)
 	} else {
-		path := fmt.Sprintf("$.pipeline[%d].with.deps", pipelineIndex)
-		yamlContent, err = l.UpdateFieldWithBlockScalar(yamlContent, path, strings.Join(deps, "\n"))
+		// Upsert: a plain replace is a silent no-op when the key is absent.
+		yamlContent, err = l.UpsertPipelineWithBlockScalar(yamlContent, pipelineIndex, depsKey, strings.Join(deps, "\n"))
 	}
 	if err != nil {
 		return nil, fmt.Errorf("updating deps for pipeline[%d]: %w", pipelineIndex, err)

@@ -1,6 +1,7 @@
 package simulate
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"slices"
@@ -53,6 +54,9 @@ type candState struct {
 	// hygieneIDs are the unlinked advisories a scanner-hygiene bump clears
 	// (see hygienePass); non-empty marks the entry as hygiene.
 	hygieneIDs []string
+	// hygieneNotFree is why a hygiene entry is not free: an existing spec
+	// pin kept anyway (see Candidate.Pinned).
+	hygieneNotFree string
 }
 
 // isDropped reports whether the candidate was dropped (see loop.drop).
@@ -437,7 +441,12 @@ func (l *loop) buildResult(ctx context.Context, resolved map[string]string, resu
 	result.FinalDeps, result.FinalReplaces, result.CVEBackedModules = l.finalOutputs(resolved)
 	result.HygieneModules = l.hygieneModules()
 	result.Dropped = l.dropped
-	result.Residuals = append(append([]Residual{}, l.persistentResiduals...), l.scanResiduals...)
+	// A shed fix the final graph resolves at or above anyway is no residual.
+	persistent := slices.DeleteFunc(append([]Residual{}, l.persistentResiduals...), func(r Residual) bool {
+		got := cmp.Or(r.ResolvedVersion, resolved[r.Module])
+		return semver.IsValid(r.FixedVersion) && semver.IsValid(got) && semver.Compare(got, r.FixedVersion) >= 0
+	})
+	result.Residuals = append(persistent, l.scanResiduals...)
 	for i := range result.Residuals {
 		// Apply-time residuals are recorded before any clean resolve exists;
 		// backfill the module's final graph version for honest reporting.

@@ -72,6 +72,55 @@ func TestReconcileBumpSteps_JavaGrammar(t *testing.T) {
 	assert.Equal(t, "HIGH", gp.SecurityFixes[0].Severity)
 }
 
+// TestReconcileBumpSteps_JavaPackagesKeyRewrittenInPlace: a step declaring
+// its deps under the packages alias is rewritten under packages, never
+// gaining a deps key (which the pipeline treats as mutually exclusive).
+func TestReconcileBumpSteps_JavaPackagesKeyRewrittenInPlace(t *testing.T) {
+	const spec = `package:
+  name: example
+  version: 1.0.0
+  epoch: 0
+
+pipeline:
+  - uses: git-checkout
+    with:
+      repository: https://github.com/example/example
+      tag: v${{package.version}}
+
+  - uses: bump
+    with:
+      language: java
+      packages: |
+        io.netty@netty-codec-http@4.1.90.Final
+`
+	gp := newTestProcessor(t, spec)
+	loader := config.NewLoader()
+	applier := NewApplier(nil)
+
+	analysis := &VulnerabilityAnalysis{
+		ByLanguage: []LanguageAnalysis{{
+			Language: "java",
+			ByModroot: []ModrootAnalysis{{
+				Modroot:             ".",
+				ExistingDeps:        []string{"io.netty@netty-codec-http@4.1.90.Final"},
+				DesiredDeps:         []string{"io.netty@netty-codec-http@4.1.94.Final"},
+				SecurityBumpModules: []string{"io.netty@netty-codec-http"},
+			}},
+		}},
+		BumpActions: []BumpAction{{Action: "needs_bump", Language: "java", Modroots: []string{"."}}},
+	}
+
+	require.NoError(t, applier.reconcileBumpSteps(t.Context(), gp, analysis, loader))
+	assert.True(t, gp.ActualChangesApplied)
+	assert.NotContains(t, string(gp.GetCurrentYAML()), "deps:")
+
+	steps, err := loader.FindBumpSteps(gp.GetCurrentYAML())
+	require.NoError(t, err)
+	require.Len(t, steps, 1)
+	assert.Equal(t, "packages", steps[0].DepsKey)
+	assert.Equal(t, []string{"io.netty@netty-codec-http@4.1.94.Final"}, steps[0].Deps)
+}
+
 func TestCoalesceModroots(t *testing.T) {
 	byModroot := []ModrootAnalysis{
 		{Modroot: "cmd/a", DesiredDeps: []string{"a@v1", "b@v1"}},

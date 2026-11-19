@@ -41,6 +41,7 @@ type textVariant struct {
 	goVersion    string
 	requires     map[string]string
 	importsExtra bool
+	breaks       bool // language.Tag changes type: the linked message package no longer type-checks
 }
 
 // modFiles renders a stub module's go.mod plus its source files.
@@ -68,6 +69,9 @@ func xtextModule(v textVariant) map[string]string {
 	language := "package language\n\nfunc Tag() string { return \"en\" }\n"
 	if v.importsExtra {
 		language = "package language\n\nimport \"" + modExtra + "\"\n\nfunc Tag() string { return extra.Name() }\n"
+	}
+	if v.breaks {
+		language = "package language\n\nfunc Tag() int { return 0 }\n"
 	}
 	return modFiles(modXText, v.goVersion, v.requires, map[string]string{
 		"language/language.go": language,
@@ -177,7 +181,7 @@ func baselineSeeds(c replayCase, pins map[string]string) []Candidate {
 				version = pin
 			}
 		}
-		candidate := Candidate{Module: bump.Name, Version: version, FromCVE: true, VulnIDs: bump.VulnIDs, Severity: bump.Severity}
+		candidate := Candidate{Module: bump.Name, Version: version, FromCVE: true, VulnIDs: bump.VulnIDs, Severity: bump.Severity, Pinned: pins[bump.Name]}
 		if rungs := FixRungs(result.Vulnerabilities, bump.Name, bump.VulnIDs, also...); len(rungs) > 1 {
 			candidate.Rungs = rungs
 		}
@@ -222,9 +226,18 @@ func hygienePinKeptCase() replayCase {
 	return c
 }
 
+// hygieneMixedPinnedCase is hygieneMixedCase(siblingAt) with the spec
+// already pinning the not-free hygiene fix: the pin must be kept, never
+// lowered to the security fix.
+func hygieneMixedPinnedCase() replayCase {
+	c := hygieneMixedCase(siblingAt, "hygiene-mixed-pinned")
+	c.req.Seeds = baselineSeeds(c, map[string]string{modXText: "v0.21.0"})
+	return c
+}
+
 func hygieneReplayCases() []replayCase {
 	return []replayCase{hygieneFreeCase(), hygieneSiblingCase(), hygieneMixedCase(siblingAt, "hygiene-mixed"),
-		hygieneBatchCase(), hygienePinKeptCase()}
+		hygieneBatchCase(), hygienePinKeptCase(), hygieneMixedPinnedCase()}
 }
 
 func hygieneDrop(result *ModrootResult, module string) (DroppedCandidate, bool) {
@@ -384,9 +397,21 @@ func TestReplay_HygienePins(t *testing.T) {
 			result, err := c.run(t, c.fixture(t), eng, false)
 			require.NoError(t, err)
 			logResult(t, result)
-			assert.Equal(t, []string{modXText + "@v0.21.0"}, result.FinalDeps, "the pin falls back to the free minimal fix")
-			assert.Equal(t, []HygieneModule{{Module: modXText, Version: "v0.21.0", VulnIDs: []string{advNorm, advPrecis}}}, result.HygieneModules)
+			assert.Equal(t, []string{modXText + "@v0.21.5"}, result.FinalDeps, "free gates only new bumps: the existing pin is kept")
+			assert.Equal(t, []HygieneModule{{Module: modXText, Version: "v0.21.5", VulnIDs: []string{advNorm, advPrecis},
+				NotFree: "changes " + modXSys + " v0.1.0->v0.2.0"}}, result.HygieneModules)
 			assert.Empty(t, result.Dropped)
+		})
+	})
+	t.Run("pin-breaks-typecheck", func(t *testing.T) {
+		forEachEngine(t, func(t *testing.T, eng Engine) {
+			c := hygieneCase("hygiene-pin-breaks", map[string]textVariant{"v0.21.5": {breaks: true}}, normAdvisories, false, []Candidate{})
+			c.req.Seeds = baselineSeeds(c, map[string]string{modXText: "v0.21.5"})
+			result, err := c.run(t, c.fixture(t), eng, false)
+			require.NoError(t, err)
+			logResult(t, result)
+			assert.Equal(t, []string{modXText + "@v0.21.0"}, result.FinalDeps, "a pin that breaks the type-check is not kept: the free minimal fix is")
+			assert.Equal(t, []HygieneModule{{Module: modXText, Version: "v0.21.0", VulnIDs: []string{advNorm, advPrecis}}}, result.HygieneModules)
 		})
 	})
 	t.Run("upstream-caught-up", func(t *testing.T) {
@@ -394,7 +419,7 @@ func TestReplay_HygienePins(t *testing.T) {
 			c := hygieneFreeCase()
 			c.main = kubeconformMain("v0.21.0", false)
 			c.req.Baseline[modXText] = "v0.21.0"
-			c.req.Seeds = []Candidate{{Module: modXText, Version: "v0.21.0"}} // last run's hygiene pin
+			c.req.Seeds = []Candidate{{Module: modXText, Version: "v0.21.0", Pinned: "v0.21.0"}} // last run's hygiene pin
 			result, err := c.run(t, c.fixture(t), eng, false)
 			require.NoError(t, err)
 			logResult(t, result)
@@ -425,6 +450,25 @@ func TestReplay_HygieneMixedModule(t *testing.T) {
 			drop, ok := hygieneDrop(result, modXText)
 			require.True(t, ok)
 			assert.Contains(t, drop.Reason, "shed: scanner hygiene pin "+modXText+"@v0.21.0 not free (changes "+modXSys)
+		})
+	})
+	t.Run("not-free-pinned", func(t *testing.T) {
+		forEachEngine(t, func(t *testing.T, eng Engine) {
+			c := hygieneMixedPinnedCase()
+			trace := &traceCapture{}
+			result, err := c.runCtx(logging.Into(t.Context(), slog.New(trace)), c.fixture(t), eng, false)
+			require.NoError(t, err)
+			logResult(t, result)
+			assert.Equal(t, []string{modXText + "@v0.21.0"}, result.FinalDeps, "the existing pin is never lowered to the security fix")
+			assert.Equal(t, []string{modXText}, result.CVEBackedModules, "the linked advisory's fix")
+			assert.Equal(t, []HygieneModule{{Module: modXText, Version: "v0.21.0", VulnIDs: []string{advNorm, advPrecis},
+				NotFree: "changes " + modXSys + " v0.1.0->v0.2.0"}}, result.HygieneModules)
+			assert.Empty(t, result.Residuals)
+			assert.Empty(t, result.Dropped, "not shed")
+			assert.Equal(t, "v0.2.0", result.Resolved[modXSys])
+			assert.False(t, slices.ContainsFunc(trace.records, func(r traceRecord) bool {
+				return r.msg == "scanner hygiene bump not free - not proposed"
+			}))
 		})
 	})
 	t.Run("free", func(t *testing.T) {

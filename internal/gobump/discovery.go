@@ -76,6 +76,9 @@ type analysisUnit struct {
 	Arches []string
 	Env    simulate.BuildEnv
 	envs   []simulate.BuildEnv
+	// Manifest is the covering bump step's with.manifest (java: the
+	// checkout-relative pom.xml omnibump reads); "" when absent.
+	Manifest string
 }
 
 // discoverAnalysisUnits determines, for every registered language, the set
@@ -96,6 +99,9 @@ func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bump
 		for _, sets := range units.add(step.EffectiveLanguage(), step.Modroots, nil, nil) {
 			if sets.step == nil {
 				sets.step = step
+			} else if step.Manifest != sets.step.Manifest {
+				logging.From(ctx).Debug("bump steps disagree on manifest; using the first step's",
+					"pipeline", step.Index, "manifest", step.Manifest, "first_pipeline", sets.step.Index, "first_manifest", sets.step.Manifest)
 			}
 		}
 	}
@@ -175,6 +181,7 @@ func (b unitSetBuilder) build(ctx context.Context, golang goDiscovery, notes map
 			unit := analysisUnit{Modroot: root, Engine: simulate.EngineOmnibump}
 			if sets.step != nil {
 				unit.NoTidy = sets.step.NoTidy
+				unit.Manifest = sets.step.Manifest
 			}
 			if language == "go" {
 				for _, tag := range goUnitDetails(ctx, golang, &unit, sets.step, sets.built, notes) {
@@ -235,7 +242,11 @@ func scanBuildSteps(ctx context.Context, cfg *melange.Configuration) buildStepSc
 	render := newLenientRenderer(ctx, cfg)
 	arches := goTargetArches(ctx, cfg)
 
+	patches := 0
 	config.ForEachPipelineStep(cfg, func(step *melange.Pipeline) {
+		if step.Uses == "patch" {
+			patches++
+		}
 		var unit analysisUnit
 		language := "go"
 		switch step.Uses {
@@ -267,6 +278,10 @@ func scanBuildSteps(ctx context.Context, cfg *melange.Configuration) buildStepSc
 		}
 		result.units[language] = append(result.units[language], unit)
 	})
+	// ponytail: patch steps are flagged, not mirrored (the simulation clones the pristine tag); mirror them if a spec's pins come to depend on patched imports.
+	if patches > 0 {
+		result.notes[fmt.Sprintf("%d patch step(s) are not applied in the simulation; deps are validated against the unpatched checkout", patches)] = struct{}{}
+	}
 	slices.Sort(result.versionedInstalls)
 	return result
 }

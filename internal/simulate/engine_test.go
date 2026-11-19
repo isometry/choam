@@ -230,8 +230,9 @@ func TestRunLoop_OmnibumpDowngradeVerification(t *testing.T) {
 // the m/sub entry is then redundant (implied by the remedy). omnibump
 // applies the remedy's concrete version as an in-place require edit, which
 // runs after every `go get`, so fetching m/sub stays ambiguous whatever the
-// remedy: the build's bump step could not apply it either, so the m/sub fix
-// is a residual and nothing is written.
+// remedy: the build's bump step could not apply it either, so no m/sub entry
+// is written. The written remedy alone resolves m/sub at the fix, so that
+// shed is no residual (only the drop record remains).
 func TestRunLoop_AmbiguousImportBothEngines(t *testing.T) {
 	forEachEngine(t, func(t *testing.T, eng Engine) {
 		subSrc := "package sub\n\nfunc Name() string { return \"sub\" }\n"
@@ -257,9 +258,11 @@ func TestRunLoop_AmbiguousImportBothEngines(t *testing.T) {
 		assert.Empty(t, result.FinalReplaces)
 		if eng == EngineOmnibump {
 			assert.NotContains(t, result.FinalDeps, "example.com/m/sub@v1.1.0")
-			require.Len(t, result.Residuals, 1)
-			assert.Equal(t, "example.com/m/sub", result.Residuals[0].Module)
-			assert.Contains(t, result.Residuals[0].Reason, "ambiguous import")
+			assert.Equal(t, "v1.1.0", result.Resolved["example.com/m/sub"])
+			assert.Empty(t, result.Residuals)
+			require.Len(t, result.Dropped, 1)
+			assert.Equal(t, "example.com/m/sub", result.Dropped[0].Module)
+			assert.Contains(t, result.Dropped[0].Reason, "ambiguous import")
 			return
 		}
 		assert.Empty(t, result.Residuals)

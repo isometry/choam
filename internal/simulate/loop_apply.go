@@ -105,17 +105,23 @@ func (l *loop) apply(ctx context.Context) error {
 // failed attempt-closing tidy, in escalating order of sacrifice:
 //  1. Repair a monolith-vs-split-module "ambiguous import" by advancing the
 //     monolith module past the split point (once per module).
-//  2. Drop the most recently raised (non-seed) candidate - the likeliest
+//  2. Drop the low floors an active CVE pin's own go.mod already implies
+//     (see dropImpliedFloors): applied after the pin, they downgrade the
+//     graph, and blame order would otherwise shed an innocent CVE pin first.
+//  3. Drop the most recently raised (non-seed) candidate - the likeliest
 //     culprit for a graph that resolves per-module but won't tidy.
-//  3. Drop the last coherence-only seed.
-//  4. Drop the last CVE-backed candidate, recording its advisories as
+//  4. Drop the last coherence-only seed.
+//  5. Drop the last CVE-backed candidate, recording its advisories as
 //     residuals ("bump as high as viable, report the rest").
-//  5. Only then drop remedies - they are load-bearing repairs, not
+//  6. Only then drop remedies - they are load-bearing repairs, not
 //     candidates, and must outlive the candidates that depend on them.
 //
 // Returns false only when nothing is left to shed.
 func (l *loop) handleTidyFailure(ctx context.Context, err error) bool {
 	if l.addAmbiguityRemedies(ctx, err) {
+		return true
+	}
+	if l.dropImpliedFloors(ctx) {
 		return true
 	}
 	if l.dropLatestRaise(err) {

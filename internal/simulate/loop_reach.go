@@ -338,6 +338,23 @@ func (l *loop) dropImpliedSiblings(ctx context.Context, c *candState) bool {
 	return dropped
 }
 
+// dropImpliedFloors runs dropImpliedSiblings for every active CVE pin after
+// a failed tidy, where the same downgrading floors break the graph outright
+// instead of holding the pin down. Drops are provisional exactly as there.
+// Reports whether anything was dropped.
+func (l *loop) dropImpliedFloors(ctx context.Context) bool {
+	dropped := false
+	for _, c := range l.activeCandidates() {
+		if c.isDropped() || c.Replace || !c.FromCVE { // implied by an earlier pin this pass
+			continue
+		}
+		if l.dropImpliedSiblings(ctx, c) {
+			dropped = true
+		}
+	}
+	return dropped
+}
+
 // markReraised records that module was re-raised after an implied drop, so
 // dropImpliedSiblings never drops it that way again.
 func (l *loop) markReraised(module string) {

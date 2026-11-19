@@ -13,6 +13,7 @@ import (
 	melange "chainguard.dev/melange/pkg/config"
 	"github.com/isometry/choam/internal/config"
 	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
+	ecojava "github.com/isometry/choam/internal/ecosystem/java"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -24,6 +25,7 @@ import (
 type sourceStub struct {
 	mu     sync.Mutex
 	status map[string]int // basename -> status for both hosts
+	body   string         // raw 200 body; "" serves a requirement-less go.mod
 	paths  []string
 }
 
@@ -44,6 +46,9 @@ func (s *sourceStub) RoundTrip(req *http.Request) (*http.Response, error) {
 	body := `{"message":"error"}`
 	if status == http.StatusOK && req.URL.Host == "raw.githubusercontent.com" {
 		body = "module example.com/app\n\ngo 1.22\n"
+		if s.body != "" {
+			body = s.body
+		}
 	}
 	return &http.Response{
 		StatusCode: status,
@@ -153,4 +158,118 @@ func TestCheckVulnerabilities_FetchesAtExpectedCommit(t *testing.T) {
 	for _, p := range stub.paths {
 		assert.Contains(t, p, "/"+commit+"/", "manifests are fetched at the commit melange builds")
 	}
+}
+
+// TestPerformAnalysis_JavaManifestOverride: a java step's with.manifest is
+// fetched checkout-relative in place of <modroot>/pom.xml, and a 404 on it
+// still fails (a typo stays visible).
+func TestPerformAnalysis_JavaManifestOverride(t *testing.T) {
+	const pom = `<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId><artifactId>a</artifactId><version>1</version></project>`
+	run := func(t *testing.T, status map[string]int, unit analysisUnit) (*sourceStub, error) {
+		t.Helper()
+		stub := &sourceStub{status: status, body: pom}
+		v := &VulnerabilityChecker{Analyzer: NewAnalyzer(&http.Client{Transport: stub})}
+		_, err := v.performAnalysis(t.Context(), ecojava.New(), "java", "https://github.com/o/r", "v1.0.0",
+			[]analysisUnit{unit}, []config.BumpStep{}, newTestProcessor(t, singleGoBumpYAML))
+		return stub, err
+	}
+
+	stub, err := run(t, map[string]int{"pom.xml": 200}, analysisUnit{Modroot: "sub", Manifest: "bom/pom.xml"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/o/r/v1.0.0/bom/pom.xml"}, stub.paths)
+
+	stub, err = run(t, map[string]int{"pom.xml": 200}, analysisUnit{Modroot: "sub"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"/o/r/v1.0.0/sub/pom.xml"}, stub.paths)
+
+	_, err = run(t, map[string]int{}, analysisUnit{Modroot: ".", Manifest: "bom/pom.xml"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "file not found")
+}
+
+func TestDiscoverAnalysisUnits_ManifestFromFirstStep(t *testing.T) {
+	steps := []config.BumpStep{
+		{Index: 1, Language: "java", Modroots: []string{"."}, Manifest: "bom/pom.xml"},
+		{Index: 2, Language: "java", Modroots: []string{"."}, Manifest: "other/pom.xml"},
+	}
+	units, _ := discoverAnalysisUnits(t.Context(), nil, steps, nil)
+	require.Len(t, units["java"], 1)
+	assert.Equal(t, "bom/pom.xml", units["java"][0].Manifest)
+}
+
+// TestPerformAnalysis_JavaGradleSkipped: a java modroot with no pom.xml but a
+// Gradle build file is skipped (not analysed, not an error); with neither, an
+// explicit manifest: that 404s, or a failed marker probe, it still fails.
+func TestPerformAnalysis_JavaGradleSkipped(t *testing.T) {
+	const pom = `<project><modelVersion>4.0.0</modelVersion><groupId>g</groupId><artifactId>a</artifactId><version>1</version></project>`
+	tests := []struct {
+		name     string
+		status   map[string]int
+		manifest string
+		wantErr  string
+		wantSkip bool
+		analysed bool
+	}{
+		{name: "build.gradle", status: map[string]int{"build.gradle": 200}, wantSkip: true},
+		{name: "settings.gradle.kts", status: map[string]int{"settings.gradle.kts": 200}, wantSkip: true},
+		{name: "neither pom nor gradle", status: map[string]int{}, wantErr: "file not found"},
+		{name: "marker probe fails closed", status: map[string]int{"build.gradle": 502}, wantErr: "502"},
+		{name: "pom.xml analysed", status: map[string]int{"pom.xml": 200, "build.gradle": 200}, analysed: true},
+		{name: "explicit manifest 404 does not probe", status: map[string]int{"build.gradle": 200}, manifest: "bom/pom.xml", wantErr: "file not found"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			stub := &sourceStub{status: tt.status, body: pom}
+			v := &VulnerabilityChecker{Analyzer: NewAnalyzer(&http.Client{Transport: stub})}
+			gp := newTestProcessor(t, singleGoBumpYAML)
+			res, err := v.performAnalysis(t.Context(), ecojava.New(), "java", "https://github.com/o/r", "v1.0.0",
+				[]analysisUnit{{Modroot: ".", Manifest: tt.manifest}}, []config.BumpStep{}, gp)
+			if tt.wantErr != "" {
+				require.Error(t, err)
+				assert.Contains(t, err.Error(), tt.wantErr)
+				if tt.manifest != "" {
+					assert.Equal(t, []string{"/o/r/v1.0.0/" + tt.manifest}, stub.paths, "no marker probe")
+				}
+				return
+			}
+			require.NoError(t, err)
+			if tt.analysed {
+				assert.Len(t, res.Analysis.ByModroot, 1)
+				assert.Empty(t, gp.SkipReasons)
+				return
+			}
+			assert.Empty(t, res.Analysis.ByModroot)
+			require.Len(t, gp.SkipReasons, 1)
+			assert.Equal(t, "java modroot .: gradle project: java dependency analysis unsupported", gp.SkipReasons[0])
+		})
+	}
+}
+
+// TestCheckVulnerabilities_GradleSpecSkipped: a whole java spec on a Gradle
+// upstream analyses cleanly and reports as skipped (status SKIPPED).
+func TestCheckVulnerabilities_GradleSpecSkipped(t *testing.T) {
+	spec := strings.Replace(singleGoBumpYAML, `  - uses: go/build
+    with:
+      packages: .
+
+  - uses: go/bump
+    with:
+      deps: |-
+        golang.org/x/net@v0.55.0
+`, `  - uses: bump
+    with:
+      language: java
+      deps: |-
+        g@a@1.0
+`, 1)
+	stub := &sourceStub{status: map[string]int{"build.gradle.kts": 200}}
+	v := &VulnerabilityChecker{Analyzer: NewAnalyzer(&http.Client{Transport: stub})}
+	gp := parsedProcessor(t, spec)
+
+	_, err := v.checkVulnerabilities(t.Context(), gp)
+	require.NoError(t, err)
+	r := gp.ToResult()
+	assert.Equal(t, 0, r.VulnerabilitiesFound)
+	require.Len(t, r.SkipReasons, 1)
+	assert.Contains(t, r.SkipReasons[0], "gradle")
 }

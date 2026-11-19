@@ -106,7 +106,7 @@ func nextRunSeeds(t *testing.T, c replayCase, existing []string) []Candidate {
 		}
 	}
 	for _, module := range sortedKeys(desired) {
-		candidate := Candidate{Module: module, Version: desired[module]}
+		candidate := Candidate{Module: module, Version: desired[module], Pinned: pins[module]}
 		if i := slices.IndexFunc(scanResult.SecurityBumps, func(b scan.SecurityBump) bool { return b.Name == module }); i >= 0 {
 			bump := scanResult.SecurityBumps[i]
 			candidate.FromCVE, candidate.VulnIDs, candidate.Severity = true, bump.VulnIDs, bump.Severity
