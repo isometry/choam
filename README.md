@@ -142,7 +142,16 @@ When simulation proves a candidate dependency set, `bump` also computes the Go l
 
 On by default (`--no-stdlib` to disable). A shipped binary's standard library is always the build toolchain's (the `go-package` input's) stdlib - the module's own `go.mod` directive does not determine it. `bump` therefore assumes a package was built with the latest upstream Go release as of the melange file's last git commit (constrained by any `go-package` pins), then compares OSV `stdlib` advisories at that assumed release against the newest allowed release; when the same run raises a `go-package` pin, the rebuild side uses the raised pin. When a rebuild would fix advisories affecting stdlib packages actually linked into the build artifacts, `package.epoch` is bumped by 1 to force a rebuild - even with zero dependency changes. Advisories a pinned rebuild cannot fix but a newer Go minor would produce an informational raise-the-pin suggestion instead of a bump. Artifact-linked-import filtering only applies when simulation runs; under `--no-validate` findings are unfiltered. The check is skipped automatically for files that are untracked, outside a git repository, or have uncommitted changes (doubling as an idempotency guard so repeated runs don't stack bumps); shallow clones are still checked but produce a warning about possible false negatives.
 
-#### Excluding a package
+#### Declaring build packages
+
+A spec that builds through a raw `runs:` script (e.g. `make WHAT=cmd/foo`) has no `go/build` step to read the build packages from, so every package of every analysed modroot counts as linked and unlinked modules get bumped. Declare the packages the script builds (modroot `.`, `go/build`'s `packages` grammar) to narrow the analysis:
+
+```yaml
+package:
+  annotations:
+    choam/bump-go-packages: ./cmd/foo
+```
+
 
 A package that must never get dependency bumps (known-broken, or a legacy GOPATH-mode build with no `go.mod`) opts out with a package annotation whose value is the reason shown in the report:
 
