@@ -179,6 +179,47 @@ func TestGoToolchain_DepGoVersionsAndLinkedStd(t *testing.T) {
 	assert.Contains(t, std, "os")
 }
 
+// TestGoToolchain_ListModulesPlaceholders pins parseModules to what the real go
+// tool prints for `go list -m -e -json all`: a requirement at the placeholder
+// version v0.0.0 (as k8s.io/kubernetes has for its staging modules) that cannot
+// be loaded is skipped, while an unloadable requirement at a real version is
+// an error. GOPROXY=off makes every lookup fail, so no network is needed.
+func TestGoToolchain_ListModulesPlaceholders(t *testing.T) {
+	toolchain, err := NewToolchain(t.Context(), time.Minute)
+	if err != nil {
+		t.Skipf("go toolchain unavailable: %v", err)
+	}
+	t.Setenv("GOPROXY", "off")
+
+	fixture := func(t *testing.T, requirement string) string {
+		t.Helper()
+		dir := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "go.mod"), []byte(
+			"module example.com/placeholderfixture\n\ngo 1.21\n\nrequire "+requirement+"\n"), 0o644))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644))
+		return dir
+	}
+
+	t.Run("placeholder version is skipped", func(t *testing.T) {
+		dir := fixture(t, "example.com/staging v0.0.0")
+		resolved, err := toolchain.ListModules(t.Context(), dir)
+		require.NoError(t, err)
+		assert.NotContains(t, resolved, "example.com/staging")
+		versions, err := toolchain.DepGoVersions(t.Context(), dir)
+		require.NoError(t, err)
+		assert.NotContains(t, versions, "example.com/staging")
+	})
+
+	t.Run("real version fails closed", func(t *testing.T) {
+		dir := fixture(t, "example.com/real v1.2.3")
+		_, err := toolchain.ListModules(t.Context(), dir)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "example.com/real@v1.2.3")
+		_, err = toolchain.DepGoVersions(t.Context(), dir)
+		require.Error(t, err)
+	})
+}
+
 // TestGoToolchain_LinkedUsesTargetBuildEnv pins that reachability (Linked,
 // LinkedStd) evaluates the build target targetBuildEnv describes: the union
 // over the target arches (default amd64 and arm64), the go/build tags, the

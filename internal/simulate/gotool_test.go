@@ -248,6 +248,17 @@ func TestParseModules(t *testing.T) {
 	assert.Equal(t, "1.22", mods[1].GoVersion)
 	assert.Equal(t, []string{"k8s.io/kubectl", "k8s.io/kubelet"}, unloadable)
 
+	// A load error on a replaced module is judged by the replacement's version,
+	// not the original's.
+	mods, unloadable, err = parseModules([]byte(`{"Path":"example.com/c","Version":"v1.0.0","Replace":{"Path":"example.com/c2","Version":"v0.0.0"},"Error":{"Err":"unknown revision"}}`))
+	require.NoError(t, err)
+	assert.Empty(t, mods)
+	assert.Equal(t, []string{"example.com/c2"}, unloadable)
+
+	_, _, err = parseModules([]byte(`{"Path":"k8s.io/kubectl","Version":"v0.0.0","Replace":{"Path":"example.com/c2","Version":"v1.1.0"},"Error":{"Err":"unknown revision"}}`))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "example.com/c2@v1.1.0")
+
 	_, _, err = parseModules([]byte(`{"Path":"example.com/b","Version":"v1.0.0","Error":{"Err":"verifying module: checksum mismatch"}}`))
 	require.Error(t, err)
 	assert.NotErrorIs(t, err, ErrInfrastructure)

@@ -238,7 +238,11 @@ func isPlaceholderVersion(v string) bool {
 // `go list -m` without -e would abort the whole listing on it. Any other load
 // error is returned (an infrastructure failure stays ErrInfrastructure):
 // -e must not silently drop real scan input.
-func parseModules(output []byte) (mods []goListModule, unloadable []string, err error) {
+func parseModules(output []byte) ([]goListModule, []string, error) {
+	var (
+		mods       []goListModule
+		unloadable []string
+	)
 	decoder := json.NewDecoder(bytes.NewReader(output))
 	for {
 		var mod goListModule
@@ -256,9 +260,9 @@ func parseModules(output []byte) (mods []goListModule, unloadable []string, err 
 				// Local filesystem replacement - nothing meaningful to scan.
 				continue
 			}
-			err := mod.Error
+			loadErr := mod.Error
 			mod = *mod.Replace
-			mod.Error = err
+			mod.Error = loadErr
 		}
 		if mod.Error != nil {
 			if isPlaceholderVersion(mod.Version) {
@@ -300,9 +304,9 @@ func (t *GoToolchain) ListModules(ctx context.Context, dir string) (map[string]s
 
 // DepGoVersions returns the go directive of every non-main module in the
 // build list (bare form, e.g. "1.24" or "1.24.5"), keyed by module path,
-// with replace directives applied - mirrors ListModules' decode loop and
-// skip-main/skip-local-replacement semantics exactly, substituting GoVersion
-// for Version throughout.
+// with replace directives applied - shares parseModules with ListModules, so
+// the skip-main/skip-local-replacement/unloadable-placeholder semantics are
+// identical, with GoVersion in place of Version.
 func (t *GoToolchain) DepGoVersions(ctx context.Context, dir string) (map[string]string, error) {
 	output, err := t.run(ctx, dir, "list", "-m", "-e", "-json", "all")
 	if err != nil {
