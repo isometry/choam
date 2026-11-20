@@ -7,6 +7,7 @@ import (
 	"time"
 
 	gogit "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -61,4 +62,35 @@ func TestCloneAtTag_MissingTag(t *testing.T) {
 	client := New()
 	err := client.CloneAtTag(t.Context(), fixture, "v9.9.9", dest)
 	assert.Error(t, err)
+}
+
+func TestGetCommitSHAForTag(t *testing.T) {
+	fixture, commitSHA := newFixtureRepo(t)
+
+	repo, err := gogit.PlainOpen(fixture)
+	require.NoError(t, err)
+	tagger := &object.Signature{Name: "test", Email: "test@example.com", When: time.Date(2026, 1, 2, 0, 0, 0, 0, time.UTC)}
+	annotated, err := repo.CreateTag("v2.0.0", plumbing.NewHash(commitSHA), &gogit.CreateTagOptions{Tagger: tagger, Message: "v2.0.0"})
+	require.NoError(t, err)
+	// The tag object is a distinct object from the commit; that is the bug's trigger.
+	require.NotEqual(t, commitSHA, annotated.Hash().String())
+
+	client := New()
+
+	t.Run("lightweight", func(t *testing.T) {
+		got, err := client.GetCommitSHAForTag(t.Context(), fixture, "v1.0.0")
+		require.NoError(t, err)
+		assert.Equal(t, commitSHA, got)
+	})
+
+	t.Run("annotated resolves to the commit, not the tag object", func(t *testing.T) {
+		got, err := client.GetCommitSHAForTag(t.Context(), fixture, "v2.0.0")
+		require.NoError(t, err)
+		assert.Equal(t, commitSHA, got)
+	})
+
+	t.Run("missing", func(t *testing.T) {
+		_, err := client.GetCommitSHAForTag(t.Context(), fixture, "v9.9.9")
+		assert.Error(t, err)
+	})
 }

@@ -225,18 +225,29 @@ func (c *Client) GetCommitSHAForTag(ctx context.Context, repoURL, tag string) (s
 		URLs: []string{repoURL},
 	})
 
-	// List all references
-	refs, err := rem.ListContext(ctx, &git.ListOptions{})
+	// AppendPeeled adds "<tag>^{}" entries pointing at the commit an annotated
+	// tag names; without it an annotated tag lists as its tag object, which is
+	// not the commit melange's expected-commit is compared with.
+	refs, err := rem.ListContext(ctx, &git.ListOptions{PeelingOption: git.AppendPeeled})
 	if err != nil {
 		return "", fmt.Errorf("listing references from %s: %w", repoURL, err)
 	}
 
-	// Find the specific tag
+	// Prefer the peeled commit; a lightweight tag has no peeled entry and its
+	// ref already is the commit.
 	tagRefName := plumbing.NewTagReferenceName(tag)
+	peeledRefName := plumbing.ReferenceName(tagRefName.String() + "^{}")
+	var found string
 	for _, ref := range refs {
-		if ref.Name() == tagRefName {
+		switch ref.Name() {
+		case peeledRefName:
 			return ref.Hash().String(), nil
+		case tagRefName:
+			found = ref.Hash().String()
 		}
+	}
+	if found != "" {
+		return found, nil
 	}
 
 	return "", fmt.Errorf("tag %s not found in repository %s", tag, repoURL)
