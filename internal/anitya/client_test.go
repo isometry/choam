@@ -183,50 +183,6 @@ func TestClient_GetLatestVersion(t *testing.T) {
 	}
 }
 
-func TestClient_GetStableVersions(t *testing.T) {
-	// Mock server
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if !strings.HasPrefix(r.URL.Path, "/api/project/") {
-			http.Error(w, "Not Found", http.StatusNotFound)
-			return
-		}
-
-		response := `{
-			"id": 123,
-			"name": "test-project",
-			"stable_versions": ["1.0.0", "1.1.0", "1.2.3"]
-		}`
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(response))
-	}))
-	defer server.Close()
-
-	// Create client with custom base URL for testing
-	client := New(httpclient.NewHTTPClientWithTimeout(httpclient.DefaultTimeout))
-	client.baseURL = server.URL
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	versions, err := client.GetStableVersions(ctx, 123)
-	if err != nil {
-		t.Fatalf("GetStableVersions() error = %v", err)
-	}
-
-	expectedVersions := []string{"1.0.0", "1.1.0", "1.2.3"}
-	if len(versions) != len(expectedVersions) {
-		t.Errorf("GetStableVersions() returned %d versions, want %d", len(versions), len(expectedVersions))
-		return
-	}
-
-	for i, version := range versions {
-		if version != expectedVersions[i] {
-			t.Errorf("GetStableVersions()[%d] = %s, want %s", i, version, expectedVersions[i])
-		}
-	}
-}
-
 func TestUnixTime_UnmarshalJSON(t *testing.T) {
 	tests := []struct {
 		name    string

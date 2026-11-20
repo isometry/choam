@@ -131,143 +131,58 @@ func newTestClient(t *testing.T, mux *http.ServeMux) *Client {
 	return &Client{client: gh}
 }
 
-func TestClient_GetFirstValidRelease(t *testing.T) {
+func TestClient_GetFirstValid(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/repos/fluxcd/flux2/releases", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = fmt.Fprint(w, `[{"tag_name":"v2.9.0"},{"tag_name":"v2.8.9"},{"tag_name":"v2.8.8"}]`)
+		_, _ = fmt.Fprint(w, `[{"name":"nameless"},{"tag_name":"v2.9.0"},{"tag_name":"v2.8.9"},{"tag_name":"v2.8.8"}]`)
 	})
-	client := newTestClient(t, mux)
-
-	acceptAll := func(string) bool { return true }
-
-	tests := []struct {
-		name        string
-		tagPrefix   string
-		tagContains string
-		filter      func(string) bool
-		want        string
-		wantErr     bool
-	}{
-		{name: "no filters returns first", filter: acceptAll, want: "v2.9.0"},
-		{name: "prefix filter", tagPrefix: "v2.8.", filter: acceptAll, want: "v2.8.9"},
-		{name: "contains filter", tagContains: "2.8.", filter: acceptAll, want: "v2.8.9"},
-		{name: "prefix and version filter combine", tagPrefix: "v2.8.", filter: func(tag string) bool { return !strings.Contains(tag, "2.8.9") }, want: "v2.8.8"},
-		{name: "prefix without match errors", tagPrefix: "v3.", filter: acceptAll, wantErr: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := client.GetFirstValidRelease(context.Background(), "fluxcd", "flux2", tt.tagPrefix, tt.tagContains, tt.filter)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("GetFirstValidRelease() error = %v, wantErr %v", err, tt.wantErr)
-			}
-			if got != tt.want {
-				t.Errorf("GetFirstValidRelease() = %s, want %s", got, tt.want)
-			}
-		})
-	}
-}
-
-func TestClient_GetFirstValidTag(t *testing.T) {
-	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v3/repos/fluxcd/flux2/tags", func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = fmt.Fprint(w, `[{"name":"v2.9.0"},{"name":"v2.8.9"},{"name":"v2.8.8"}]`)
+		_, _ = fmt.Fprint(w, `[{"commit":{}},{"name":"v2.9.0"},{"name":"v2.8.9"},{"name":"v2.8.8"}]`)
 	})
 	client := newTestClient(t, mux)
 
-	acceptAll := func(string) bool { return true }
-
-	tests := []struct {
-		name        string
-		tagPrefix   string
-		tagContains string
-		filter      func(string) bool
-		want        string
-		wantErr     bool
-	}{
-		{name: "no filters returns first", filter: acceptAll, want: "v2.9.0"},
-		{name: "prefix filter", tagPrefix: "v2.8.", filter: acceptAll, want: "v2.8.9"},
-		{name: "contains filter", tagContains: "2.8.", filter: acceptAll, want: "v2.8.9"},
-		{name: "prefix and version filter combine", tagPrefix: "v2.8.", filter: func(tag string) bool { return !strings.Contains(tag, "2.8.9") }, want: "v2.8.8"},
-		{name: "contains without match errors", tagContains: "rc", filter: acceptAll, wantErr: true},
+	sources := map[string]func(context.Context, string, string, func(string) bool) (string, error){
+		"tags": func(ctx context.Context, o, r string, f func(string) bool) (string, error) {
+			return client.GetFirstValidTag(ctx, o, r, f)
+		},
+		"releases": func(ctx context.Context, o, r string, f func(string) bool) (string, error) {
+			return client.GetFirstValidRelease(ctx, o, r, f)
+		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := client.GetFirstValidTag(context.Background(), "fluxcd", "flux2", tt.tagPrefix, tt.tagContains, tt.filter)
-			if (err != nil) != tt.wantErr {
-				t.Fatalf("GetFirstValidTag() error = %v, wantErr %v", err, tt.wantErr)
-			}
-			if got != tt.want {
-				t.Errorf("GetFirstValidTag() = %s, want %s", got, tt.want)
-			}
-		})
+	tests := []struct {
+		name    string
+		filter  func(string) bool
+		want    string
+		wantErr string
+	}{
+		{name: "accept all returns first, skipping unnamed", filter: func(string) bool { return true }, want: "v2.9.0"},
+		{name: "filter skips rejected", filter: func(tag string) bool { return !strings.Contains(tag, "2.9") }, want: "v2.8.9"},
+		{name: "filter skips several", filter: func(tag string) bool { return strings.HasSuffix(tag, ".8") }, want: "v2.8.8"},
+		{name: "no match errors", filter: func(string) bool { return false }, wantErr: "no valid version found after checking up to"},
+	}
+
+	for kind, get := range sources {
+		for _, tt := range tests {
+			t.Run(kind+"/"+tt.name, func(t *testing.T) {
+				got, err := get(context.Background(), "fluxcd", "flux2", tt.filter)
+				if tt.wantErr != "" {
+					require.ErrorContains(t, err, tt.wantErr)
+					return
+				}
+				require.NoError(t, err)
+				assert.Equal(t, tt.want, got)
+			})
+		}
 	}
 }
 
-func TestClient_FilterTagsWithPrefix(t *testing.T) {
-	client := New(&http.Client{})
+func TestClient_GetFirstValid_APIError(t *testing.T) {
+	client := newTestClient(t, http.NewServeMux()) // unrouted paths 404
 
-	tags := []*github.RepositoryTag{
-		{Name: new("v1.0.0")},
-		{Name: new("v1.1.0")},
-		{Name: new("go1.22.0")},
-		{Name: new("go1.22.1")},
-		{Name: new("release-2.0.0")},
-	}
+	_, err := client.GetFirstValidTag(context.Background(), "fluxcd", "flux2", func(string) bool { return true })
+	require.ErrorContains(t, err, "listing tags page 1:")
 
-	tests := []struct {
-		name     string
-		tags     []*github.RepositoryTag
-		prefix   string
-		expected []string
-	}{
-		{
-			name:     "filter with v prefix",
-			tags:     tags,
-			prefix:   "v",
-			expected: []string{"v1.0.0", "v1.1.0"},
-		},
-		{
-			name:     "filter with go prefix",
-			tags:     tags,
-			prefix:   "go",
-			expected: []string{"go1.22.0", "go1.22.1"},
-		},
-		{
-			name:     "filter with release prefix",
-			tags:     tags,
-			prefix:   "release",
-			expected: []string{"release-2.0.0"},
-		},
-		{
-			name:     "no prefix",
-			tags:     tags,
-			prefix:   "",
-			expected: []string{"v1.0.0", "v1.1.0", "go1.22.0", "go1.22.1", "release-2.0.0"},
-		},
-		{
-			name:     "no matches",
-			tags:     tags,
-			prefix:   "nonexistent",
-			expected: []string{},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result := client.FilterTagsWithPrefix(tt.tags, tt.prefix)
-
-			if len(result) != len(tt.expected) {
-				t.Errorf("FilterTagsWithPrefix() returned %d items, want %d", len(result), len(tt.expected))
-				return
-			}
-
-			for i, tag := range result {
-				if tag.Name != nil && *tag.Name != tt.expected[i] {
-					t.Errorf("FilterTagsWithPrefix()[%d].Name = %s, want %s", i, *tag.Name, tt.expected[i])
-				}
-			}
-		})
-	}
+	_, err = client.GetFirstValidRelease(context.Background(), "fluxcd", "flux2", func(string) bool { return true })
+	require.ErrorContains(t, err, "listing releases page 1:")
 }

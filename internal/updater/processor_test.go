@@ -315,7 +315,7 @@ func TestUpdaterProcessor_GetNewEpoch(t *testing.T) {
 	}
 }
 
-func TestUpdaterProcessor_GetOldEpoch(t *testing.T) {
+func TestUpdaterProcessor_GetCurrentEpoch(t *testing.T) {
 	tests := []struct {
 		name        string
 		startEpoch  int64
@@ -341,7 +341,7 @@ func TestUpdaterProcessor_GetOldEpoch(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			proc := NewUpdaterProcessor("/test/path.yaml", "test-pkg", "1.0.0", tt.startEpoch)
-			assert.Equal(t, tt.expectEpoch, proc.GetOldEpoch())
+			assert.Equal(t, tt.expectEpoch, proc.GetCurrentEpoch())
 		})
 	}
 }
@@ -649,7 +649,7 @@ func TestUpdaterProcessor_Integration(t *testing.T) {
 		assert.True(t, proc.IsVersionChanged())
 		assert.True(t, proc.IsEpochChanged())
 		assert.True(t, proc.HasChanges())
-		assert.Equal(t, int64(5), proc.GetOldEpoch())
+		assert.Equal(t, int64(5), proc.GetCurrentEpoch())
 		assert.Equal(t, int64(6), proc.GetNewEpoch())
 	})
 }

@@ -158,28 +158,3 @@ func (vc *VersionComparator) IsValidVersion(version string, allowPreRelease bool
 
 	return true
 }
-
-// FilterPreReleases filters out pre-release versions unless enabled
-func (vc *VersionComparator) FilterPreReleases(versions []string, enablePreReleases bool) []string {
-	var filtered []string
-	for _, version := range versions {
-		// Multi-part numeric versions pass through (no pre-release concept)
-		if isMultiPartNumeric(version) {
-			filtered = append(filtered, version)
-			continue
-		}
-
-		// For SemVer versions, apply pre-release filtering
-		normalized := vc.normalizeVersion(version)
-		sv, err := semver.NewVersion(normalized)
-		if err != nil {
-			continue // Skip invalid SemVer
-		}
-
-		if enablePreReleases || sv.Prerelease() == "" {
-			filtered = append(filtered, version)
-		}
-	}
-
-	return filtered
-}

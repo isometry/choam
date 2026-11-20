@@ -69,11 +69,6 @@ func (p *UpdaterProcessor) GetNewEpoch() int64 {
 	return p.BaseProcessor.GetNewEpoch()
 }
 
-// GetOldEpoch returns the old epoch (for compatibility)
-func (p *UpdaterProcessor) GetOldEpoch() int64 {
-	return p.GetCurrentEpoch()
-}
-
 // AddPipelineChange records a pipeline modification
 func (p *UpdaterProcessor) AddPipelineChange(change PipelineChange) {
 	p.PipelineChanges = append(p.PipelineChanges, change)

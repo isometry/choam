@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/isometry/choam/internal/httpclient"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -40,7 +41,7 @@ func TestProcessPackageCheck_LogsCarryFileAttributionNoDuplicateKeys(t *testing.
 	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
-	orchestrator := NewOrchestrator()
+	orchestrator := NewOrchestratorWithTimeout(httpclient.DefaultTimeout)
 	proc, err := orchestrator.ProcessPackageCheck(t.Context(), filePath)
 	require.NoError(t, err)
 	require.NotNil(t, proc)

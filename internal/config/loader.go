@@ -1,10 +1,8 @@
 package config
 
 import (
-	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"os"
 	"regexp"
 	"sort"
@@ -81,26 +79,6 @@ func (l *Loader) UpdatePackageVersion(yamlContent []byte, newVersion string) ([]
 
 	// Epoch handling is now centralized in EpochApplier
 	return updated, nil
-}
-
-// IncrementEpoch increments the epoch field by 1
-func (l *Loader) IncrementEpoch(yamlContent []byte) ([]byte, error) {
-	// Parse to get current epoch
-	var parsed map[string]any
-	if err := yaml.Unmarshal(yamlContent, &parsed); err != nil {
-		return nil, fmt.Errorf("parsing YAML to get current epoch: %w", err)
-	}
-
-	currentEpoch := int64(0)
-	if pkg, ok := parsed["package"].(map[string]any); ok {
-		if epoch, ok := pkg["epoch"].(int); ok {
-			currentEpoch = int64(epoch)
-		} else if epoch, ok := pkg["epoch"].(int64); ok {
-			currentEpoch = epoch
-		}
-	}
-
-	return l.UpdateIntField(yamlContent, "$.package.epoch", currentEpoch+1)
 }
 
 // SetEpoch sets the epoch field to a specific value
@@ -292,102 +270,6 @@ func (l *Loader) RemovePipelineWithField(yamlContent []byte, pipelineIndex int, 
 	mapping.Values = filtered
 
 	return []byte(file.String()), nil
-}
-
-// SaveWithBackup saves the updated YAML content to file with backup
-func (l *Loader) SaveWithBackup(path string, content []byte) error {
-	return l.Save(path, content, ".bak")
-}
-
-// Save saves the updated YAML content to file, optionally creating a backup
-// backupSuffix: suffix for backup files (empty = no backup)
-// Returns error if save failed, nil if no changes needed or save successful
-func (l *Loader) Save(path string, content []byte, backupSuffix string) error {
-	// Read the current content to compare
-	currentContent, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("reading current file %s: %w", path, err)
-	}
-
-	// Check if content has actually changed
-	if bytes.Equal(currentContent, content) {
-		// No changes needed
-		return nil
-	}
-
-	// Create backup if suffix is provided
-	if backupSuffix != "" {
-		backupPath := path + backupSuffix
-		if err := l.copyFile(path, backupPath); err != nil {
-			return fmt.Errorf("creating backup %s: %w", backupPath, err)
-		}
-	}
-
-	// Write updated content
-	if err := os.WriteFile(path, content, 0644); err != nil {
-		return fmt.Errorf("writing updated file %s: %w", path, err)
-	}
-
-	return nil
-}
-
-// ValidateUpdatedConfig validates that the updated YAML is still valid
-func (l *Loader) ValidateUpdatedConfig(content []byte, tempPath string) error {
-	// Write to temp file for validation
-	if err := os.WriteFile(tempPath, content, 0644); err != nil {
-		return fmt.Errorf("writing temp file for validation: %w", err)
-	}
-	defer func() { _ = os.Remove(tempPath) }()
-
-	// Try to parse with melange
-	_, err := config.ParseConfiguration(context.Background(), tempPath)
-	if err != nil {
-		return fmt.Errorf("validation failed - updated config is invalid: %w", err)
-	}
-
-	return nil
-}
-
-// copyFile copies a file from src to dst
-func (l *Loader) copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = sourceFile.Close() }()
-
-	destFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = destFile.Close() }()
-
-	_, err = io.Copy(destFile, sourceFile)
-	return err
-}
-
-// GetPackageInfo extracts package name and version from YAML content
-func (l *Loader) GetPackageInfo(yamlContent []byte) (name, version string, epoch int64, err error) {
-	var parsed map[string]any
-	if err := yaml.Unmarshal(yamlContent, &parsed); err != nil {
-		return "", "", 0, fmt.Errorf("parsing YAML to get package info: %w", err)
-	}
-
-	if pkg, ok := parsed["package"].(map[string]any); ok {
-		if n, ok := pkg["name"].(string); ok {
-			name = n
-		}
-		if v, ok := pkg["version"].(string); ok {
-			version = v
-		}
-		if e, ok := pkg["epoch"].(int); ok {
-			epoch = int64(e)
-		} else if e, ok := pkg["epoch"].(int64); ok {
-			epoch = e
-		}
-	}
-
-	return name, version, epoch, nil
 }
 
 // whitespaceRegex splits block-scalar or space-separated pipeline field values
@@ -779,57 +661,6 @@ func (l *Loader) RemovePipelineStep(yamlContent []byte, pipelineIndex int) ([]by
 
 	// Remove the pipeline step, keeping any comments on the remaining steps intact
 	removeSequenceValue(seqNode, pipelineIndex)
-
-	// Return the AST string representation with formatting preserved
-	return []byte(file.String()), nil
-}
-
-// InsertPipelineStep inserts a new pipeline step at the specified index
-func (l *Loader) InsertPipelineStep(yamlContent []byte, pipelineIndex int, pipelineStep map[string]any) ([]byte, error) {
-	// Parse YAML to AST with comments preserved
-	file, err := parser.ParseBytes(yamlContent, parser.ParseComments)
-	if err != nil {
-		return nil, fmt.Errorf("parsing YAML: %w", err)
-	}
-
-	// Get the pipeline array using path
-	yamlPath, err := yaml.PathString("$.pipeline")
-	if err != nil {
-		return nil, fmt.Errorf("creating pipeline path: %w", err)
-	}
-
-	node, err := yamlPath.FilterFile(file)
-	if err != nil {
-		return nil, fmt.Errorf("pipeline not found: %w", err)
-	}
-
-	// Check if it's a sequence node (array)
-	seqNode, ok := node.(*ast.SequenceNode)
-	if !ok {
-		return nil, fmt.Errorf("pipeline is not a sequence")
-	}
-
-	// Convert the pipeline step to YAML node
-	stepYAML, err := yaml.Marshal(pipelineStep)
-	if err != nil {
-		return nil, fmt.Errorf("marshaling pipeline step: %w", err)
-	}
-
-	stepNode, err := parser.ParseBytes(stepYAML, 0)
-	if err != nil {
-		return nil, fmt.Errorf("parsing pipeline step: %w", err)
-	}
-
-	// Extract the document node contents
-	var stepASTNode ast.Node
-	if len(stepNode.Docs) > 0 {
-		stepASTNode = stepNode.Docs[0].Body
-	} else {
-		return nil, fmt.Errorf("invalid pipeline step structure")
-	}
-
-	// Insert the new step, keeping any comments on the surrounding steps intact
-	insertSequenceValue(seqNode, pipelineIndex, stepASTNode)
 
 	// Return the AST string representation with formatting preserved
 	return []byte(file.String()), nil

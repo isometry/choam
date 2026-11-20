@@ -146,26 +146,18 @@ func (vc *VersionChecker) getLatestValidGitHubVersion(ctx context.Context, cfg *
 	// The deprecated tag-filter key has prefix semantics; tag-filter-prefix wins when both are set.
 	tagPrefix := cmp.Or(monitor.TagFilterPrefix, monitor.TagFilter) //nolint:staticcheck // deprecated tag-filter kept for compat
 
+	// Apply the monitor's tag filters to raw tags before version processing
+	inner := filterFunc
+	filterFunc = func(tag string) bool {
+		return matchesTagFilters(tag, tagPrefix, monitor.TagFilterContains) && inner(tag)
+	}
+
 	// Get the first valid version using the filter
 	var validVersion string
 	if monitor.UseTags {
-		validVersion, err = githubClient.GetFirstValidTag(
-			ctx,
-			repo.Owner,
-			repo.Name,
-			tagPrefix,
-			monitor.TagFilterContains,
-			filterFunc,
-		)
+		validVersion, err = githubClient.GetFirstValidTag(ctx, repo.Owner, repo.Name, filterFunc)
 	} else {
-		validVersion, err = githubClient.GetFirstValidRelease(
-			ctx,
-			repo.Owner,
-			repo.Name,
-			tagPrefix,
-			monitor.TagFilterContains,
-			filterFunc,
-		)
+		validVersion, err = githubClient.GetFirstValidRelease(ctx, repo.Owner, repo.Name, filterFunc)
 	}
 
 	if err != nil {
@@ -231,16 +223,47 @@ func (vc *VersionChecker) getLatestValidGitVersion(ctx context.Context, cfg *mel
 		return matchesTagFilters(tag, monitor.TagFilterPrefix, monitor.TagFilterContains) && inner(tag)
 	}
 
-	// Get the first valid version using the filter
-	validVersion, err := gitClient.GetFirstValidTag(ctx, repoURL, filterFunc)
+	tags, err := gitClient.ListTags(ctx, repoURL)
 	if err != nil {
 		return "", "git", err
 	}
 
-	// Process the valid version to get the final processed form
-	processed, _, _ := versionFilter.ProcessVersion(ctx, validVersion, &cfg.Update)
+	// Rank by processed version: raw tag names mis-order pre-releases
+	// (v1.2.3-rc.1 sorts above v1.2.3 by digit runs).
+	_, comparator := orchestrator.GetVersionComponents()
+	process := func(tag string) string {
+		processed, _, _ := versionFilter.ProcessVersion(ctx, tag, &cfg.Update)
+		return processed
+	}
+	processed, ok := newestValidTag(tags, filterFunc, process, comparator.Compare)
+	if !ok {
+		return "", "git", fmt.Errorf("no valid version found in repository %s", repoURL)
+	}
 
 	return processed, "git", nil
+}
+
+// newestValidTag returns the processed version of the greatest tag accepted by
+// accept. Ties are broken by raw tag name so the result does not depend on the
+// order tags were listed in. A candidate cmp cannot compare is never preferred
+// over one it can.
+func newestValidTag(tags []string, accept func(string) bool, process func(string) string, cmp func(a, b string) (int, error)) (string, bool) {
+	var bestTag, best string
+	found := false
+	for _, tag := range tags {
+		if !accept(tag) {
+			continue
+		}
+		v := process(tag)
+		if found {
+			c, err := cmp(v, best)
+			if err != nil || c < 0 || (c == 0 && tag <= bestTag) {
+				continue
+			}
+		}
+		bestTag, best, found = tag, v, true
+	}
+	return best, found
 }
 
 // matchesTagFilters reports whether a raw tag/version passes the monitor's

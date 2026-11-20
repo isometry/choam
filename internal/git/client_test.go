@@ -94,3 +94,20 @@ func TestGetCommitSHAForTag(t *testing.T) {
 		assert.Error(t, err)
 	})
 }
+
+func TestListTags(t *testing.T) {
+	fixture, _ := newFixtureRepo(t)
+
+	tags, err := New().ListTags(t.Context(), fixture)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"v1.0.0"}, tags)
+}
+
+func TestListTags_NoTags(t *testing.T) {
+	dir := t.TempDir()
+	_, err := gogit.PlainInit(dir, false)
+	require.NoError(t, err)
+
+	_, err = New().ListTags(t.Context(), dir)
+	assert.Error(t, err)
+}
