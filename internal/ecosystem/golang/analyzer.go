@@ -11,6 +11,7 @@ import (
 	"github.com/isometry/choam/internal/scan"
 	"github.com/isometry/choam/internal/utils"
 	"golang.org/x/mod/modfile"
+	xmodule "golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
 )
 
@@ -26,10 +27,26 @@ func newAnalyzer() *analyzer {
 //
 // Debug trace: one "analyzing bumps" header after dedup, one "bump decision"
 // per unique module (in sorted module order) and the closing summary.
-func (a *analyzer) analyzeBumps(ctx context.Context, deps []string, goModInfo *GoModInfo) ([]bumpAnalysis, []string) {
+//
+// existing is the spec's own deps entries (a subset of deps, as "module@version"):
+// an existing pin that crosses a major version of a module go.mod has (v0 ->
+// v1, +incompatible) is kept (see pinnedCrossMajor); a fresh bump that crosses
+// a major version is still rejected.
+func (a *analyzer) analyzeBumps(ctx context.Context, deps, existing []string, goModInfo *GoModInfo) ([]bumpAnalysis, []string) {
 	var analysis []bumpAnalysis
 
-	// First, deduplicate and keep only the latest version per module
+	// acceptable reports whether a deps entry for module can be applied at
+	// version at all (not a major change, or a deliberate one the spec pins).
+	acceptable := func(module, version string) bool {
+		if _, ok := a.normalizeModulePath(ctx, module, version, goModInfo); ok {
+			return true
+		}
+		return pinnedCrossMajor(module, version, existing, goModInfo)
+	}
+
+	// First, deduplicate and keep only the latest acceptable version per
+	// module: an unacceptable (major-crossing) fix must not mask a pin that
+	// can apply. With nothing acceptable, the latest is kept and reported.
 	latestVersions := make(map[string]string)
 
 	for _, dep := range deps {
@@ -51,20 +68,25 @@ func (a *analyzer) analyzeBumps(ctx context.Context, deps []string, goModInfo *G
 		module := parts[0]
 		bumpVersion := parts[1]
 
-		// Keep only the latest version for each module
-		if existing, exists := latestVersions[module]; exists {
-			if existing == "" {
+		// Keep only the latest acceptable version for each module
+		if cur, exists := latestVersions[module]; exists {
+			switch {
+			case cur == "":
 				// Previous was malformed, this one is valid
 				latestVersions[module] = bumpVersion
-			} else if semver.Compare(bumpVersion, existing) == 0 {
+			case acceptable(module, bumpVersion) != acceptable(module, cur):
+				if acceptable(module, bumpVersion) {
+					latestVersions[module] = bumpVersion
+				}
+			case semver.Compare(bumpVersion, cur) == 0:
 				// Two spellings of one version (v2.8.2, v2.8.2+incompatible):
 				// keep the canonical one whichever came first.
-				latestVersions[module] = scan.PreferVersion(existing, bumpVersion)
-			} else if semver.Compare(bumpVersion, existing) > 0 {
+				latestVersions[module] = scan.PreferVersion(cur, bumpVersion)
+			case semver.Compare(bumpVersion, cur) > 0:
 				// This version is newer
 				latestVersions[module] = bumpVersion
 			}
-			// Otherwise keep existing
+			// Otherwise keep the current one
 		} else {
 			latestVersions[module] = bumpVersion
 		}
@@ -121,6 +143,9 @@ func (a *analyzer) analyzeBumps(ctx context.Context, deps []string, goModInfo *G
 
 		// Normalize module path for v2+ modules (adds /vN suffix if needed)
 		normalizedModule, exists := a.normalizeModulePath(ctx, module, bumpVersion, goModInfo)
+		if !exists && pinnedCrossMajor(module, bumpVersion, existing, goModInfo) {
+			normalizedModule, exists = module, true
+		}
 		if !exists {
 			// Module not found even with path correction
 			decide(module, "", bumpAnalysis{
@@ -274,6 +299,28 @@ func (a *analyzer) normalizeModulePath(_ context.Context, module, version string
 
 	// Not found even with correction
 	return module, false
+}
+
+// pinnedCrossMajor reports whether module@version crosses a major version of
+// the module go.mod has (v0 -> v1, or any +incompatible major) and the spec
+// already pins that major itself. That is a deliberate choice (e.g. a CVE fix
+// only released at the higher major), so it is kept - the toolchain and the
+// type-check gate still decide whether it works - unlike a major crossing
+// choam would propose on its own. The module path must be the same one go.mod
+// has and must admit the version (xmodule.CheckPathMajor): a /vN path change
+// is a different module and a source migration, never a pin.
+func pinnedCrossMajor(module, version string, existing []string, goModInfo *GoModInfo) bool {
+	cur, ok := goModInfo.AllRequirements[module]
+	if !ok || semver.Major(version) == semver.Major(cur) {
+		return false
+	}
+	if _, pathMajor, ok := xmodule.SplitPathVersion(module); !ok || xmodule.CheckPathMajor(version, pathMajor) != nil {
+		return false
+	}
+	return slices.ContainsFunc(existing, func(dep string) bool {
+		m, v, ok := strings.Cut(strings.TrimSpace(dep), "@")
+		return ok && m == module && semver.Major(v) == semver.Major(version)
+	})
 }
 
 // getEffectiveVersion returns the effective version considering replace directives.

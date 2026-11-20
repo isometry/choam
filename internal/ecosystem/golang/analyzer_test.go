@@ -229,7 +229,7 @@ func TestAnalyzer_AnalyzeBumps(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			a := newAnalyzer()
-			analysis, filteredDeps := a.analyzeBumps(t.Context(), tt.deps, tt.goModInfo)
+			analysis, filteredDeps := a.analyzeBumps(t.Context(), tt.deps, nil, tt.goModInfo)
 
 			if len(filteredDeps) != len(tt.wantKeep) {
 				t.Errorf("filteredDeps count = %d, want %d", len(filteredDeps), len(tt.wantKeep))
@@ -451,7 +451,7 @@ func TestAnalyzer_AnalyzeBumps_SortingStability(t *testing.T) {
 	}
 
 	a := newAnalyzer()
-	_, filteredDeps := a.analyzeBumps(t.Context(), deps, goModInfo)
+	_, filteredDeps := a.analyzeBumps(t.Context(), deps, nil, goModInfo)
 
 	expected := []string{
 		"github.com/m-package/middle@v1.1.0",
@@ -557,7 +557,7 @@ func TestAnalyzer_AnalyzeBumps_DependencyOrdering(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			a := newAnalyzer()
-			_, filteredDeps := a.analyzeBumps(t.Context(), tt.deps, tt.goModInfo)
+			_, filteredDeps := a.analyzeBumps(t.Context(), tt.deps, nil, tt.goModInfo)
 
 			if len(filteredDeps) != len(tt.wantOrdered) {
 				t.Fatalf("got %d deps, want %d\nGot: %v\nWant: %v", len(filteredDeps), len(tt.wantOrdered), filteredDeps, tt.wantOrdered)
@@ -623,7 +623,7 @@ func TestAnalyzer_AnalyzeBumps_PreReleaseVersions(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			a := newAnalyzer()
-			_, filteredDeps := a.analyzeBumps(t.Context(), tt.deps, tt.goModInfo)
+			_, filteredDeps := a.analyzeBumps(t.Context(), tt.deps, nil, tt.goModInfo)
 
 			if len(filteredDeps) != len(tt.wantKeep) {
 				t.Fatalf("got %d deps, want %d", len(filteredDeps), len(tt.wantKeep))
@@ -797,7 +797,7 @@ func TestAnalyzer_LogsCarryCtxAttribution(t *testing.T) {
 		AllRequirements: map[string]string{"example.com/mod": "v1.0.0"},
 		Replacements:    map[string]*modfile.Replace{},
 	}
-	a.analyzeBumps(ctx, []string{"example.com/mod@v1.1.0"}, goModInfo)
+	a.analyzeBumps(ctx, []string{"example.com/mod@v1.1.0"}, nil, goModInfo)
 
 	out := buf.String()
 	if !strings.Contains(out, "file=example.yaml") {
@@ -838,7 +838,7 @@ func TestAnalyzer_DebugTraceOneDecisionPerModule(t *testing.T) {
 		"golang.org/x/net@v0.60.0", // duplicate
 		"example.com/missing@v1.0.0",
 	}
-	newAnalyzer().analyzeBumps(ctx, deps, goModInfo)
+	newAnalyzer().analyzeBumps(ctx, deps, nil, goModInfo)
 
 	var decisions []string
 	for _, line := range strings.Split(strings.TrimRight(buf.String(), "\n"), "\n") {
@@ -910,9 +910,55 @@ func TestAnalyzer_IncompatibleSpelling(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, got := newAnalyzer().analyzeBumps(t.Context(), tt.deps, info)
+			_, got := newAnalyzer().analyzeBumps(t.Context(), tt.deps, nil, info)
 			if !slices.Equal(got, tt.want) {
 				t.Errorf("analyzeBumps(%v) = %v, want %v", tt.deps, got, tt.want)
+			}
+		})
+	}
+}
+
+// An existing spec pin that crosses a major version (v0 -> v1, +incompatible)
+// of a module go.mod has is deliberate and kept; the same raise proposed fresh
+// (not in the spec's own deps) is still a major change, and a different module
+// path or a version the path does not admit is never a pin.
+func TestAnalyzer_ExistingCrossMajorPin(t *testing.T) {
+	info := &GoModInfo{
+		AllRequirements: map[string]string{
+			"example.com/otel/log":     "v0.21.0",
+			"example.com/a":            "v1.0.0",
+			"example.com/foo":          "v1.5.0",
+			"github.com/docker/docker": "v25.0.0+incompatible",
+		},
+		Replacements: map[string]*modfile.Replace{},
+	}
+	const (
+		log1   = "example.com/otel/log@v1.47.0"
+		docker = "github.com/docker/docker@v28.5.1+incompatible"
+	)
+	tests := []struct {
+		name     string
+		deps     []string
+		existing []string
+		want     []string
+	}{
+		{"v0 -> v1 pin kept", []string{log1}, []string{log1}, []string{log1}},
+		{"fresh v0 -> v1 rejected", []string{log1}, nil, nil},
+		{"existing v0 pin is no v1 pin", []string{log1}, []string{"example.com/otel/log@v0.22.0"}, nil},
+		{"other module's pin does not cover", []string{log1}, []string{"example.com/a@v1.1.0"}, nil},
+		{"+incompatible major pin kept", []string{docker}, []string{docker}, []string{docker}},
+		{"fresh +incompatible major rejected", []string{docker}, nil, nil},
+		{"version the path does not admit rejected", []string{"example.com/a@v2.0.0"}, []string{"example.com/a@v2.0.0"}, nil},
+		{"different module path is no pin", []string{"example.com/foo/v2@v2.0.0"}, []string{"example.com/foo/v2@v2.0.0"}, nil},
+		{"fix in another major does not mask the pin", []string{log1, "example.com/otel/log@v2.0.1"}, []string{log1}, []string{log1}},
+		{"fix in another major does not mask the pin (any order)", []string{"example.com/otel/log@v2.0.1", log1}, []string{log1}, []string{log1}},
+		{"fix in the pin's major wins when higher", []string{log1, "example.com/otel/log@v1.50.0"}, []string{log1}, []string{"example.com/otel/log@v1.50.0"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, got := newAnalyzer().analyzeBumps(t.Context(), tt.deps, tt.existing, info)
+			if !slices.Equal(got, tt.want) {
+				t.Errorf("got %v, want %v", got, tt.want)
 			}
 		})
 	}
