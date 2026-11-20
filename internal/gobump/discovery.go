@@ -35,8 +35,17 @@ var buildStepSignals = map[string]string{
 // The value is deliberately just a comma-separated modroot list - build
 // package patterns are NOT expressible here (wedging a second per-modroot
 // list into one annotation value has no clean grammar); annotation-declared
-// modroots simply get the ./... reachability fallback.
+// modroots simply get the ./... reachability fallback. A build that shells
+// out can narrow modroot "." with goPackagesAnnotation.
 const annotationPrefix = "choam/bump-"
+
+// goPackagesAnnotation declares the build package patterns (go/build's
+// space-separated with.packages grammar, relative to modroot ".") of a spec
+// whose build is an opaque `runs:` script, e.g. "./cmd/kubectl". Without it
+// such a spec's reachability falls back to ./... - every package of the
+// modroot counts as linked.
+// ponytail: modroot "." only; add a "<modroot>:" form if a spec needs patterns elsewhere.
+const goPackagesAnnotation = "choam/bump-go-packages"
 
 // excludeAnnotation opts a package out of dependency bumping; its value is
 // the reason shown in the report. Go stdlib rebuild epoch bumps still apply.
@@ -121,6 +130,9 @@ func discoverAnalysisUnits(ctx context.Context, cfg *melange.Configuration, bump
 		}
 		for language, modroots := range modrootsFromAnnotations(cfg) {
 			units.add(language, modroots, nil, nil)
+		}
+		if patterns := goPackagesFromAnnotation(cfg, notes); len(patterns) > 0 {
+			units.add("go", []string{"."}, patterns, nil)
 		}
 	}
 
@@ -432,6 +444,20 @@ func (r lenientRenderer) value(value string) string {
 // whitespace), dropping empties.
 func splitBuildTags(value string) []string {
 	return strings.FieldsFunc(value, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' })
+}
+
+// goPackagesFromAnnotation reads goPackagesAnnotation. A pattern starting
+// with "-" is skipped with a note: patterns reach `go list` as arguments.
+func goPackagesFromAnnotation(cfg *melange.Configuration, notes map[string]struct{}) []string {
+	var patterns []string
+	for pattern := range strings.FieldsSeq(cfg.Package.Annotations[goPackagesAnnotation]) {
+		if strings.HasPrefix(pattern, "-") {
+			notes[fmt.Sprintf("%s: pattern %q starts with '-' - ignored", goPackagesAnnotation, pattern)] = struct{}{}
+			continue
+		}
+		patterns = append(patterns, pattern)
+	}
+	return patterns
 }
 
 // modrootsFromAnnotations reads package.annotations["choam/bump-<language>"]

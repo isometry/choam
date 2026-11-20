@@ -319,6 +319,29 @@ func TestDiscoverAnalysisUnits(t *testing.T) {
 		assert.ElementsMatch(t, []string{"cmd/existing", "cmd/build", "cmd/annotated"}, roots(units["go"]))
 	})
 
+	t.Run("choam/bump-go-packages narrows modroot \".\", merging into its bump step", func(t *testing.T) {
+		bumpSteps := []config.BumpStep{{Action: "bump", Language: "go", Modroots: []string{"."}}}
+		cfg := &melange.Configuration{Package: melange.Package{Annotations: map[string]string{
+			"choam/bump-go-packages": "./cmd/a  ./cmd/b -bad",
+		}}}
+		units, notes := discoverAnalysisUnits(t.Context(), cfg, bumpSteps, nil)
+		require.Len(t, units["go"], 1)
+		assert.Equal(t, ".", units["go"][0].Modroot)
+		assert.Equal(t, []string{"./cmd/a", "./cmd/b"}, units["go"][0].Packages)
+		assert.Equal(t, []string{`choam/bump-go-packages: pattern "-bad" starts with '-' - ignored`}, notes)
+	})
+
+	t.Run("choam/bump-go-packages alone creates the \".\" unit; empty creates none", func(t *testing.T) {
+		cfg := &melange.Configuration{Package: melange.Package{Annotations: map[string]string{"choam/bump-go-packages": "./cmd/a"}}}
+		units, _ := discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		require.Len(t, units["go"], 1)
+		assert.Equal(t, []string{"./cmd/a"}, units["go"][0].Packages)
+
+		cfg.Package.Annotations["choam/bump-go-packages"] = " "
+		units, _ = discoverAnalysisUnits(t.Context(), cfg, nil, nil)
+		assert.Empty(t, units["go"])
+	})
+
 	t.Run("engine, tidy and go-package pin per modroot", func(t *testing.T) {
 		bumpSteps := []config.BumpStep{
 			{Action: "go/bump", Modroots: []string{"cmd/legacy"}},
