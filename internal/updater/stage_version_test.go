@@ -9,6 +9,7 @@ import (
 
 	melange "chainguard.dev/melange/pkg/config"
 	githubClient "github.com/isometry/choam/internal/github"
+	"github.com/isometry/choam/internal/httpclient"
 )
 
 func TestMatchesTagFilters(t *testing.T) {
@@ -135,11 +136,22 @@ func TestGetLatestValidGitHubVersion_TagFilters(t *testing.T) {
 			wantVersion: "2.8.9",
 			wantSource:  "github-tags",
 		},
+		{
+			name: "tag-filter-contains applies to tags path",
+			monitor: melange.GitHubMonitor{
+				Identifier:        "fluxcd/flux2",
+				StripPrefix:       "v",
+				TagFilterContains: "2.8.",
+				UseTags:           true,
+			},
+			wantVersion: "2.8.9",
+			wantSource:  "github-tags",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			orchestrator := NewOrchestrator()
+			orchestrator := NewOrchestratorWithTimeout(httpclient.DefaultTimeout)
 			orchestrator.githubClient = githubClient.New(&http.Client{
 				Transport: rewriteTransport{host: serverURL.Host},
 			})
@@ -162,5 +174,115 @@ func TestGetLatestValidGitHubVersion_TagFilters(t *testing.T) {
 				t.Errorf("getLatestValidGitHubVersion() source = %s, want %s", gotSource, tt.wantSource)
 			}
 		})
+	}
+}
+
+// gitTagSelector wires newestValidTag the way getLatestValidGitVersion does.
+func gitTagSelector(t *testing.T, monitor *melange.GitMonitor, preRelease bool) func(tags []string) (string, bool) {
+	t.Helper()
+	ctx := t.Context()
+	cfg := &melange.Configuration{}
+	cfg.Update.EnablePreReleaseTags = preRelease
+	cfg.Update.GitMonitor = monitor
+	vf := NewVersionFilter()
+	vc := &VersionChecker{}
+	inner := vc.createVersionFilter(ctx, cfg, vf)
+	accept := func(tag string) bool {
+		return matchesTagFilters(tag, monitor.TagFilterPrefix, monitor.TagFilterContains) && inner(tag)
+	}
+	process := func(tag string) string {
+		p, _, _ := vf.ProcessVersion(ctx, tag, &cfg.Update)
+		return p
+	}
+	return func(tags []string) (string, bool) {
+		return newestValidTag(tags, accept, process, NewVersionComparator().Compare)
+	}
+}
+
+func TestNewestValidTag(t *testing.T) {
+	tests := []struct {
+		name       string
+		monitor    melange.GitMonitor
+		preRelease bool
+		tags       []string
+		want       string
+		wantOK     bool
+	}{
+		{
+			name: "final release beats its rc with pre-releases enabled", preRelease: true,
+			monitor: melange.GitMonitor{StripPrefix: "v"},
+			tags:    []string{"v1.36.5", "v1.36.6-rc.1", "v1.36.6"},
+			want:    "1.36.6", wantOK: true,
+		},
+		{
+			name: "rc newer than last final is chosen when enabled", preRelease: true,
+			monitor: melange.GitMonitor{StripPrefix: "v"},
+			tags:    []string{"v1.36.5", "v1.36.6-rc.1"},
+			want:    "1.36.6-rc.1", wantOK: true,
+		},
+		{
+			name:    "pre-releases disabled rejects the rc",
+			monitor: melange.GitMonitor{StripPrefix: "v"},
+			tags:    []string{"v1.36.5", "v1.36.6-rc.1"},
+			want:    "1.36.5", wantOK: true,
+		},
+		{
+			name:    "multi-part numeric: 1.10.0 beats 1.9.0",
+			monitor: melange.GitMonitor{StripPrefix: "v"},
+			tags:    []string{"v1.9.0", "v1.10.0", "v1.2.0"},
+			want:    "1.10.0", wantOK: true,
+		},
+		{
+			name:    "strip-prefix: release-1.10 beats release-1.9",
+			monitor: melange.GitMonitor{StripPrefix: "release-"},
+			tags:    []string{"release-1.9", "release-1.10", "release-1.8"},
+			want:    "1.10", wantOK: true,
+		},
+		{
+			name:    "tag filter prefix restricts candidates",
+			monitor: melange.GitMonitor{StripPrefix: "v", TagFilterPrefix: "v1.8."},
+			tags:    []string{"v1.9.0", "v1.8.2", "v1.8.10"},
+			want:    "1.8.10", wantOK: true,
+		},
+		{
+			name:    "no valid tag",
+			monitor: melange.GitMonitor{StripPrefix: "v"},
+			tags:    []string{"nightly", "foo", "v1.0.0-rc.1"},
+			wantOK:  false,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			sel := gitTagSelector(t, &tt.monitor, tt.preRelease)
+			// Every rotation of the input must agree: the result is
+			// independent of the order the remote lists tags in.
+			for i := range tt.tags {
+				rot := append(append([]string{}, tt.tags[i:]...), tt.tags[:i]...)
+				got, ok := sel(rot)
+				if ok != tt.wantOK || got != tt.want {
+					t.Errorf("order %v: got (%q, %v), want (%q, %v)", rot, got, ok, tt.want, tt.wantOK)
+				}
+			}
+		})
+	}
+}
+
+func TestNewestValidTag_TieBreakAndCompareError(t *testing.T) {
+	identity := func(s string) string { return s }
+	always := func(string) bool { return true }
+
+	// Versions that compare equal but differ textually: the greater raw tag
+	// wins whatever the listing order.
+	equal := func(string, string) (int, error) { return 0, nil }
+	for _, tags := range [][]string{{"1.0", "1.0.0"}, {"1.0.0", "1.0"}} {
+		if got, ok := newestValidTag(tags, always, identity, equal); !ok || got != "1.0.0" {
+			t.Errorf("order %v: got (%q, %v), want (1.0.0, true)", tags, got, ok)
+		}
+	}
+
+	// A comparison error never displaces an already chosen candidate.
+	boom := func(string, string) (int, error) { return 0, fmt.Errorf("boom") }
+	if got, ok := newestValidTag([]string{"1.0.0", "2.0.0"}, always, identity, boom); !ok || got != "1.0.0" {
+		t.Errorf("compare error: got (%q, %v), want (1.0.0, true)", got, ok)
 	}
 }

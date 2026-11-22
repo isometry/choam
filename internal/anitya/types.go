@@ -38,11 +38,3 @@ type Project struct {
 	StableVersions []string `json:"stable_versions"`
 	Versions       []string `json:"versions"`
 }
-
-// ProjectResponse represents the API response structure
-type ProjectResponse struct {
-	Items      []Project `json:"items"`
-	Page       int       `json:"page"`
-	ItemsCount int       `json:"items_count"`
-	Total      int       `json:"total"`
-}

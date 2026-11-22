@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	melange "chainguard.dev/melange/pkg/config"
 	"github.com/isometry/choam/internal/anitya"
 	"github.com/isometry/choam/internal/git"
 	githubClient "github.com/isometry/choam/internal/github"
@@ -32,11 +31,6 @@ type UpdateOrchestrator struct {
 	versionComparator *VersionComparator
 }
 
-// NewOrchestrator creates a new update orchestrator with default HTTP timeout
-func NewOrchestrator() *UpdateOrchestrator {
-	return NewOrchestratorWithTimeout(httpclient.DefaultTimeout)
-}
-
 // NewOrchestratorWithTimeout creates a new update orchestrator with a custom HTTP timeout
 func NewOrchestratorWithTimeout(httpTimeout time.Duration) *UpdateOrchestrator {
 	// Create shared HTTP client with specified timeout
@@ -55,24 +49,9 @@ func NewOrchestratorWithTimeout(httpTimeout time.Duration) *UpdateOrchestrator {
 // ProcessPackageCheck runs only the check pipeline for a package
 // This loads the configuration and determines if updates are available
 func (o *UpdateOrchestrator) ProcessPackageCheck(ctx context.Context, filePath string) (*UpdaterProcessor, error) {
-	return o.processPackageCheckWithConfig(ctx, filePath, nil, nil)
-}
-
-// ProcessPackageCheckWithConfig runs check pipeline with pre-loaded configuration
-func (o *UpdateOrchestrator) ProcessPackageCheckWithConfig(ctx context.Context, filePath string, cfg *melange.Configuration, originalContent []byte) (*UpdaterProcessor, error) {
-	return o.processPackageCheckWithConfig(ctx, filePath, cfg, originalContent)
-}
-
-// processPackageCheckWithConfig is the internal implementation
-func (o *UpdateOrchestrator) processPackageCheckWithConfig(ctx context.Context, filePath string, cfg *melange.Configuration, originalContent []byte) (*UpdaterProcessor, error) {
-	// Load configuration if not provided
-	if cfg == nil {
-		loader := newMelangeLoader()
-		var err error
-		cfg, originalContent, err = loader.LoadWithPreservation(ctx, filePath)
-		if err != nil {
-			return nil, fmt.Errorf("loading configuration %s: %w", filePath, err)
-		}
+	cfg, originalContent, err := newMelangeLoader().LoadWithPreservation(ctx, filePath)
+	if err != nil {
+		return nil, fmt.Errorf("loading configuration %s: %w", filePath, err)
 	}
 
 	// Create processor using the modern architecture
@@ -104,7 +83,7 @@ func (o *UpdateOrchestrator) processPackageCheckWithConfig(ctx context.Context, 
 // This includes checking for updates and applying them if found
 func (o *UpdateOrchestrator) ProcessPackageApply(ctx context.Context, filePath string, options ProcessorOptions) (*UpdaterProcessor, error) {
 	// Start with check phase (get the internal processor, not the legacy result)
-	updaterProcessor, err := o.processPackageCheckWithConfig(ctx, filePath, nil, nil)
+	updaterProcessor, err := o.ProcessPackageCheck(ctx, filePath)
 	if err != nil {
 		return nil, fmt.Errorf("check phase failed: %w", err)
 	}

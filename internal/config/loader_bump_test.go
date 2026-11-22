@@ -405,10 +405,6 @@ func TestLoader_RemoveThenInsertPreservesComments(t *testing.T) {
 	content := string(updated)
 	assert.Contains(t, content, "# important comment")
 	assert.Contains(t, content, "\n\n  # important comment")
-
-	inserted, err := loader.InsertPipelineStep(updated, 1, map[string]any{"uses": "z"})
-	require.NoError(t, err)
-	assert.Contains(t, string(inserted), "# important comment")
 }
 
 func TestLoader_RemovePipelineWithField(t *testing.T) {

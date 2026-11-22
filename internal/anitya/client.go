@@ -33,11 +33,6 @@ func New(httpClient *http.Client) *Client {
 	}
 }
 
-// IsAuthenticated checks if the client is using authentication
-func (c *Client) IsAuthenticated() bool {
-	return c.token != ""
-}
-
 // GetProject fetches a project by its ID
 func (c *Client) GetProject(ctx context.Context, id int) (*Project, error) {
 	// Use the v1 API endpoint which works correctly for individual project lookups
@@ -91,14 +86,4 @@ func (c *Client) GetLatestVersion(ctx context.Context, id int) (string, error) {
 	}
 
 	return project.Version, nil
-}
-
-// GetStableVersions returns all stable versions for a project by ID
-func (c *Client) GetStableVersions(ctx context.Context, id int) ([]string, error) {
-	project, err := c.GetProject(ctx, id)
-	if err != nil {
-		return nil, fmt.Errorf("getting project: %w", err)
-	}
-
-	return project.StableVersions, nil
 }
