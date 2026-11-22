@@ -439,6 +439,7 @@ func (l *loop) buildResult(ctx context.Context, resolved map[string]string, resu
 	result.Requires = l.requirements
 	result.UnrequiredModules = l.unrequiredModules(resolved)
 	result.FinalDeps, result.FinalReplaces, result.CVEBackedModules = l.finalOutputs(resolved)
+	result.MajorRaises = l.majorRaises(result.FinalDeps)
 	result.HygieneModules = l.hygieneModules()
 	result.Dropped = l.dropped
 	// A shed fix the final graph resolves at or above anyway is no residual.

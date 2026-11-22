@@ -286,6 +286,14 @@ func reportBlindSpots(gp *Processor, modroot string, result *simulate.ModrootRes
 		gp.AddMessage(fmt.Sprintf("modroot %s: tolerated unmatched go:embed pattern(s) in %s (generated at build time): linkage computed from imports",
 			modroot, strings.Join(byPackage, ", ")))
 	}
+	for _, r := range result.MajorRaises {
+		prefix := ""
+		if modroot != "." {
+			prefix = "modroot " + modroot + ": "
+		}
+		gp.AddNote(fmt.Sprintf("%s%s: v0 -> v1 raise %s -> %s (%s), proven by the type-check gate only",
+			prefix, r.Module, r.From, r.To, strings.Join(r.VulnIDs, ", ")))
+	}
 	if result.GateUnchecked > 0 {
 		gp.AddMessage(fmt.Sprintf("modroot %s: type-check gate cannot check %d package(s) that already fail to type-check at baseline (first: %s)",
 			modroot, result.GateUnchecked, result.GateUncheckedFirst))

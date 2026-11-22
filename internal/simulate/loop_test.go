@@ -682,6 +682,82 @@ func TestRunLoop_V0ToV1FixIsResidual(t *testing.T) {
 	assert.Empty(t, result.FinalDeps)
 }
 
+func TestGatedV0ToV1(t *testing.T) {
+	cases := []struct {
+		module, fixed, resolved string
+		want                    bool
+	}{
+		{"example.com/a", "v1.0.1", "v0.9.0", true},
+		{"example.com/a", "v1.47.0", "v0.21.0", true},
+		{"example.com/a", "v0.9.1", "v0.9.0", false},    // not a major change
+		{"example.com/a", "v2.0.0", "v1.9.0", false},    // v1 -> v2 stays a residual
+		{"example.com/a", "v2.0.0", "v0.9.0", false},    // v0 -> v2 likewise
+		{"example.com/a/v2", "v1.0.0", "v0.9.0", false}, // path major
+		{"gopkg.in/yaml.v3", "v1.0.0", "v0.9.0", false}, // gopkg.in path major
+		{"example.com/a", "v1.0.0+incompatible", "v0.9.0", false},
+		{"example.com/a", "v1.0.0", "", false},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, gatedV0ToV1(tc.module, tc.fixed, tc.resolved), "%s %s -> %s", tc.module, tc.resolved, tc.fixed)
+	}
+}
+
+func TestRunLoop_V0ToV1FixUngatedIsResidual(t *testing.T) {
+	tc := &fakeChecker{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/young": "v0.9.0"}}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/young", id: "GO-Y", fixed: "v1.0.1"}}}
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{Modroot: "."}, Options{NoTypecheck: true})
+	require.NoError(t, err)
+	require.Len(t, result.Residuals, 1)
+	assert.Contains(t, result.Residuals[0].Reason, "major version change")
+	assert.Empty(t, result.FinalDeps)
+	assert.Empty(t, result.MajorRaises)
+}
+
+func TestRunLoop_V0ToV1FixGatedApplied(t *testing.T) {
+	tc := &fakeChecker{fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/young": "v0.9.0"}}}
+	sc := &fakeScanner{advisories: []fakeAdvisory{{module: "example.com/young", id: "GO-Y", fixed: "v1.0.1"}}}
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot:  ".",
+		Baseline: map[string]string{"example.com/young": "v0.9.0"},
+	}, Options{})
+	require.NoError(t, err)
+	assert.Empty(t, result.Residuals)
+	assert.Equal(t, []string{"example.com/young@v1.0.1"}, result.FinalDeps)
+	assert.Equal(t, []MajorRaise{{Module: "example.com/young", From: "v0.9.0", To: "v1.0.1", VulnIDs: []string{"GO-Y"}}}, result.MajorRaises)
+}
+
+func TestRunLoop_V0ToV1FixRelaxedOnTypecheckFailure(t *testing.T) {
+	// The v1 graduation breaks the build: the gate relaxes to the v0 rung
+	// (which still fixes GO-A) and the v1-only advisory is a residual.
+	tc := &fakeChecker{
+		fakeToolchain: &fakeToolchain{base: map[string]string{"example.com/young": "v0.9.0"}},
+		checkFn: func(resolved map[string]string) *CheckReport {
+			if resolved["example.com/young"] != "v1.0.1" {
+				return &CheckReport{}
+			}
+			return &CheckReport{
+				Failed:  map[string][]string{"example.com/young/pkg": {"x.go:1:1: undefined: Old"}},
+				Modules: map[string]string{"example.com/young/pkg": "example.com/young"},
+				Imports: map[string][]string{"example.com/young/pkg": {}},
+			}
+		},
+	}
+	sc := &fakeScanner{advisories: []fakeAdvisory{
+		{module: "example.com/young", id: "GO-A", fixed: "v0.9.5"},
+		{module: "example.com/young", id: "GO-B", fixed: "v1.0.1"},
+	}}
+	result, err := RunLoop(t.Context(), tc, sc, newTestModuleDir(t), ModrootRequest{
+		Modroot:  ".",
+		Baseline: map[string]string{"example.com/young": "v0.9.0"},
+	}, Options{})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"example.com/young@v0.9.5"}, result.FinalDeps)
+	assert.Empty(t, result.MajorRaises)
+	require.Len(t, result.Residuals, 1)
+	assert.Equal(t, []string{"GO-B"}, result.Residuals[0].VulnIDs)
+	assert.Contains(t, result.Residuals[0].Reason, "breaks type-check")
+}
+
 func TestRunLoop_BaselineNoopsDropped(t *testing.T) {
 	tc := &fakeToolchain{base: map[string]string{
 		"example.com/aaa": "v2.2.0",
