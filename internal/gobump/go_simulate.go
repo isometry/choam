@@ -56,13 +56,11 @@ type SimulationStage struct {
 
 func NewSimulationStage(analyzer *Analyzer, opts Options) *SimulationStage {
 	return &SimulationStage{
-		BaseStage: processor.BaseStage{
-			StageName:        "bump_simulation",
-			StageDescription: "Validate Go bump candidates against a source checkout",
-		},
-		Analyzer:     analyzer,
-		Options:      opts,
-		newSimulator: defaultSimulator,
+		StageName:        "bump_simulation",
+		StageDescription: "Validate Go bump candidates against a source checkout",
+		Analyzer:         analyzer,
+		Options:          opts,
+		newSimulator:     defaultSimulator,
 	}
 }
 

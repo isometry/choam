@@ -49,13 +49,11 @@ type StdlibStage struct {
 
 func NewStdlibStage(analyzer *Analyzer, opts Options) *StdlibStage {
 	stage := &StdlibStage{
-		BaseStage: processor.BaseStage{
-			StageName:        "stdlib_check",
-			StageDescription: "Check for Go stdlib vulnerabilities fixable by a toolchain rebuild",
-		},
-		Analyzer:   analyzer,
-		Options:    opts,
-		lastCommit: git.LastCommitInfo,
+		StageName:        "stdlib_check",
+		StageDescription: "Check for Go stdlib vulnerabilities fixable by a toolchain rebuild",
+		Analyzer:         analyzer,
+		Options:          opts,
+		lastCommit:       git.LastCommitInfo,
 	}
 	if analyzer != nil {
 		stage.index = analyzer.goReleases

@@ -20,11 +20,9 @@ type GoPackagePinStage struct {
 
 func NewGoPackagePinStage(analyzer *Analyzer) *GoPackagePinStage {
 	return &GoPackagePinStage{
-		BaseStage: processor.BaseStage{
-			StageName:        "go_package_pins",
-			StageDescription: "Raise too-old go-package toolchain pins",
-		},
-		Analyzer: analyzer,
+		StageName:        "go_package_pins",
+		StageDescription: "Raise too-old go-package toolchain pins",
+		Analyzer:         analyzer,
 	}
 }
 

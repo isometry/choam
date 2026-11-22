@@ -313,7 +313,7 @@ func (l *loop) trialPins(g *gateRun, live []*candState, repairs map[string]strin
 	}
 	for _, module := range sortedKeys(repairs) {
 		if _, ok := pinned[module]; !ok {
-			pins = append(pins, &candState{Candidate: Candidate{Module: module, Version: repairs[module]}, repair: true})
+			pins = append(pins, &candState{Module: module, Version: repairs[module], repair: true})
 		}
 	}
 	return pins

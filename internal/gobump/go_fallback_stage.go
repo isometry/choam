@@ -51,16 +51,14 @@ func NewGoVersionFallbackStage(analyzer *Analyzer) *GoVersionFallbackStage {
 		proxyURL = defaultGoProxyURL
 	}
 	return &GoVersionFallbackStage{
-		BaseStage: processor.BaseStage{
-			StageName:        "go_version_fallback",
-			StageDescription: "Best-effort required Go version for modroots simulation did not prove",
-		},
-		Analyzer:        analyzer,
-		goProxyURL:      proxyURL,
-		probeDisabled:   goproxy.Disabled(os.Getenv("GOPROXY")),
-		goPrivate:       os.Getenv("GOPRIVATE"),
-		goNoProxy:       os.Getenv("GONOPROXY"),
-		goProxyIsPublic: proxyURL == defaultGoProxyURL,
+		StageName:        "go_version_fallback",
+		StageDescription: "Best-effort required Go version for modroots simulation did not prove",
+		Analyzer:         analyzer,
+		goProxyURL:       proxyURL,
+		probeDisabled:    goproxy.Disabled(os.Getenv("GOPROXY")),
+		goPrivate:        os.Getenv("GOPRIVATE"),
+		goNoProxy:        os.Getenv("GONOPROXY"),
+		goProxyIsPublic:  proxyURL == defaultGoProxyURL,
 	}
 }
 

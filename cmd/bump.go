@@ -15,7 +15,6 @@ import (
 	"github.com/isometry/choam/internal/gobump"
 	"github.com/isometry/choam/internal/httpclient"
 	"github.com/isometry/choam/internal/output"
-	"github.com/isometry/choam/internal/processor"
 	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
@@ -136,11 +135,9 @@ func bumpExitError(summary output.BumpSummary) error {
 // testable without driving the full command.
 func buildBumpProcessorOptions() gobump.Options {
 	return gobump.Options{
-		ProcessorOptions: processor.ProcessorOptions{
-			DryRun:       dryRun,
-			BackupSuffix: backupSuffix,
-			TempDir:      os.TempDir(),
-		},
+		DryRun:            dryRun,
+		BackupSuffix:      backupSuffix,
+		TempDir:           os.TempDir(),
 		Validate:          !noValidate,
 		SimulationTimeout: simulationTimeout,
 		Typecheck:         !noValidate && !noTypecheck,

@@ -25,12 +25,10 @@ func NewFileWriterStage(createBackup bool, backupSuffix string) *FileWriterStage
 	}
 
 	return &FileWriterStage{
-		BaseStage: processor.BaseStage{
-			StageName:        "file_writer",
-			StageDescription: "Write changes to file",
-		},
-		CreateBackup: createBackup,
-		BackupSuffix: backupSuffix,
+		StageName:        "file_writer",
+		StageDescription: "Write changes to file",
+		CreateBackup:     createBackup,
+		BackupSuffix:     backupSuffix,
 	}
 }
 

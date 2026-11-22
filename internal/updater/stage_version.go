@@ -20,11 +20,9 @@ type VersionChecker struct {
 
 func NewVersionChecker(orchestrator *UpdateOrchestrator) *VersionChecker {
 	return &VersionChecker{
-		BaseStage: processor.BaseStage{
-			StageName:        "version_check",
-			StageDescription: "Check for available package updates",
-		},
-		orchestrator: orchestrator,
+		StageName:        "version_check",
+		StageDescription: "Check for available package updates",
+		orchestrator:     orchestrator,
 	}
 }
 
@@ -310,10 +308,8 @@ type VersionApplier struct {
 
 func NewVersionApplier() *VersionApplier {
 	return &VersionApplier{
-		BaseStage: processor.BaseStage{
-			StageName:        "version_apply",
-			StageDescription: "Apply version updates to melange configuration",
-		},
+		StageName:        "version_apply",
+		StageDescription: "Apply version updates to melange configuration",
 	}
 }
 

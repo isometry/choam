@@ -300,8 +300,8 @@ func (l *loop) dropLastRemedy(err error) bool {
 func (l *loop) shedCandidate(err error, eligible func(*candState) bool) bool {
 	errText := err.Error()
 	var victim *candState
-	for i := len(l.cands) - 1; i >= 0; i-- {
-		c := l.cands[i]
+	for _, c := range slices.Backward(l.cands) {
+
 		if c.isDropped() || !eligible(c) {
 			continue
 		}

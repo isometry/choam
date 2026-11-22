@@ -424,8 +424,8 @@ func TestRawSkip(t *testing.T) {
 }
 
 func TestOmnibumpClassify(t *testing.T) {
-	a := &candState{Candidate: Candidate{Module: "example.com/a", Version: "v1.2.0"}}
-	ab := &candState{Candidate: Candidate{Module: "example.com/a/b", Version: "v0.3.0"}}
+	a := &candState{Module: "example.com/a", Version: "v1.2.0"}
+	ab := &candState{Module: "example.com/a/b", Version: "v0.3.0"}
 	keep := []*candState{a, ab}
 	e := &omnibumpEngine{}
 	ctx := t.Context()

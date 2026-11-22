@@ -1146,7 +1146,7 @@ func TestRunLoop_ImpliedFloorDroppedInsteadOfSteppingDown(t *testing.T) {
 func TestReviveRelinked_ImpliedSibling(t *testing.T) {
 	const sys = "golang.org/x/sys"
 	l := &loop{req: ModrootRequest{Modroot: "."}, byModule: map[string]*candState{}}
-	c := &candState{Candidate: Candidate{Module: sys, Version: "v0.45.0", FromCVE: true}}
+	c := &candState{Module: sys, Version: "v0.45.0", FromCVE: true}
 	l.byModule[sys] = c
 	l.cands = []*candState{c}
 	l.drop(c, "redundant: implied by golang.org/x/net@v0.62.0")
@@ -2313,7 +2313,7 @@ func TestRunLoop_CtxLoggerAttributesRecords(t *testing.T) {
 
 	out := buf.String()
 	require.NotEmpty(t, out, "the failed-reachability fixture must produce log output")
-	for _, line := range strings.Split(strings.TrimRight(out, "\n"), "\n") {
+	for line := range strings.SplitSeq(strings.TrimRight(out, "\n"), "\n") {
 		assert.Contains(t, line, "file=x.yaml", "every record must carry the ctx-supplied attribute")
 	}
 }
@@ -3111,11 +3111,11 @@ func TestLogTrial_RecordShape(t *testing.T) {
 	}
 	l := &loop{req: ModrootRequest{Modroot: "."}, baselineResolved: baseline}
 	pins := []*candState{
-		{Candidate: Candidate{Module: "example.com/cve", Version: "v1.1.0", FromCVE: true}, seed: true},
-		{Candidate: Candidate{Module: "example.com/seed", Version: "v1.0.0"}, seed: true},
-		{Candidate: Candidate{Module: "example.com/rem", Version: "v0.0.0-20260226221140-a57be14db171"}, remedy: true},
-		{Candidate: Candidate{Module: "example.com/coh", Version: "v0.2.0"}, repair: true},
-		{Candidate: Candidate{Module: "example.com/new", Version: "v2.0.0", Replace: true, ReplaceOld: "example.com/old"}},
+		{Module: "example.com/cve", Version: "v1.1.0", FromCVE: true, seed: true},
+		{Module: "example.com/seed", Version: "v1.0.0", seed: true},
+		{Module: "example.com/rem", Version: "v0.0.0-20260226221140-a57be14db171", remedy: true},
+		{Module: "example.com/coh", Version: "v0.2.0", repair: true},
+		{Module: "example.com/new", Version: "v2.0.0", Replace: true, ReplaceOld: "example.com/old"},
 	}
 	st := &trialOutcome{
 		report:   &CheckReport{Modules: map[string]string{"example.com/x/p": "example.com/x", "example.com/app": ""}},

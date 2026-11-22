@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -59,9 +60,7 @@ func modFiles(path, goVersion string, requires map[string]string, files map[stri
 		b.WriteString(")\n")
 	}
 	out := map[string]string{"go.mod": b.String()}
-	for name, src := range files {
-		out[name] = src
-	}
+	maps.Copy(out, files)
 	return out
 }
 

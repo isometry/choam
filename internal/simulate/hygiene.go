@@ -520,7 +520,7 @@ func withHygiene(set []*candState, pins []hygienePin) []*candState {
 	}
 	for _, p := range pins {
 		if !placed[p.module] {
-			out = append(out, &candState{Candidate: Candidate{Module: p.module, Version: p.version}, hygieneIDs: p.ids})
+			out = append(out, &candState{Module: p.module, Version: p.version, hygieneIDs: p.ids})
 		}
 	}
 	return out

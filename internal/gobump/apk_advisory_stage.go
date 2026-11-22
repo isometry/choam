@@ -52,11 +52,9 @@ type ApkAdvisoryStage struct {
 
 func NewApkAdvisoryStage(analyzer *Analyzer, opts Options) *ApkAdvisoryStage {
 	stage := &ApkAdvisoryStage{
-		BaseStage: processor.BaseStage{
-			StageName:        "apk_advisories",
-			StageDescription: "Align the epoch with Chainguard/Wolfi APK advisories",
-		},
-		Options: opts,
+		StageName:        "apk_advisories",
+		StageDescription: "Align the epoch with Chainguard/Wolfi APK advisories",
+		Options:          opts,
 	}
 	if analyzer != nil {
 		stage.advisories = analyzer.vulnerabilityScanner

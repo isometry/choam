@@ -594,15 +594,13 @@ func collectGoToolchainSteps(steps *[]GoToolchainStep, pipeline any, pathPrefix,
 		}
 		withPath := fmt.Sprintf("%s.pipeline[%d].with", pathPrefix, i)
 		*steps = append(*steps, GoToolchainStep{
-			GoPackagePin: GoPackagePin{
-				Path:       withPath + ".go-package",
-				Subpackage: subpackage,
-				Value:      value,
-				Uses:       uses,
-				Modroot:    modroot,
-			},
-			WithPath: withPath,
-			HasPin:   hasPin,
+			Path:       withPath + ".go-package",
+			Subpackage: subpackage,
+			Value:      value,
+			Uses:       uses,
+			Modroot:    modroot,
+			WithPath:   withPath,
+			HasPin:     hasPin,
 		})
 	}
 }

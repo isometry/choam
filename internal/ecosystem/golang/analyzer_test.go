@@ -841,11 +841,11 @@ func TestAnalyzer_DebugTraceOneDecisionPerModule(t *testing.T) {
 	newAnalyzer().analyzeBumps(ctx, deps, nil, goModInfo)
 
 	var decisions []string
-	for _, line := range strings.Split(strings.TrimRight(buf.String(), "\n"), "\n") {
+	for line := range strings.SplitSeq(strings.TrimRight(buf.String(), "\n"), "\n") {
 		if !strings.Contains(line, `msg="bump decision"`) {
 			continue
 		}
-		for _, f := range strings.Fields(line) {
+		for f := range strings.FieldsSeq(line) {
 			if v, ok := strings.CutPrefix(f, "module="); ok {
 				decisions = append(decisions, v)
 			}

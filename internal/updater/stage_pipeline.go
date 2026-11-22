@@ -21,11 +21,9 @@ type PipelineProcessor struct {
 
 func NewPipelineProcessor(orchestrator *UpdateOrchestrator) *PipelineProcessor {
 	return &PipelineProcessor{
-		BaseStage: processor.BaseStage{
-			StageName:        "pipeline_process",
-			StageDescription: "Process and update pipeline configurations",
-		},
-		orchestrator: orchestrator,
+		StageName:        "pipeline_process",
+		StageDescription: "Process and update pipeline configurations",
+		orchestrator:     orchestrator,
 	}
 }
 

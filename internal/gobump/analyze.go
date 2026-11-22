@@ -83,11 +83,9 @@ type VulnerabilityChecker struct {
 
 func NewVulnerabilityChecker(analyzer *Analyzer) *VulnerabilityChecker {
 	return &VulnerabilityChecker{
-		BaseStage: processor.BaseStage{
-			StageName:        "vulnerability_check",
-			StageDescription: "Check for dependency vulnerabilities",
-		},
-		Analyzer: analyzer,
+		StageName:        "vulnerability_check",
+		StageDescription: "Check for dependency vulnerabilities",
+		Analyzer:         analyzer,
 	}
 }
 
@@ -262,8 +260,7 @@ func (v *VulnerabilityChecker) performAnalysis(ctx context.Context, eco ecosyste
 		ctx := logging.With(ctx, "modroot", root)
 
 		m, err := v.analyzeModroot(ctx, eco, repoURL, ref, unit, existing, gp)
-		var unsupported *unsupportedBuildError
-		if errors.As(err, &unsupported) {
+		if unsupported, ok := errors.AsType[*unsupportedBuildError](err); ok {
 			// Absent from ByModroot, so planEdits leaves its steps untouched.
 			gp.Skip(ctx, fmt.Sprintf("%s modroot %s: %s", language, root, unsupported.reason))
 			continue

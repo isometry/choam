@@ -67,8 +67,8 @@ func TestLadder_EqualRungMergedIntoTop(t *testing.T) {
 	l := &loop{baselineResolved: map[string]string{dockerModule: "v2.8.0+incompatible"}}
 	for range shuffleRuns {
 		for _, version := range []string{"v2.8.2", "v2.8.2+incompatible"} {
-			c := &candState{Candidate: Candidate{Module: dockerModule, Version: version, FromCVE: true,
-				Rungs: shuffled(rng, dockerRungs())}}
+			c := &candState{Module: dockerModule, Version: version, FromCVE: true,
+				Rungs: shuffled(rng, dockerRungs())}
 			require.Equal(t, wantDockerRungs, l.ladder(c), "candidate version %s, rungs %v", version, c.Rungs)
 		}
 	}
@@ -79,8 +79,8 @@ func TestStepDown_LandsOnCanonicalRung(t *testing.T) {
 	for range shuffleRuns {
 		l := &loop{req: ModrootRequest{Baseline: map[string]string{dockerModule: "v2.8.0+incompatible"}}}
 		rungs := append(shuffled(rng, dockerRungs()), Rung{Version: "v2.8.3+incompatible", VulnIDs: []string{"GO-NEWER"}})
-		c := &candState{Candidate: Candidate{Module: dockerModule, Version: "v2.8.3+incompatible", FromCVE: true,
-			VulnIDs: []string{"GHSA-hqxw-f8mx-cpmw", "GO-NEWER"}, Rungs: shuffled(rng, rungs)}}
+		c := &candState{Module: dockerModule, Version: "v2.8.3+incompatible", FromCVE: true,
+			VulnIDs: []string{"GHSA-hqxw-f8mx-cpmw", "GO-NEWER"}, Rungs: shuffled(rng, rungs)}
 		l.stepDown(t.Context(), c, "fix unresolvable")
 		require.Equal(t, "v2.8.2+incompatible", c.Version)
 		require.Equal(t, wantDockerRungs, c.Rungs)

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -278,9 +279,7 @@ func otelFamilyModules() map[string]map[string]string {
 		modGRPC + "@v1.83.2": stubModule(modGRPC, "grpc.go", grpcSrc, nil),
 	}
 	for _, e := range [][2]string{{modLogHTTP, "otlploghttp"}, {modLogGRPC, "otlploggrpc"}, {modStdoutLog, "stdoutlog"}} {
-		for coord, files := range exporter(e[0], e[1]) {
-			modules[coord] = files
-		}
+		maps.Copy(modules, exporter(e[0], e[1]))
 	}
 	return modules
 }

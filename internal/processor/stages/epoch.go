@@ -91,11 +91,9 @@ type EpochStage struct {
 // NewEpochStage creates a new epoch stage with the given strategy
 func NewEpochStage(strategy EpochStrategy) *EpochStage {
 	return &EpochStage{
-		BaseStage: processor.BaseStage{
-			StageName:        "epoch",
-			StageDescription: "Handle epoch updates based on configured strategy",
-		},
-		Strategy: strategy,
+		StageName:        "epoch",
+		StageDescription: "Handle epoch updates based on configured strategy",
+		Strategy:         strategy,
 	}
 }
 

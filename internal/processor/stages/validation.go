@@ -20,10 +20,8 @@ type ValidationStage struct {
 // NewValidationStage creates a new validation stage
 func NewValidationStage(validateOriginal, validateCurrent bool) *ValidationStage {
 	return &ValidationStage{
-		BaseStage: processor.BaseStage{
-			StageName:        "validation",
-			StageDescription: "Validate YAML syntax and melange configuration",
-		},
+		StageName:        "validation",
+		StageDescription: "Validate YAML syntax and melange configuration",
 		ValidateOriginal: validateOriginal,
 		ValidateCurrent:  validateCurrent,
 	}

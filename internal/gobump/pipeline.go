@@ -21,11 +21,9 @@ type Applier struct {
 
 func NewApplier(analyzer *Analyzer) *Applier {
 	return &Applier{
-		BaseStage: processor.BaseStage{
-			StageName:        "bump_apply",
-			StageDescription: "Apply bump/go-bump pipeline changes",
-		},
-		Analyzer: analyzer,
+		StageName:        "bump_apply",
+		StageDescription: "Apply bump/go-bump pipeline changes",
+		Analyzer:         analyzer,
 	}
 }
 

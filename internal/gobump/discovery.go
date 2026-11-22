@@ -372,7 +372,7 @@ func buildEnv(where string, env map[string]string, experiments *string, render l
 			notes[fmt.Sprintf("%s: GOFLAGS %q does not render - not mirrored", where, raw)] = struct{}{}
 			value = ""
 		}
-		for _, flag := range strings.Fields(value) {
+		for flag := range strings.FieldsSeq(value) {
 			name, arg, _ := strings.Cut(strings.TrimLeft(flag, "-"), "=")
 			switch {
 			case name == "tags" && experiments == nil:
