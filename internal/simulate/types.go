@@ -290,6 +290,14 @@ type Residual struct {
 	Introduced bool `json:"introduced,omitempty" yaml:"introduced,omitempty"`
 }
 
+// MajorRaise is one v0 -> v1 raise in ModrootResult.FinalDeps.
+type MajorRaise struct {
+	Module  string   `json:"module" yaml:"module"`
+	From    string   `json:"from" yaml:"from"`
+	To      string   `json:"to" yaml:"to"`
+	VulnIDs []string `json:"vuln_ids,omitempty" yaml:"vuln_ids,omitempty"`
+}
+
 // ModrootResult is the outcome of simulating one module root.
 type ModrootResult struct {
 	Modroot string `json:"modroot" yaml:"modroot"`
@@ -299,6 +307,11 @@ type ModrootResult struct {
 	// filtered to entries that actually move the module graph forward
 	// relative to the original manifest.
 	FinalDeps []string `json:"final_deps" yaml:"final_deps"`
+
+	// MajorRaises are the final deps that graduate a module from v0 to v1 on
+	// the same import path (see gatedV0ToV1): proven by the type-check gate
+	// only, so callers report them at default verbosity.
+	MajorRaises []MajorRaise `json:"major_raises,omitempty" yaml:"major_raises,omitempty"`
 
 	// FinalReplaces are the user-authored replace directives ("old=new@version",
 	// gobump grammar) proven to apply cleanly, raised where an advisory

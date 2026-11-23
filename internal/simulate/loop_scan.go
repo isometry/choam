@@ -240,9 +240,11 @@ func securityFix(scanResult *scan.ScanResult, bump scan.SecurityBump, linked, un
 
 // raiseBlocked is why module cannot be raised from resolvedVersion to fix
 // with a deps entry ("" when it can): a major version change, or an upstream
-// replace pin.
+// replace pin. A same-path v0 -> v1 security raise is let through when the
+// type-check gate is on (see gatedV0ToV1): the gate then proves it or
+// relaxes it to the highest v0 fix rung.
 func (l *loop) raiseBlocked(module, fix, resolvedVersion string) string {
-	if majorChange(module, fix, resolvedVersion) {
+	if majorChange(module, fix, resolvedVersion) && (l.checker == nil || !gatedV0ToV1(module, fix, resolvedVersion)) {
 		return fmt.Sprintf("fix requires a major version change (%s -> %s)", resolvedVersion, fix)
 	}
 	if oldPath := l.upstreamHoldBack(module); oldPath != "" {
@@ -292,10 +294,23 @@ func packagesFor(resolved map[string]string) []scan.Package {
 	return pkgs
 }
 
+// gatedV0ToV1 reports whether moving module from resolvedVersion to fix is a
+// v0 -> v1 graduation on the same import path: no /vN or gopkg.in path
+// major, no +incompatible. It is the only major crossing choam proposes on
+// its own, and only for a security fix that the type-check gate can prove.
+func gatedV0ToV1(modulePath, fix, resolvedVersion string) bool {
+	if semver.Major(resolvedVersion) != "v0" || semver.Major(fix) != "v1" || semver.Build(fix) != "" {
+		return false
+	}
+	_, pathMajor, ok := module.SplitPathVersion(modulePath)
+	return ok && pathMajor == ""
+}
+
 // majorChange reports whether moving module from the resolved version to
 // the fixed version crosses a major version boundary - v0 -> v1 included:
 // v0 promises no compatibility, and a v1 release is the API break that
-// declares the stable one - unless module's path already encodes the fixed
+// declares the stable one (a security raise may still cross it behind the
+// type-check gate, see gatedV0ToV1; hygiene bumps never do) - unless module's path already encodes the fixed
 // version's major (/vN, gopkg.in .vN). Such a fix is not a compatible raise
 // a deps entry can express.
 func majorChange(modulePath, fixedVersion, resolvedVersion string) bool {
@@ -390,4 +405,23 @@ func compareResiduals(a, b Residual) int {
 		slices.Compare(a.VulnIDs, b.VulnIDs),
 		strings.Compare(a.ResolvedVersion, b.ResolvedVersion),
 	)
+}
+
+// majorRaises lists the final deps that graduate a module from its pristine
+// v0 version to v1 (see gatedV0ToV1), in deps order.
+func (l *loop) majorRaises(finalDeps []string) []MajorRaise {
+	var raises []MajorRaise
+	for _, dep := range finalDeps {
+		mod, version, ok := strings.Cut(dep, "@")
+		from := l.baselineResolved[mod]
+		if !ok || from == "" || !gatedV0ToV1(mod, version, from) {
+			continue
+		}
+		r := MajorRaise{Module: mod, From: from, To: version}
+		if c, ok := l.byModule[mod]; ok {
+			r.VulnIDs = c.VulnIDs
+		}
+		raises = append(raises, r)
+	}
+	return raises
 }
