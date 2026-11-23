@@ -42,6 +42,7 @@ Path can be a single file or a directory containing .yaml files.`,
 	cmd.Flags().BoolVar(&noTypecheck, "no-typecheck", false, "Skip the simulation's type-check gate (bumps are still simulated and proven to resolve and cover advisories, but the go/build packages are not type-checked against them); implied by --no-validate")
 	cmd.Flags().BoolVar(&failOnResidual, "fail-on-residual", false, "Exit non-zero when any advisory remains residual or a first-party apk advisory needs a patch (files that error always exit non-zero)")
 	cmd.Flags().BoolVar(&noStdlib, "no-stdlib", false, "Skip the Go stdlib staleness check (no epoch bump for toolchain-fixed vulnerabilities). The check is also skipped automatically for files with uncommitted changes.")
+	cmd.Flags().BoolVar(&noGitRange, "no-git-range", false, "Skip the git-range advisory pass (CVEs OSV holds only as commit ranges, matched through the module proxy's origin commit); it needs the module proxy, so use this when the proxy is unreachable or needs credentials")
 	cmd.Flags().BoolVar(&noApkAdvisories, "no-apk-advisories", false, "Skip the Chainguard/Wolfi apk advisory check (no epoch alignment with published apk advisories, no first-party patch alerts)")
 
 	return cmd
@@ -81,6 +82,9 @@ func runBump(cmd *cobra.Command, args []string) error {
 	// Create shared HTTP client with custom timeout
 	httpClient := httpclient.NewHTTPClientWithTimeout(httpTimeout)
 	analyzer := gobump.NewAnalyzer(httpClient)
+	if noGitRange {
+		analyzer.DisableGitRange()
+	}
 
 	results := make([]*gobump.Result, 0, len(files))
 	for i, file := range files {

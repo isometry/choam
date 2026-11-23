@@ -769,3 +769,10 @@ Action needed:
 		assert.LessOrEqual(t, len(line), defaultWrapWidth)
 	}
 }
+
+// TestBumpNoGitRangeFlag verifies --no-git-range is registered.
+func TestBumpNoGitRangeFlag(t *testing.T) {
+	flag := NewBumpCmd().Flags().Lookup("no-git-range")
+	require.NotNil(t, flag, "--no-git-range should be registered")
+	assert.Equal(t, "false", flag.DefValue)
+}

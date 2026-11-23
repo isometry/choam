@@ -28,6 +28,13 @@ type VulnerabilityCache struct {
 	mu         sync.RWMutex
 	entries    map[string][]*osvschema.Vulnerability // Key: "ecosystem|package@version"
 	advisories map[string]*osvschema.Vulnerability   // Key: advisory ID
+
+	// Git-range lookups (see gitrange.go): module proxy origins by
+	// "module@version", proxy version lists by module, and OSV commit-query
+	// results by commit hash.
+	origins  map[string]originInfo
+	versions map[string][]string
+	commits  map[string][]*osvschema.Vulnerability
 }
 
 // cacheKeyFor builds an ecosystem-qualified cache key, preventing collisions
@@ -42,6 +49,9 @@ func NewVulnerabilityCache() *VulnerabilityCache {
 	return &VulnerabilityCache{
 		entries:    make(map[string][]*osvschema.Vulnerability),
 		advisories: make(map[string]*osvschema.Vulnerability),
+		origins:    make(map[string]originInfo),
+		versions:   make(map[string][]string),
+		commits:    make(map[string][]*osvschema.Vulnerability),
 	}
 }
 
@@ -89,4 +99,52 @@ func (c *VulnerabilityCache) Clear() {
 	defer c.mu.Unlock()
 	c.entries = make(map[string][]*osvschema.Vulnerability)
 	c.advisories = make(map[string]*osvschema.Vulnerability)
+	c.origins = make(map[string]originInfo)
+	c.versions = make(map[string][]string)
+	c.commits = make(map[string][]*osvschema.Vulnerability)
+}
+
+// GetOrigin returns the cached proxy origin of a module@version.
+func (c *VulnerabilityCache) GetOrigin(key string) (originInfo, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	o, ok := c.origins[key]
+	return o, ok
+}
+
+// SetOrigin caches the proxy origin of a module@version.
+func (c *VulnerabilityCache) SetOrigin(key string, o originInfo) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.origins[key] = o
+}
+
+// GetVersions returns the cached proxy version list of a module.
+func (c *VulnerabilityCache) GetVersions(module string) ([]string, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	v, ok := c.versions[module]
+	return v, ok
+}
+
+// SetVersions caches the proxy version list of a module.
+func (c *VulnerabilityCache) SetVersions(module string, versions []string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.versions[module] = versions
+}
+
+// GetCommit returns the cached OSV commit-query result for a commit hash.
+func (c *VulnerabilityCache) GetCommit(hash string) ([]*osvschema.Vulnerability, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	v, ok := c.commits[hash]
+	return v, ok
+}
+
+// SetCommit caches the OSV commit-query result for a commit hash.
+func (c *VulnerabilityCache) SetCommit(hash string, vulns []*osvschema.Vulnerability) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.commits[hash] = vulns
 }

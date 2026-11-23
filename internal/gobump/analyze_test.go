@@ -221,3 +221,16 @@ func TestRecordHygieneBumps(t *testing.T) {
 	require.NoError(t, err)
 	assert.NotContains(t, string(empty), "hygiene", "no new keys without hygiene bumps")
 }
+
+func TestGitRangeMessages(t *testing.T) {
+	gitRange := map[string]any{"source": "osv-git-range"}
+	msgs := gitRangeMessages(".", []scan.Vulnerability{
+		{Module: "example.com/a", ID: "CVE-1", FixedVersion: "v1.2.3", DatabaseSpecific: gitRange},
+		{Module: "example.com/b", ID: "CVE-2", DatabaseSpecific: gitRange},
+		{Module: "example.com/c", ID: "GO-3", FixedVersion: "v1.0.0"}, // package-scoped: not mentioned
+	})
+	assert.Equal(t, []string{
+		"modroot .: example.com/a CVE-1 found by git commit range (no Go package record), fixed in v1.2.3",
+		"modroot .: example.com/b CVE-2 found by git commit range (no Go package record), fixed in no release",
+	}, msgs)
+}

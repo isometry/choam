@@ -42,7 +42,7 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `cmd/root.go:55` - `collectMelangeFiles()` YAML discovery
 - `cmd/check.go:15` - `NewCheckCmd()` update detection command
 - `cmd/update.go:16` - `NewUpdateCmd()` apply updates command
-- `cmd/bump.go:19` - `NewBumpCmd()` vulnerability-bump command (`gobump` alias; flags: `--dry-run`, `--format`, `--backup-suffix`, `--no-validate`, `--no-typecheck`, `--simulation-timeout`, `--no-stdlib`, `--no-apk-advisories`, `--fail-on-residual`)
+- `cmd/bump.go:19` - `NewBumpCmd()` vulnerability-bump command (`gobump` alias; flags: `--dry-run`, `--format`, `--backup-suffix`, `--no-validate`, `--no-typecheck`, `--simulation-timeout`, `--no-stdlib`, `--no-apk-advisories`, `--no-git-range`, `--fail-on-residual`)
 - `cmd/bump.go:51` - `runBump()` vulnerability scan/apply logic; exits non-zero (`ErrBumpFailed`) when any file errors; `summarizeBumpResults()` feeds both table and JSON/YAML (results keyed by file path)
 
 ### Core Processing Architecture
@@ -83,6 +83,7 @@ CHOAM is a CLI tool for managing melange build specifications and securing softw
 - `internal/ecosystem/fetcher.go` - remote manifest fetching (go.mod/Cargo.lock/pom.xml)
 - `internal/scan/vulnerability.go` - `NewVulnerabilityScanner()` OSV scanner (language-agnostic `ScanPackages`; fails closed on incomplete pages or advisory lookups)
 - `internal/scan/osv.go` - minimal api.osv.dev client (querybatch + vulns/{id})
+- `internal/scan/gitrange.go` - git-range advisories: proxy origin commit -> OSV commit query, fix resolved from release tags
 - `internal/scan/cache.go` - Vulnerability result caching (ecosystem-qualified keys)
 
 ### Service Clients
@@ -192,6 +193,7 @@ make fmt && make lint && make test
 ./choam bump --no-typecheck ./packages/   # Simulate but skip the type-check gate
 ./choam bump --no-stdlib ./packages/      # Skip the Go stdlib staleness/epoch-bump check
 ./choam bump --no-apk-advisories ./packages/  # Skip the Chainguard/Wolfi apk advisory epoch alignment
+./choam bump --no-git-range ./packages/   # Skip the git-range advisory pass (needs the module proxy)
 
 # Verbosity control (available for all commands)
 ./choam check -v ./packages/              # Info level
@@ -262,6 +264,7 @@ make fmt && make lint && make test
 - Security is highest priority
 - OSV database integration via `internal/scan/vulnerability.go`
 - Advisory records are fetched into the shared per-run `VulnerabilityCache` concurrently (`PrefetchAdvisories`, at most `osvFetchConcurrency` = 8 in flight, one request per ID via singleflight); it is only a warm-up - the ordered hydration pass still decides results and errors, so scans fail closed exactly as before
+- Git-range advisories (`internal/scan/gitrange.go`): CNA records that reach OSV only as GIT commit ranges with no Go package (e.g. HashiCorp's go-getter CVEs) never match a package@version query. For every non-private Go module at its repo root (the module proxy's `.info` `Origin.Subdir` is empty; submodules of a monorepo would inherit the whole repo's advisories, so they are skipped) the scan queries OSV by the proxy's `Origin.Hash` commit, drops anything a package-scoped record already covers (`fixAccumulator.known`: IDs and aliases) or that names a Go package, and resolves the fix as the first same-major release cut from one of the record's fixed commits, else the first whose commit OSV no longer matches. Findings carry no vulnerable imports (linked whenever the module is) and `database_specific.source` = `osv-git-range`. Origins, version lists and commit hits are cached in `VulnerabilityCache`; a proxy 4xx skips the module, a transport/5xx failure fails the scan closed; `--no-git-range` (or `GOPROXY=off|direct`) disables the pass. `+incompatible` releases count as later versions. The scan logs a match at debug level only (it repeats on every simulation rescan); the per-package report names each one once (`gitRangeMessages`, `-v`)
 - Minimal fix strategy to reduce update impact; choam never proposes a major-version raise of its own (v1 -> v2, `+incompatible`; REVIEW residual), with one exception: a same-path v0 -> v1 graduation (no `/vN` or gopkg.in path major) that is a security fix for a linked advisory is raised when the type-check gate is on (`gatedV0ToV1`, `internal/simulate/loop_scan.go`) - the gate proves it or relaxes it to the highest v0 fix rung, and a surviving one is reported as a default-verbosity note (`ModrootResult.MajorRaises`); with `--no-typecheck` it stays a REVIEW residual. Hygiene bumps never cross a major. In addition, an existing spec pin that crosses a major of a module go.mod already has - same module path, a version the path admits - is kept (`pinnedCrossMajor`, `internal/ecosystem/golang/analyzer.go`); the toolchain and type-check gate still decide whether it holds. A `/vN` path change is a different module, never a pin
 - Reported advisory IDs are CVE-first (`scan.PreferredID`; `Vulnerability.Aliases` retained); the epoch is aligned to proven Chainguard/Wolfi apk advisories (`--no-apk-advisories` to disable) and never raised past an advisory not proven fixed (a rerun with no bump actions still runs the simulation when such an advisory shares an upstream ID with a pristine Go dependency advisory - `apkProofWanted` - since only the simulation proves the spec's existing deps fix it; hygiene pins already in the spec count as fixing their advisories, not only ones this run writes - `shippedHygieneIDs`); an advisory whose upstream records affect only modules outside the analysed dependency graph is `not-applicable` (cannot ship, so it never blocks and the epoch may align with it)
 - Epoch management tied to actual fixes (security fixes, scanner-hygiene bumps or stdlib rebuilds) and to any other edit this run writes to the build inputs (`Processor.buildInputsChanged`: parsed original vs current YAML minus `package.epoch`; comment-only rewrites do not count)
