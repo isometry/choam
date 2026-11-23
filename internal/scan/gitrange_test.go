@@ -57,8 +57,8 @@ func (f *gitFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		_, _ = fmt.Fprintf(w, `{"Version":%q,"Origin":{"VCS":"git","Hash":%q,"Subdir":%q}}`, version, hash, f.subdir[version])
 	case "api.osv.dev":
-		if strings.HasPrefix(r.URL.Path, "/v1/vulns/") {
-			record, ok := f.records[strings.TrimPrefix(r.URL.Path, "/v1/vulns/")]
+		if after, ok := strings.CutPrefix(r.URL.Path, "/v1/vulns/"); ok {
+			record, ok := f.records[after]
 			if !ok {
 				w.WriteHeader(http.StatusNotFound)
 				return
