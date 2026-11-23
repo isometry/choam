@@ -45,13 +45,23 @@ const (
 )
 
 // originInfo is what a module proxy reports about where a version was built
-// from. ok is false when it reports nothing usable (no Origin, or a proxy
+// from. hash is empty when it reports nothing usable (no Origin, or a proxy
 // answer in the 4xx range).
 type originInfo struct {
 	hash   string
 	subdir string
-	ok     bool
 }
+
+// FromGitRange reports whether v was found by commit range (see above) rather
+// than by a package-scoped record.
+func (v Vulnerability) FromGitRange() bool {
+	m, ok := v.DatabaseSpecific.(map[string]any)
+	return ok && m["source"] == gitRangeSource
+}
+
+// DisableGitRange turns the git-range pass off (--no-git-range): it needs the
+// module proxy, which an outage or credentials may put out of reach.
+func (vs *VulnerabilityScanner) DisableGitRange() { vs.proxyURL = "" }
 
 func proxyURLFromEnv() string {
 	url, _ := goproxy.FirstURL(os.Getenv("GOPROXY"))
@@ -88,7 +98,7 @@ func (vs *VulnerabilityScanner) addGitRangeAdvisories(ctx context.Context, plan 
 
 	var hashes []string
 	for _, o := range origins {
-		if o.ok && o.subdir == "" {
+		if o.hash != "" && o.subdir == "" {
 			hashes = append(hashes, o.hash)
 		}
 	}
@@ -98,7 +108,7 @@ func (vs *VulnerabilityScanner) addGitRangeAdvisories(ctx context.Context, plan 
 	}
 
 	for i, pkg := range pkgs {
-		if !origins[i].ok || origins[i].subdir != "" {
+		if origins[i].hash == "" || origins[i].subdir != "" {
 			continue
 		}
 		groups, err := vs.gitRangeGroups(ctx, pkg, hits[origins[i].hash], fixes.known)
@@ -111,7 +121,7 @@ func (vs *VulnerabilityScanner) addGitRangeAdvisories(ctx context.Context, plan 
 				return err
 			}
 			vulnerability := gitRangeVulnerability(pkg, group, fix)
-			logging.From(ctx).Info("advisory matched by git commit range (no Go package record)",
+			logging.From(ctx).Debug("advisory matched by git commit range (no Go package record)",
 				"module", pkg.Name, "version", pkg.Version, "vuln", vulnerability.ID, "fixed", vulnerability.FixedVersion)
 			result.Vulnerabilities = append(result.Vulnerabilities, vulnerability)
 			if vulnerability.FixedVersion != "" {
@@ -190,26 +200,33 @@ func (vs *VulnerabilityScanner) gitRangeFix(ctx context.Context, pkg Package, gr
 		return "", err
 	}
 	var rooted []string // versions with a usable root origin, ascending
+	hashOf := make(map[string]string)
 	for _, version := range versions {
 		o, err := vs.originFor(ctx, pkg.Name, version)
 		if err != nil {
 			return "", err
 		}
-		if !o.ok || o.subdir != "" {
+		if o.hash == "" || o.subdir != "" {
 			continue
 		}
 		if _, ok := fixed[strings.ToLower(o.hash)]; ok {
 			return version, nil
 		}
 		rooted = append(rooted, version)
+		hashOf[version] = o.hash
+	}
+	// No release was cut from a fixed commit (fixes usually land mid-release):
+	// the first release OSV no longer matches contains it. One batched query.
+	hashes := make([]string, 0, len(rooted))
+	for _, version := range rooted {
+		hashes = append(hashes, hashOf[version])
+	}
+	hits, err := vs.commitVulns(ctx, hashes)
+	if err != nil {
+		return "", err
 	}
 	for _, version := range rooted {
-		o, _ := vs.originFor(ctx, pkg.Name, version)
-		hits, err := vs.commitVulns(ctx, []string{o.hash})
-		if err != nil {
-			return "", err
-		}
-		if !slices.ContainsFunc(hits[o.hash], func(v *osvschema.Vulnerability) bool { return coveredBy(v, ids) }) {
+		if !slices.ContainsFunc(hits[hashOf[version]], func(v *osvschema.Vulnerability) bool { return coveredBy(v, ids) }) {
 			return version, nil
 		}
 	}
@@ -242,7 +259,8 @@ func gitRangeVulnerability(pkg Package, group []*osvschema.Vulnerability, fix st
 
 // laterVersions lists pkg's proxy releases above its version in the same
 // major, ascending, bounded at maxGitRangeWalk. A pre-release is skipped
-// unless pkg is itself on one.
+// unless pkg is itself on one; "+incompatible" releases (v2+ without a /vN
+// path) count, any other build metadata does not.
 func (vs *VulnerabilityScanner) laterVersions(ctx context.Context, pkg Package) ([]string, error) {
 	current := "v" + pkg.Version
 	all, err := vs.versionList(ctx, pkg.Name)
@@ -252,7 +270,8 @@ func (vs *VulnerabilityScanner) laterVersions(ctx context.Context, pkg Package) 
 	var later []string
 	for _, v := range all {
 		switch {
-		case !semver.IsValid(v) || semver.Build(v) != "", semver.Major(v) != semver.Major(current),
+		case !semver.IsValid(v) || (semver.Build(v) != "" && semver.Build(v) != "+incompatible"),
+			semver.Major(v) != semver.Major(current),
 			semver.Compare(v, current) <= 0,
 			semver.Prerelease(v) != "" && semver.Prerelease(current) == "":
 			continue
@@ -302,7 +321,7 @@ func (vs *VulnerabilityScanner) originFor(ctx context.Context, mod, version stri
 		if err := json.Unmarshal(body, &info); err != nil {
 			return o, fmt.Errorf("decoding proxy info for %s: %w", key, err)
 		}
-		o = originInfo{hash: info.Origin.Hash, subdir: info.Origin.Subdir, ok: info.Origin.Hash != ""}
+		o = originInfo{hash: info.Origin.Hash, subdir: info.Origin.Subdir}
 	}
 	if vs.cache != nil {
 		vs.cache.SetOrigin(key, o)

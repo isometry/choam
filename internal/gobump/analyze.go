@@ -40,6 +40,25 @@ type Analyzer struct {
 	httpClient *http.Client
 }
 
+// DisableGitRange turns off the scanner's git-range advisory pass (see
+// scan.VulnerabilityScanner.DisableGitRange).
+func (a *Analyzer) DisableGitRange() { a.vulnerabilityScanner.DisableGitRange() }
+
+// gitRangeMessages names, per advisory found by commit range, where it came
+// from: the report would otherwise show a fix with no package-scoped record.
+func gitRangeMessages(modroot string, vulns []scan.Vulnerability) []string {
+	var msgs []string
+	for _, v := range vulns {
+		if !v.FromGitRange() {
+			continue
+		}
+		fix := cmp.Or(v.FixedVersion, "no release")
+		msgs = append(msgs, fmt.Sprintf("modroot %s: %s %s found by git commit range (no Go package record), fixed in %s",
+			modroot, v.Module, v.ID, fix))
+	}
+	return msgs
+}
+
 // NewAnalyzer creates a new analyzer with the provided HTTP client
 func NewAnalyzer(httpClient *http.Client) *Analyzer {
 	if httpClient == nil {
@@ -318,6 +337,10 @@ func (v *VulnerabilityChecker) analyzeModroot(ctx context.Context, eco ecosystem
 	}
 	if scanResult.Error != "" {
 		return ModrootAnalysis{}, fmt.Errorf("modroot %s: security scan error: %s", root, scanResult.Error)
+	}
+
+	for _, msg := range gitRangeMessages(root, scanResult.Vulnerabilities) {
+		gp.AddMessage(msg)
 	}
 
 	existingDeps := existing.deps[root]

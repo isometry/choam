@@ -20,16 +20,17 @@ const getter = "github.com/hashicorp/go-getter"
 // gitFixture serves a module proxy (host proxy.test) and the OSV API (host
 // api.osv.dev) from maps, recording what was asked.
 type gitFixture struct {
-	versions   []string            // the proxy's @v/list
-	hashes     map[string]string   // version -> origin commit
-	subdir     map[string]string   // version -> origin subdir
-	status     map[string]int      // proxy path suffix -> forced status
-	commitHits map[string][]string // commit -> advisory IDs
-	pkgHits    map[string][]string // "module@version" -> advisory IDs
-	records    map[string]*osvschema.Vulnerability
-	mu         sync.Mutex
-	commitQs   int
-	proxyGets  int
+	versions      []string            // the proxy's @v/list
+	hashes        map[string]string   // version -> origin commit
+	subdir        map[string]string   // version -> origin subdir
+	status        map[string]int      // proxy path suffix -> forced status
+	commitHits    map[string][]string // commit -> advisory IDs
+	pkgHits       map[string][]string // "module@version" -> advisory IDs
+	records       map[string]*osvschema.Vulnerability
+	mu            sync.Mutex
+	commitQs      int
+	commitBatches int
+	proxyGets     int
 }
 
 func (f *gitFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -73,6 +74,9 @@ func (f *gitFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		resp := &api.BatchVulnerabilityList{}
+		if len(batch.GetQueries()) > 0 && batch.GetQueries()[0].GetCommit() != "" {
+			f.commitBatches++
+		}
 		for _, q := range batch.GetQueries() {
 			var ids []string
 			if commit := q.GetCommit(); commit != "" {
@@ -274,4 +278,66 @@ func TestGitRange_ResultsAreCached(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, gets, f.proxyGets, "a rescan of the same module@version repeats no proxy request")
 	assert.Equal(t, qs, f.commitQs, "...nor commit query")
+}
+
+func TestGitRange_IncompatibleReleasesAreCandidates(t *testing.T) {
+	// A v2+ module without a /vN path: the proxy lists its releases as
+	// "+incompatible", and a fix may only exist as one.
+	f := newGetterFixture()
+	f.versions = []string{"v25.0.0+incompatible", "v25.0.1+incompatible", "v26.0.0+incompatible"}
+	f.hashes = map[string]string{
+		"v25.0.0+incompatible": "hash-25.0.0",
+		"v25.0.1+incompatible": "hash-25.0.1",
+		"v26.0.0+incompatible": "hash-26.0.0",
+	}
+	f.commitHits = map[string][]string{"hash-25.0.0": {"CVE-A"}}
+	f.records = map[string]*osvschema.Vulnerability{"CVE-A": gitRecord("CVE-A", "hash-25.0.1")}
+
+	vs := newTestScanner(newMockHTTPClient(f))
+	vs.proxyURL = "https://proxy.test"
+	result, err := vs.ScanPackages(t.Context(), []Package{{Name: getter, Version: "v25.0.0+incompatible", Ecosystem: "Go"}})
+	require.NoError(t, err)
+	require.Len(t, result.Vulnerabilities, 1)
+	assert.Equal(t, "v25.0.1+incompatible", result.Vulnerabilities[0].FixedVersion, "same major only: not v26")
+}
+
+func TestGitRange_NonModuleNameMakesNoRequests(t *testing.T) {
+	// go_stdlib.go scans the pseudo-package "stdlib" as a Go package: it has
+	// no proxy entry and must never cost a request.
+	f := newGetterFixture()
+	vs := newTestScanner(newMockHTTPClient(f))
+	vs.proxyURL = "https://proxy.test"
+	result, err := vs.ScanPackages(t.Context(), []Package{{Name: "stdlib", Version: "v1.26.4", Ecosystem: "Go"}})
+	require.NoError(t, err)
+	assert.Empty(t, result.Vulnerabilities)
+	assert.Zero(t, f.proxyGets)
+	assert.Zero(t, f.commitQs)
+}
+
+func TestGitRange_DisableGitRange(t *testing.T) {
+	f := newGetterFixture()
+	result, err := f.scan(t, func(vs *VulnerabilityScanner) { vs.DisableGitRange() })
+	require.NoError(t, err)
+	assert.Empty(t, result.Vulnerabilities)
+	assert.Zero(t, f.proxyGets)
+}
+
+func TestGitRange_FallbackQueriesOSVInOneBatch(t *testing.T) {
+	f := newGetterFixture()
+	f.records["CVE-A"] = gitRecord("CVE-A", "not-a-release-commit")
+	f.commitHits = map[string][]string{
+		"hash-v1.8.6": {"CVE-A"}, "hash-v1.8.7": {"CVE-A"}, "hash-v1.8.8": {"CVE-A"}, "hash-v1.8.9": {"CVE-A"},
+	}
+	result, err := f.scan(t, nil)
+	require.NoError(t, err)
+	require.Len(t, result.Vulnerabilities, 1)
+	assert.Equal(t, "v1.8.10", result.Vulnerabilities[0].FixedVersion)
+	assert.Equal(t, 5, f.commitQs, "the scanned version's hash, then the four later releases' hashes")
+	assert.Equal(t, 2, f.commitBatches, "one batch for the scanned version, one for all later releases")
+}
+
+func TestFromGitRange(t *testing.T) {
+	assert.True(t, Vulnerability{DatabaseSpecific: map[string]any{"source": gitRangeSource}}.FromGitRange())
+	assert.False(t, Vulnerability{DatabaseSpecific: map[string]any{"source": "other"}}.FromGitRange())
+	assert.False(t, Vulnerability{}.FromGitRange())
 }
