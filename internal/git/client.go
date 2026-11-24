@@ -3,17 +3,33 @@ package git
 import (
 	"context"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/transport"
+	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/go-git/go-git/v5/storage/memory"
 )
 
 // Client represents a Git client using go-git
 type Client struct{}
+
+// authFor returns token auth for https://github.com URLs when GITHUB_TOKEN is
+// set, so private repositories are reachable (go-git ignores credential
+// helpers). Never for other hosts, so the token cannot leak to a third party.
+func authFor(repoURL string) transport.AuthMethod {
+	token := os.Getenv("GITHUB_TOKEN")
+	u, err := url.Parse(repoURL)
+	if token == "" || err != nil || u.Scheme != "https" || !strings.EqualFold(u.Hostname(), "github.com") {
+		return nil // untyped nil: go-git treats it as anonymous
+	}
+	return &githttp.BasicAuth{Username: "x-access-token", Password: token}
+}
 
 // New creates a new Git client
 func New() *Client {
@@ -29,7 +45,7 @@ func (c *Client) ListTags(ctx context.Context, repoURL string) ([]string, error)
 		URLs: []string{repoURL},
 	})
 
-	refs, err := rem.ListContext(ctx, &git.ListOptions{})
+	refs, err := rem.ListContext(ctx, &git.ListOptions{Auth: authFor(repoURL)})
 	if err != nil {
 		return nil, fmt.Errorf("listing references from %s: %w", repoURL, err)
 	}
@@ -59,7 +75,7 @@ func (c *Client) GetCommitSHAForTag(ctx context.Context, repoURL, tag string) (s
 	// AppendPeeled adds "<tag>^{}" entries pointing at the commit an annotated
 	// tag names; without it an annotated tag lists as its tag object, which is
 	// not the commit melange's expected-commit is compared with.
-	refs, err := rem.ListContext(ctx, &git.ListOptions{PeelingOption: git.AppendPeeled})
+	refs, err := rem.ListContext(ctx, &git.ListOptions{PeelingOption: git.AppendPeeled, Auth: authFor(repoURL)})
 	if err != nil {
 		return "", fmt.Errorf("listing references from %s: %w", repoURL, err)
 	}
@@ -90,6 +106,7 @@ func (c *Client) GetCommitSHAForTag(ctx context.Context, repoURL, tag string) (s
 func (c *Client) CloneAtTag(ctx context.Context, repoURL, tag, destDir string) error {
 	opts := &git.CloneOptions{
 		URL:           repoURL,
+		Auth:          authFor(repoURL),
 		ReferenceName: plumbing.NewTagReferenceName(tag),
 		SingleBranch:  true,
 		Depth:         1,
