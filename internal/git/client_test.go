@@ -9,6 +9,7 @@ import (
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/object"
+	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -110,4 +111,34 @@ func TestListTags_NoTags(t *testing.T) {
 
 	_, err = New().ListTags(t.Context(), dir)
 	assert.Error(t, err)
+}
+
+func TestAuthFor(t *testing.T) {
+	tests := []struct {
+		name  string
+		token string
+		url   string
+		want  bool
+	}{
+		{"github https with token", "tok", "https://github.com/o/r.git", true},
+		{"github host case-insensitive", "tok", "https://GitHub.com/o/r.git", true},
+		{"other host never gets token", "tok", "https://gitlab.com/o/r.git", false},
+		{"lookalike host", "tok", "https://github.com.evil.example/o/r.git", false},
+		{"plain http", "tok", "http://github.com/o/r.git", false},
+		{"ssh", "tok", "git@github.com:o/r.git", false},
+		{"no token", "", "https://github.com/o/r.git", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GITHUB_TOKEN", tt.token)
+			got := authFor(tt.url)
+			if !tt.want {
+				assert.Nil(t, got)
+				return
+			}
+			ba, ok := got.(*githttp.BasicAuth)
+			require.True(t, ok)
+			assert.Equal(t, "tok", ba.Password)
+		})
+	}
 }
