@@ -31,12 +31,6 @@ type GoVersionFallbackStage struct {
 	// affected modroot gets one explanatory message instead.
 	probeDisabled bool
 
-	// goPrivate/goNoProxy are GOPRIVATE/GONOPROXY captured once at
-	// construction (see internal/goproxy.IsPrivate) so the fallback probe
-	// never sends a private module's name/version to a public proxy.
-	goPrivate string
-	goNoProxy string
-
 	// goProxyIsPublic is true when goProxyURL is (or falls back to) the
 	// public https://proxy.golang.org - either because GOPROXY named it
 	// directly, or because GOPROXY's first entry was unusable ("direct",
@@ -56,14 +50,13 @@ func NewGoVersionFallbackStage(analyzer *Analyzer) *GoVersionFallbackStage {
 		Analyzer:         analyzer,
 		goProxyURL:       proxyURL,
 		probeDisabled:    goproxy.Disabled(os.Getenv("GOPROXY")),
-		goPrivate:        os.Getenv("GOPRIVATE"),
-		goNoProxy:        os.Getenv("GONOPROXY"),
 		goProxyIsPublic:  proxyURL == defaultGoProxyURL,
 	}
 }
 
-// skipPrivateModule reports whether modulePath is private per the stage's
-// captured GOPRIVATE/GONOPROXY - the skip func the best-effort go-version
+// skipPrivateModule reports whether modulePath is private per ctx's
+// GOPRIVATE/GONOPROXY (the spec's unioned with the process's, see
+// goproxy.WithSpecEnv) - the skip func the best-effort go-version
 // fallback probe uses to avoid leaking private module names/versions to a
 // public proxy.
 //
@@ -78,11 +71,12 @@ func NewGoVersionFallbackStage(analyzer *Analyzer) *GoVersionFallbackStage {
 // Skip on the UNION of GOPRIVATE and GONOPROXY instead, expressed by
 // consulting goproxy.IsPrivate once per pattern list with the other left
 // empty.
-func (s *GoVersionFallbackStage) skipPrivateModule(modulePath string) bool {
+func (s *GoVersionFallbackStage) skipPrivateModule(ctx context.Context, modulePath string) bool {
+	goPrivate, goNoProxy := goproxy.Getenv(ctx, "GOPRIVATE"), goproxy.Getenv(ctx, "GONOPROXY")
 	if s.goProxyIsPublic {
-		return goproxy.IsPrivate(modulePath, s.goPrivate, "") || goproxy.IsPrivate(modulePath, "", s.goNoProxy)
+		return goproxy.IsPrivate(modulePath, goPrivate, "") || goproxy.IsPrivate(modulePath, "", goNoProxy)
 	}
-	return goproxy.IsPrivate(modulePath, s.goPrivate, s.goNoProxy)
+	return goproxy.IsPrivate(modulePath, goPrivate, goNoProxy)
 }
 
 // ShouldRun: the apply phase runs (bumpActionsPending) and at least one Go
@@ -149,7 +143,9 @@ func (s *GoVersionFallbackStage) fallbackGoVersions(ctx context.Context, gp *Pro
 				gp.AddMessage(fmt.Sprintf("modroot %s: GOPROXY=off - skipping best-effort Go version probe", m.Modroot))
 				continue
 			}
-			required, unfetched, err := fallbackRequiredGoVersion(ctx, s.Analyzer.client(), s.goProxyURL, m, s.skipPrivateModule)
+			required, unfetched, err := fallbackRequiredGoVersion(ctx, s.Analyzer.client(), s.goProxyURL, m, func(modulePath string) bool {
+				return s.skipPrivateModule(ctx, modulePath)
+			})
 			if cerr := ctx.Err(); cerr != nil {
 				return cerr
 			}

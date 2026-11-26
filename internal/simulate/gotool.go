@@ -18,6 +18,8 @@ import (
 	"time"
 	"unicode"
 
+	"github.com/isometry/choam/internal/git"
+	"github.com/isometry/choam/internal/goproxy"
 	"github.com/isometry/choam/internal/logging"
 	"golang.org/x/mod/modfile"
 	"golang.org/x/mod/module"
@@ -25,7 +27,8 @@ import (
 )
 
 // GoToolchain runs the local go binary. The environment passes through the
-// user's proxy/auth configuration (GOPROXY, GOPRIVATE, netrc via HOME) and
+// user's proxy/auth configuration (GOPROXY, netrc via HOME), adds the spec's
+// GOPRIVATE & co. and github.com git credentials (moduleEnv), and
 // forces the settings resolution parity depends on: GOTOOLCHAIN=auto so a
 // go.mod demanding a newer toolchain is honored, -mod=mod so a vendor/
 // directory doesn't mask resolution, and GOWORK=off so a stray go.work can't
@@ -103,6 +106,7 @@ func (t *GoToolchain) runEnvTimeout(parent context.Context, dir string, extraEnv
 		"GOWORK=off",
 		"GO111MODULE=on",
 	)
+	cmd.Env = append(cmd.Env, moduleEnv(ctx)...)
 	cmd.Env = append(cmd.Env, extraEnv...)
 
 	var stdout, stderr bytes.Buffer
@@ -126,6 +130,12 @@ func (t *GoToolchain) runEnvTimeout(parent context.Context, dir string, extraEnv
 		return nil, err
 	}
 	return stdout.Bytes(), nil
+}
+
+// moduleEnv is the spec's private-module variables (goproxy.Environ) plus the
+// github.com git credentials (git.CredentialEnv) for a go subprocess.
+func moduleEnv(ctx context.Context) []string {
+	return append(goproxy.Environ(ctx), git.CredentialEnv()...)
 }
 
 // waitDelay bounds how long a cancelled go command's output pipes are

@@ -457,13 +457,16 @@ func TestOmnibumpEnv(t *testing.T) {
 		require.NoError(t, err)
 		return mf
 	}
-	assert.Equal(t, "local", omnibumpEnv(raw("1.26.6"), "1.27.1", "1.27.1")["GOTOOLCHAIN"])
-	assert.Equal(t, "local", omnibumpEnv(raw("1.28.0"), "1.27.1", "1.27.1")["GOTOOLCHAIN"], "lowered to the build's Go")
-	assert.Equal(t, "auto", omnibumpEnv(raw("1.28.0"), "1.29.0", "1.27.1")["GOTOOLCHAIN"], "host older than the directive left")
-	assert.Equal(t, "auto", omnibumpEnv(raw("1.21"), "", "")["GOTOOLCHAIN"], "unknown host")
-	env := omnibumpEnv(raw("1.21"), "1.27.1", "1.27.1")
+	assert.Equal(t, "local", omnibumpEnv(raw("1.26.6"), "1.27.1", "1.27.1", nil)["GOTOOLCHAIN"])
+	assert.Equal(t, "local", omnibumpEnv(raw("1.28.0"), "1.27.1", "1.27.1", nil)["GOTOOLCHAIN"], "lowered to the build's Go")
+	assert.Equal(t, "auto", omnibumpEnv(raw("1.28.0"), "1.29.0", "1.27.1", nil)["GOTOOLCHAIN"], "host older than the directive left")
+	assert.Equal(t, "auto", omnibumpEnv(raw("1.21"), "", "", nil)["GOTOOLCHAIN"], "unknown host")
+	env := omnibumpEnv(raw("1.21"), "1.27.1", "1.27.1", nil)
 	assert.Equal(t, "-mod=mod", env["GOFLAGS"])
 	assert.Equal(t, "off", env["GOWORK"])
+	env = omnibumpEnv(raw("1.21"), "", "", []string{"GOPRIVATE=github.com/example/*", "GIT_CONFIG_VALUE_0=!f() { x=y; }; f"})
+	assert.Equal(t, "github.com/example/*", env["GOPRIVATE"])
+	assert.Equal(t, "!f() { x=y; }; f", env["GIT_CONFIG_VALUE_0"], "split on the first = only")
 }
 
 func TestWithProcessEnvRestores(t *testing.T) {

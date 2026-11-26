@@ -1,12 +1,14 @@
 // Package goproxy provides pure helpers for interpreting the GOPROXY,
 // GOPRIVATE and GONOPROXY environment variables the way the go command
-// itself does. Callers read the environment once at a construction site
-// (os.Getenv) and pass the resulting values in; every function here is a
-// pure string -> value transform so it stays hermetic to test.
+// itself does. The parsing helpers are pure string -> value transforms; the
+// per-spec module variables (GOPRIVATE and friends) ride on ctx, see
+// WithSpecEnv.
 package goproxy
 
 import (
+	"context"
 	"net/url"
+	"os"
 	"strings"
 
 	"golang.org/x/mod/module"
@@ -94,4 +96,49 @@ func IsPrivate(modulePath, goprivate, gonoproxy string) bool {
 		return false
 	}
 	return module.MatchPrefixPatterns(patterns, modulePath)
+}
+
+// moduleVars are the go command's private-module variables a melange spec's
+// build environment may set.
+var moduleVars = []string{"GOPRIVATE", "GONOPROXY", "GONOSUMDB", "GOINSECURE"}
+
+type specEnvKey struct{}
+
+// WithSpecEnv returns ctx carrying each module variable as the union of the
+// process environment and spec (a melange spec's environment), comma-joined
+// with empty values skipped, so a spec's private modules are treated as
+// private by every go subprocess and module-name check run for it.
+func WithSpecEnv(ctx context.Context, spec map[string]string) context.Context {
+	env := make(map[string]string, len(moduleVars))
+	for _, key := range moduleVars {
+		var parts []string
+		for _, v := range []string{os.Getenv(key), spec[key]} {
+			if v != "" {
+				parts = append(parts, v)
+			}
+		}
+		env[key] = strings.Join(parts, ",")
+	}
+	return context.WithValue(ctx, specEnvKey{}, env)
+}
+
+// Getenv returns key's value from ctx's spec environment when ctx carries
+// one (see WithSpecEnv), else the process environment.
+func Getenv(ctx context.Context, key string) string {
+	if env, ok := ctx.Value(specEnvKey{}).(map[string]string); ok {
+		if v, ok := env[key]; ok {
+			return v
+		}
+	}
+	return os.Getenv(key)
+}
+
+// Environ returns KEY=value for every module variable, always all of them
+// (empty when unset), so a go subprocess sees exactly ctx's values.
+func Environ(ctx context.Context) []string {
+	out := make([]string, 0, len(moduleVars))
+	for _, key := range moduleVars {
+		out = append(out, key+"="+Getenv(ctx, key))
+	}
+	return out
 }
