@@ -76,9 +76,10 @@ func (vs *VulnerabilityScanner) addGitRangeAdvisories(ctx context.Context, plan 
 		return nil
 	}
 	var pkgs []Package
+	privatePatterns := goproxy.Getenv(ctx, "GOPRIVATE") // GOPRIVATE only: see planScan
 	for _, key := range plan.order {
 		pkg := plan.pkgs[key]
-		if pkg.Ecosystem == "Go" && !goproxy.IsPrivate(pkg.Name, vs.privatePatterns, "") {
+		if pkg.Ecosystem == "Go" && !goproxy.IsPrivate(pkg.Name, privatePatterns, "") {
 			pkgs = append(pkgs, pkg)
 		}
 	}

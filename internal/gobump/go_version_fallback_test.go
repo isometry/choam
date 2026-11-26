@@ -10,6 +10,7 @@ import (
 	"time"
 
 	ecogolang "github.com/isometry/choam/internal/ecosystem/golang"
+	"github.com/isometry/choam/internal/goproxy"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -475,10 +476,10 @@ func TestNewGoVersionFallbackStage_GOPRIVATEWiring(t *testing.T) {
 	t.Setenv("GONOPROXY", "")
 
 	stage := NewGoVersionFallbackStage(nil)
-	assert.Equal(t, "example.com/private/*", stage.goPrivate)
-	assert.Equal(t, "", stage.goNoProxy)
-	assert.True(t, stage.skipPrivateModule("example.com/private/foo"))
-	assert.False(t, stage.skipPrivateModule("example.com/public/foo"))
+	assert.True(t, stage.skipPrivateModule(t.Context(), "example.com/private/foo"))
+	assert.False(t, stage.skipPrivateModule(t.Context(), "example.com/public/foo"))
+	specCtx := goproxy.WithSpecEnv(t.Context(), map[string]string{"GOPRIVATE": "example.com/public/*"})
+	assert.True(t, stage.skipPrivateModule(specCtx, "example.com/public/foo"), "spec GOPRIVATE unioned in")
 }
 
 // TestGoVersionFallbackStage_PublicFallbackSkipsGOPRIVATEUnion covers the residual
@@ -506,7 +507,7 @@ func TestGoVersionFallbackStage_PublicFallbackSkipsGOPRIVATEUnion(t *testing.T) 
 	t.Cleanup(server.Close)
 
 	m := &ModrootAnalysis{DesiredDeps: []string{"secret.corp/private@v1.0.0"}}
-	got, _, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, stage.skipPrivateModule)
+	got, _, err := fallbackRequiredGoVersion(t.Context(), server.Client(), server.URL, m, func(p string) bool { return stage.skipPrivateModule(t.Context(), p) })
 	require.Error(t, err) // the only candidate is private, so nothing was fetched.
 	assert.Equal(t, "", got)
 	assert.Empty(t, hitPaths, "GOPRIVATE-matched module must never reach the public proxy fallback")

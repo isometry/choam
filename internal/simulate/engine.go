@@ -124,7 +124,7 @@ func (l *loop) newEngine(ctx context.Context) (engine, error) {
 	if goVersion == "" {
 		goVersion = host // pinned explicitly: DoUpdate would otherwise run `go version` from the process cwd
 	}
-	e := &omnibumpEngine{l: l, raw: raw, goVersion: goVersion, env: omnibumpEnv(raw, goVersion, host)}
+	e := &omnibumpEngine{l: l, raw: raw, goVersion: goVersion, env: omnibumpEnv(raw, goVersion, host, moduleEnv(ctx))}
 	logging.From(ctx).Debug("simulating with omnibump", "modroot", l.req.Modroot, "omnibump", OmnibumpVersion(),
 		"go_version", goVersion, "tidy", !l.req.NoTidy, "gotoolchain", e.env["GOTOOLCHAIN"])
 	return e, nil
@@ -413,8 +413,9 @@ func rawReplaced(raw *modfile.File, module string) bool {
 // lowered to goVersion) - the build image runs its own go without toolchain
 // switching. When the host is older (or unknown) it stays auto, so the
 // simulation can still resolve; a dependency demanding a newer go than the
-// build's then fails at build time, not here.
-func omnibumpEnv(raw *modfile.File, goVersion, host string) map[string]string {
+// build's then fails at build time, not here. extra (KEY=value entries,
+// moduleEnv) is added as is.
+func omnibumpEnv(raw *modfile.File, goVersion, host string, extra []string) map[string]string {
 	directive := ""
 	if raw.Go != nil {
 		directive = raw.Go.Version
@@ -426,12 +427,18 @@ func omnibumpEnv(raw *modfile.File, goVersion, host string) map[string]string {
 	if host != "" && goversion.Compare(host, directive) >= 0 {
 		toolchain = "local"
 	}
-	return map[string]string{
+	env := map[string]string{
 		"GOTOOLCHAIN": toolchain,
 		"GOFLAGS":     "-mod=mod",
 		"GOWORK":      "off",
 		"GO111MODULE": "on",
 	}
+	for _, kv := range extra {
+		if key, value, ok := strings.Cut(kv, "="); ok {
+			env[key] = value
+		}
+	}
+	return env
 }
 
 // processEnvMu serializes withProcessEnv.

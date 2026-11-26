@@ -122,3 +122,43 @@ func TestIsPrivate(t *testing.T) {
 		})
 	}
 }
+
+func TestWithSpecEnv(t *testing.T) {
+	tests := []struct {
+		name    string
+		process string
+		spec    map[string]string
+		want    string
+	}{
+		{name: "neither", want: ""},
+		{name: "process only", process: "github.com/a/*", want: "github.com/a/*"},
+		{name: "spec only", spec: map[string]string{"GOPRIVATE": "github.com/example/*"}, want: "github.com/example/*"},
+		{name: "both", process: "github.com/a/*", spec: map[string]string{"GOPRIVATE": "github.com/example/*"}, want: "github.com/a/*,github.com/example/*"},
+		{name: "empty spec value skipped", process: "github.com/a/*", spec: map[string]string{"GOPRIVATE": ""}, want: "github.com/a/*"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GOPRIVATE", tt.process)
+			ctx := WithSpecEnv(t.Context(), tt.spec)
+			assert.Equal(t, tt.want, Getenv(ctx, "GOPRIVATE"))
+		})
+	}
+}
+
+func TestEnviron(t *testing.T) {
+	for _, key := range moduleVars {
+		t.Setenv(key, "")
+	}
+	ctx := WithSpecEnv(t.Context(), map[string]string{"GONOSUMDB": "github.com/example/*"})
+	assert.Equal(t, []string{
+		"GOPRIVATE=",
+		"GONOPROXY=",
+		"GONOSUMDB=github.com/example/*",
+		"GOINSECURE=",
+	}, Environ(ctx))
+}
+
+func TestGetenvFallsBackToProcess(t *testing.T) {
+	t.Setenv("GOPRIVATE", "github.com/example/*")
+	assert.Equal(t, "github.com/example/*", Getenv(t.Context(), "GOPRIVATE"))
+}

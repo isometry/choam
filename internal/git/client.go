@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/go-git/go-git/v5"
@@ -29,6 +30,30 @@ func authFor(repoURL string) transport.AuthMethod {
 		return nil // untyped nil: go-git treats it as anonymous
 	}
 	return &githttp.BasicAuth{Username: "x-access-token", Password: token}
+}
+
+// credentialHelper answers git's `get` with GITHUB_TOKEN, read from the
+// helper's own environment at run time so the token never appears in argv,
+// a file or a config value.
+const credentialHelper = `!f() { test "$1" = get && echo username=x-access-token && echo "password=$GITHUB_TOKEN"; }; f`
+
+// CredentialEnv returns the environment entries that give a git subprocess
+// (the go tool's) a credential helper for https://github.com backed by
+// GITHUB_TOKEN - the same host scoping as authFor - appended after any
+// GIT_CONFIG_COUNT entries already in the environment. Nil without a token.
+func CredentialEnv() []string {
+	if os.Getenv("GITHUB_TOKEN") == "" {
+		return nil
+	}
+	n, err := strconv.Atoi(os.Getenv("GIT_CONFIG_COUNT"))
+	if err != nil || n < 0 {
+		n = 0
+	}
+	return []string{
+		fmt.Sprintf("GIT_CONFIG_COUNT=%d", n+1),
+		fmt.Sprintf("GIT_CONFIG_KEY_%d=credential.https://github.com.helper", n),
+		fmt.Sprintf("GIT_CONFIG_VALUE_%d=%s", n, credentialHelper),
+	}
 }
 
 // New creates a new Git client

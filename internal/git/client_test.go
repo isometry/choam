@@ -142,3 +142,35 @@ func TestAuthFor(t *testing.T) {
 		})
 	}
 }
+
+func TestCredentialEnv(t *testing.T) {
+	const key = "credential.https://github.com.helper"
+	tests := []struct {
+		name  string
+		token string
+		count string
+		want  []string
+	}{
+		{name: "no token", token: "", want: nil},
+		{name: "token, no existing config", token: "secret", want: []string{
+			"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=" + key, "GIT_CONFIG_VALUE_0=" + credentialHelper,
+		}},
+		{name: "token appended after existing config", token: "secret", count: "2", want: []string{
+			"GIT_CONFIG_COUNT=3", "GIT_CONFIG_KEY_2=" + key, "GIT_CONFIG_VALUE_2=" + credentialHelper,
+		}},
+		{name: "invalid count treated as none", token: "secret", count: "x", want: []string{
+			"GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=" + key, "GIT_CONFIG_VALUE_0=" + credentialHelper,
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GITHUB_TOKEN", tt.token)
+			t.Setenv("GIT_CONFIG_COUNT", tt.count)
+			got := CredentialEnv()
+			assert.Equal(t, tt.want, got)
+			for _, kv := range got {
+				assert.NotContains(t, kv, "secret", "the token must stay in the environment")
+			}
+		})
+	}
+}

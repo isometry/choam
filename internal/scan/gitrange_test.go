@@ -232,8 +232,9 @@ func TestGitRange_NoFixIsReportedWithoutBump(t *testing.T) {
 }
 
 func TestGitRange_PrivateModuleNeverLeavesTheMachine(t *testing.T) {
+	t.Setenv("GOPRIVATE", "github.com/hashicorp/*")
 	f := newGetterFixture()
-	result, err := f.scan(t, func(vs *VulnerabilityScanner) { vs.privatePatterns = "github.com/hashicorp/*" })
+	result, err := f.scan(t, nil)
 	require.NoError(t, err)
 	assert.Empty(t, result.Vulnerabilities)
 	assert.Zero(t, f.proxyGets)

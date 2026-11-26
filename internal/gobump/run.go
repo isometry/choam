@@ -6,6 +6,7 @@ import (
 	"os"
 
 	melange "chainguard.dev/melange/pkg/config"
+	"github.com/isometry/choam/internal/goproxy"
 	"github.com/isometry/choam/internal/logging"
 )
 
@@ -53,6 +54,10 @@ func ProcessFile(ctx context.Context, filePath string, opts Options, analyzer *A
 		goBumpProcessor.AddMessage(fmt.Sprintf("excluded from bump by %s: %s", excludeAnnotation, reason))
 		logging.From(ctx).Debug("package excluded from bump", "reason", reason)
 	}
+
+	// The spec's GOPRIVATE & co. reach every go subprocess and private-module
+	// check for this file.
+	ctx = goproxy.WithSpecEnv(ctx, cfg.Environment.Environment)
 
 	// Create and execute the pipeline
 	pipeline := NewPipeline(analyzer, opts)
